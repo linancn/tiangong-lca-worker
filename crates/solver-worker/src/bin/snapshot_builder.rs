@@ -26,8 +26,8 @@ use solver_core::{ModelSparseData, SparseTriplet};
 use solver_worker::compiled_graph::{
     CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition, CompiledFlow,
     CompiledFlowKind, CompiledGraph, CompiledMatchingStats, CompiledProcess,
-    CompiledProviderAllocation, CompiledProviderDecision, CompiledProviderDecisionKind,
-    CompiledProviderFailureReason, CompiledProviderGeographyTier,
+    CompiledProviderAllocation, CompiledProviderCandidate, CompiledProviderDecision,
+    CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
     CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource, CompiledReferenceStats,
     CompiledTechnosphereEdge,
 };
@@ -35,6 +35,9 @@ use solver_worker::graph_types::{
     RequestRootProcess, ResolvedScopeProcess, ScopeProcessPartition, SnapshotSelectionMode,
 };
 use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row, postgres::PgPoolOptions};
+use solver_worker::readiness::{
+    MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
+};
 use solver_worker::snapshot_artifacts::{
     SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage, SnapshotBuildConfig,
     SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary,
@@ -233,6 +236,7 @@ struct BuildOutput {
     data: ModelSparseData,
     coverage: SnapshotCoverageReport,
     snapshot_index: SnapshotIndexDocument,
+    readiness: MatrixReadinessReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -709,6 +713,8 @@ async fn main() -> anyhow::Result<()> {
         &source_fingerprint,
         &build_timing,
     )?;
+    let readiness_path =
+        write_matrix_readiness_report_file(&cli.report_dir, snapshot_id, &built.readiness)?;
 
     println!(
         "[build_timing_sec] {}",
@@ -731,6 +737,14 @@ async fn main() -> anyhow::Result<()> {
         built.coverage.matching.unique_provider_match_pct,
         built.coverage.matching.any_provider_match_pct,
         built.coverage.singular_risk.risk_level
+    );
+    println!("[matrix_readiness_report] {}", readiness_path.display());
+    println!(
+        "[matrix_readiness] status={:?} next_action={} blockers={} findings={}",
+        built.readiness.status,
+        built.readiness.next_action,
+        built.readiness.blockers.len(),
+        built.readiness.findings.len()
     );
 
     Ok(())
@@ -1356,6 +1370,7 @@ async fn compile_scope_graph(
         let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
         matching_stats.input_edges_total += 1;
         let providers = provider_map.get(&ex.flow_id);
+        let provider_candidates = provider_candidates_for_indices(providers, &process_meta)?;
         let candidate_provider_count = i32::try_from(providers.map_or(0, Vec::len))
             .map_err(|_| anyhow::anyhow!("providers"))?;
         if candidate_provider_count == 1 {
@@ -1373,6 +1388,7 @@ async fn compile_scope_graph(
                 flow_id: ex.flow_id,
                 candidate_provider_count,
                 matched_provider_count: 1,
+                candidates: provider_candidates,
                 decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
                 resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
                 failure_reason: None,
@@ -1444,6 +1460,7 @@ async fn compile_scope_graph(
                         candidate_provider_count,
                         matched_provider_count: i32::try_from(allocations.len())
                             .map_err(|_| anyhow::anyhow!("provider allocation overflow"))?,
+                        candidates: provider_candidates.clone(),
                         decision_kind: Some(CompiledProviderDecisionKind::MultiResolved),
                         resolution_strategy: Some(resolution.resolution_strategy),
                         failure_reason: None,
@@ -1493,6 +1510,7 @@ async fn compile_scope_graph(
                         flow_id: ex.flow_id,
                         candidate_provider_count,
                         matched_provider_count: 0,
+                        candidates: provider_candidates,
                         decision_kind: Some(CompiledProviderDecisionKind::MultiUnresolved),
                         resolution_strategy: None,
                         failure_reason: Some(failure_reason),
@@ -1513,6 +1531,7 @@ async fn compile_scope_graph(
                 flow_id: ex.flow_id,
                 candidate_provider_count: 0,
                 matched_provider_count: 0,
+                candidates: Vec::new(),
                 decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
                 resolution_strategy: None,
                 failure_reason: Some(CompiledProviderFailureReason::NoProviderCandidates),
@@ -1812,11 +1831,24 @@ fn assemble_sparse_payload(
         process_map,
         impact_map,
     };
+    let readiness = verify_matrix_readiness(&MatrixReadinessInput {
+        schema_version: "matrix_readiness_input.v1".to_owned(),
+        snapshot_id: Some(snapshot_id),
+        config: None,
+        coverage: coverage.clone(),
+        payload: data.clone(),
+        compiled_graph: Some(compiled_graph.clone()),
+        policy: MatrixReadinessPolicy {
+            require_lcia_factors: has_lcia,
+            ..MatrixReadinessPolicy::default()
+        },
+    });
 
     Ok(BuildOutput {
         data,
         coverage,
         snapshot_index,
+        readiness,
     })
 }
 
@@ -2264,6 +2296,31 @@ fn process_meta_for_idx(process_meta: &[ProcessMeta], process_idx: i32) -> Optio
     usize::try_from(process_idx)
         .ok()
         .and_then(|idx| process_meta.get(idx))
+}
+
+fn provider_candidates_for_indices(
+    providers: Option<&Vec<i32>>,
+    process_meta: &[ProcessMeta],
+) -> anyhow::Result<Vec<CompiledProviderCandidate>> {
+    let Some(providers) = providers else {
+        return Ok(Vec::new());
+    };
+    providers
+        .iter()
+        .map(|provider_idx| {
+            let meta = process_meta_for_idx(process_meta, *provider_idx).ok_or_else(|| {
+                anyhow::anyhow!("missing provider process meta idx={provider_idx}")
+            })?;
+            Ok(CompiledProviderCandidate {
+                provider_idx: *provider_idx,
+                provider_id: meta.process_id,
+                process_name: meta.process_name.clone(),
+                location: meta.location.clone(),
+                reference_year: meta.reference_year,
+                annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
+            })
+        })
+        .collect()
 }
 
 fn compiled_process_for_idx(
@@ -4183,6 +4240,17 @@ fn write_report_files(
     Ok(())
 }
 
+fn write_matrix_readiness_report_file(
+    report_dir: &PathBuf,
+    snapshot_id: Uuid,
+    readiness: &MatrixReadinessReport,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let path = report_dir.join(format!("matrix-readiness-{snapshot_id}.json"));
+    fs::write(&path, serde_json::to_vec_pretty(readiness)?)?;
+    Ok(path)
+}
+
 fn parse_provider_rule_list(input: &str) -> anyhow::Result<Vec<ProviderRule>> {
     let mut out = Vec::<ProviderRule>::new();
     for token in input.split(',') {
@@ -4652,6 +4720,7 @@ mod tests {
                     flow_id: Uuid::from_u128(301),
                     candidate_provider_count: 1,
                     matched_provider_count: 1,
+                    candidates: Vec::new(),
                     decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
                     resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
                     failure_reason: None,
@@ -4673,6 +4742,7 @@ mod tests {
                     flow_id: Uuid::from_u128(302),
                     candidate_provider_count: 3,
                     matched_provider_count: 2,
+                    candidates: Vec::new(),
                     decision_kind: Some(CompiledProviderDecisionKind::MultiResolved),
                     resolution_strategy: Some(
                         CompiledProviderResolutionStrategy::SplitByProcessVolume,
@@ -4702,6 +4772,7 @@ mod tests {
                     flow_id: flow_without_provider,
                     candidate_provider_count: 0,
                     matched_provider_count: 0,
+                    candidates: Vec::new(),
                     decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
                     resolution_strategy: None,
                     failure_reason: Some(CompiledProviderFailureReason::NoProviderCandidates),

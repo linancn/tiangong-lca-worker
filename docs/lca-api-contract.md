@@ -189,6 +189,37 @@ snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linkin
 
 `build_snapshot` job 运行和完成时，`lca_jobs.diagnostics.build_snapshot_lock` 会记录全局构建并发锁信息，包括 `strategy`、`max_concurrency`、`slot`、`waiting` 与 `wait_sec`；当前 `strategy` 为 `postgres_transaction_advisory_lock`。完成时 `lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
+### 5.1 Matrix-readiness verification report
+
+自动化 LCA 数据研制使用 calculator 侧的 matrix-readiness gate 判断写入后的数据是否可被行业级计算链路接受。该 gate 不决定是否创建 process/flow，也不替代 CLI schema/ruleset gate；它只验证 provider closure、snapshot graph readiness 和 solver/LCIA compute stability。
+
+可调用入口：
+
+```bash
+cargo run -p solver-worker --bin matrix_readiness -- \
+  --input matrix-readiness-input.json \
+  --out matrix-readiness-report.json
+```
+
+fresh `snapshot_builder` run 也会在 `report_dir` 下写出 `matrix-readiness-<snapshot_id>.json`。输入 `matrix_readiness_input.v1` 包含：
+
+- `coverage`: snapshot coverage report。
+- `payload`: `ModelSparseData` sparse payload。
+- `compiled_graph`（可选）：fresh build 时包含逐边 provider decision、candidate providers、allocation weights、geography tier 和 failure reason。没有该字段时仍可验证 coverage/compute，但 provider evidence 会降级为空。
+- `policy`: provider write percentage、unmatched / unresolved provider 容忍度、singular risk、LCIA factor、factorization 和 negative LCIA anomaly 策略。
+
+输出 `matrix_readiness_report.v1` 包含：
+
+- `status`: `passed` 或 `failed`。
+- `next_action`: 例如 `publish_ready`、`repair_provider_closure_then_recheck`、`repair_compute_stability_then_recheck`。
+- `metrics.provider_closure`: input edge、written edge、unmatched provider、multi-provider unresolved 和 equal-fallback 统计。
+- `metrics.graph_readiness`: process/flow/impact scale、A/B/C/M nnz、reference/allocation closure 和 singular risk。
+- `metrics.compute_stability`: factorization readiness、matrix validation report、sample unit solves、non-finite count 和 negative LCIA count。
+- `provider_evidence`: 每条 input edge 的 consumer、flow、candidate providers、resolution strategy、failure reason、allocation weights、ambiguity 和 confidence。
+- `findings` / `blockers`: machine-readable issue codes、severity、message 和 detail payload。
+
+Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics` 和 `provider_evidence`；不应在外部复制 calculator 的 provider resolution、singular-risk 或 UMFPACK readiness 规则。
+
 ## 6. 幂等与请求缓存（建议约束）
 
 - `lca_jobs.idempotency_key`：同一业务请求重试时复用，避免重复创建 job。

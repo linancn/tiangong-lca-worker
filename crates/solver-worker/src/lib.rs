@@ -24,6 +24,7 @@ pub mod package_execution;
 pub mod package_types;
 pub mod pgbouncer_sqlx;
 pub mod queue;
+pub mod readiness;
 pub mod snapshot_artifacts;
 pub mod snapshot_index;
 pub mod storage;

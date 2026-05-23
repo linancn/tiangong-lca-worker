@@ -64,7 +64,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | --- | --- |
 | `crates/suitesparse-ffi/**` | CSC matrix representation and SuiteSparse bindings |
 | `crates/solver-core/**` | matrix build, factorization cache, solve orchestration, provider matching |
-| `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, result persistence |
+| `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
 | `tools/bw25-validator/**` | manual Brightway comparison tooling |
 | `supabase/migrations/**` | local runtime-facing SQL expectations referenced by the calculator runtime |
@@ -95,6 +95,8 @@ These flows belong to the calculator runtime, not to the API repo.
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
 The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
+
+`crates/solver-worker/src/readiness.rs` owns the calculator-side verification gate for automated data production. It turns snapshot coverage, sparse payloads, and optional compiled provider decisions into a machine-readable matrix-readiness report. Foundry and CLI callers should consume that report instead of reimplementing provider closure, singular-risk, LCIA, or factorization checks outside calculator.
 
 ### Package worker
 

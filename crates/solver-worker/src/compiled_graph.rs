@@ -65,6 +65,20 @@ pub struct CompiledProviderAllocation {
     pub weight: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledProviderCandidate {
+    pub provider_idx: i32,
+    pub provider_id: Uuid,
+    #[serde(default)]
+    pub process_name: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub reference_year: Option<i32>,
+    #[serde(default)]
+    pub annual_supply_or_production_volume: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompiledProviderDecisionKind {
@@ -120,6 +134,8 @@ pub struct CompiledProviderDecision {
     pub flow_id: Uuid,
     pub candidate_provider_count: i32,
     pub matched_provider_count: i32,
+    #[serde(default)]
+    pub candidates: Vec<CompiledProviderCandidate>,
     #[serde(default)]
     pub decision_kind: Option<CompiledProviderDecisionKind>,
     #[serde(default)]
