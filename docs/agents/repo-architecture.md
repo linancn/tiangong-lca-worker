@@ -24,6 +24,7 @@ checkPaths:
   - supabase/migrations/**
   - docs/lca-api-contract.md
   - docs/matrix-readiness-report-contract.md
+  - docs/review-submit-fast-gate-contract.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
@@ -39,6 +40,7 @@ related:
   - ./repo-validation.md
   - ../../docs/lca-api-contract.md
   - ../../docs/matrix-readiness-report-contract.md
+  - ../../docs/review-submit-fast-gate-contract.md
 ---
 
 ## Repo Shape
@@ -71,6 +73,8 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `tools/bw25-validator/**` | manual Brightway comparison tooling |
 | `supabase/migrations/**` | local runtime-facing SQL expectations referenced by the calculator runtime |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
+| `docs/matrix-readiness-report-contract.md` | calculator-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
+| `docs/review-submit-fast-gate-contract.md` | calculator-owned review-submit fast gate schema, blocker codes, and targeted probe contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
 | `docs/frontend-integration.md` | frontend-side solve/result interaction contract |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling notes for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics |
@@ -99,6 +103,8 @@ The snapshot builder path owns sparse payload generation, provider matching, and
 The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
 `crates/solver-worker/src/readiness.rs` owns the calculator-side verification gate for automated data production. It turns snapshot coverage, sparse payloads, and optional compiled provider decisions into a machine-readable matrix-readiness report. Foundry and CLI callers should consume that report instead of reimplementing provider closure, singular-risk, LCIA, or factorization checks outside calculator. The stable report schema, blocker/finding codes, and next-action semantics live in `docs/matrix-readiness-report-contract.md`.
+
+`crates/solver-worker/src/review_submit_gate.rs` owns the calculator-side fast gate for dataset revision review submission. It layers revision freshness, process/exchange scans, provider evidence, sparse structural checks, and targeted RHS probes into a binary `passed` / `blocked` report without full matrix inversion or full `solve_all_unit`.
 
 ### Package worker
 

@@ -18,6 +18,7 @@ checkPaths:
   - crates/**
   - supabase/migrations/**
   - docs/matrix-readiness-report-contract.md
+  - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-05-25
@@ -26,6 +27,7 @@ related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/matrix-readiness-report-contract.md
+  - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/repo-validation.md
@@ -223,6 +225,29 @@ fresh `snapshot_builder` run 也会在 `report_dir` 下写出 `matrix-readiness-
 当前 matrix-readiness 只通过 calculator CLI 与 `snapshot_builder` report artifact 暴露；本节不表示 Edge/API 已提供 HTTP 调用入口。稳定 code、`blockers` / `findings` / `next_action` 规则、policy 默认值和调用方消费约束由 `docs/matrix-readiness-report-contract.md` 维护。
 
 Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics` 和 `provider_evidence`；不应在外部复制 calculator 的 provider resolution、singular-risk 或 UMFPACK readiness 规则。
+
+### 5.2 Review-submit fast gate report
+
+dataset revision 提交审核前使用 calculator 侧 `review_submit_gate` 判断当前 revision 是否可进入审核流程。该 gate 输出二元结果：`passed` 或 `blocked`，不产生 `manual_review_required` 状态。
+
+可调用入口：
+
+```bash
+cargo run -p solver-worker --bin review_submit_gate -- \
+  --input review-submit-gate-input.json \
+  --out review-submit-gate-report.json
+```
+
+输入 `review_submit_gate_input.v1` 复用 snapshot coverage、`ModelSparseData` sparse payload、compiled provider graph，并可附加 dataset revision checksum、target process indices 和 process/exchange scan records。输出 `review_submit_gate_report.v1` 包含：
+
+- `status`: `passed` 或 `blocked`。
+- `policy`: 默认 profile 为 `review_submit_fast.v1`。
+- `metrics`: revision、process_scan、provider_scan、sparse_scan 和 targeted probe 统计。
+- `blockers`: 提交审核硬失败 code、message 和 detail payload。
+
+该 gate 先执行 revision/process/provider/flow/sparse 结构检查；只有没有结构 blocker 时才执行 sparse factorization readiness 与 targeted RHS solve。它不 materialize inverse，也不要求 full `solve_all_unit`。
+
+稳定 blocker code、policy 默认值、快速验证顺序和 caller consumption 约束由 `docs/review-submit-fast-gate-contract.md` 维护。Edge 或 Next 在提交审核链路中应消费该 report 或由服务端封装后的等价 gate result，不应直接把 `matrix_readiness_report.v1` 的 blocker 当成提交审核结论。
 
 ## 6. 幂等与请求缓存（建议约束）
 
