@@ -28,6 +28,7 @@ ownership:
           - docs/agents/**
           - docs/lca-api-contract.md
           - docs/matrix-readiness-report-contract.md
+          - docs/review-submit-fast-gate-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
           - docs/implicit-regional-supply-mix-modeling.md
@@ -77,6 +78,7 @@ coverage:
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
     - docs/matrix-readiness-report-contract.md
+    - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/implicit-regional-supply-mix-modeling.md
@@ -127,6 +129,14 @@ routing:
         - crates/solver-worker/src/compiled_graph.rs
         - docs/matrix-readiness-report-contract.md
         - docs/agents/repo-validation.md
+    review-submit-gate:
+      paths:
+        - crates/solver-worker/src/review_submit_gate.rs
+        - crates/solver-worker/src/bin/review_submit_gate.rs
+        - crates/solver-worker/src/readiness.rs
+        - crates/solver-worker/src/compiled_graph.rs
+        - docs/review-submit-fast-gate-contract.md
+        - docs/lca-api-contract.md
     snapshot-and-provider:
       paths:
         - crates/solver-worker/src/bin/snapshot_builder.rs
@@ -177,6 +187,7 @@ routing:
         - docs/agents/**
         - docs/lca-api-contract.md
         - docs/matrix-readiness-report-contract.md
+        - docs/review-submit-fast-gate-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
         - docs/implicit-regional-supply-mix-modeling.md
@@ -195,6 +206,7 @@ docInventory:
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
     - docs/matrix-readiness-report-contract.md
+    - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/implicit-regional-supply-mix-modeling.md
@@ -366,6 +378,34 @@ rules:
       - path: docs/matrix-readiness-report-contract.md
         mode: review_or_update
     reason: Calculator-owned matrix-readiness report semantics must stay aligned with the CLI, snapshot artifact output, provider evidence, and proof guidance.
+  - id: calculator-review-submit-gate-contract
+    scope: repo
+    repo: calculator
+    triggers:
+      - path: docs/review-submit-fast-gate-contract.md
+        kind: runtime-contract
+      - path: crates/solver-worker/src/review_submit_gate.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/bin/review_submit_gate.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/readiness.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/compiled_graph.rs
+        kind: runtime-code
+    requiredDocs:
+      - path: AGENTS.md
+        mode: review_or_update
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/lca-api-contract.md
+        mode: review_or_update
+      - path: docs/review-submit-fast-gate-contract.md
+        mode: review_or_update
+    reason: Dataset review-submit gate semantics must stay aligned with calculator-owned blocker codes, policy defaults, provider evidence, and targeted probe behavior.
   - id: calculator-edge-frontend-integration-contract
     scope: repo
     repo: calculator
