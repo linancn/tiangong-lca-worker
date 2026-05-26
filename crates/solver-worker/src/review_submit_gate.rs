@@ -17,7 +17,7 @@ use solver_core::{
 };
 use uuid::Uuid;
 
-use crate::compiled_graph::{CompiledFlowKind, CompiledGraph, CompiledProviderDecisionKind};
+use crate::compiled_graph::{CompiledFlowKind, CompiledGraph};
 use crate::readiness::{FindingSeverity, ReadinessFinding};
 use crate::snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport};
 
@@ -41,9 +41,9 @@ pub struct ReviewSubmitGatePolicy {
     pub require_revision_checksum_match: bool,
     #[serde(default = "default_allowed_scope_states")]
     pub allowed_scope_states: Vec<i32>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub block_equal_fallback: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub block_provider_volume_fallback: bool,
     #[serde(default = "default_true")]
     pub require_lcia_for_impact_submit: bool,
@@ -69,8 +69,8 @@ impl Default for ReviewSubmitGatePolicy {
             policy_profile: default_policy_profile(),
             require_revision_checksum_match: true,
             allowed_scope_states: default_allowed_scope_states(),
-            block_equal_fallback: true,
-            block_provider_volume_fallback: true,
+            block_equal_fallback: false,
+            block_provider_volume_fallback: false,
             require_lcia_for_impact_submit: true,
             require_target_process_probe: true,
             run_factorization_probe: true,
@@ -213,7 +213,7 @@ pub fn verify_review_submit_gate(input: &ReviewSubmitGateInput) -> ReviewSubmitG
 
     check_revision_freshness(input, &mut metrics, &mut blockers);
     check_process_records(input, &mut metrics, &mut blockers);
-    check_provider_closure(input, &mut metrics, &mut blockers);
+    check_provider_closure(input, &mut metrics);
     check_flow_semantics(input, &mut metrics, &mut blockers);
     check_sparse_structure(input, &mut metrics, &mut blockers);
     check_lcia_requirement(input, &mut blockers);
@@ -534,11 +534,7 @@ fn check_service_loops(
     }
 }
 
-fn check_provider_closure(
-    input: &ReviewSubmitGateInput,
-    metrics: &mut ReviewSubmitGateMetrics,
-    blockers: &mut Vec<ReadinessFinding>,
-) {
+fn check_provider_closure(input: &ReviewSubmitGateInput, metrics: &mut ReviewSubmitGateMetrics) {
     let matching = &input.coverage.matching;
     metrics.provider_scan.provider_missing_count = matching.unmatched_no_provider;
     metrics.provider_scan.provider_unresolved_count = matching.matched_multi_unresolved;
@@ -550,81 +546,13 @@ fn check_provider_closure(
                 .decisions_partial_missing_count
             + matching.volume_weight_summary.decisions_all_missing_count;
 
-    let mut unresolved_examples = Vec::new();
-    let mut fallback_examples = Vec::new();
-    let mut unconserved_examples = Vec::new();
-    let mut volume_examples = Vec::new();
-
     if let Some(graph) = &input.compiled_graph {
         metrics.provider_scan.provider_decisions_total = graph.provider_decisions.len();
         for decision in &graph.provider_decisions {
-            if matches!(
-                decision.decision_kind,
-                Some(CompiledProviderDecisionKind::MultiUnresolved)
-            ) {
-                unresolved_examples.push(provider_decision_detail(decision));
-            }
-            if decision.used_equal_fallback {
-                fallback_examples.push(provider_decision_detail(decision));
-            }
-            if decision.volume_fallback_to_one_count > 0 {
-                volume_examples.push(provider_decision_detail(decision));
-            }
             if !provider_allocation_is_conserved(decision, input.policy.allocation_sum_epsilon) {
-                unconserved_examples.push(provider_decision_detail(decision));
+                metrics.provider_scan.allocation_not_conserved_count += 1;
             }
         }
-    }
-
-    metrics.provider_scan.allocation_not_conserved_count = unconserved_examples.len();
-
-    if metrics.provider_scan.provider_unresolved_count > 0 || !unresolved_examples.is_empty() {
-        push_blocker(
-            blockers,
-            "provider_unresolved",
-            "multi-provider product input edges are unresolved",
-            json!({
-                "coverage_matched_multi_unresolved": matching.matched_multi_unresolved,
-                "examples": unresolved_examples.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
-            }),
-        );
-    }
-    if input.policy.block_equal_fallback
-        && (metrics.provider_scan.equal_fallback_count > 0 || !fallback_examples.is_empty())
-    {
-        push_blocker(
-            blockers,
-            "provider_equal_fallback",
-            "provider resolution used equal fallback in a review-submit gate",
-            json!({
-                "coverage_matched_multi_fallback_equal": matching.matched_multi_fallback_equal,
-                "examples": fallback_examples.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
-            }),
-        );
-    }
-    if !unconserved_examples.is_empty() {
-        push_blocker(
-            blockers,
-            "provider_allocation_not_conserved",
-            "provider allocation weights are invalid or do not sum to 1",
-            json!({
-                "allocation_not_conserved_count": metrics.provider_scan.allocation_not_conserved_count,
-                "examples": unconserved_examples.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
-            }),
-        );
-    }
-    if input.policy.block_provider_volume_fallback
-        && (metrics.provider_scan.volume_evidence_invalid_count > 0 || !volume_examples.is_empty())
-    {
-        push_blocker(
-            blockers,
-            "provider_volume_evidence_invalid",
-            "provider volume evidence fell back to default weights in a review-submit gate",
-            json!({
-                "volume_evidence_invalid_count": metrics.provider_scan.volume_evidence_invalid_count,
-                "examples": volume_examples.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
-            }),
-        );
     }
 }
 
@@ -730,39 +658,16 @@ fn check_sparse_structure(
         .collect::<Vec<_>>();
 
     metrics.sparse_scan.zero_or_near_zero_diagonal_count = near_zero_diagonal.len();
-    if !near_zero_diagonal.is_empty()
-        || matches!(
-            input.coverage.singular_risk.risk_level.as_str(),
-            "medium" | "high"
-        )
-    {
+    if !near_zero_diagonal.is_empty() {
         push_blocker(
             blockers,
             "sparse_matrix_zero_or_near_zero_diagonal",
-            "M = I - A has zero/near-zero diagonal or elevated singular risk",
+            "M = I - A has a zero or near-zero diagonal",
             json!({
                 "zero_or_near_zero_diagonal_count": near_zero_diagonal.len(),
-                "singular_risk_level": input.coverage.singular_risk.risk_level,
-                "m_zero_diagonal_count": input.coverage.singular_risk.m_zero_diagonal_count,
-                "m_min_abs_diagonal": input.coverage.singular_risk.m_min_abs_diagonal,
                 "examples": near_zero_diagonal.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
             }),
         );
-        if matches!(
-            input.coverage.singular_risk.risk_level.as_str(),
-            "medium" | "high"
-        ) {
-            push_blocker(
-                blockers,
-                "singular_risk_medium_or_high",
-                "review-submit gate blocks medium or high singular risk",
-                json!({
-                    "singular_risk_level": input.coverage.singular_risk.risk_level,
-                    "m_zero_diagonal_count": input.coverage.singular_risk.m_zero_diagonal_count,
-                    "m_min_abs_diagonal": input.coverage.singular_risk.m_min_abs_diagonal
-                }),
-            );
-        }
     }
 
     let duplicate_columns =
@@ -1101,21 +1006,6 @@ fn exchange_detail(process: &ReviewProcessRecord, exchange: &ReviewExchangeRecor
     })
 }
 
-fn provider_decision_detail(decision: &crate::compiled_graph::CompiledProviderDecision) -> Value {
-    json!({
-        "consumer_idx": decision.consumer_idx,
-        "flow_id": decision.flow_id,
-        "candidate_provider_count": decision.candidate_provider_count,
-        "matched_provider_count": decision.matched_provider_count,
-        "decision_kind": decision.decision_kind,
-        "resolution_strategy": decision.resolution_strategy,
-        "failure_reason": decision.failure_reason,
-        "used_equal_fallback": decision.used_equal_fallback,
-        "volume_fallback_to_one_count": decision.volume_fallback_to_one_count,
-        "allocation_weight_sum": decision.allocations.iter().map(|allocation| allocation.weight).sum::<f64>()
-    })
-}
-
 fn format_numeric(value: f64) -> String {
     if value == 0.0 {
         "0.000000000000e0".to_owned()
@@ -1154,6 +1044,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_target_probe_limit() -> usize {
     32
 }
@@ -1181,8 +1075,8 @@ mod tests {
     use super::*;
     use crate::compiled_graph::{
         CompiledAllocationStats, CompiledFlow, CompiledMatchingStats, CompiledProcess,
-        CompiledProviderAllocation, CompiledProviderDecision, CompiledProviderResolutionStrategy,
-        CompiledReferenceStats,
+        CompiledProviderAllocation, CompiledProviderDecision, CompiledProviderDecisionKind,
+        CompiledProviderResolutionStrategy, CompiledReferenceStats,
     };
     use crate::graph_types::ScopeProcessPartition;
     use crate::snapshot_artifacts::{
@@ -1314,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_provider_and_semantic_failures() {
+    fn records_provider_diagnostics_without_blocking() {
         let mut input = clean_input();
         let flow_id = input.compiled_graph.as_ref().unwrap().flows[0].flow_id;
         let graph = input.compiled_graph.as_mut().unwrap();
@@ -1336,14 +1230,24 @@ mod tests {
         let report = verify_review_submit_gate(&input);
 
         assert_eq!(report.metrics.provider_scan.provider_missing_count, 1);
+        assert_eq!(report.metrics.provider_scan.equal_fallback_count, 1);
+        assert_eq!(
+            report.metrics.provider_scan.volume_evidence_invalid_count,
+            1
+        );
+        assert_eq!(
+            report.metrics.provider_scan.allocation_not_conserved_count,
+            0
+        );
         assert!(!has_blocker(&report, "provider_missing"));
-        assert!(has_blocker(&report, "provider_equal_fallback"));
-        assert!(has_blocker(&report, "provider_volume_evidence_invalid"));
+        assert!(!has_blocker(&report, "provider_equal_fallback"));
+        assert!(!has_blocker(&report, "provider_allocation_not_conserved"));
+        assert!(!has_blocker(&report, "provider_volume_evidence_invalid"));
         assert!(has_blocker(&report, "flow_lcia_semantic_mismatch"));
     }
 
     #[test]
-    fn blocks_unresolved_multi_provider_decisions() {
+    fn records_unresolved_multi_provider_without_blocking() {
         let mut input = clean_input();
         let graph = input.compiled_graph.as_mut().unwrap();
         graph.provider_decisions[0].decision_kind =
@@ -1354,7 +1258,14 @@ mod tests {
 
         let report = verify_review_submit_gate(&input);
 
-        assert!(has_blocker(&report, "provider_unresolved"));
+        assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
+        assert_eq!(report.metrics.provider_scan.provider_unresolved_count, 1);
+        assert_eq!(
+            report.metrics.provider_scan.allocation_not_conserved_count,
+            1
+        );
+        assert!(!has_blocker(&report, "provider_unresolved"));
+        assert!(!has_blocker(&report, "provider_allocation_not_conserved"));
     }
 
     #[test]
@@ -1374,9 +1285,24 @@ mod tests {
             &report,
             "sparse_matrix_zero_or_near_zero_diagonal"
         ));
-        assert!(has_blocker(&report, "singular_risk_medium_or_high"));
+        assert!(!has_blocker(&report, "singular_risk_medium_or_high"));
         assert!(has_blocker(&report, "target_process_not_covered_by_probe"));
         assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn does_not_block_medium_singular_risk_without_structural_symptom() {
+        let mut input = clean_input();
+        input.coverage.singular_risk.risk_level = "medium".to_owned();
+
+        let report = verify_review_submit_gate(&input);
+
+        assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
+        assert!(!has_blocker(
+            &report,
+            "sparse_matrix_zero_or_near_zero_diagonal"
+        ));
+        assert!(!has_blocker(&report, "singular_risk_medium_or_high"));
     }
 
     #[test]

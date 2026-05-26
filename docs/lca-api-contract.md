@@ -22,7 +22,7 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-05-26
-lastReviewedCommit: 877f8318a1716786beb32bc86ac208c57a9168d9
+lastReviewedCommit: b6137656059cb16531e2d97e2bbdbacbfdf0fff6
 related:
   - AGENTS.md
   - .docpact/config.yaml

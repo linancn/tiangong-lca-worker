@@ -121,9 +121,8 @@ DB runner 写回数据库时：
 
 - 要求 `expected_revision_checksum == actual_revision_checksum`。
 - `allowed_scope_states = [0] + 100..=199`；`0` 表示提交审核前 draft root，`100..=199` 用于已审核 / 可用依赖数据兼容；`20` 等审核中状态不允许，仍会触发 `invalid_scope_state`。
-- 阻断 provider equal fallback。
-- 阻断 provider volume fallback evidence。
-- provider missing 只记录在 `metrics.provider_scan.provider_missing_count`，不作为提交审核 blocker。
+- provider missing、unresolved、equal fallback、allocation conservation 和 volume evidence 只记录在 `metrics.provider_scan`，不作为提交审核 blocker。
+- legacy provider policy 字段 `block_equal_fallback` / `block_provider_volume_fallback` 默认为 `false`；即使旧请求传入 `true`，review-submit gate 也不再据此产生 provider blocker。
 - impact-ready 提交要求 LCIA factors。
 - 要求 target process probe。
 - target probe 默认最多覆盖 `32` 个 process。
@@ -144,18 +143,17 @@ DB runner 写回数据库时：
 | `invalid_allocation_fraction` | allocation fraction 不可解析、带 `%` 或超出允许数值范围 | 统一 allocation fraction 表达 |
 | `duplicate_exchange_fingerprint` | 不同 process 的 flow/direction/amount fingerprint 完全一致 | 合并重复 process 或补充可区分 exchange |
 | `service_loop_detected` | 同一 process 中同一 flow 的 input/output amount 相同或近似相同 | 修正自供给、循环或拆分 process |
-| `provider_unresolved` | multi-provider input edge 未解析 | 补 provider evidence 或缩小候选集 |
-| `provider_equal_fallback` | provider resolution 使用 equal fallback 且 policy 阻断 | 补 annual volume / evidence，避免等权兜底 |
-| `provider_allocation_not_conserved` | provider allocation weight 非有限、负数、为空或 sum 不为 1 | 修复 provider allocation |
-| `provider_volume_evidence_invalid` | provider volume evidence fallback-to-one 或缺失超过 policy 容忍 | 补充可比较 annual volume evidence |
 | `flow_lcia_semantic_mismatch` | product/elementary flow 或 LCIA factor 语义错配 | 修复 flow kind、biosphere edge 或 LCIA factor mapping |
 | `lcia_factor_missing_for_impact_submit` | impact-ready 提交要求 LCIA factors，但 `c_nnz = 0` | 补齐 LCIA factors 或改用非 impact 提交策略 |
 | `sparse_matrix_zero_or_near_zero_diagonal` | `M = I - A` 对角线为 0 / near-zero，或 payload process count 无效 | 修复自环、reference 或 matrix structure |
 | `duplicate_sparse_columns` | `M = I - A` 存在重复 sparse column signature | 排查重复结构和线性相关 process |
-| `singular_risk_medium_or_high` | coverage singular risk 为 `medium` 或 `high` | 修复 matrix structure 后重跑 |
 | `target_process_not_covered_by_probe` | target process list 缺失、越界或超过 probe limit | 明确 submitted / changed process list，或拆分 gate |
 | `factorization_probe_failed` | sparse factorization readiness probe 失败 | 修复 matrix structure 后重跑 |
 | `target_probe_non_finite_result` | targeted RHS solve 失败或产生 NaN / Infinity | 修复 compute stability / flow / LCIA 数据 |
+
+Provider 相关信号仍会保留在 `metrics.provider_scan` 中，供 UI 展示和后续数据治理使用，但不进入 `blockers`。当前提交审核 gate 的 provider 语义不是“全库 provider 证据完整性验收”，而是避免把历史依赖或库级 provider 质量问题转嫁为当前数据集提交阻断。
+
+数值不稳定的快速结构表象优先由 `service_loop_detected` 表达：同一 process 中相同 flow 同量同时出现在 input 和 output。`singular_risk = medium/high` 是 coverage diagnostic，不单独产生 blocker；只有真实 zero / near-zero diagonal、重复 sparse column、factorization/probe 失败或 non-finite 结果才会阻断。
 
 ## 快速验证顺序
 
@@ -163,9 +161,9 @@ Gate 按便宜到昂贵的顺序执行：
 
 1. revision freshness。
 2. process record scan：scope state、reference、exchange amount、allocation、duplicate fingerprint、service-loop。
-3. provider scan：missing metric、unresolved、equal fallback、allocation conservation、volume evidence。
+3. provider scan：missing metric、unresolved、equal fallback、allocation conservation、volume evidence，仅记录 metrics。
 4. flow / LCIA semantic scan。
-5. sparse structure scan：diagonal、duplicate sparse column、singular risk。
+5. sparse structure scan：diagonal、duplicate sparse column。
 6. target process coverage check。
 7. 仅当以上没有 blocker 时，执行 sparse factorization readiness 与 targeted RHS solve。
 
