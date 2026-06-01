@@ -4,17 +4,17 @@ docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: zh-CN
 whenToUse:
-  - 当 dataset revision 提交审核前需要 calculator 侧数值稳定性快速 gate 时
+  - 当 dataset revision 提交审核前需要 worker 侧数值稳定性快速 gate 时
   - 当 Edge、Foundry 或 Next 需要消费 review-submit gate report 时
   - 当 review_submit_gate 的 schema、policy、blocker 或 probe 规则变化时
 whenToUpdate:
   - 当 crates/solver-worker/src/review_submit_gate.rs 的 report schema、policy 或 blocker code 变化时
   - 当 crates/solver-worker/src/bin/review_submit_gate.rs 的 CLI contract 变化时
   - 当 crates/solver-worker/src/bin/review_submit_gate_runner.rs 的 DB runner contract 变化时
-  - 当提交审核前的 calculator-owned gate 与 matrix-readiness 的边界变化时
+  - 当提交审核前的 worker-owned gate 与 matrix-readiness 的边界变化时
 checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - crates/solver-worker/src/review_submit_gate.rs
@@ -41,16 +41,16 @@ related:
 
 # Review Submit Fast Gate Contract
 
-`review_submit_gate` 是 calculator 侧的 dataset revision 提交审核前快速 gate。它输出二元结果：`passed` 或 `blocked`。
+`review_submit_gate` 是 worker 侧的 dataset revision 提交审核前快速 gate。它输出二元结果：`passed` 或 `blocked`。
 
-该 gate 不属于 Edge HTTP API，也不属于 Next UI 行为。Edge、Foundry 和 Next 可以消费 report，但不应复制 calculator 的 provider、sparse-structure、factorization probe 或 target solve 判断逻辑。
+该 gate 不属于 Edge HTTP API，也不属于 Next UI 行为。Edge、Foundry 和 Next 可以消费 report，但不应复制 worker runtime 的 provider、sparse-structure、factorization probe 或 target solve 判断逻辑。
 
 ## 调用入口
 
-calculator 暴露两个入口：
+worker runtime 暴露两个入口：
 
 - `review_submit_gate`：纯文件输入/输出 CLI，适合 fixture、CI、Foundry 或手工诊断。
-- `review_submit_gate_runner`：数据库运行时 runner，兼容 legacy gate-run 模式和 `worker_jobs` 模式；两种模式都构造 snapshot、执行同一 calculator gate，再通过对应数据库 RPC 写回结果。
+- `review_submit_gate_runner`：数据库运行时 runner，兼容 legacy gate-run 模式和 `worker_jobs` 模式；两种模式都构造 snapshot、执行同一 worker-side gate，再通过对应数据库 RPC 写回结果。
 
 纯文件 CLI：
 
@@ -114,7 +114,7 @@ worker_jobs payload schema version 为 `review_submit.gate.request.v1`：
 - `payload`: `ModelSparseData` sparse payload。
 - `compiled_graph`: provider decision、flow kind、technosphere/biosphere edge 与 process metadata。
 - `target_process_indices`: 本次提交审核必须覆盖的 target / changed process index。
-- `process_records`: calculator 可解释的 process/exchange scan record，用于 reference、allocation、duplicate fingerprint 和 service-loop 快速检查。
+- `process_records`: worker runtime 可解释的 process/exchange scan record，用于 reference、allocation、duplicate fingerprint 和 service-loop 快速检查。
 - `policy`: `review_submit_fast.v1` policy surface。
 
 `process_records` 是提交审核快速 gate 的可选增强输入。没有它时，gate 仍可根据 `coverage`、`payload` 与 `compiled_graph` 执行 provider、sparse structure 和 probe 检查，但无法发现所有 JSON/process-level 历史事故模式。
@@ -154,7 +154,7 @@ worker_jobs 模式写回 `public.worker_jobs` 时：
 - gate blocked：`status=blocked`，`blocker_codes` 取自 `calculatorReport.blockers[].code`，`resolution_scope=user`，`retryable=true`，同时保留完整 `calculatorReport`。
 - runner / S3 / DB / unsupported dataset runtime error：`status=failed`，写入 `error_code`、`error_message`、`error_details` 和 operator diagnostics。
 
-calculator 不调用 final submit，也不修改 review-submit domain 状态。worker_jobs 只代表 calculator gate 计算任务；gate passed 后的 final submit durable coordinator 属于 Edge / database 层。
+worker runtime 不调用 final submit，也不修改 review-submit domain 状态。worker_jobs 只代表 worker-side gate 计算任务；gate passed 后的 final submit durable coordinator 属于 Edge / database 层。
 
 ## Policy 默认值
 

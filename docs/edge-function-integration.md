@@ -4,15 +4,15 @@ docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: zh-CN
 whenToUse:
-  - 当你需要把 edge-functions 请求稳定映射到 calculator 异步求解链路时
+  - 当你需要把 edge-functions 请求稳定映射到 worker 异步求解链路时
   - 当 enqueue、polling、service-role、request_key 或 snapshot 选择规则变化时
   - 当 Edge 需要接入 dataset review-submit gate 的 enqueue/read/rerun/status contract 时
 whenToUpdate:
   - 当 edge-facing solve API、入队流程、worker 边界或错误处理约定变化时
-  - 当 review-submit gate 的 Edge RPC 边界或 calculator runner 结果回写边界变化时
+  - 当 review-submit gate 的 Edge RPC 边界或 worker runner 结果回写边界变化时
 checkPaths:
   - docs/edge-function-integration.md
   - AGENTS.md
@@ -35,7 +35,7 @@ related:
 
 # Edge Function Integration Guide
 
-本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 calculator 异步链路。legacy 路径是 `lca_jobs + pgmq`；统一任务路径是 `worker_jobs(worker_queue=solver)`，但 result/cache domain truth 在切流期仍保留 `lca_jobs` / `lca_results`。
+本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 worker 异步链路。legacy 路径是 `lca_jobs + pgmq`；统一任务路径是 `worker_jobs(worker_queue=solver)`，但 result/cache domain truth 在切流期仍保留 `lca_jobs` / `lca_results`。
 
 ## 1. 为什么必须走 Edge Function
 
@@ -201,10 +201,10 @@ worker：
 
 - Edge 负责鉴权、请求校验、创建 / 读取 / rerun gate task，并把返回状态透出给 Next。
 - Database 负责 `dataset_review_submit_gate_runs` legacy 状态、`worker_jobs` 生命周期、result projection、lease fencing 和发布前断言。
-- calculator `review_submit_gate_runner` legacy 模式负责领取 queued gate run，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
-- calculator `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。
+- worker `review_submit_gate_runner` legacy 模式负责领取 queued gate run，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
+- worker `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。
 
-Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 或 targeted RHS solve。Edge 也不应直接更新 `dataset_review_submit_gate_runs.calculator_report`；结果写入只能由 calculator runner 使用 service-role DB 连接完成。
+Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 或 targeted RHS solve。Edge 也不应直接更新 `dataset_review_submit_gate_runs.calculator_report`；结果写入只能由 worker runner 使用 service-role DB 连接完成。
 
 worker_jobs enqueue payload 只需要表达 dataset revision 与可选诊断 checksum：
 
@@ -219,7 +219,7 @@ worker_jobs enqueue payload 只需要表达 dataset revision 与可选诊断 che
 }
 ```
 
-calculator 会从 `processes.json_ordered` 计算权威 checksum，并在 worker job result 的 `datasetRevision.revisionChecksum` 返回。Edge 不应把浏览器端 checksum 当作权威值。
+worker runtime 会从 `processes.json_ordered` 计算权威 checksum，并在 worker job result 的 `datasetRevision.revisionChecksum` 返回。Edge 不应把浏览器端 checksum 当作权威值。
 
 状态语义：
 

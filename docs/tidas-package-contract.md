@@ -4,7 +4,7 @@ docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: zh-CN
 whenToUse:
   - 当你需要 package-worker 的异步 import/export 契约时
@@ -28,7 +28,7 @@ related:
 
 # TIDAS Package Async Contract
 
-本文档定义 TIDAS 数据包异步导入/导出在 `tiangong-lca-calculator` 中的 worker、表结构与 artifact 契约。
+本文档定义 TIDAS 数据包异步导入/导出在 `tiangong-lca-worker` 中的 worker、表结构与 artifact 契约。
 
 ## 1. 目标
 
@@ -173,7 +173,7 @@ package artifact 必须带或刷新 `expires_at`：
 - `is_pinned = true` 的 artifact 不参与自动 GC；
 - `status = deleted` 表示对象 payload 已被 GC 删除，API 不应再返回可下载 URL。
 
-calculator 侧 GC 必须 object-aware：
+worker 侧 GC 必须 object-aware：
 
 1. dry-run 先输出 eligible/protected reason；
 2. 只处理 `expires_at <= now()`、`is_pinned = false`、父 job 非 `queued/running`、且无 active/recent request-cache 引用的 ready artifact；
@@ -182,7 +182,7 @@ calculator 侧 GC 必须 object-aware：
 5. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
 6. 当一个 terminal package job 的 artifact 都已 `deleted`、且无 active/recent cache 引用后，才允许删除 job metadata，让 `lca_package_export_items` 通过 FK cascade 清理。
 
-当前 calculator 提供 `package_gc` CLI：
+当前 worker runtime 提供 `package_gc` CLI：
 
 ```bash
 cargo run -p solver-worker --bin package_gc --
@@ -193,7 +193,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 
 生产部署契约：
 
-- `package_gc` release binary 应随 `package_worker` 一起部署到所有活跃 calculator worker 主机；
+- `package_gc` release binary 应随 `package_worker` 一起部署到所有活跃 worker 主机；
 - legacy `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
 - 统一队列模式下，timer 或 operator action 只负责 enqueue `tidas.package_artifact_gc` worker job，不直接代表任务事实；
 - timer 首次启用必须 dry-run，不带 `--execute`，并检查 `[retention]` eligible/protected reason 与 `[summary] dry_run=true ...`；
@@ -251,7 +251,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 重要差异：
 
 - legacy `export_package` 多 pass 通过重新写入 `pgmq.lca_package_jobs` 继续执行；
-- `worker_jobs` 模式下，calculator 不再把 continuation 写回 legacy pgmq，而是在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
+- `worker_jobs` 模式下，worker runtime 不再把 continuation 写回 legacy pgmq，而是在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
 - 因此 `PACKAGE_WORKER_JOBS_LEASE_SECONDS` 必须大于正常单 pass 时间，长导出仍应依赖 pass 间 heartbeat 续租。
 
 ## 9. 权限边界
