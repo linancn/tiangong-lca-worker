@@ -1,15 +1,15 @@
 ---
-title: calculator Validation Guide
+title: worker Validation Guide
 docType: guide
 scope: repo
 status: active
 authoritative: false
-owner: calculator
+owner: worker
 language: en
 whenToUse:
-  - when a tiangong-lca-calculator change is ready for local validation
+  - when a tiangong-lca-worker change is ready for local validation
   - when deciding the minimum proof required for solver, worker, script, runtime-contract, or docpact changes
-  - when writing PR validation notes for tiangong-lca-calculator work
+  - when writing PR validation notes for tiangong-lca-worker work
 whenToUpdate:
   - when the repo gains new canonical validation wrappers
   - when change categories require different proof
@@ -38,7 +38,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-06-01
-lastReviewedCommit: cc31672ee15d1769b4e8aa7e2e0b516128dd920f
+lastReviewedCommit: 7acbbade00b55c8fb2eba40e23dabe7a99cdc0e9
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

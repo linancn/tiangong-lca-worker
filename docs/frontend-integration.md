@@ -4,7 +4,7 @@ docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: zh-CN
 whenToUse:
   - 当你需要给前端消费方说明 solve/result 交互契约时
@@ -131,13 +131,13 @@ export type JobStatus =
 - `error`：展示系统错误态，允许稍后重试或联系运维。
 - `stale`：旧 gate run 已被替代，应重新读取最新 gate run。
 
-前端不要复制 calculator 的 provider、sparse factorization、targeted RHS solve 或 blocker 判定逻辑。
+前端不要复制 worker runtime 的 provider、sparse factorization、targeted RHS solve 或 blocker 判定逻辑。
 
 切到 `worker_jobs` 后，前端仍然只消费 Edge 返回的服务端 projection，不直接读写 `public.worker_jobs`。状态映射为：
 
 - `queued` / `running`：进入任务中心并展示服务端任务状态，不需要在提交按钮上长时间 blocking loading。
-- `completed`：表示 calculator gate passed；Edge / database coordinator 才能继续 final submit。前端应使用 result 中的 `datasetRevision.revisionChecksum` 作为权威 checksum 展示 / 传递依据。
-- `blocked`：表示 calculator 发现数据 blocker；主提示使用 `blocker_codes` / `calculatorReport.blockers` 的友好文案，raw details 仅作为诊断信息。
+- `completed`：表示 worker-side gate passed；Edge / database coordinator 才能继续 final submit。前端应使用 result 中的 `datasetRevision.revisionChecksum` 作为权威 checksum 展示 / 传递依据。
+- `blocked`：表示 worker runtime 发现数据 blocker；主提示使用 `blocker_codes` / `calculatorReport.blockers` 的友好文案，raw details 仅作为诊断信息。
 - `failed`：表示 runner、S3、DB 或部署错误；应与数据 blocker 分开展示，支持重试或联系运维。
 
 `worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 适合任务中心展示。浏览器本地 task 只能作为 UI cache，不能作为任务事实来源。

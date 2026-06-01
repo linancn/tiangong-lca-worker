@@ -1780,7 +1780,8 @@ fn snapshot_builder_candidates(builder_args: Vec<String>) -> Vec<BuilderCommandC
         current_dir: None,
     });
 
-    let root = std::env::var("LCA_CALCULATOR_ROOT")
+    let root = std::env::var("LCA_WORKER_ROOT")
+        .or_else(|_| std::env::var("LCA_CALCULATOR_ROOT"))
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)

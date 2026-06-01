@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=oneshot
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
-EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
+WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
+EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
 Environment=RUST_LOG=info
 Environment=MAINTENANCE_JOB_ENVIRONMENT=main
 SyslogIdentifier=maintenance_enqueue
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/maintenance_enqueue snapshot-gc --execute --snapshot-retention-days 30 --orphan-retention-days 30 --max-snapshots 100 --max-orphan-dirs 200 --max-bytes 2147483648 --batch-size 50
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/maintenance_enqueue snapshot-gc --execute --snapshot-retention-days 30 --orphan-retention-days 30 --max-snapshots 100 --max-orphan-dirs 200 --max-bytes 2147483648 --batch-size 50

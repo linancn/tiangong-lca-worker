@@ -4,7 +4,7 @@ docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: zh-CN
 whenToUse:
   - 当你需要消费或维护 matrix_readiness CLI 输出时

@@ -4,7 +4,7 @@ docType: theory
 scope: repo
 status: active
 authoritative: false
-owner: calculator
+owner: worker
 language: en
 whenToUse:
   - when reasoning about provider link semantics based on process annual supply or production volume

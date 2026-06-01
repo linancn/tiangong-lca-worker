@@ -1,16 +1,16 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-06-01"
-lastReviewedCommit: "cc31672ee15d1769b4e8aa7e2e0b516128dd920f"
+lastReviewedCommit: "7acbbade00b55c8fb2eba40e23dabe7a99cdc0e9"
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
 # Narrow source docs keep proof, repo-shape, and consumer-facing contract details.
 catalog:
   repos:
-    - id: calculator
+    - id: worker
       path: .
-      canonicalRepo: linancn/tiangong-lca-calculator
+      canonicalRepo: linancn/tiangong-lca-worker
       entryDoc: AGENTS.md
       workflowDocs:
         - docs/agents/repo-validation.md
@@ -36,7 +36,7 @@ ownership:
           - docs/implicit-regional-supply-mix-modeling.en.md
           - docs/tidas-package-contract.md
           - .github/workflows/ai-doc-lint.yml
-      ownerRepo: calculator
+      ownerRepo: worker
     - id: solver-runtime-and-ci
       paths:
         include:
@@ -44,18 +44,18 @@ ownership:
           - Makefile
           - crates/**
           - .github/workflows/ci.yml
-      ownerRepo: calculator
+      ownerRepo: worker
     - id: validation-debug-and-diagnostics-tooling
       paths:
         include:
           - scripts/**
           - tools/bw25-validator/**
-      ownerRepo: calculator
+      ownerRepo: worker
     - id: runtime-sql-expectations
       paths:
         include:
           - supabase/migrations/**
-      ownerRepo: calculator
+      ownerRepo: worker
 
     - id: local-docpact-push-gate
       paths:
@@ -64,7 +64,7 @@ ownership:
           - scripts/docpact
           - scripts/docpact-gate.sh
           - scripts/install-git-hooks.sh
-      ownerRepo: calculator
+      ownerRepo: worker
 
 coverage:
   include:
@@ -219,13 +219,13 @@ docInventory:
     - docs/tidas-package-contract.md
 
 repo:
-  id: calculator
-  owner: calculator
+  id: worker
+  owner: worker
 
 rules:
-  - id: calculator-bootstrap-contract
+  - id: worker-bootstrap-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: AGENTS.md
         kind: doc-contract
@@ -245,9 +245,9 @@ rules:
       - path: docs/agents/repo-architecture.md
         mode: review_or_update
     reason: Repo entry guidance, machine-readable routing, and retained source docs must stay aligned.
-  - id: calculator-readme-contract
+  - id: worker-readme-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: README.md
         kind: repo-landing
@@ -261,9 +261,9 @@ rules:
       - path: .docpact/config.yaml
         mode: review_or_update
     reason: Repo landing text should stay aligned with the current contract and AI entry surface.
-  - id: calculator-runtime-contract
+  - id: worker-runtime-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: Cargo.toml
         kind: workspace-topology
@@ -285,9 +285,9 @@ rules:
       - path: docs/lca-api-contract.md
         mode: review_or_update
     reason: Solver runtime, worker behavior, and CI gates shape ownership, proof, and the shared runtime contract together.
-  - id: calculator-provider-allocation-theory-contract
+  - id: worker-provider-allocation-theory-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/implicit-regional-supply-mix-modeling.md
         kind: theory-doc
@@ -311,9 +311,9 @@ rules:
       - path: docs/implicit-regional-supply-mix-modeling.en.md
         mode: review_or_update
     reason: Provider allocation code and implicit regional supply mix theory must stay aligned when annual-volume weighting semantics change.
-  - id: calculator-debug-and-tooling-contract
+  - id: worker-debug-and-tooling-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: scripts/**
         kind: tooling
@@ -326,10 +326,10 @@ rules:
         mode: review_or_update
       - path: docs/agents/repo-architecture.md
         mode: review_or_update
-    reason: Manual validation helpers and diagnostics tooling define how calculator changes are proved and debugged.
-  - id: calculator-runtime-sql-boundary-contract
+    reason: Manual validation helpers and diagnostics tooling define how worker changes are proved and debugged.
+  - id: worker-runtime-sql-boundary-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: supabase/migrations/**
         kind: runtime-sql
@@ -344,10 +344,10 @@ rules:
         mode: review_or_update
       - path: docs/frontend-integration.md
         mode: review_or_update
-    reason: Local runtime-facing SQL expectations can alter validation guidance and the calculator-to-consumer boundary without becoming durable schema truth.
-  - id: calculator-lca-api-contract
+    reason: Local runtime-facing SQL expectations can alter validation guidance and the worker-to-consumer boundary without becoming durable schema truth.
+  - id: worker-lca-api-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/lca-api-contract.md
         kind: runtime-contract
@@ -361,9 +361,9 @@ rules:
       - path: docs/agents/repo-validation.md
         mode: review_or_update
     reason: Shared jobs, payload, and result semantics must stay aligned with repo runtime and proof guidance.
-  - id: calculator-matrix-readiness-report-contract
+  - id: worker-matrix-readiness-report-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/matrix-readiness-report-contract.md
         kind: runtime-contract
@@ -384,10 +384,10 @@ rules:
         mode: review_or_update
       - path: docs/matrix-readiness-report-contract.md
         mode: review_or_update
-    reason: Calculator-owned matrix-readiness report semantics must stay aligned with the CLI, snapshot artifact output, provider evidence, and proof guidance.
-  - id: calculator-review-submit-gate-contract
+    reason: Worker-owned matrix-readiness report semantics must stay aligned with the CLI, snapshot artifact output, provider evidence, and proof guidance.
+  - id: worker-review-submit-gate-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/review-submit-fast-gate-contract.md
         kind: runtime-contract
@@ -416,10 +416,10 @@ rules:
         mode: review_or_update
       - path: docs/review-submit-fast-gate-contract.md
         mode: review_or_update
-    reason: Dataset review-submit gate semantics must stay aligned with calculator-owned blocker codes, policy defaults, provider evidence, and targeted probe behavior.
-  - id: calculator-edge-frontend-integration-contract
+    reason: Dataset review-submit gate semantics must stay aligned with worker-owned blocker codes, policy defaults, provider evidence, and targeted probe behavior.
+  - id: worker-edge-frontend-integration-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/edge-function-integration.md
         kind: runtime-contract
@@ -437,9 +437,9 @@ rules:
       - path: docs/frontend-integration.md
         mode: review_or_update
     reason: Consumer-repo integration guidance must stay aligned with the current solver contract and repo boundaries.
-  - id: calculator-tidas-package-contract
+  - id: worker-tidas-package-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: docs/tidas-package-contract.md
         kind: runtime-contract
@@ -455,9 +455,9 @@ rules:
       - path: docs/tidas-package-contract.md
         mode: review_or_update
     reason: Package-worker behavior and async import or export semantics need an explicit retained contract surface.
-  - id: calculator-doc-maintenance-contract
+  - id: worker-doc-maintenance-contract
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: .github/workflows/ai-doc-lint.yml
         kind: automation
@@ -469,9 +469,9 @@ rules:
       - path: docs/agents/repo-validation.md
         mode: review_or_update
     reason: Repo-local documentation maintenance automation must stay aligned with the repo contract and governed-doc rules.
-  - id: calculator-local-docpact-push-gate
+  - id: worker-local-docpact-push-gate
     scope: repo
-    repo: calculator
+    repo: worker
     triggers:
       - path: .githooks/pre-push
         kind: local-git-hook

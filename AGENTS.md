@@ -1,14 +1,14 @@
 ---
-title: calculator Repo Contract
+title: worker Repo Contract
 docType: contract
 scope: repo
 status: active
 authoritative: true
-owner: calculator
+owner: worker
 language: en
 whenToUse:
   - when a task may change solver runtime behavior, worker jobs, snapshot building, package-worker flows, or calculation-side validation tooling
-  - when routing work from the workspace root into tiangong-lca-calculator
+  - when routing work from the workspace root into tiangong-lca-worker
   - when deciding whether a change belongs here, in edge-functions, in database-engine, or in lca-workspace
 whenToUpdate:
   - when runtime job families, validation gates, retained contract docs, or ownership boundaries change
@@ -40,7 +40,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-06-01
-lastReviewedCommit: cc31672ee15d1769b4e8aa7e2e0b516128dd920f
+lastReviewedCommit: 7acbbade00b55c8fb2eba40e23dabe7a99cdc0e9
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -55,7 +55,7 @@ related:
 
 ## Repo Contract
 
-`tiangong-lca-calculator` owns the TianGong LCA solver runtime: sparse-matrix build and solve logic, worker job execution, snapshot building, provider matching, package import and export worker flows, runtime SQL expectations referenced by the solver, and calculation-side diagnostics tooling.
+`tiangong-lca-worker` owns the TianGong LCA worker runtime: sparse-matrix build and solve logic, worker job execution, snapshot building, provider matching, package import and export worker flows, runtime SQL expectations referenced by the solver, and calculation-side diagnostics tooling.
 
 Start here when the task may change what the compute stack does.
 
@@ -69,8 +69,8 @@ Start here when the task may change what the compute stack does.
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
-| `docs/matrix-readiness-report-contract.md` | calculator-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
-| `docs/review-submit-fast-gate-contract.md` | calculator-owned review-submit fast gate schema, passed/blocked semantics, blocker codes, policy defaults, targeted probe contract, and DB runner result-recorder behavior | Edge HTTP API, persistence schema, or Next submit-review UX |
+| `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
+| `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, passed/blocked semantics, blocker codes, policy defaults, targeted probe contract, and DB runner result-recorder behavior | Edge HTTP API, persistence schema, or Next submit-review UX |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics | implementation checklist or consumer API contract |
@@ -130,7 +130,7 @@ At a human-readable level, this repo owns:
 
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
-- `supabase/migrations/**` for runtime SQL expectations still referenced by the calculator runtime
+- `supabase/migrations/**` for runtime SQL expectations still referenced by the worker runtime
 - `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
@@ -153,7 +153,7 @@ Route those tasks to:
 - routine PR base: `main`
 - branch model: `M1`
 
-`tiangong-lca-calculator` does not use a separate promote line. Normal implementation merges to `main`, and later workspace delivery still requires a root submodule bump when the updated solver should ship.
+`tiangong-lca-worker` does not use a separate promote line. Normal implementation merges to `main`, and later workspace delivery still requires a root submodule bump when the updated worker runtime should ship.
 
 ## Operational Invariants
 
@@ -187,11 +187,11 @@ Route those tasks to:
 
 ## Workspace Integration
 
-A merged PR in `tiangong-lca-calculator` is repo-complete, not delivery-complete.
+A merged PR in `tiangong-lca-worker` is repo-complete, not delivery-complete.
 
 If the change must ship through the workspace:
 
-1. merge the child PR into `tiangong-lca-calculator`
+1. merge the child PR into `tiangong-lca-worker`
 2. update the `lca-workspace` submodule pointer deliberately
 3. complete any later workspace-level validation that depends on the updated solver snapshot
 

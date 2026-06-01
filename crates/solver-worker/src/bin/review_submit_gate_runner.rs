@@ -13,7 +13,7 @@ use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "review-submit-gate-runner")]
-#[command(about = "Claim persisted review-submit gate runs and record calculator results.")]
+#[command(about = "Claim persisted review-submit gate runs and record worker gate results.")]
 struct Cli {
     #[command(flatten)]
     config: AppConfig,
