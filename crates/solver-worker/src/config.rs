@@ -48,6 +48,14 @@ pub struct AppConfig {
     /// Queue name in pgmq.
     #[arg(long, env = "PGMQ_QUEUE", default_value = "lca_jobs")]
     pub pgmq_queue: String,
+    /// Explicitly allow legacy job-table + pgmq backends.
+    ///
+    /// Keep this disabled in production. The legacy backends still depend on
+    /// retained `lca_jobs` / `lca_package_jobs` tables and are only intended
+    /// for compatibility/debug runs while the canonical `worker_jobs` path is
+    /// being completed.
+    #[arg(long, env = "ALLOW_LEGACY_JOB_TABLE_BACKEND", default_value_t = false)]
+    pub allow_legacy_job_table_backend: bool,
     /// Stable worker id recorded on claimed `worker_jobs` rows.
     #[arg(long, env = "WORKER_ID")]
     pub worker_id: Option<String>,
@@ -164,6 +172,20 @@ impl AppConfig {
             )
     }
 
+    /// Ensures legacy job-table + pgmq backends were explicitly enabled.
+    pub fn require_legacy_job_table_backend_allowed(
+        &self,
+        backend_name: &str,
+    ) -> anyhow::Result<()> {
+        if self.allow_legacy_job_table_backend {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "{backend_name} uses retained legacy job tables and is disabled by default; set ALLOW_LEGACY_JOB_TABLE_BACKEND=true only for explicit compatibility/debug runs"
+        )
+    }
+
     /// Sanitized `worker_jobs` claim limit.
     #[must_use]
     pub fn worker_jobs_claim_limit(&self) -> i32 {
@@ -258,6 +280,7 @@ mod tests {
         assert_eq!(config.queue_db_min_connections(), 0);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(30));
         assert_eq!(config.queue_backend, QueueBackend::WorkerJobs);
+        assert!(!config.allow_legacy_job_table_backend);
         assert!(config.worker_id().starts_with("solver-worker-"));
         assert_eq!(config.worker_jobs_claim_limit(), 1);
         assert_eq!(config.worker_jobs_lease_seconds(), 900);
@@ -348,5 +371,39 @@ mod tests {
         assert_eq!(config.worker_id(), "solver-a");
         assert_eq!(config.worker_jobs_claim_limit(), 50);
         assert_eq!(config.worker_jobs_lease_seconds(), 86_400);
+    }
+
+    #[test]
+    fn legacy_job_table_backend_requires_explicit_opt_in() {
+        let blocked = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--queue-backend",
+            "pgmq",
+        ]);
+
+        assert_eq!(blocked.queue_backend, QueueBackend::Pgmq);
+        assert!(
+            blocked
+                .require_legacy_job_table_backend_allowed("solver pgmq backend")
+                .unwrap_err()
+                .to_string()
+                .contains("ALLOW_LEGACY_JOB_TABLE_BACKEND=true")
+        );
+
+        let allowed = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--queue-backend",
+            "pgmq",
+            "--allow-legacy-job-table-backend",
+        ]);
+
+        assert!(allowed.allow_legacy_job_table_backend);
+        allowed
+            .require_legacy_job_table_backend_allowed("solver pgmq backend")
+            .expect("legacy backend opt-in should allow pgmq");
     }
 }

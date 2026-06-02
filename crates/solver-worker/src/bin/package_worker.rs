@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.package_queue_backend {
         PackageQueueBackend::Pgmq => {
+            cli.app
+                .require_legacy_job_table_backend_allowed("package pgmq backend")?;
             let queue_name = resolve_queue_name(&cli.app.pgmq_queue);
 
             if cli.app.pgmq_queue == "lca_jobs" {
@@ -927,6 +929,40 @@ mod tests {
         ]);
 
         assert_eq!(cli.package_queue_backend, PackageQueueBackend::WorkerJobs);
+    }
+
+    #[test]
+    fn package_pgmq_backend_requires_global_legacy_opt_in() {
+        let cli = PackageWorkerCli::parse_from([
+            "package-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--package-queue-backend",
+            "pgmq",
+        ]);
+
+        assert_eq!(cli.package_queue_backend, PackageQueueBackend::Pgmq);
+        assert!(
+            cli.app
+                .require_legacy_job_table_backend_allowed("package pgmq backend")
+                .unwrap_err()
+                .to_string()
+                .contains("ALLOW_LEGACY_JOB_TABLE_BACKEND=true")
+        );
+
+        let allowed = PackageWorkerCli::parse_from([
+            "package-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--package-queue-backend",
+            "pgmq",
+            "--allow-legacy-job-table-backend",
+        ]);
+
+        allowed
+            .app
+            .require_legacy_job_table_backend_allowed("package pgmq backend")
+            .expect("legacy backend opt-in should allow package pgmq");
     }
 
     #[test]

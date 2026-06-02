@@ -288,8 +288,9 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 - `DATABASE_URL` 或 `CONN`
 - `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅 legacy pgmq read/archive 需要，未设置时复用 `DATABASE_URL` / `CONN`）
-- `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug）
-- `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug）
+- `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
+- `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
+- `ALLOW_LEGACY_JOB_TABLE_BACKEND`（默认 `false`；只允许显式兼容/debug 运行进入 retained `lca_jobs` / `lca_package_jobs` + pgmq 后端，生产保持关闭）
 - `PGMQ_QUEUE`（legacy pgmq 队列名，默认 `lca_jobs`）
 - `SOLVER_MODE`（`worker` / `http` / `both`）
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
@@ -464,8 +465,8 @@ cargo run -p solver-worker --bin review_submit_gate_runner --release --
 
 说明：
 
-- `solver-worker` 默认消费 `worker_queue=solver` 的 `worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；`--queue-backend pgmq` 才进入 legacy `lca_jobs` 队列。
-- `package_worker` 默认消费 `worker_queue=package` 的 `worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；`--package-queue-backend pgmq --pgmq-queue lca_package_jobs` 才进入 legacy package 队列。
+- `solver-worker` 默认消费 `worker_queue=solver` 的 `worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；只有 `--queue-backend pgmq --allow-legacy-job-table-backend` 或 `SOLVER_QUEUE_BACKEND=pgmq ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 才进入 legacy `lca_jobs` 队列。
+- `package_worker` 默认消费 `worker_queue=package` 的 `worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；只有 `--package-queue-backend pgmq --pgmq-queue lca_package_jobs --allow-legacy-job-table-backend` 或 `PACKAGE_QUEUE_BACKEND=pgmq ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 才进入 legacy package 队列。
 - `review_submit_gate_runner` 消费数据库表 `dataset_review_submit_gate_runs` 中的 gate run，执行 request-root snapshot + calculator gate，并通过数据库 RPC 写回结果。
 
 ### 6.2 计算正确性基线流程（Expected 对比）

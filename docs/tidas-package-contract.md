@@ -87,7 +87,7 @@ legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
 | `tidas.export_package` | `tidas.export_package.request.v1` | `export_package` | `tidas.export_package.result.v1` |
 | `tidas.import_package` | `tidas.import_package.request.v1` | `import_package` | `tidas.import_package.result.v1` |
 
-`package_worker` 默认走 `worker_jobs`；使用 `--package-queue-backend pgmq` 或 `PACKAGE_QUEUE_BACKEND=pgmq` 才进入 legacy 兼容/debug 路径。`worker_jobs` 模式领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
+`package_worker` 默认走 `worker_jobs`；legacy `pgmq` 兼容/debug 路径必须同时使用 `--package-queue-backend pgmq` 或 `PACKAGE_QUEUE_BACKEND=pgmq`，并显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`。`worker_jobs` 模式领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
 
 ## 6. Payload 契约
 
