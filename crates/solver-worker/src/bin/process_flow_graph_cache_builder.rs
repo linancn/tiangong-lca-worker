@@ -24,6 +24,11 @@ use solver_worker::{
     storage::ObjectStoreClient,
 };
 
+#[path = "process_flow_graph_cache_builder/geo_regions.rs"]
+mod process_flow_graph_geo_regions;
+
+use process_flow_graph_geo_regions::{CHINA_REGION_SHAPES, GeoRegionShape, WORLD_REGION_SHAPES};
+
 const BASIC_FLOW_TYPE: &str = "Elementary flow";
 const DEFAULT_CACHE_PREFIX: &str = "national-carbon/process-flow-graph/v1";
 const DEFAULT_PAGE_SIZE: i64 = 500;
@@ -49,6 +54,8 @@ const WORLD_MAP_WIDTH: f32 = 1120.0;
 const WORLD_MAP_HEIGHT: f32 = 640.0;
 const CHINA_MAP_WIDTH: f32 = 1100.0;
 const CHINA_MAP_HEIGHT: f32 = 720.0;
+const GEO_LOCATION_RULE_VERSION: &str = "geo-map-location-v1";
+const GEO_EXCLUDED_LOCATION_EXAMPLE_LIMIT: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(name = "process-flow-graph-cache-builder")]
@@ -421,15 +428,27 @@ struct ProcessLink {
 #[serde(rename_all = "camelCase")]
 struct GeoMapSummary {
     edge_count: usize,
+    excluded_location_count: usize,
     node_count: usize,
     process_link_count: usize,
+    region_count: usize,
     scope: GeoMapScope,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoMapDiagnostics {
+    excluded_location_count: usize,
+    excluded_location_examples: Vec<String>,
+    location_rule_version: &'static str,
+    region_count: usize,
 }
 
 #[derive(Debug, Clone)]
 struct GeoMapBuild {
     adjacency: BTreeMap<String, Vec<String>>,
     background: GeoMapBackground,
+    diagnostics: GeoMapDiagnostics,
     layout: Vec<[f32; 3]>,
     nodes: Vec<GraphNode>,
     process_links: Vec<ProcessLink>,
@@ -442,6 +461,8 @@ struct GeoMapBuild {
 #[derive(Debug, Clone)]
 struct GeoAnchor {
     key: String,
+    radius_x: f32,
+    radius_y: f32,
     x: f32,
     y: f32,
 }
@@ -1085,8 +1106,10 @@ async fn publish_graph(
             .iter()
             .map(|geo_map| GeoMapSummary {
                 edge_count: geo_map.stats.edge_count,
+                excluded_location_count: geo_map.diagnostics.excluded_location_count,
                 node_count: geo_map.nodes.len(),
                 process_link_count: geo_map.process_links.len(),
+                region_count: geo_map.diagnostics.region_count,
                 scope: geo_map.scope,
             })
             .collect(),
@@ -1508,6 +1531,7 @@ fn encode_geo_map_objects(
         "adjacencyIncludesProcessLinks": true,
         "clustersLevel1": collect_clusters(&geo_map.nodes, ClusterLevel::Level1),
         "clustersLevel3": collect_clusters(&geo_map.nodes, ClusterLevel::Level3),
+        "diagnostics": geo_map.diagnostics,
         "searchFlows": geo_map.search_flows,
         "stats": geo_map.stats,
         "units": units,
@@ -1642,12 +1666,19 @@ fn create_geo_map_build(
     scope: GeoMapScope,
 ) -> anyhow::Result<GeoMapBuild> {
     let mut anchor_by_node_id = BTreeMap::<String, GeoAnchor>::new();
+    let mut excluded_location_count = 0_usize;
+    let mut excluded_location_examples = Vec::<String>::new();
+    let mut region_keys = BTreeSet::<String>::new();
     let mut visible_node_indices = Vec::<usize>::new();
 
     for (index, node) in graph.nodes.iter().enumerate() {
         if let Some(anchor) = resolve_geo_anchor(node, scope) {
+            region_keys.insert(anchor.key.clone());
             anchor_by_node_id.insert(node.id.clone(), anchor);
             visible_node_indices.push(index);
+        } else {
+            excluded_location_count += 1;
+            record_excluded_location_example(node, &mut excluded_location_examples);
         }
     }
 
@@ -1696,10 +1727,17 @@ fn create_geo_map_build(
             .filter(|node| node.kind == NodeKind::Process)
             .count(),
     };
+    let diagnostics = GeoMapDiagnostics {
+        excluded_location_count,
+        excluded_location_examples,
+        location_rule_version: GEO_LOCATION_RULE_VERSION,
+        region_count: region_keys.len(),
+    };
 
     Ok(GeoMapBuild {
         adjacency,
         background: create_geo_background(scope),
+        diagnostics,
         layout,
         nodes,
         process_links,
@@ -1708,6 +1746,25 @@ fn create_geo_map_build(
         stats,
         visible_edge_indices,
     })
+}
+
+fn record_excluded_location_example(node: &GraphNode, examples: &mut Vec<String>) {
+    if examples.len() >= GEO_EXCLUDED_LOCATION_EXAMPLE_LIMIT {
+        return;
+    }
+
+    let location = node
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("<missing>");
+
+    if examples.iter().any(|example| example == location) {
+        return;
+    }
+
+    examples.push(location.to_owned());
 }
 
 fn build_geo_adjacency(
@@ -1760,17 +1817,20 @@ fn create_geo_layout(
     anchor_by_node_id: &BTreeMap<String, GeoAnchor>,
     scope: GeoMapScope,
 ) -> Vec<[f32; 3]> {
-    let mut nodes_by_anchor = BTreeMap::<String, Vec<usize>>::new();
-    for (index, node) in nodes.iter().enumerate() {
+    let mut node_ids_by_anchor = BTreeMap::<String, Vec<String>>::new();
+    for node in nodes {
         if let Some(anchor) = anchor_by_node_id.get(&node.id) {
-            nodes_by_anchor
+            node_ids_by_anchor
                 .entry(anchor.key.clone())
                 .or_default()
-                .push(index);
+                .push(node.id.clone());
         }
     }
 
-    let mut seen_by_anchor = BTreeMap::<String, usize>::new();
+    for node_ids in node_ids_by_anchor.values_mut() {
+        node_ids.sort();
+    }
+
     let (frame_width, frame_height) = scope.frame();
 
     nodes
@@ -1779,11 +1839,23 @@ fn create_geo_layout(
             let Some(anchor) = anchor_by_node_id.get(&node.id) else {
                 return [0.0, 0.0, get_geo_layout_z(node)];
             };
-            let seen = seen_by_anchor.entry(anchor.key.clone()).or_default();
-            let anchor_count = nodes_by_anchor.get(&anchor.key).map_or(1, Vec::len).max(1);
-            let point =
-                distribute_geo_anchor(anchor, *seen, anchor_count, frame_width, frame_height);
-            *seen += 1;
+            let anchor_node_ids = node_ids_by_anchor
+                .get(&anchor.key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let anchor_count = anchor_node_ids.len().max(1);
+            let rank = anchor_node_ids
+                .binary_search(&node.id)
+                .unwrap_or_default()
+                .min(anchor_count - 1);
+            let point = distribute_geo_anchor(
+                anchor,
+                &node.id,
+                rank,
+                anchor_count,
+                frame_width,
+                frame_height,
+            );
             [point[0], point[1], get_geo_layout_z(node)]
         })
         .collect()
@@ -1791,6 +1863,7 @@ fn create_geo_layout(
 
 fn distribute_geo_anchor(
     anchor: &GeoAnchor,
+    node_id: &str,
     index: usize,
     count: usize,
     frame_width: f32,
@@ -1801,10 +1874,18 @@ fn distribute_geo_anchor(
     }
     let rank = index as f32 + 0.5;
     let count_f = count as f32;
-    let angle = rank * GOLDEN_ANGLE + hash_unit(&anchor.key, 3329) * 0.24;
-    let radius = (rank / count_f).sqrt() * (10.0 + count_f.sqrt().min(56.0) * 4.2);
-    let x = (anchor.x + angle.cos() * radius).clamp(-frame_width / 2.0, frame_width / 2.0);
-    let y = (anchor.y + angle.sin() * radius * 0.74).clamp(-frame_height / 2.0, frame_height / 2.0);
+    let hash_key = format!("{}:{node_id}", anchor.key);
+    let angle = rank.mul_add(
+        GOLDEN_ANGLE,
+        hash_unit(&hash_key, 3329) * std::f32::consts::TAU,
+    );
+    let radius = (rank / count_f).sqrt();
+    let coverage = (0.34 + count_f.ln_1p() * 0.13).clamp(0.42, 1.0);
+    let jitter = 0.86 + hash_unit(&hash_key, 3331) * 0.18;
+    let x = (anchor.x + angle.cos() * anchor.radius_x * radius * coverage * jitter)
+        .clamp(-frame_width / 2.0, frame_width / 2.0);
+    let y = (anchor.y + angle.sin() * anchor.radius_y * radius * coverage * jitter)
+        .clamp(-frame_height / 2.0, frame_height / 2.0);
 
     [x, y]
 }
@@ -1927,57 +2008,105 @@ fn resolve_geo_anchor(node: &GraphNode, scope: GeoMapScope) -> Option<GeoAnchor>
 }
 
 fn resolve_world_anchor(location: &str) -> Option<GeoAnchor> {
-    let code = if location == "CN" || location.starts_with("CN-") {
-        "CN"
-    } else if location.len() == 2 && location.chars().all(|ch| ch.is_ascii_uppercase()) {
-        location
-    } else {
-        location.split('-').next().unwrap_or(location)
-    };
-    let (lon, lat) = world_coordinate(code)?;
-    let [x, y] = project_world(lon, lat);
+    let region_key = resolve_world_region_key(location)?;
+    let shape = find_geo_region_shape(WORLD_REGION_SHAPES, &region_key)?;
 
     Some(GeoAnchor {
-        key: format!("world:{code}"),
-        x,
-        y,
+        key: format!("world:{}", shape.key),
+        radius_x: shape.radius_x,
+        radius_y: shape.radius_y,
+        x: shape.x,
+        y: shape.y,
     })
 }
 
 fn resolve_china_anchor(location: &str) -> Option<GeoAnchor> {
-    if location != "CN" && !location.starts_with("CN-") {
-        return None;
-    }
-    let province_code = location.split('-').nth(1).unwrap_or("CN");
-    let (lon, lat) = china_coordinate(province_code)?;
-    let [x, y] = project_china(lon, lat);
+    let province_code = resolve_china_province_code(location)?;
+    let shape = find_geo_region_shape(CHINA_REGION_SHAPES, province_code)?;
 
     Some(GeoAnchor {
-        key: format!("china:{province_code}"),
-        x,
-        y,
+        key: format!("china:{}", shape.key),
+        radius_x: shape.radius_x,
+        radius_y: shape.radius_y,
+        x: shape.x,
+        y: shape.y,
     })
 }
 
-fn project_world(lon: f32, lat: f32) -> [f32; 2] {
-    [
-        ((lon + 180.0) / 360.0) * WORLD_MAP_WIDTH - WORLD_MAP_WIDTH / 2.0,
-        WORLD_MAP_HEIGHT / 2.0 - ((lat + 90.0) / 180.0) * WORLD_MAP_HEIGHT,
-    ]
+fn resolve_world_region_key(location: &str) -> Option<String> {
+    if location == "CN" || location.starts_with("CN-") {
+        return Some("CN".to_owned());
+    }
+
+    let code = location.split('-').next().unwrap_or(location);
+    if code.len() != 2 || !code.chars().all(|ch| ch.is_ascii_uppercase()) {
+        return None;
+    }
+    if is_world_excluded_region_code(code) {
+        return None;
+    }
+
+    let normalized_code = match code {
+        "UK" => "GB",
+        _ => code,
+    };
+
+    find_geo_region_shape(WORLD_REGION_SHAPES, normalized_code).map(|shape| shape.key.to_owned())
 }
 
-fn project_china(lon: f32, lat: f32) -> [f32; 2] {
-    let lon_min = 73.0_f32;
-    let lon_max = 135.0_f32;
-    let lat_min = 18.0_f32;
-    let lat_max = 54.0_f32;
+fn resolve_china_province_code(location: &str) -> Option<&str> {
+    if !location.starts_with("CN-") {
+        return None;
+    }
 
-    [
-        ((lon - lon_min) / (lon_max - lon_min)).clamp(0.0, 1.0) * CHINA_MAP_WIDTH
-            - CHINA_MAP_WIDTH / 2.0,
-        CHINA_MAP_HEIGHT / 2.0
-            - ((lat - lat_min) / (lat_max - lat_min)).clamp(0.0, 1.0) * CHINA_MAP_HEIGHT,
-    ]
+    let province_code = location.split('-').nth(1)?;
+    find_geo_region_shape(CHINA_REGION_SHAPES, province_code).map(|shape| shape.key)
+}
+
+fn find_geo_region_shape(
+    shapes: &'static [GeoRegionShape],
+    key: &str,
+) -> Option<&'static GeoRegionShape> {
+    shapes.iter().find(|shape| shape.key == key)
+}
+
+fn is_world_excluded_region_code(code: &str) -> bool {
+    matches!(
+        code,
+        "AFR"
+            | "CENTREL"
+            | "CIS"
+            | "CPA"
+            | "EAS"
+            | "EC-CC"
+            | "EEU"
+            | "EU+EFTA+UK"
+            | "EU-15"
+            | "EU-25"
+            | "EU-25&CC"
+            | "EU-25&CC&AC"
+            | "EU-27"
+            | "EU-AC"
+            | "EU-NMC"
+            | "FSU"
+            | "GLO"
+            | "MEA"
+            | "NORDEL"
+            | "OCE"
+            | "PAO"
+            | "PAS"
+            | "RAF"
+            | "RAM"
+            | "RAS"
+            | "RER"
+            | "RLA"
+            | "RME"
+            | "RNA"
+            | "RNE"
+            | "SAS"
+            | "UCTE"
+            | "WEU"
+    )
 }
 
 fn create_geo_background(scope: GeoMapScope) -> GeoMapBackground {
@@ -1998,97 +2127,6 @@ fn create_geo_background(scope: GeoMapScope) -> GeoMapBackground {
         scope,
         width,
     }
-}
-
-fn world_coordinate(code: &str) -> Option<(f32, f32)> {
-    let coordinate = match code {
-        "AFR" | "RAF" => (20.0, 1.0),
-        "AU" | "OCE" | "PAO" => (137.0, -25.0),
-        "BR" => (-52.0, -10.0),
-        "CA" => (-106.0, 57.0),
-        "CENTREL" => (15.0, 49.0),
-        "CN" | "CPA" | "EAS" => (103.0, 36.0),
-        "DE" => (10.0, 51.0),
-        "EEU" => (24.0, 51.0),
-        "EU+EFTA+UK" | "EU-15" | "EU-25" | "EU-27" | "EU-NMC" | "RER" | "UCTE" | "WEU" => {
-            (10.0, 50.0)
-        }
-        "FR" => (2.0, 47.0),
-        "FSU" => (62.0, 56.0),
-        "GB" | "UK" => (-2.0, 54.0),
-        "GLO" => (0.0, 8.0),
-        "IN" | "SAS" => (78.0, 20.0),
-        "JP" => (138.0, 37.0),
-        "KR" => (128.0, 36.0),
-        "MEA" => (38.0, 25.0),
-        "NO" | "NORDEL" => (18.0, 62.0),
-        "PAS" => (116.0, 7.0),
-        "PT" => (-8.0, 39.5),
-        "RAM" => (-76.0, 8.0),
-        "RAS" => (103.0, 20.0),
-        "RLA" => (-65.0, -16.0),
-        "RME" => (44.0, 27.0),
-        "RNA" => (-101.0, 46.0),
-        "RNE" => (40.0, 31.0),
-        "RU" => (96.0, 61.0),
-        "US" => (-98.0, 39.0),
-        code if code.len() == 2 && code.chars().all(|ch| ch.is_ascii_uppercase()) => {
-            fallback_country_coordinate(code)
-        }
-        _ => return None,
-    };
-
-    Some(coordinate)
-}
-
-fn fallback_country_coordinate(code: &str) -> (f32, f32) {
-    let lon = hash_unit(code, 4301).mul_add(330.0, -165.0);
-    let lat = hash_unit(code, 4303).mul_add(120.0, -55.0);
-
-    (lon, lat)
-}
-
-fn china_coordinate(code: &str) -> Option<(f32, f32)> {
-    let coordinate = match code {
-        "CN" => (104.0, 35.5),
-        "AH" => (117.3, 31.8),
-        "BJ" => (116.4, 39.9),
-        "CQ" => (106.6, 29.6),
-        "FJ" => (119.3, 26.1),
-        "GD" => (113.3, 23.1),
-        "GS" => (103.8, 36.1),
-        "GX" => (108.3, 22.8),
-        "GZ" => (106.7, 26.6),
-        "HA" => (113.6, 34.8),
-        "HB" => (114.3, 30.6),
-        "HE" => (114.5, 38.0),
-        "HI" => (110.3, 20.0),
-        "HK" => (114.2, 22.3),
-        "HL" => (126.6, 45.8),
-        "HN" => (112.9, 28.2),
-        "JL" => (125.3, 43.9),
-        "JS" => (118.8, 32.1),
-        "JX" => (115.9, 28.7),
-        "LN" => (123.4, 41.8),
-        "MO" => (113.5, 22.2),
-        "NM" => (111.7, 40.8),
-        "NX" => (106.3, 38.5),
-        "QH" => (101.8, 36.6),
-        "SC" => (104.1, 30.7),
-        "SD" => (117.0, 36.7),
-        "SH" => (121.5, 31.2),
-        "SN" => (108.9, 34.3),
-        "SX" => (112.6, 37.9),
-        "TJ" => (117.2, 39.1),
-        "TW" => (121.0, 23.7),
-        "XJ" => (87.6, 43.8),
-        "XZ" => (91.1, 29.7),
-        "YN" => (102.7, 25.0),
-        "ZJ" => (120.2, 30.3),
-        _ => return None,
-    };
-
-    Some(coordinate)
 }
 
 fn create_sphere_layout(nodes: &[GraphNode]) -> Vec<[f32; 3]> {
@@ -3228,12 +3266,14 @@ fn extract_unit_hint(text: &str) -> Option<String> {
 mod tests {
     use flate2::read::GzDecoder;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::io::Read;
 
     use super::DatasetRow;
     use super::{
-        Cli, ExchangeDirection, GeoMapScope, build_graph, cluster_payload, encoded_gzip_json,
-        normalize_exchange_direction,
+        Cli, ExchangeDirection, GEO_LOCATION_RULE_VERSION, GeoMapScope, build_graph,
+        cluster_payload, encoded_gzip_json, normalize_exchange_direction,
+        resolve_china_province_code, resolve_world_region_key,
     };
 
     fn test_cli() -> Cli {
@@ -3529,6 +3569,125 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[test]
+    fn geo_location_code_resolution_matches_map_coverage() {
+        for code in ["AD", "GE", "GF", "GP", "MQ", "PG", "RE", "YT"] {
+            assert_eq!(resolve_world_region_key(code).as_deref(), Some(code));
+        }
+        assert_eq!(resolve_world_region_key("UK").as_deref(), Some("GB"));
+        assert_eq!(resolve_world_region_key("CN-GD-SZX").as_deref(), Some("CN"));
+
+        for code in ["BV", "EU-27", "GI", "GLO", "RER", "UM"] {
+            assert!(resolve_world_region_key(code).is_none());
+        }
+
+        assert_eq!(resolve_china_province_code("CN-GD"), Some("GD"));
+        assert_eq!(resolve_china_province_code("CN-GD-SZX"), Some("GD"));
+        assert_eq!(resolve_china_province_code("CN-HK"), Some("HK"));
+        assert!(resolve_china_province_code("CN").is_none());
+        assert!(resolve_china_province_code("HK").is_none());
+        assert!(resolve_china_province_code("CN-XX").is_none());
+    }
+
+    #[test]
+    fn geo_map_location_rules_filter_nodes_by_scope() {
+        let flows = vec![flow_row("flow-a", "Flow A", "Product flow")];
+        let processes = vec![
+            process_row_for_flow("cn-country", "CN", "flow-a", "Output"),
+            process_row_for_flow("cn-province", "CN-GD-SZX", "flow-a", "Input"),
+            process_row_for_flow("gb-alias", "UK", "flow-a", "Output"),
+            process_row_for_flow("global", "GLO", "flow-a", "Output"),
+            process_row_for_flow("null-location", "NULL", "flow-a", "Output"),
+            process_row_for_flow("unknown", "ZZ", "flow-a", "Output"),
+        ];
+        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let world = graph
+            .geo_maps
+            .iter()
+            .find(|geo_map| geo_map.scope == GeoMapScope::World)
+            .expect("world geo map");
+        let world_node_ids = world
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(world_node_ids.contains("process:cn-country@01.00.000"));
+        assert!(world_node_ids.contains("process:cn-province@01.00.000"));
+        assert!(world_node_ids.contains("process:gb-alias@01.00.000"));
+        assert!(!world_node_ids.contains("process:global@01.00.000"));
+        assert!(!world_node_ids.contains("process:null-location@01.00.000"));
+        assert!(!world_node_ids.contains("process:unknown@01.00.000"));
+        assert_eq!(
+            world.diagnostics.location_rule_version,
+            GEO_LOCATION_RULE_VERSION
+        );
+        assert!(world.diagnostics.excluded_location_count >= 3);
+
+        let china = graph
+            .geo_maps
+            .iter()
+            .find(|geo_map| geo_map.scope == GeoMapScope::China)
+            .expect("china geo map");
+        let china_node_ids = china
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(china_node_ids.contains("process:cn-province@01.00.000"));
+        assert!(!china_node_ids.contains("process:cn-country@01.00.000"));
+        assert!(!china_node_ids.contains("process:gb-alias@01.00.000"));
+        assert!(!china_node_ids.contains("process:global@01.00.000"));
+        assert!(!china_node_ids.contains("process:null-location@01.00.000"));
+        assert!(!china_node_ids.contains("process:unknown@01.00.000"));
+        assert_eq!(
+            china.diagnostics.location_rule_version,
+            GEO_LOCATION_RULE_VERSION
+        );
+        assert!(china.diagnostics.excluded_location_count >= 5);
+    }
+
+    #[test]
+    fn geo_map_layout_spreads_nodes_inside_same_region() {
+        let flows = vec![flow_row("flow-a", "Flow A", "Product flow")];
+        let processes = (0..12)
+            .map(|index| {
+                process_row_for_flow(
+                    &format!("gd-process-{index:02}"),
+                    "CN-GD",
+                    "flow-a",
+                    if index % 2 == 0 { "Output" } else { "Input" },
+                )
+            })
+            .collect::<Vec<_>>();
+        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let china = graph
+            .geo_maps
+            .iter()
+            .find(|geo_map| geo_map.scope == GeoMapScope::China)
+            .expect("china geo map");
+        let (frame_width, frame_height) = GeoMapScope::China.frame();
+        let unique_points = china
+            .layout
+            .iter()
+            .map(|position| {
+                assert!(position[0] >= -frame_width / 2.0);
+                assert!(position[0] <= frame_width / 2.0);
+                assert!(position[1] >= -frame_height / 2.0);
+                assert!(position[1] <= frame_height / 2.0);
+                assert!(position.iter().all(|value| value.is_finite()));
+                (
+                    (position[0] * 10.0).round() as i32,
+                    (position[1] * 10.0).round() as i32,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(china.nodes.len(), 12);
+        assert!(unique_points.len() >= 10);
     }
 
     #[test]
