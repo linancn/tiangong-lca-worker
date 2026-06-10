@@ -5,6 +5,7 @@ use serde_json::{Map, Value, json};
 use solver_worker::{
     config::AppConfig,
     db::{AppState, archive_queue_message, read_one_queue_message},
+    db_pool::{APP_PACKAGE_WORKER, APP_PACKAGE_WORKER_QUEUE},
     package_db::{
         PackageJobContinuation, extract_package_job_id, extract_package_job_id_from_raw_payload,
         handle_package_job_payload, handle_package_job_payload_once,
@@ -90,7 +91,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = PackageWorkerCli::parse();
-    let state = Arc::new(AppState::new(&cli.app).await?);
+    let state = Arc::new(
+        AppState::new_with_application_names(
+            &cli.app,
+            APP_PACKAGE_WORKER,
+            APP_PACKAGE_WORKER_QUEUE,
+        )
+        .await?,
+    );
 
     match cli.package_queue_backend {
         PackageQueueBackend::Pgmq => {

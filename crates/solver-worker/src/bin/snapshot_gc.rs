@@ -1,7 +1,8 @@
 use clap::Parser;
 use serde_json::json;
 use solver_worker::{
-    pgbouncer_sqlx::{self as sqlx, postgres::PgPoolOptions},
+    db_pool::{APP_SNAPSHOT_GC, WorkerDbPoolOptions},
+    pgbouncer_sqlx::{self as sqlx},
     snapshot_retention::{
         DEFAULT_BATCH_SIZE, DEFAULT_MAX_BYTES, DEFAULT_MAX_ORPHAN_DIRS, DEFAULT_MAX_SNAPSHOTS,
         DEFAULT_ORPHAN_RETENTION_DAYS, DEFAULT_SNAPSHOT_RETENTION_DAYS, ObjectDeleteStatus,
@@ -176,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     validate_positive_i32(cli.max_orphan_dirs, "SNAPSHOT_GC_MAX_ORPHAN_DIRS")?;
 
     let db_url = resolve_db_url(&cli)?;
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_SNAPSHOT_GC)
         .max_connections(4)
         .connect(db_url)
         .await?;

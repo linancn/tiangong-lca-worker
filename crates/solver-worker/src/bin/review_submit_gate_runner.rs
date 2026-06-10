@@ -4,6 +4,7 @@ use clap::Parser;
 use solver_worker::{
     config::AppConfig,
     db::AppState,
+    db_pool::{APP_REVIEW_SUBMIT_GATE_RUNNER, APP_REVIEW_SUBMIT_GATE_RUNNER_QUEUE},
     review_submit_gate_runner::{
         ReviewSubmitGateRunnerOptions, ReviewSubmitGateWorkerJobsOptions,
         run_review_submit_gate_runner, run_review_submit_gate_worker_jobs_runner,
@@ -52,7 +53,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let state = AppState::new(&cli.config).await?;
+    let state = AppState::new_with_application_names(
+        &cli.config,
+        APP_REVIEW_SUBMIT_GATE_RUNNER,
+        APP_REVIEW_SUBMIT_GATE_RUNNER_QUEUE,
+    )
+    .await?;
     let poll_interval = Duration::from_millis(cli.poll_ms.max(100));
     let max_runs = cli.max_runs.or_else(|| cli.once.then_some(1));
     let exit_when_idle = cli.once;

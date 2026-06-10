@@ -309,6 +309,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `BUILD_SNAPSHOT_LOCK_POLL_MS`（等待 `build_snapshot` 并发槽位时的轮询间隔，默认 `5000`）
 - `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
 - `SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS`（`snapshot_builder` 获取连接超时，默认 `30`）
+- `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS`（`snapshot_builder` 单条 SQL statement timeout，默认 `900`；设置为 `0` 表示关闭，仅建议用于人工恢复或排障）
 - `REVIEW_SUBMIT_GATE_POLL_MS`（review-submit gate runner 轮询间隔，默认 `1000`）
 - `REVIEW_SUBMIT_GATE_MAX_RUNS`（可选；设置后 runner 处理指定条数后退出）
 - `REVIEW_SUBMIT_GATE_STALE_RUNNING_SECONDS`（runner 重新领取 stale `running` gate run 的阈值，默认 `21600`）
@@ -319,6 +320,8 @@ Supabase 连接说明：
 - 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
+- worker 入口会设置明确的 PostgreSQL `application_name`，例如 `solver-worker`、`snapshot-builder`、`package-worker`、`package-gc`、`snapshot-gc`、`result-gc`、`maintenance-worker` 和 `maintenance-enqueue`，用于在 `pg_stat_activity` 中归因长连接或长事务。
+- 如果 `snapshot_builder` 查询超过 `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS`，当前任务应失败并释放连接；短期可调大该值恢复生产，但稳定超时应进入后续查询优化，而不是长期设置为 `0`。
 
 对象存储（snapshot builder / solver-worker / result_gc 必需；`package_gc --execute` 删除 package artifact 对象时也必需）：
 

@@ -142,6 +142,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 - Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. High-frequency pgmq polling and archive operations use the queue-only pool plus `raw_sql` with validated queue-name literals so they can run through the simple query protocol on Supabase's 6543 transaction pooler without moving compute/package/snapshot queries onto that pooler.
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.
+- Worker-owned DB pools set explicit PostgreSQL `application_name` values for observability. `snapshot_builder` also applies `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS` as a bounded statement timeout; `0` is reserved for targeted manual recovery, not normal production operation.
 
 ## Runtime SQL Boundary
 

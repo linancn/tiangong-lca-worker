@@ -1,5 +1,6 @@
 use clap::Parser;
-use solver_worker::pgbouncer_sqlx::{self as sqlx, Row, postgres::PgPoolOptions};
+use solver_worker::db_pool::{APP_RESULT_GC, WorkerDbPoolOptions};
+use solver_worker::pgbouncer_sqlx::{self as sqlx, Row};
 use solver_worker::storage::ObjectStoreClient;
 use uuid::Uuid;
 
@@ -181,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
     let access_key = required(cli.s3_access_key_id.as_deref(), "S3_ACCESS_KEY_ID")?;
     let secret = required(cli.s3_secret_access_key.as_deref(), "S3_SECRET_ACCESS_KEY")?;
 
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_RESULT_GC)
         .max_connections(4)
         .connect(db_url)
         .await?;
