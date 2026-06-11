@@ -1,12 +1,13 @@
 use clap::Parser;
 use solver_worker::{
+    db_pool::{APP_PACKAGE_GC, WorkerDbPoolOptions},
     package_retention::{
         PackageArtifactGcCandidate, delete_package_jobs_after_object_gc,
         delete_stale_package_request_cache_rows, fetch_package_artifact_gc_candidates,
         fetch_package_retention_summary, mark_package_artifact_deleted,
         record_package_artifact_gc_error, validate_retention_days,
     },
-    pgbouncer_sqlx::{self as sqlx, postgres::PgPoolOptions},
+    pgbouncer_sqlx::{self as sqlx},
     storage::ObjectStoreClient,
 };
 
@@ -150,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     let db_url = resolve_db_url(&cli)?;
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_PACKAGE_GC)
         .max_connections(4)
         .connect(db_url)
         .await?;

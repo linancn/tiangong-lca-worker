@@ -3,7 +3,8 @@ use std::{path::PathBuf, process::Command, time::Duration};
 use clap::Parser;
 use serde_json::{Map, Value, json};
 use solver_worker::{
-    pgbouncer_sqlx::{self as sqlx, Row, postgres::PgPoolOptions},
+    db_pool::{APP_MAINTENANCE_WORKER, WorkerDbPoolOptions},
+    pgbouncer_sqlx::{self as sqlx, Row},
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
         record_worker_job_result,
@@ -125,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_MAINTENANCE_WORKER)
         .max_connections(cli.db_max_connections.max(1))
         .connect(cli.resolved_database_url()?)
         .await?;

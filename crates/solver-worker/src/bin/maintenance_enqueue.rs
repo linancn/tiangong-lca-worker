@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use serde_json::{Map, Value, json};
-use solver_worker::pgbouncer_sqlx::{Row, postgres::PgPoolOptions};
+use solver_worker::{
+    db_pool::{APP_MAINTENANCE_ENQUEUE, WorkerDbPoolOptions},
+    pgbouncer_sqlx::Row,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -146,7 +149,7 @@ impl Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_MAINTENANCE_ENQUEUE)
         .max_connections(1)
         .connect(cli.resolved_database_url()?)
         .await?;

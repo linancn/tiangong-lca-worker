@@ -5,9 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::pgbouncer_sqlx::{
-    self as sqlx, PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions,
-};
+use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, Row, Transaction};
 use serde_json::{Map, Value};
 use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
@@ -24,6 +22,7 @@ use crate::{
     },
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
+    db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
     snapshot_artifacts::{DecodedSnapshotArtifact, decode_snapshot_artifact},
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::ObjectStoreClient,
@@ -79,6 +78,7 @@ struct BuildSnapshotLockGuard {
     slot: u32,
     wait_sec: f64,
     max_concurrency: u32,
+    acquired_at: Instant,
 }
 
 impl BuildSnapshotLockGuard {
@@ -89,6 +89,7 @@ impl BuildSnapshotLockGuard {
             "max_concurrency": self.max_concurrency,
             "slot": self.slot,
             "wait_sec": self.wait_sec,
+            "hold_sec": self.acquired_at.elapsed().as_secs_f64(),
         })
     }
 
@@ -97,7 +98,17 @@ impl BuildSnapshotLockGuard {
             return Ok(());
         };
 
+        let hold_sec = self.acquired_at.elapsed().as_secs_f64();
         tx.commit().await?;
+        info!(
+            lock_key = self.key,
+            slot = self.slot,
+            max_concurrency = self.max_concurrency,
+            wait_sec = self.wait_sec,
+            hold_sec,
+            release_path = "explicit",
+            "released build_snapshot transaction advisory lock"
+        );
         Ok(())
     }
 }
@@ -105,9 +116,14 @@ impl BuildSnapshotLockGuard {
 impl Drop for BuildSnapshotLockGuard {
     fn drop(&mut self) {
         if self.tx.is_some() {
+            let hold_sec = self.acquired_at.elapsed().as_secs_f64();
             warn!(
                 lock_key = self.key,
                 slot = self.slot,
+                max_concurrency = self.max_concurrency,
+                wait_sec = self.wait_sec,
+                hold_sec,
+                release_path = "drop",
                 "build_snapshot transaction advisory lock guard dropped before explicit release"
             );
         }
@@ -117,7 +133,17 @@ impl Drop for BuildSnapshotLockGuard {
 impl AppState {
     /// Creates app state with DB pool and required object storage.
     pub async fn new(config: &AppConfig) -> anyhow::Result<Self> {
+        Self::new_with_application_names(config, APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE).await
+    }
+
+    /// Creates app state with explicit DB application names for the main and queue pools.
+    pub async fn new_with_application_names(
+        config: &AppConfig,
+        application_name: &str,
+        queue_application_name: &str,
+    ) -> anyhow::Result<Self> {
         let pool = connect_pool(
+            application_name,
             config.resolved_database_url()?,
             config.db_max_connections(),
             config.db_min_connections(),
@@ -127,6 +153,7 @@ impl AppState {
 
         let queue_pool = if config.has_explicit_queue_database_url() {
             connect_pool(
+                queue_application_name,
                 config.resolved_queue_database_url()?,
                 config.queue_db_max_connections(),
                 config.queue_db_min_connections(),
@@ -177,20 +204,18 @@ impl AppState {
 }
 
 async fn connect_pool(
+    application_name: &str,
     database_url: &str,
     max_connections: u32,
     min_connections: u32,
     acquire_timeout: Duration,
 ) -> anyhow::Result<PgPool> {
-    Ok(PgPoolOptions::new()
+    WorkerDbPoolOptions::new(application_name)
         .max_connections(max_connections)
         .min_connections(min_connections)
         .acquire_timeout(acquire_timeout)
-        .idle_timeout(Duration::from_mins(5))
-        .max_lifetime(Duration::from_mins(30))
-        .test_before_acquire(true)
         .connect(database_url)
-        .await?)
+        .await
 }
 
 async fn acquire_build_snapshot_lock(
@@ -225,6 +250,7 @@ async fn acquire_build_snapshot_lock(
                     slot,
                     wait_sec,
                     max_concurrency,
+                    acquired_at: Instant::now(),
                 });
             }
             tx.rollback().await?;

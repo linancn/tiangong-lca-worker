@@ -23,8 +23,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-05-26
-lastReviewedCommit: fe323a1f2d884e7f812e9ebd66d5a32146e80766
+lastReviewedAt: 2026-06-10
+lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
 related:
   - AGENTS.md
   - .docpact/config.yaml

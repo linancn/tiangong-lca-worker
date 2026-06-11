@@ -14,6 +14,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tempfile::{Builder, NamedTempFile, TempDir};
+use tracing::{info, warn};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -45,6 +46,7 @@ const EXPORT_FINALIZE_FETCH_BATCH_SIZE: usize = 256;
 const EXPORT_ITEM_INSERT_CHUNK_SIZE: usize = 500;
 const EXPORT_BATCHES_PER_PASS: usize = 6;
 const EXPORT_PASS_TIME_BUDGET: Duration = Duration::from_secs(20);
+const EXPORT_SEED_SCAN_SLOW_BATCH_THRESHOLD: Duration = Duration::from_secs(5);
 
 const SUPPORTED_PACKAGE_TABLES: [PackageRootTable; 7] = [
     PackageRootTable::Contacts,
@@ -925,6 +927,8 @@ async fn fetch_scope_seed_scan_batch_after_cursor(
     after_version: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<Vec<PackageSeedScanEntry>> {
+    let query_started = Instant::now();
+    let has_cursor = after_id.is_some();
     let mut builder = QueryBuilder::<Postgres>::new(scope_seed_scan_select_prefix_sql(table));
     builder.push(" WHERE ");
     match scope {
@@ -965,6 +969,28 @@ async fn fetch_scope_seed_scan_batch_after_cursor(
         .push(" ORDER BY id ASC, version ASC LIMIT ")
         .push_bind(limit);
     let rows = builder.build().persistent(false).fetch_all(pool).await?;
+    let elapsed = query_started.elapsed();
+    if elapsed >= EXPORT_SEED_SCAN_SLOW_BATCH_THRESHOLD {
+        warn!(
+            ?table,
+            ?scope,
+            limit,
+            has_cursor,
+            rows = rows.len(),
+            elapsed_sec = elapsed.as_secs_f64(),
+            "package seed scan batch completed slowly"
+        );
+    } else {
+        info!(
+            ?table,
+            ?scope,
+            limit,
+            has_cursor,
+            rows = rows.len(),
+            elapsed_sec = elapsed.as_secs_f64(),
+            "package seed scan batch completed"
+        );
+    }
 
     rows.iter()
         .map(|row| parse_seed_scan_entry_row(table, row))
@@ -1225,6 +1251,7 @@ async fn process_seed_scan_pass(
     mut state: ExportSeedScanState,
     pass_started: Instant,
 ) -> anyhow::Result<ExportSeedScanResult> {
+    let seed_scan_pass_started = Instant::now();
     let mut pass_scanned_count = 0usize;
     let mut pass_discovered_count = 0usize;
 
@@ -1295,6 +1322,27 @@ async fn process_seed_scan_pass(
 
     if state.table_index >= SUPPORTED_PACKAGE_TABLES.len() {
         state.complete = true;
+    }
+
+    let elapsed = seed_scan_pass_started.elapsed();
+    if elapsed >= EXPORT_PASS_TIME_BUDGET {
+        warn!(
+            scanned_count = pass_scanned_count,
+            discovered_count = pass_discovered_count,
+            table_index = state.table_index,
+            complete = state.complete,
+            elapsed_sec = elapsed.as_secs_f64(),
+            "package seed scan pass consumed time budget"
+        );
+    } else {
+        info!(
+            scanned_count = pass_scanned_count,
+            discovered_count = pass_discovered_count,
+            table_index = state.table_index,
+            complete = state.complete,
+            elapsed_sec = elapsed.as_secs_f64(),
+            "package seed scan pass completed"
+        );
     }
 
     Ok(ExportSeedScanResult {

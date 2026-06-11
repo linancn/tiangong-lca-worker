@@ -32,10 +32,11 @@ use solver_worker::compiled_graph::{
     CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource, CompiledReferenceStats,
     CompiledTechnosphereEdge,
 };
+use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
 use solver_worker::graph_types::{
     RequestRootProcess, ResolvedScopeProcess, ScopeProcessPartition, SnapshotSelectionMode,
 };
-use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row, postgres::PgPoolOptions};
+use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use solver_worker::readiness::{
     MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
 };
@@ -56,6 +57,8 @@ use uuid::Uuid;
 const REVIEW_SUBMIT_OVERLAY_ARTIFACT_PURPOSE: &str = "review_submit_overlay";
 const REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE: &str = "review_submit_baseline";
 const REVIEW_SUBMIT_BASELINE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+const DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS: u64 = 900;
+const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "snapshot-builder")]
@@ -76,6 +79,12 @@ struct Cli {
         default_value_t = 30_u64
     )]
     db_acquire_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS",
+        default_value_t = DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS
+    )]
+    db_statement_timeout_seconds: u64,
     #[arg(long, env = "S3_ENDPOINT")]
     s3_endpoint: Option<String>,
     #[arg(long, env = "S3_REGION")]
@@ -421,6 +430,14 @@ impl AllocationMode {
     }
 }
 
+fn snapshot_db_statement_timeout(seconds: u64) -> Option<Duration> {
+    if seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(seconds))
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let total_started = Instant::now();
@@ -434,19 +451,29 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .or(cli.conn.as_deref())
         .ok_or_else(|| anyhow::anyhow!("missing DB connection: set DATABASE_URL or CONN"))?;
-    let pool = PgPoolOptions::new()
+    let statement_timeout = snapshot_db_statement_timeout(cli.db_statement_timeout_seconds);
+    if statement_timeout.is_none() {
+        eprintln!(
+            "[warn] SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS=0 disables statement_timeout; use only for targeted manual recovery"
+        );
+    }
+    let pool_options = WorkerDbPoolOptions::new(APP_SNAPSHOT_BUILDER)
         .max_connections(cli.db_max_connections.max(1))
         .acquire_timeout(Duration::from_secs(cli.db_acquire_timeout_seconds.max(1)))
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::query("SET statement_timeout = 0")
-                    .execute(conn)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect(db_url)
-        .await?;
+        .statement_timeout(statement_timeout);
+    println!(
+        "[db_pool] application_name={} max_connections={} min_connections={} acquire_timeout_seconds={} idle_timeout_seconds={} max_lifetime_seconds={} statement_timeout_seconds={}",
+        pool_options.application_name(),
+        pool_options.max_connections_value(),
+        pool_options.min_connections_value(),
+        pool_options.acquire_timeout_value().as_secs(),
+        pool_options.idle_timeout_value().as_secs(),
+        pool_options.max_lifetime_value().as_secs(),
+        pool_options
+            .statement_timeout_value()
+            .map_or(0, |duration| duration.as_secs())
+    );
+    let pool = pool_options.connect(db_url).await?;
 
     let requested_snapshot_id = cli.snapshot_id;
     let (all_states, state_codes, process_states_label) =
@@ -4510,6 +4537,7 @@ async fn fetch_processes(
     state_codes: &[i32],
     include_user_id: Option<Uuid>,
 ) -> anyhow::Result<Vec<ProcessRow>> {
+    let query_started = Instant::now();
     let rows = if all_states {
         sqlx::query(
             r#"
@@ -4550,6 +4578,20 @@ async fn fetch_processes(
         .await?
     };
 
+    let elapsed = query_started.elapsed();
+    let level = if elapsed >= SLOW_QUERY_LOG_THRESHOLD {
+        "warn"
+    } else {
+        "info"
+    };
+    println!(
+        "[query] level={level} name=snapshot.fetch_processes all_states={all_states} state_code_count={} include_user_id={} rows={} elapsed_seconds={:.3}",
+        state_codes.len(),
+        include_user_id.is_some(),
+        rows.len(),
+        elapsed.as_secs_f64()
+    );
+
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(ProcessRow {
@@ -4571,6 +4613,7 @@ async fn fetch_flow_meta(
     if flow_candidates.is_empty() {
         return Ok(HashMap::new());
     }
+    let query_started = Instant::now();
     let candidate_ids = flow_candidates.iter().copied().collect::<Vec<_>>();
     let rows = sqlx::query(
         r#"
@@ -4583,6 +4626,21 @@ async fn fetch_flow_meta(
     .bind(&candidate_ids)
     .fetch_all(pool)
     .await?;
+
+    let elapsed = query_started.elapsed();
+    let missing_count = candidate_ids.len().saturating_sub(rows.len());
+    let level = if elapsed >= SLOW_QUERY_LOG_THRESHOLD {
+        "warn"
+    } else {
+        "info"
+    };
+    println!(
+        "[query] level={level} name=snapshot.fetch_flow_meta candidate_count={} rows={} missing_count={} elapsed_seconds={:.3}",
+        candidate_ids.len(),
+        rows.len(),
+        missing_count,
+        elapsed.as_secs_f64()
+    );
 
     let mut out = HashMap::<Uuid, Value>::new();
     for row in rows {
@@ -5724,7 +5782,8 @@ fn write_provider_rule_replay_report_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocationFractionState, AllocationMode, Cli, ExchangeDirection, MethodSelection,
+        AllocationFractionState, AllocationMode, Cli,
+        DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, MethodSelection,
         MultiProviderDecision, NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow,
         ProviderRule, add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
         biosphere_gross_value, build_review_submit_overlay_graph, candidate_count_bucket_label,
@@ -5732,7 +5791,8 @@ mod tests {
         normalize_request_roots, parse_process_annual_supply_or_production_volume,
         parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
         resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
-        review_submit_root_dependency_fingerprint, summarize_matching_diagnostics, time_score,
+        review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
+        summarize_matching_diagnostics, time_score,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -5758,6 +5818,19 @@ mod tests {
             delta <= 1e-12,
             "expected {expected}, got {actual}, delta={delta}"
         );
+    }
+
+    #[test]
+    fn snapshot_db_statement_timeout_defaults_to_bounded_duration() {
+        assert_eq!(
+            snapshot_db_statement_timeout(DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS),
+            Some(std::time::Duration::from_secs(900))
+        );
+    }
+
+    #[test]
+    fn snapshot_db_statement_timeout_allows_explicit_unbounded_recovery_mode() {
+        assert_eq!(snapshot_db_statement_timeout(0), None);
     }
 
     #[test]
