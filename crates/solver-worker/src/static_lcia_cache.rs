@@ -14,6 +14,8 @@ use serde_json::Value;
 use sha2::Digest;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::calculation_evidence::method_factor_source_contract_fixture;
 use crate::calculation_evidence::{
     LcaMethodFactorSourceSnapshot, METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
     RELEASE_BUNDLE_MANIFEST_SHA256, RELEASE_BUNDLE_VERSION, RELEASE_FACTOR_MANIFEST_SHA256,
@@ -1334,28 +1336,8 @@ mod tests {
             RELEASE_BUNDLE_MANIFEST_SHA256
         );
         let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest json");
-        let request = json!({
-            "schema_version": METHOD_SOURCE_REQUEST_SCHEMA_VERSION,
-            "source_kind": "static_cache_bundle",
-            "bundle_manifest_path": STATIC_CACHE_BUNDLE_MANIFEST_PATH,
-            "bundle_manifest_sha256": RELEASE_BUNDLE_MANIFEST_SHA256,
-            "bundle_manifest": manifest,
-            "base_url_binding": "worker_trusted_configuration",
-            "evidence_schema_version": METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
-            "snapshot_binding": {
-                "required": true,
-                "hash_algorithm": "sha256",
-                "required_fields": [
-                    "bundle_manifest_sha256",
-                    "bundle_version",
-                    "source_snapshot_sha256",
-                    "method_manifest_sha256",
-                    "factor_manifest_sha256",
-                    "method_identity_manifest_sha256",
-                    "method_count",
-                ]
-            }
-        });
+        let request = method_factor_source_contract_fixture();
+        assert_eq!(request.get("bundle_manifest"), Some(&manifest));
         validate_release_request_binding(&request).expect("release binding");
         let verified = verify_static_lcia_bundle(
             &request,

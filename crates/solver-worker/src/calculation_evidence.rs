@@ -20,6 +20,8 @@ pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 pub const RELEASE_BUNDLE_VERSION: &str = "1.2.4";
 pub const RELEASE_BUNDLE_MANIFEST_SHA256: &str =
     "e9b4e7f9a5125bb921efbffba9a4b50711f9ea982e22b500f35211884a0479c5";
+pub const RELEASE_BUNDLE_MANIFEST_CANONICAL_SHA256: &str =
+    "d5bcd0f8e6295eb2a17aa4a41144756c4f19570318e184b231566d002ebb91e3";
 pub const RELEASE_SOURCE_SNAPSHOT_SHA256: &str =
     "4efbe0b027969dc2b3b151a84422b3fb749bf1fc2d334c60d1fcf37bf7cc2c11";
 pub const RELEASE_METHOD_MANIFEST_SHA256: &str =
@@ -29,6 +31,8 @@ pub const RELEASE_METHOD_IDENTITY_MANIFEST_SHA256: &str =
 pub const RELEASE_FACTOR_MANIFEST_SHA256: &str =
     "40ffd33323c9882dbd0b0d9c99982bad1752e311062231bcf1f490ee96f92e96";
 pub const RELEASE_METHOD_COUNT: u64 = 25;
+const REVIEWED_RELEASE_BUNDLE_MANIFEST_JSON: &str =
+    include_str!("lcia_static_cache_bundle_manifest.json");
 pub const RELEASE_METHOD_IDENTITIES: [(&str, &str, &str); 25] = [
     (
         "01500b74-7ffb-463e-9bd4-72f17c2263ff",
@@ -294,31 +298,14 @@ pub fn expected_scope_manifest(actor_user_id: Uuid) -> Value {
 
 #[must_use]
 pub fn method_factor_source_contract_fixture() -> Value {
-    let methods = RELEASE_METHOD_IDENTITIES
-        .iter()
-        .map(|(method_id, method_version, artifact_locator_id)| {
-            serde_json::json!({
-                "method_id": method_id,
-                "method_version": method_version,
-                "artifact_locator_id": artifact_locator_id,
-            })
-        })
-        .collect::<Vec<_>>();
+    let bundle_manifest = reviewed_release_bundle_manifest()
+        .expect("checked-in reviewed LCIA bundle manifest must remain valid");
     serde_json::json!({
         "schema_version": METHOD_SOURCE_REQUEST_SCHEMA_VERSION,
         "source_kind": "static_cache_bundle",
         "bundle_manifest_path": STATIC_CACHE_BUNDLE_MANIFEST_PATH,
         "bundle_manifest_sha256": RELEASE_BUNDLE_MANIFEST_SHA256,
-        "bundle_manifest": {
-            "schema_version": STATIC_CACHE_BUNDLE_SCHEMA_VERSION,
-            "source_kind": "static_cache_bundle",
-            "bundle_version": RELEASE_BUNDLE_VERSION,
-            "source_snapshot_sha256": RELEASE_SOURCE_SNAPSHOT_SHA256,
-            "method_manifest_sha256": RELEASE_METHOD_MANIFEST_SHA256,
-            "factor_manifest_sha256": RELEASE_FACTOR_MANIFEST_SHA256,
-            "method_identity_manifest_sha256": RELEASE_METHOD_IDENTITY_MANIFEST_SHA256,
-            "methods": methods,
-        },
+        "bundle_manifest": bundle_manifest,
         "base_url_binding": "worker_trusted_configuration",
         "evidence_schema_version": METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_binding": {
@@ -335,6 +322,23 @@ pub fn method_factor_source_contract_fixture() -> Value {
             ],
         },
     })
+}
+
+fn reviewed_release_bundle_manifest() -> anyhow::Result<Value> {
+    if sha256_bytes(REVIEWED_RELEASE_BUNDLE_MANIFEST_JSON.as_bytes())
+        != RELEASE_BUNDLE_MANIFEST_SHA256
+    {
+        return Err(anyhow::anyhow!(
+            "checked-in reviewed LCIA bundle manifest raw SHA-256 drift"
+        ));
+    }
+    let manifest: Value = serde_json::from_str(REVIEWED_RELEASE_BUNDLE_MANIFEST_JSON)?;
+    if canonical_json_sha256(&manifest)? != RELEASE_BUNDLE_MANIFEST_CANONICAL_SHA256 {
+        return Err(anyhow::anyhow!(
+            "checked-in reviewed LCIA bundle manifest canonical SHA-256 drift"
+        ));
+    }
+    Ok(manifest)
 }
 
 #[must_use]
@@ -422,10 +426,17 @@ pub fn validate_method_factor_source_request(value: &Value) -> anyhow::Result<()
         return Err(anyhow::anyhow!("LCIA snapshot binding contract drift"));
     }
 
-    let manifest = object
+    let manifest_value = object
         .get("bundle_manifest")
-        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("LCIA bundle manifest is missing"))?;
+    let manifest = manifest_value
+        .as_object()
         .ok_or_else(|| anyhow::anyhow!("LCIA bundle manifest must be an object"))?;
+    if canonical_json_sha256(manifest_value)? != RELEASE_BUNDLE_MANIFEST_CANONICAL_SHA256 {
+        return Err(anyhow::anyhow!(
+            "LCIA bundle_manifest must embed the complete reviewed release manifest"
+        ));
+    }
     let manifest_string = |field: &str| manifest.get(field).and_then(Value::as_str);
     if manifest_string("schema_version") != Some(STATIC_CACHE_BUNDLE_SCHEMA_VERSION)
         || manifest_string("source_kind") != Some("static_cache_bundle")
@@ -898,6 +909,40 @@ mod tests {
         assert_eq!(
             canonical_json_sha256(&Value::Array(identities)).expect("identity hash"),
             RELEASE_METHOD_IDENTITY_MANIFEST_SHA256
+        );
+    }
+
+    #[test]
+    fn reviewed_release_request_fixture_embeds_the_complete_manifest() {
+        let source = method_factor_source_contract_fixture();
+        let manifest = source
+            .get("bundle_manifest")
+            .expect("embedded bundle manifest");
+        assert_eq!(
+            sha256_bytes(REVIEWED_RELEASE_BUNDLE_MANIFEST_JSON.as_bytes()),
+            RELEASE_BUNDLE_MANIFEST_SHA256
+        );
+        assert_eq!(
+            canonical_json_sha256(manifest).expect("canonical manifest hash"),
+            RELEASE_BUNDLE_MANIFEST_CANONICAL_SHA256
+        );
+        assert!(manifest.get("files").is_some());
+        assert!(manifest.get("source_snapshot_hash_input").is_some());
+        assert!(manifest.get("identity_aliases").is_some());
+        assert!(manifest.get("factor_index_summary").is_some());
+        validate_method_factor_source_request(&source).expect("full reviewed request");
+    }
+
+    #[test]
+    fn rejects_reviewed_manifest_metadata_drift_before_execution() {
+        let mut source = method_factor_source_contract_fixture();
+        source["bundle_manifest"]["files"]["list"]["byte_size"] = Value::from(25_312);
+        let error = validate_method_factor_source_request(&source)
+            .expect_err("manifest metadata drift must fail during request validation");
+        assert!(
+            error
+                .to_string()
+                .contains("complete reviewed release manifest")
         );
     }
 

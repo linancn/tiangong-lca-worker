@@ -1408,7 +1408,8 @@ mod tests {
             RELEASE_METHOD_COUNT, RELEASE_METHOD_IDENTITIES,
             RELEASE_METHOD_IDENTITY_MANIFEST_SHA256, RELEASE_METHOD_MANIFEST_SHA256,
             RELEASE_SOURCE_SNAPSHOT_SHA256, STATIC_CACHE_BUNDLE_MANIFEST_PATH,
-            canonical_json_sha256, expected_factor_coverage_contract, expected_scope_manifest,
+            STATIC_CACHE_BUNDLE_SCHEMA_VERSION, canonical_json_sha256,
+            expected_factor_coverage_contract, expected_scope_manifest,
             method_factor_source_contract_fixture,
         },
         queue::{
@@ -1435,6 +1436,31 @@ mod tests {
             lease_token: Uuid::new_v4(),
             attempt_count: 1,
         }
+    }
+
+    fn summary_only_method_factor_source() -> serde_json::Value {
+        let mut source = method_factor_source_contract_fixture();
+        let methods = RELEASE_METHOD_IDENTITIES
+            .iter()
+            .map(|(method_id, method_version, artifact_locator_id)| {
+                json!({
+                    "method_id": method_id,
+                    "method_version": method_version,
+                    "artifact_locator_id": artifact_locator_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        source["bundle_manifest"] = json!({
+            "schema_version": STATIC_CACHE_BUNDLE_SCHEMA_VERSION,
+            "source_kind": "static_cache_bundle",
+            "bundle_version": RELEASE_BUNDLE_VERSION,
+            "source_snapshot_sha256": RELEASE_SOURCE_SNAPSHOT_SHA256,
+            "method_manifest_sha256": RELEASE_METHOD_MANIFEST_SHA256,
+            "factor_manifest_sha256": RELEASE_FACTOR_MANIFEST_SHA256,
+            "method_identity_manifest_sha256": RELEASE_METHOD_IDENTITY_MANIFEST_SHA256,
+            "methods": methods,
+        });
+        source
     }
 
     fn complete_calculation_evidence(scope_hash: String) -> LcaCalculationEvidence {
@@ -1655,6 +1681,42 @@ mod tests {
                 ..
             } if parsed_actor == actor && scope == "public_plus_owner_draft"
         ));
+    }
+
+    #[test]
+    fn rejects_summary_only_lcia_manifest_before_build_execution() {
+        let actor = Uuid::new_v4();
+        let manifest = expected_scope_manifest(actor);
+        let manifest_hash = canonical_json_sha256(&manifest).expect("manifest hash");
+        let mut job = worker_job(
+            "lca.build_snapshot",
+            "lca.build_snapshot.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "all_states": false,
+                "process_states": "100",
+                "include_user_id": actor,
+                "include_user_state_codes": "0",
+                "include_user_unassigned_only": true,
+                "include_user_review_free_only": true,
+                "data_scope": "public_plus_owner_draft",
+                "scope_manifest": manifest,
+                "scope_manifest_sha256": manifest_hash,
+                "lcia_method_factor_source": summary_only_method_factor_source(),
+                "lcia_factor_coverage_contract": expected_factor_coverage_contract(),
+                "no_lcia": false,
+            }),
+        );
+        job.requested_by = Some(actor);
+
+        let error = solver_worker_job_payload(&job)
+            .expect_err("summary-only bundle manifest must fail during payload validation");
+        assert!(
+            error
+                .to_string()
+                .contains("complete reviewed release manifest")
+        );
     }
 
     #[test]
