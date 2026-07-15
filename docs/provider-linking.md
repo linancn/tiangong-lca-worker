@@ -64,6 +64,38 @@ Provider-link 的结果直接决定：
 - provider closure / A-write 覆盖率；
 - matrix-readiness 和结果解释中的 provider evidence。
 
+## Process、quantitative reference 与矩阵列
+
+一个完整 TIDAS Process 只代表其 `quantitativeReference.referenceToReferenceFlow`：
+
+- 一个 Process revision 在 snapshot 中只对应一个 process index 和一个矩阵列；
+- 只有 quantitative reference output 能声明该 Process 可供应对应 product flow；
+- 同一 Process 中的非 reference co-product output 只保留为数据集内容和 rejected candidate evidence，不生成额外矩阵列，也不成为 provider；
+- 如果 co-product `B` 需要作为 root 或 provider 参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 TIDAS Process。worker 不从原 Process 临时派生不完整 Process。
+
+因此，同一个联合生产来源可以由上游发布多个完整 Process，但矩阵身份始终来自这些实际 Process revisions，而不是由 snapshot builder 展开 co-products。
+
+## TIDAS exchange allocation
+
+Exchange allocation 在 provider matching 之前应用，用于得到当前 Process quantitative reference 对应的 exchange amount：
+
+```text
+normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
+```
+
+运行时规则如下：
+
+- calculation amount 按 `resultingAmount`、`meanAmount`、`meanValue` 的顺序选择；
+- `allocations.allocation` 可以是 object 或 array；worker 按 `@internalReferenceToCoProduct == referenceToReferenceFlow` 选择目标项，不取第一项，也不对数组求和作为当前产品 fraction；
+- `@allocatedFraction` 使用 TIDAS `Perc` 语义，JSON string 或 number 都按百分数解释并除以 `100`；带 `%` 后缀不是合法 `Perc`；
+- allocation vector 的非零项闭合为 `100%`、但没有当前 reference target 时，按稀疏零处理，selected fraction 为 `0`；
+- exchange 完全未声明 `allocations` 时，selected fraction 为 `1`；
+- 一旦声明 allocation，空数组、坏结构、缺失 target/fraction、重复或未知 target、非有限/越界 fraction、总和不闭合都 fail closed，不能在 lenient 路径回退为 `1`。
+
+selected fraction 为显式零或稀疏零的 Input 不进入 request-root provider closure，不计入 provider matching / missing-provider diagnostics，也不写入 `A`；零 attributed elementary exchange 同样不写入 `B`，也不参与 LCIA direction / factor-coverage evidence。否则会把不属于当前 quantitative reference 的零负担分支误判成供应链或 LCIA 缺口。
+
+Exchange allocation 与下文的 multi-provider share 是两个独立阶段：前者决定 consumer column 的 attributed amount，后者只决定该 amount 在 eligible provider rows 之间的分布。
+
 ## Provider 候选与 eligibility
 
 候选集合按 product/reference `flow_id` 建立：
@@ -209,3 +241,5 @@ Provider decisions 至少应支持解释：
 - `a_input_edges_written` 与 provider-present resolved coverage。
 
 Matrix-readiness、diagnostics export 和人工 debug 应消费这些 provider decisions，而不是在外部重写 provider resolution。
+
+Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v1`。该字段进入 source fingerprint，因此新语义不会复用旧语义构建的 snapshot。此次变更不改变 coverage payload 形状，coverage schema 保持 `snapshot_coverage.v2`。

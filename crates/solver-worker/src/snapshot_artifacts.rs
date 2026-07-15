@@ -64,6 +64,9 @@ pub struct SnapshotBuildConfig {
     /// Allocation fraction mode (`strict`/`lenient`).
     #[serde(default = "default_strict_mode")]
     pub allocation_fraction_mode: String,
+    /// Versioned TIDAS allocation/reference semantics used by matrix compilation.
+    #[serde(default = "default_legacy_allocation_semantics_version")]
+    pub allocation_semantics_version: String,
     /// Biosphere sign convention (`signed`/`gross`).
     #[serde(default = "default_biosphere_sign_mode")]
     pub biosphere_sign_mode: String,
@@ -290,6 +293,10 @@ fn default_strict_mode() -> String {
     "strict".to_owned()
 }
 
+fn default_legacy_allocation_semantics_version() -> String {
+    "legacy-unscoped-v0".to_owned()
+}
+
 fn default_biosphere_sign_mode() -> String {
     "signed".to_owned()
 }
@@ -452,7 +459,8 @@ mod tests {
     use tempfile::Builder;
 
     use crate::compiled_graph::{
-        CompiledAllocationStats, CompiledGraph, CompiledMatchingStats, CompiledReferenceStats,
+        CompiledAllocationStats, CompiledFlow, CompiledFlowKind, CompiledGraph,
+        CompiledMatchingStats, CompiledReferenceStats,
     };
 
     use super::{
@@ -482,6 +490,7 @@ mod tests {
             provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
+            allocation_semantics_version: "tidas-quantitative-reference-v1".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -616,9 +625,14 @@ mod tests {
         assert_eq!(decoded.payload, payload);
         assert!(decoded.compiled_graph.is_none());
 
+        let product_flow_id = uuid::Uuid::new_v4();
         let graph = CompiledGraph {
             processes: Vec::new(),
-            flows: Vec::new(),
+            flows: vec![CompiledFlow {
+                flow_idx: 0,
+                flow_id: product_flow_id,
+                kind: CompiledFlowKind::Product,
+            }],
             provider_outputs: Vec::new(),
             provider_decisions: Vec::new(),
             technosphere_edges: Vec::new(),
@@ -637,7 +651,10 @@ mod tests {
         .expect("encode with graph");
         let decoded_with_graph =
             decode_snapshot_artifact(encoded_with_graph.bytes.as_slice()).expect("decode graph");
-        assert!(decoded_with_graph.compiled_graph.is_some());
+        let decoded_graph = decoded_with_graph.compiled_graph.expect("compiled graph");
+        assert_eq!(decoded_graph.flows.len(), 1);
+        assert_eq!(decoded_graph.flows[0].flow_id, product_flow_id);
+        assert_eq!(decoded_graph.flows[0].kind, CompiledFlowKind::Product);
     }
 
     #[test]
@@ -656,6 +673,7 @@ mod tests {
         });
         let parsed: SnapshotBuildConfig = serde_json::from_value(legacy).expect("parse legacy");
         assert_eq!(parsed.biosphere_sign_mode, "signed");
+        assert_eq!(parsed.allocation_semantics_version, "legacy-unscoped-v0");
         assert_eq!(parsed.include_user_id, None);
         assert_eq!(
             parsed.selection_mode,

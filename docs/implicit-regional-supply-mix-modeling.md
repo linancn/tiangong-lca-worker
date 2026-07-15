@@ -271,15 +271,21 @@ fallback `1.0` 用于 annual volume 缺失、非法、非有限或非正的 prov
 
 ## Allocation Fraction 与 Provider Eligibility 的边界
 
-`allocation_fraction` 用于 exchange amount attribution：
+一个完整 TIDAS Process 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且在 snapshot 中只形成一个 process index / 矩阵列。Process 中的其他 co-product outputs 不形成派生列，也不获得 provider eligibility。如果 co-product `B` 需要独立参与计算或供应其他 Process，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 TIDAS Process。
+
+`allocation_fraction` 用于当前 quantitative reference 的 exchange amount attribution：
 
 ```text
-normalized exchange amount = raw amount * reference_scale * allocation_fraction
+normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
 ```
 
-它可以继续缩放 input、output 或 elementary exchange 的归属量，但它不授予 provider eligibility。一个非 reference output 即使有 amount 与 allocation fraction，也只说明该 exchange 参与当前 process dataset 的分摊核算；它不等于该 process 可以自动供应这个 output flow 的 product input demand。
+其中 calculation amount 按 `resultingAmount -> meanAmount -> meanValue` 选择。`allocations.allocation` 可以是 object 或 array；worker 按 `@internalReferenceToCoProduct == quantitativeReference.referenceToReferenceFlow` 选择目标 fraction。`@allocatedFraction` 是 TIDAS `Perc`，string 和 number 都按百分数除以 `100`，带 `%` 后缀不合法。
 
-若未来需要支持 allocated co-product provider linking，应作为显式规则实现，并要求独立的产品语义、allocation、output amount 和 diagnostics 证据，而不是从同 `flow_id` 自动推断。
+若一个已声明的 allocation vector 的非零项闭合为 `100%`，但没有当前 reference target，则该缺项表示稀疏零，selected fraction 为 `0`。若 exchange 完全未声明 `allocations`，selected fraction 为 `1`。一旦声明 allocation，空数组、坏结构、缺失 target/fraction、重复或未知 target、非有限或越界 fraction、总和不闭合都必须 fail closed，不能回退为 `1`。
+
+Allocation 可以缩放 input、output 或 elementary exchange 的归属量，但不授予 provider eligibility。一个非 reference output 即使有 amount 与 allocation fraction，也只说明该 exchange 参与当前 Process 的分摊核算；它不等于该 Process 可以自动供应这个 output flow 的 product input demand。
+
+Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v1`，并将其纳入 source fingerprint 以阻止旧语义 snapshot reuse。该内部语义版本不改变 coverage payload，coverage schema 仍为 `snapshot_coverage.v2`。
 
 ## 与显式 Market Process 的关系
 

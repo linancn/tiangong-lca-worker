@@ -236,7 +236,15 @@ legacy pgmq/debug 路径语义：
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 
+Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
+
+Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`，而已声明但无效的 allocation fail closed。当前语义通过 build config 的 `allocation_semantics_version = tidas-quantitative-reference-v1` 记录，并进入 source fingerprint，避免复用旧语义 snapshot。
+
+显式零或稀疏零 allocation 得到的 Input 不展开 provider closure、不产生 provider-gap diagnostics，也不写入 `A`；零 attributed elementary exchange 也不写入 `B`，不参与 LCIA direction 与 factor-coverage evidence。它只表示该 exchange 对当前 quantitative reference 没有 attributed burden。
+
 snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linking 和矩阵写入质量统计，用于解释供应链连接完整性。当前 coverage schema 为 `snapshot_coverage.v2`，在保留 `provider_decision_diagnostics` 兼容字段的同时，新增按用途分组的 summary：
+
+`allocation_semantics_version` 属于 snapshot build config / source identity，不新增 coverage 字段，因此本次语义变更不升级 `snapshot_coverage.v2`。
 
 Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 
