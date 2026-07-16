@@ -1292,6 +1292,7 @@ mod tests {
                 reference_stats: CompiledReferenceStats::default(),
                 allocation_stats: CompiledAllocationStats::default(),
                 matching_stats: CompiledMatchingStats::default(),
+                release_evidence: None,
             }),
             policy: MatrixReadinessPolicy::default(),
         }

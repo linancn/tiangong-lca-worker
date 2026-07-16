@@ -362,13 +362,13 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 .map(|_| ())
         }
         _ => {
-            handle_worker_jobs_job_payload(
+            Box::pin(handle_worker_jobs_job_payload(
                 state,
                 payload.clone(),
                 job.id,
                 job.lease_token,
                 lease_seconds,
-            )
+            ))
             .await
         }
     };

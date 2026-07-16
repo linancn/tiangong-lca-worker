@@ -34,6 +34,8 @@ pub struct SnapshotProcessMapEntry {
 pub struct SnapshotImpactMapEntry {
     pub impact_id: Uuid,
     pub impact_index: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_version: Option<String>,
     pub impact_key: String,
     pub impact_name: String,
     pub unit: String,

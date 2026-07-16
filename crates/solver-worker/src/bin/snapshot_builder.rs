@@ -34,12 +34,14 @@ use solver_worker::calculation_evidence::{
     validate_calculation_evidence, validate_public_owner_draft_build_request,
 };
 use solver_worker::compiled_graph::{
-    CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition, CompiledFlow,
-    CompiledFlowKind, CompiledGraph, CompiledMatchingStats, CompiledProcess,
-    CompiledProviderAllocation, CompiledProviderCandidate, CompiledProviderCandidateEligibility,
-    CompiledProviderDecision, CompiledProviderDecisionKind, CompiledProviderFailureReason,
-    CompiledProviderGeographyTier, CompiledProviderOutput, CompiledProviderOutputAllocationState,
-    CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource, CompiledReferenceStats,
+    CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition,
+    CompiledExchangeDirection, CompiledFlow, CompiledFlowKind, CompiledGraph,
+    CompiledMatchingStats, CompiledProcess, CompiledProviderAllocation, CompiledProviderCandidate,
+    CompiledProviderCandidateEligibility, CompiledProviderDecision, CompiledProviderDecisionKind,
+    CompiledProviderFailureReason, CompiledProviderGeographyTier, CompiledProviderOutput,
+    CompiledProviderOutputAllocationState, CompiledProviderResolutionStrategy,
+    CompiledProviderSupplyRegionSource, CompiledReferenceStats, CompiledReleaseEvidence,
+    CompiledReleaseInventoryExchange, CompiledReleaseProcess, CompiledReleaseTechnosphereEdge,
     CompiledTechnosphereEdge,
 };
 use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
@@ -235,6 +237,12 @@ struct FlowRow {
 }
 
 #[derive(Debug, Clone)]
+struct FlowReleaseMetadata {
+    version: String,
+    reference_unit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct MethodRow {
     id: Uuid,
     version: String,
@@ -276,6 +284,8 @@ struct ParsedExchange {
     is_reference_exchange: bool,
     amount: Option<f64>,
     allocation_state: AllocationFractionState,
+    allocation_fraction: f64,
+    allocation_target_internal_id: String,
     location: Option<String>,
 }
 
@@ -1806,6 +1816,7 @@ fn empty_compiled_graph() -> CompiledGraph {
         reference_stats: CompiledReferenceStats::default(),
         allocation_stats: CompiledAllocationStats::default(),
         matching_stats: CompiledMatchingStats::default(),
+        release_evidence: None,
     }
 }
 
@@ -2976,6 +2987,8 @@ fn parse_process_chunk(
             ),
             amount,
             allocation_state,
+            allocation_fraction,
+            allocation_target_internal_id: reference_internal_id.clone(),
             location: parse_exchange_location(ex),
         });
         local_flow_ids.insert(flow_id);
@@ -3115,6 +3128,7 @@ async fn compile_scope_graph(
     }
 
     let flow_meta = fetch_flow_meta(pool, &flow_candidates, versioned_scope).await?;
+    let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta).await?;
     if versioned_scope.is_some() {
         for flow_id in &exchange_flow_candidates {
             if !flow_meta.contains_key(flow_id) {
@@ -3183,6 +3197,7 @@ async fn compile_scope_graph(
     let mut provider_decisions = Vec::<CompiledProviderDecision>::new();
     let mut technosphere_edges = Vec::<CompiledTechnosphereEdge>::new();
     let mut biosphere_edges = Vec::<CompiledBiosphereEdge>::new();
+    let mut release_technosphere_edges = Vec::<CompiledReleaseTechnosphereEdge>::new();
     let mut matching_stats = CompiledMatchingStats::default();
 
     for ex in &exchanges {
@@ -3275,6 +3290,21 @@ async fn compile_scope_graph(
                     consumer.partition,
                 ),
             });
+            release_technosphere_edges.push(CompiledReleaseTechnosphereEdge {
+                consumer_process_idx: ex.process_idx,
+                consumer_input_exchange_internal_id: ex.internal_id.clone().unwrap_or_default(),
+                provider_process_idx: provider_idx,
+                provider_output_exchange_internal_id: provider_output_internal_id(
+                    provider_outputs,
+                    provider_idx,
+                )
+                .unwrap_or_default(),
+                provider_weight: 1.0,
+                normalized_amount: amount,
+                flow_id: ex.flow_id,
+                flow_version: ex.flow_version.clone(),
+                location: ex.location.clone(),
+            });
         } else if candidate_provider_count > 1 {
             matching_stats.matched_multi_provider += 1;
             let resolution =
@@ -3348,6 +3378,24 @@ async fn compile_scope_graph(
                                 consumer.partition,
                             ),
                         });
+                        release_technosphere_edges.push(CompiledReleaseTechnosphereEdge {
+                            consumer_process_idx: ex.process_idx,
+                            consumer_input_exchange_internal_id: ex
+                                .internal_id
+                                .clone()
+                                .unwrap_or_default(),
+                            provider_process_idx: allocation.provider_idx,
+                            provider_output_exchange_internal_id: provider_output_internal_id(
+                                provider_outputs,
+                                allocation.provider_idx,
+                            )
+                            .unwrap_or_default(),
+                            provider_weight: allocation.weight,
+                            normalized_amount: amount,
+                            flow_id: ex.flow_id,
+                            flow_version: ex.flow_version.clone(),
+                            location: ex.location.clone(),
+                        });
                     }
                 }
                 MultiProviderDecision::Unresolved(failure_reason) => {
@@ -3404,6 +3452,14 @@ async fn compile_scope_graph(
         })
         .collect();
 
+    let release_evidence = build_compiled_release_evidence(
+        &process_meta,
+        &exchanges,
+        &flow_release_metadata,
+        &flow_kind_by_id,
+        release_technosphere_edges,
+    )?;
+
     Ok(CompiledScopeGraph {
         graph: CompiledGraph {
             processes: compiled_processes,
@@ -3428,6 +3484,7 @@ async fn compile_scope_graph(
                     .legacy_single_output_target_inferred_count,
             },
             matching_stats,
+            release_evidence: Some(release_evidence),
         },
         lcia_exchange_observations,
     })
@@ -3450,6 +3507,136 @@ fn lcia_exchange_observation_for_attributed_exchange(
         exchange_id: exchange.exchange_id.clone(),
         amount: exchange.amount,
     })
+}
+
+fn provider_output_internal_id(
+    outputs: Option<&Vec<ProviderOutputCandidate>>,
+    provider_idx: i32,
+) -> Option<String> {
+    outputs?
+        .iter()
+        .find(|output| {
+            output.provider_idx == provider_idx
+                && output.output_exchange_is_reference
+                && output.output_allocation_state != AllocationFractionState::Invalid
+        })?
+        .output_exchange_internal_id
+        .clone()
+}
+
+fn build_compiled_release_evidence(
+    processes: &[ProcessMeta],
+    exchanges: &[ParsedExchange],
+    flow_metadata: &HashMap<Uuid, FlowReleaseMetadata>,
+    flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
+    mut technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
+) -> anyhow::Result<CompiledReleaseEvidence> {
+    let mut release_processes = Vec::with_capacity(processes.len());
+    for process in processes {
+        let reference_exchanges = exchanges
+            .iter()
+            .filter(|exchange| {
+                exchange.process_idx == process.process_idx && exchange.is_reference_exchange
+            })
+            .collect::<Vec<_>>();
+        if reference_exchanges.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "release evidence requires exactly one quantitative reference for process={}@{}",
+                process.process_id,
+                process.process_version
+            ));
+        }
+        let reference = reference_exchanges[0];
+        let metadata = flow_metadata.get(&reference.flow_id);
+        let reference_unit = metadata
+            .filter(|metadata| metadata.version == reference.flow_version)
+            .and_then(|metadata| metadata.reference_unit.clone())
+            .unwrap_or_default();
+        release_processes.push(CompiledReleaseProcess {
+            process_idx: process.process_idx,
+            process_id: process.process_id,
+            process_version: process.process_version.clone(),
+            quantitative_reference_exchange_internal_id: reference
+                .internal_id
+                .clone()
+                .unwrap_or_default(),
+            quantitative_reference_flow_id: reference.flow_id,
+            quantitative_reference_flow_version: reference.flow_version.clone(),
+            reference_unit,
+            normalized_mean_amount: reference.amount.unwrap_or(f64::NAN),
+        });
+    }
+    release_processes.sort_unstable_by_key(|process| process.process_idx);
+
+    let mut inventory_exchanges = Vec::with_capacity(exchanges.len());
+    let mut biosphere_edges = Vec::new();
+    for exchange in exchanges {
+        let Some(direction) = exchange.direction.map(compiled_exchange_direction) else {
+            continue;
+        };
+        let Some(amount) = exchange.amount else {
+            continue;
+        };
+        let metadata = flow_metadata.get(&exchange.flow_id);
+        let unit = metadata
+            .filter(|metadata| metadata.version == exchange.flow_version)
+            .and_then(|metadata| metadata.reference_unit.clone())
+            .unwrap_or_default();
+        let release_exchange = CompiledReleaseInventoryExchange {
+            process_idx: exchange.process_idx,
+            exchange_internal_id: exchange.internal_id.clone(),
+            flow_id: exchange.flow_id,
+            flow_version: exchange.flow_version.clone(),
+            direction,
+            unit,
+            location: exchange.location.clone(),
+            normalized_mean_amount: amount,
+            allocation_target_internal_id: exchange.allocation_target_internal_id.clone(),
+            allocation_fraction: exchange.allocation_fraction,
+        };
+        inventory_exchanges.push(release_exchange.clone());
+        if flow_kind_by_id.get(&exchange.flow_id) == Some(&CompiledFlowKind::Elementary)
+            && amount != 0.0
+        {
+            biosphere_edges.push(release_exchange);
+        }
+    }
+    inventory_exchanges.sort_by(compiled_release_inventory_order);
+    biosphere_edges.sort_by(compiled_release_inventory_order);
+    technosphere_edges.sort_by(|left, right| {
+        left.consumer_process_idx
+            .cmp(&right.consumer_process_idx)
+            .then_with(|| {
+                left.consumer_input_exchange_internal_id
+                    .cmp(&right.consumer_input_exchange_internal_id)
+            })
+            .then_with(|| left.provider_process_idx.cmp(&right.provider_process_idx))
+    });
+
+    Ok(CompiledReleaseEvidence {
+        processes: release_processes,
+        inventory_exchanges,
+        technosphere_edges,
+        biosphere_edges,
+    })
+}
+
+fn compiled_release_inventory_order(
+    left: &CompiledReleaseInventoryExchange,
+    right: &CompiledReleaseInventoryExchange,
+) -> std::cmp::Ordering {
+    left.process_idx
+        .cmp(&right.process_idx)
+        .then_with(|| left.direction.cmp(&right.direction))
+        .then_with(|| left.flow_id.cmp(&right.flow_id))
+        .then_with(|| left.exchange_internal_id.cmp(&right.exchange_internal_id))
+}
+
+fn compiled_exchange_direction(direction: ExchangeDirection) -> CompiledExchangeDirection {
+    match direction {
+        ExchangeDirection::Input => CompiledExchangeDirection::Input,
+        ExchangeDirection::Output => CompiledExchangeDirection::Output,
+    }
 }
 
 fn assemble_sparse_payload(
@@ -3972,6 +4159,7 @@ fn build_snapshot_impact_map(
         return Ok(vec![SnapshotImpactMapEntry {
             impact_id: snapshot_id,
             impact_index: 0,
+            impact_version: None,
             impact_key: "lcia-disabled".to_owned(),
             impact_name: "LCIA disabled (placeholder impact)".to_owned(),
             unit: "unknown".to_owned(),
@@ -3989,6 +4177,7 @@ fn build_snapshot_impact_map(
             impact_id: impact.impact_id,
             impact_index: i32::try_from(impact_idx)
                 .map_err(|_| anyhow::anyhow!("impact index overflow"))?,
+            impact_version: Some(impact.method_version.clone()),
             impact_key: impact.impact_key.clone(),
             impact_name: impact.impact_name.clone(),
             unit: impact.unit.clone(),
@@ -5206,6 +5395,10 @@ fn resolve_process_selection(
                             ),
                             amount: None,
                             allocation_state: AllocationFractionState::Missing,
+                            allocation_fraction: 1.0,
+                            allocation_target_internal_id: reference_internal_id
+                                .clone()
+                                .unwrap_or_default(),
                             location: parse_exchange_location(exchange),
                         },
                     ),
@@ -5233,6 +5426,10 @@ fn resolve_process_selection(
                     ),
                     amount: allocation_amount,
                     allocation_state,
+                    allocation_fraction: allocation_amount.unwrap_or(f64::NAN),
+                    allocation_target_internal_id: reference_internal_id
+                        .clone()
+                        .unwrap_or_default(),
                     location: parse_exchange_location(exchange),
                 });
             }
@@ -5858,6 +6055,180 @@ async fn fetch_flow_meta(
         out.insert(flow.id, flow);
     }
     Ok(out)
+}
+
+async fn fetch_flow_release_metadata(
+    pool: &PgPool,
+    flows: &HashMap<Uuid, FlowRow>,
+) -> anyhow::Result<HashMap<Uuid, FlowReleaseMetadata>> {
+    let flow_property_refs = flows
+        .iter()
+        .filter_map(|(flow_id, flow)| {
+            parse_flow_reference_property(&flow.json).map(|(id, version)| (*flow_id, id, version))
+        })
+        .collect::<Vec<_>>();
+    let flow_property_ids = flow_property_refs
+        .iter()
+        .map(|(_, id, _)| *id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut flow_properties = HashMap::<(Uuid, String), Value>::new();
+    if !flow_property_ids.is_empty() {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json
+            FROM public.flowproperties
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(&flow_property_ids)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            flow_properties.insert(
+                (
+                    row.try_get::<Uuid, _>("id")?,
+                    row.try_get::<String, _>("version")?,
+                ),
+                row.try_get::<Value, _>("json")?,
+            );
+        }
+    }
+
+    let unit_group_refs = flow_properties
+        .values()
+        .filter_map(parse_flow_property_reference_unit_group)
+        .collect::<BTreeSet<_>>();
+    let unit_group_ids = unit_group_refs
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut unit_groups = HashMap::<(Uuid, String), Value>::new();
+    if !unit_group_ids.is_empty() {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json
+            FROM public.unitgroups
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(&unit_group_ids)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            unit_groups.insert(
+                (
+                    row.try_get::<Uuid, _>("id")?,
+                    row.try_get::<String, _>("version")?,
+                ),
+                row.try_get::<Value, _>("json")?,
+            );
+        }
+    }
+
+    let mut out = HashMap::with_capacity(flows.len());
+    for (flow_id, flow) in flows {
+        let reference_unit = parse_flow_reference_property(&flow.json)
+            .and_then(|(property_id, property_version)| {
+                flow_properties.get(&(property_id, property_version))
+            })
+            .and_then(parse_flow_property_reference_unit_group)
+            .and_then(|unit_group_key| unit_groups.get(&unit_group_key))
+            .and_then(parse_unit_group_reference_unit_name);
+        out.insert(
+            *flow_id,
+            FlowReleaseMetadata {
+                version: flow.version.clone(),
+                reference_unit,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn parse_flow_reference_property(flow_json: &Value) -> Option<(Uuid, String)> {
+    let root = flow_json.get("flowDataSet")?;
+    let reference_id = root
+        .get("flowInformation")?
+        .get("quantitativeReference")?
+        .get("referenceToReferenceFlowProperty")?
+        .as_str()?
+        .trim();
+    let property = json_object_or_array_items(root.get("flowProperties")?.get("flowProperty")?)
+        .into_iter()
+        .find(|property| {
+            property
+                .get("@dataSetInternalID")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim() == reference_id)
+        })?;
+    parse_exact_global_reference(property.get("referenceToFlowPropertyDataSet")?)
+}
+
+fn parse_flow_property_reference_unit_group(value: &Value) -> Option<(Uuid, String)> {
+    parse_exact_global_reference(
+        value
+            .get("flowPropertyDataSet")?
+            .get("flowPropertiesInformation")?
+            .get("quantitativeReference")?
+            .get("referenceToReferenceUnitGroup")?,
+    )
+}
+
+fn parse_unit_group_reference_unit_name(value: &Value) -> Option<String> {
+    let root = value.get("unitGroupDataSet")?;
+    let reference_id = root
+        .get("unitGroupInformation")?
+        .get("quantitativeReference")?
+        .get("referenceToReferenceUnit")?
+        .as_str()?
+        .trim();
+    let unit = json_object_or_array_items(root.get("units")?.get("unit")?)
+        .into_iter()
+        .find(|unit| {
+            unit.get("@dataSetInternalID")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim() == reference_id)
+        })?;
+    parse_text_value(unit.get("name")?)
+}
+
+fn parse_exact_global_reference(value: &Value) -> Option<(Uuid, String)> {
+    let id = value
+        .get("@refObjectId")?
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())?;
+    let version = value.get("@version")?.as_str()?.trim().to_owned();
+    (!version.is_empty()).then_some((id, version))
+}
+
+fn json_object_or_array_items(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    }
+}
+
+fn parse_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        Value::Object(_) => value
+            .get("#text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned),
+        Value::Array(items) => items.iter().find_map(parse_text_value),
+        _ => None,
+    }
 }
 
 fn validate_flow_row_visibility(row: &FlowRow, actor_user_id: Uuid) -> anyhow::Result<()> {
@@ -7452,6 +7823,7 @@ mod tests {
             },
             allocation_stats: CompiledAllocationStats::default(),
             matching_stats: CompiledMatchingStats::default(),
+            release_evidence: None,
         };
         let target = ProcessRow {
             id: target_id,
@@ -7555,6 +7927,7 @@ mod tests {
             reference_stats: CompiledReferenceStats::default(),
             allocation_stats: CompiledAllocationStats::default(),
             matching_stats: CompiledMatchingStats::default(),
+            release_evidence: None,
         };
         let factors = vec![ImpactFactorSet {
             impact_id: method_id,
@@ -8105,6 +8478,7 @@ mod tests {
             reference_stats: CompiledReferenceStats::default(),
             allocation_stats: CompiledAllocationStats::default(),
             matching_stats: CompiledMatchingStats::default(),
+            release_evidence: None,
         };
 
         let diagnostics = summarize_matching_diagnostics(&compiled_graph);
@@ -8445,6 +8819,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -8493,6 +8869,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -8534,6 +8912,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -8577,6 +8957,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: Some("GLO".to_owned()),
         };
 
@@ -8618,6 +9000,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -8658,6 +9042,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: Some("CN".to_owned()),
         };
 
@@ -8701,6 +9087,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: Some("not-a-location".to_owned()),
         };
 
@@ -9094,6 +9482,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -9163,6 +9553,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -9226,6 +9618,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -9291,6 +9685,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -9353,6 +9749,8 @@ mod tests {
             is_reference_exchange: false,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
             location: None,
         };
 
@@ -9598,6 +9996,8 @@ mod tests {
             is_reference_exchange: true,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "1".to_owned(),
             location: None,
         };
 
@@ -9743,6 +10143,8 @@ mod tests {
                 } else {
                     AllocationFractionState::Present
                 },
+                allocation_fraction: if amount == Some(0.0) { 0.0 } else { 1.0 },
+                allocation_target_internal_id: "1".to_owned(),
                 location: None,
             };
         let exchanges = [
@@ -10139,5 +10541,75 @@ mod tests {
             .expect("first finite factor");
         assert!(accumulate_finite_factor(&mut factors, Uuid::nil(), f64::MAX, method_id).is_err());
         assert!(factors[&Uuid::nil()].is_finite());
+    }
+
+    #[test]
+    fn release_metadata_resolves_exact_flow_property_and_reference_unit() {
+        let property_id = Uuid::new_v4();
+        let flow = json!({
+            "flowDataSet": {
+                "flowInformation": {
+                    "quantitativeReference": { "referenceToReferenceFlowProperty": "7" }
+                },
+                "flowProperties": {
+                    "flowProperty": [
+                        {
+                            "@dataSetInternalID": "3",
+                            "referenceToFlowPropertyDataSet": {
+                                "@refObjectId": Uuid::new_v4(),
+                                "@version": "01.00.000"
+                            }
+                        },
+                        {
+                            "@dataSetInternalID": "7",
+                            "referenceToFlowPropertyDataSet": {
+                                "@refObjectId": property_id,
+                                "@version": "03.00.003"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            super::parse_flow_reference_property(&flow),
+            Some((property_id, "03.00.003".to_owned()))
+        );
+
+        let unit_group = json!({
+            "unitGroupDataSet": {
+                "unitGroupInformation": {
+                    "quantitativeReference": { "referenceToReferenceUnit": "1" }
+                },
+                "units": {
+                    "unit": [
+                        { "@dataSetInternalID": "0", "name": "g" },
+                        { "@dataSetInternalID": "1", "name": "kg" }
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            super::parse_unit_group_reference_unit_name(&unit_group).as_deref(),
+            Some("kg")
+        );
+    }
+
+    #[test]
+    fn release_metadata_rejects_unversioned_flow_property_reference() {
+        let flow = json!({
+            "flowDataSet": {
+                "flowInformation": {
+                    "quantitativeReference": { "referenceToReferenceFlowProperty": "0" }
+                },
+                "flowProperties": {
+                    "flowProperty": {
+                        "@dataSetInternalID": "0",
+                        "referenceToFlowPropertyDataSet": { "@refObjectId": Uuid::new_v4() }
+                    }
+                }
+            }
+        });
+        assert!(super::parse_flow_reference_property(&flow).is_none());
     }
 }

@@ -21,6 +21,10 @@ use crate::{
         EncodedArtifact, encode_contribution_path_artifact, encode_solve_all_unit_query_artifact,
         encode_solve_batch_artifact, encode_solve_one_artifact,
     },
+    calculation_bundle::{
+        CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT, CalculationBundleArtifactRef,
+        CalculationBundleWriter, upload_built_calculation_bundle,
+    },
     calculation_evidence::{
         LcaCalculationEvidence, validate_calculation_evidence,
         validate_calculation_evidence_binding,
@@ -744,8 +748,9 @@ fn merge_job_status_update_timing(
 
 #[derive(Debug, Clone)]
 struct SnapshotArtifactMeta {
-    artifact_url: String,
-    artifact_format: String,
+    url: String,
+    format: String,
+    sha256: String,
 }
 
 /// Loads sparse snapshot data from snapshot artifact first, then falls back to `lca_*` tables.
@@ -761,7 +766,7 @@ pub async fn fetch_snapshot_sparse_data(
             Err(err) => {
                 warn!(
                     snapshot_id = %snapshot_id,
-                    artifact_format = %meta.artifact_format,
+                    artifact_format = %meta.format,
                     error = %err,
                     "failed to load snapshot artifact, falling back to table-backed sparse data"
                 );
@@ -860,7 +865,7 @@ async fn fetch_snapshot_artifact_meta(
 ) -> anyhow::Result<Option<SnapshotArtifactMeta>> {
     let row = match sqlx::query(
         r"
-        SELECT artifact_url, artifact_format
+        SELECT artifact_url, artifact_format, artifact_sha256
         FROM lca_snapshot_artifacts
         WHERE snapshot_id = $1
           AND status = 'ready'
@@ -879,8 +884,9 @@ async fn fetch_snapshot_artifact_meta(
 
     row.map(|r| {
         Ok(SnapshotArtifactMeta {
-            artifact_url: r.try_get::<String, _>("artifact_url")?,
-            artifact_format: r.try_get::<String, _>("artifact_format")?,
+            url: r.try_get::<String, _>("artifact_url")?,
+            format: r.try_get::<String, _>("artifact_format")?,
+            sha256: r.try_get::<String, _>("artifact_sha256")?,
         })
     })
     .transpose()
@@ -903,10 +909,7 @@ async fn fetch_decoded_snapshot_artifact_from_meta(
     snapshot_id: Uuid,
     meta: &SnapshotArtifactMeta,
 ) -> anyhow::Result<DecodedSnapshotArtifact> {
-    let bytes = state
-        .object_store
-        .download_object_url(&meta.artifact_url)
-        .await?;
+    let bytes = state.object_store.download_object_url(&meta.url).await?;
 
     let decoded = decode_snapshot_artifact(bytes.as_slice())?;
     if decoded.snapshot_id != snapshot_id {
@@ -937,7 +940,7 @@ pub(crate) async fn fetch_snapshot_index_document(
     let meta = fetch_snapshot_artifact_meta(&state.pool, snapshot_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} has no ready artifact"))?;
-    let snapshot_index_url = derive_snapshot_index_url(&meta.artifact_url);
+    let snapshot_index_url = derive_snapshot_index_url(&meta.url);
     let bytes = state
         .object_store
         .download_object_url(&snapshot_index_url)
@@ -975,7 +978,7 @@ fn is_undefined_table(err: &sqlx::Error) -> bool {
 /// Executes one queue payload end-to-end.
 #[instrument(skip(state))]
 pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow::Result<()> {
-    handle_job_payload_with_worker_lease(state, payload, None).await
+    Box::pin(handle_job_payload_with_worker_lease(state, payload, None)).await
 }
 
 pub(crate) async fn handle_worker_jobs_job_payload(
@@ -985,7 +988,7 @@ pub(crate) async fn handle_worker_jobs_job_payload(
     lease_token: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<()> {
-    handle_job_payload_with_worker_lease(
+    Box::pin(handle_job_payload_with_worker_lease(
         state,
         payload,
         Some(BuildSnapshotWorkerLease {
@@ -993,7 +996,7 @@ pub(crate) async fn handle_worker_jobs_job_payload(
             lease_token,
             lease_seconds,
         }),
-    )
+    ))
     .await
 }
 
@@ -1149,6 +1152,7 @@ async fn handle_job_payload_with_worker_lease(
                 &solved,
                 "solve_batch",
                 calculation_evidence.clone(),
+                None,
             )
             .await?;
             let completed_diag = merge_job_status_update_timing(
@@ -1214,22 +1218,16 @@ async fn handle_job_payload_with_worker_lease(
                 ));
             }
             let batch_size = normalize_all_unit_batch_size(unit_batch_size, n);
-            let solve_options = resolve_solve_all_unit_options(solve)?;
-
-            let mut items = Vec::with_capacity(n);
-            for start in (0..n).step_by(batch_size) {
-                let end = (start + batch_size).min(n);
-                let rhs_batch = build_all_unit_rhs_batch(n, start, end);
-                let partial = state.solver.solve_batch(
-                    snapshot_id,
-                    NumericOptions { print_level: level },
-                    rhs_batch.as_slice(),
-                    solve_options,
-                )?;
-                items.extend(partial.items);
-            }
-
-            let solved = SolveBatchResult { items };
+            let _ = resolve_solve_all_unit_options(solve)?;
+            let (solved, calculation_bundle) = solve_all_unit_with_calculation_bundle(
+                state,
+                job_id,
+                snapshot_id,
+                n,
+                batch_size,
+                level,
+            )
+            .await?;
             let query_artifact_meta =
                 persist_solve_all_unit_query_artifact(state, job_id, snapshot_id, &solved)
                     .await
@@ -1250,6 +1248,7 @@ async fn handle_job_payload_with_worker_lease(
                 &solved,
                 "solve_all_unit",
                 calculation_evidence.clone(),
+                Some(calculation_bundle.clone()),
             )
             .await?;
             let completed_diag = merge_job_status_update_timing(
@@ -1260,6 +1259,7 @@ async fn handle_job_payload_with_worker_lease(
                         "process_count": n,
                         "unit_batch_size": batch_size,
                     },
+                    "calculation_bundle": calculation_bundle,
                     "calculation_evidence": calculation_evidence,
                 }),
                 "running",
@@ -1762,6 +1762,7 @@ async fn persist_solve_one_result(
             compute_timing: Some(timing_json),
             encode_artifact_sec,
             calculation_evidence,
+            calculation_bundle: None,
         },
     )
     .await
@@ -1774,6 +1775,7 @@ async fn persist_solve_batch_result(
     solved: &SolveBatchResult,
     suffix: &'static str,
     calculation_evidence: Option<LcaCalculationEvidence>,
+    calculation_bundle: Option<CalculationBundleArtifactRef>,
 ) -> anyhow::Result<Value> {
     let encode_started = Instant::now();
     let encoded = encode_solve_batch_artifact(snapshot_id, job_id, solved)?;
@@ -1789,9 +1791,88 @@ async fn persist_solve_batch_result(
             compute_timing: None,
             encode_artifact_sec,
             calculation_evidence,
+            calculation_bundle,
         },
     )
     .await
+}
+
+async fn solve_all_unit_with_calculation_bundle(
+    state: &AppState,
+    job_id: Uuid,
+    snapshot_id: Uuid,
+    process_count: usize,
+    solve_batch_size: usize,
+    print_level: f64,
+) -> anyhow::Result<(SolveBatchResult, CalculationBundleArtifactRef)> {
+    let snapshot_meta = fetch_snapshot_artifact_meta(&state.pool, snapshot_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} has no ready artifact"))?;
+    let decoded =
+        fetch_decoded_snapshot_artifact_from_meta(state, snapshot_id, &snapshot_meta).await?;
+    let release_evidence = decoded
+        .compiled_graph
+        .as_ref()
+        .and_then(|graph| graph.release_evidence.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot {snapshot_id} lacks exact Calculation Bundle release evidence; rebuild the snapshot"
+            )
+        })?;
+    let snapshot_index = fetch_snapshot_index_document(state, snapshot_id).await?;
+    if usize::try_from(decoded.payload.process_count)? != process_count {
+        return Err(anyhow::anyhow!(
+            "snapshot process count drift while building Calculation Bundle"
+        ));
+    }
+    let mut bundle_writer = CalculationBundleWriter::new(
+        job_id,
+        snapshot_id,
+        snapshot_meta.sha256,
+        usize::try_from(decoded.payload.flow_count)?,
+        decoded.config,
+        decoded.coverage,
+        &snapshot_index,
+        &release_evidence,
+    )?;
+
+    let mut legacy_items = Vec::with_capacity(process_count);
+    let internal_options = SolveOptions {
+        return_x: true,
+        return_g: false,
+        return_h: true,
+    };
+    for artifact_start in (0..process_count).step_by(CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT) {
+        let artifact_end =
+            (artifact_start + CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT).min(process_count);
+        let mut artifact_items = Vec::with_capacity(artifact_end - artifact_start);
+        for solve_start in (artifact_start..artifact_end).step_by(solve_batch_size) {
+            let solve_end = (solve_start + solve_batch_size).min(artifact_end);
+            let rhs_batch = build_all_unit_rhs_batch(process_count, solve_start, solve_end);
+            let partial = state.solver.solve_batch(
+                snapshot_id,
+                NumericOptions { print_level },
+                rhs_batch.as_slice(),
+                internal_options,
+            )?;
+            artifact_items.extend(partial.items);
+        }
+        bundle_writer.write_result_chunk(artifact_start, artifact_items.as_slice())?;
+        legacy_items.extend(artifact_items.into_iter().map(|item| SolveResult {
+            x: None,
+            g: None,
+            h: item.h,
+            factorization_state: item.factorization_state,
+        }));
+    }
+    let built = bundle_writer.finish()?;
+    let bundle_ref = upload_built_calculation_bundle(&state.object_store, &built).await?;
+    Ok((
+        SolveBatchResult {
+            items: legacy_items,
+        },
+        bundle_ref,
+    ))
 }
 
 async fn persist_solve_all_unit_query_artifact(
@@ -1841,6 +1922,7 @@ async fn persist_contribution_path_result(
             compute_timing: None,
             encode_artifact_sec: 0.0,
             calculation_evidence,
+            calculation_bundle: None,
         },
     )
     .await
@@ -1900,6 +1982,7 @@ struct PersistArtifactInput {
     compute_timing: Option<Value>,
     encode_artifact_sec: f64,
     calculation_evidence: Option<LcaCalculationEvidence>,
+    calculation_bundle: Option<CalculationBundleArtifactRef>,
 }
 
 struct ArtifactMeta {
@@ -1939,6 +2022,7 @@ struct LciaResultPackageArtifacts {
     latest_all_unit_result_id: Uuid,
     result_diag: Value,
     query_artifact_meta: QueryArtifactMeta,
+    calculation_bundle: CalculationBundleArtifactRef,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1979,6 +2063,7 @@ struct PersistTimingContext {
     encode_artifact_sec: f64,
     upload_artifact_sec: f64,
     calculation_evidence: Option<LcaCalculationEvidence>,
+    calculation_bundle: Option<CalculationBundleArtifactRef>,
 }
 
 pub(crate) async fn run_review_submit_gate_snapshot_builder(
@@ -2086,7 +2171,8 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             "artifactSha256": artifacts.query_artifact_meta.sha256.clone(),
             "artifactByteSize": artifacts.query_artifact_meta.byte_size,
             "artifactFormat": artifacts.query_artifact_meta.format.clone(),
-        }
+        },
+        "calculationBundle": artifacts.calculation_bundle.clone(),
     });
 
     let mark_ready = mark_lcia_result_package_ready(
@@ -2194,22 +2280,16 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         ));
     }
 
-    let mut items = Vec::with_capacity(n);
     let batch_size = normalize_all_unit_batch_size(None, n);
-    let solve_options = resolve_solve_all_unit_options(None)?;
-    for start in (0..n).step_by(batch_size) {
-        let end = (start + batch_size).min(n);
-        let rhs_batch = build_all_unit_rhs_batch(n, start, end);
-        let partial = state.solver.solve_batch(
-            snapshot_id,
-            NumericOptions { print_level: 0.0 },
-            rhs_batch.as_slice(),
-            solve_options,
-        )?;
-        items.extend(partial.items);
-    }
-
-    let solved = SolveBatchResult { items };
+    let (solved, calculation_bundle) = solve_all_unit_with_calculation_bundle(
+        state,
+        result_job_id,
+        snapshot_id,
+        n,
+        batch_size,
+        0.0,
+    )
+    .await?;
     let query_artifact_meta =
         persist_solve_all_unit_query_artifact(state, result_job_id, snapshot_id, &solved).await?;
     let result_diag = persist_solve_batch_result(
@@ -2219,6 +2299,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         &solved,
         "solve_all_unit",
         None,
+        Some(calculation_bundle.clone()),
     )
     .await?;
     let result_id = latest_result_id_for_job(&state.pool, result_job_id)
@@ -2240,6 +2321,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         latest_all_unit_result_id,
         result_diag,
         query_artifact_meta,
+        calculation_bundle,
     })
 }
 
@@ -2273,6 +2355,7 @@ async fn persist_result_artifact(
         compute_timing,
         encode_artifact_sec,
         calculation_evidence,
+        calculation_bundle,
     } = input;
     let EncodedArtifact {
         format,
@@ -2299,6 +2382,7 @@ async fn persist_result_artifact(
         encode_artifact_sec,
         upload_artifact_sec: upload_started.elapsed().as_secs_f64(),
         calculation_evidence,
+        calculation_bundle,
     };
     persist_object_storage_result(
         state,
@@ -2802,6 +2886,7 @@ async fn persist_object_storage_result(
         "artifact_bytes": artifact_meta.encoded_len,
         "artifact_url": artifact_url,
         "calculation_evidence": timing.calculation_evidence.clone(),
+        "calculation_bundle": timing.calculation_bundle.clone(),
         "compute_timing_sec": timing.compute_timing,
         "persistence_timing_sec": persistence_timing_json(
             Some(timing.encode_artifact_sec),
@@ -2834,6 +2919,7 @@ async fn persist_object_storage_result(
         "artifact_bytes": artifact_meta.encoded_len,
         "artifact_url": artifact_url,
         "calculation_evidence": timing.calculation_evidence.clone(),
+        "calculation_bundle": timing.calculation_bundle.clone(),
         "compute_timing_sec": timing.compute_timing,
         "persistence_timing_sec": persistence_timing_json(
             Some(timing.encode_artifact_sec),

@@ -650,6 +650,7 @@ mod tests {
                 ..CompiledAllocationStats::default()
             },
             matching_stats: CompiledMatchingStats::default(),
+            release_evidence: None,
         };
         let encoded_with_graph = encode_snapshot_artifact_with_graph(
             snapshot_id,

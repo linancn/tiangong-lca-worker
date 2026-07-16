@@ -38,9 +38,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-15
-lastReviewedCommit: 19c4ddbf18a8792c939341ba97ab8393112b7be3
-lastReviewedNote: "Reviewed bounded targetless allocation compatibility and successful-task replay proof for Issue #121."
+lastReviewedAt: 2026-07-16
+lastReviewedCommit: 31f2bb4af9a73c39e548d9a0d8390ace92647ad5
+lastReviewedNote: "Reviewed Calculation Bundle deterministic artifact, directional numeric parity, bounded chunk, and exact-identity validation for Issue #123."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -70,6 +70,7 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | Change type | Minimum local proof | Additional proof when risk is higher | Notes |
 | --- | --- | --- | --- |
 | `crates/**` solver or worker code | `make check`; hard Clippy gate; hard format gate | run the narrow manual script that matches the touched area, such as snapshot build, full compute debug, or BW25 validation | Record which job family or worker path was exercised. |
+| Calculation Bundle / all-unit directional LCI | `cargo test -p solver-worker calculation_bundle`; `cargo test -p solver-worker --bin snapshot_builder`; `cargo check -p solver-worker --all-targets`; hard Clippy and format gates | with safe DB/S3 env, rebuild one snapshot, run `solve_all_unit`, verify manifest-last upload, all compressed/uncompressed hashes, exact 256-process boundaries, reviewed 25-method identities, directional LCI parity, and retry byte determinism | Old snapshots without `compiled_graph.release_evidence` must fail closed and be rebuilt. Never infer exchange IDs, versions, units, directions, or provider output IDs from matrix indices. |
 | solver `worker_jobs` queue backend | `cargo test -p solver-worker worker_jobs`; `cargo test -p solver-worker maps_worker_jobs`; `cargo check -p solver-worker`; hard Clippy gate; hard format gate | when DB/S3 env is available, enqueue one safe `worker_queue=solver` job and run `solver-worker --queue-backend worker-jobs --mode worker` to verify claim/heartbeat/result projection; for legacy-table retirement, run against a schema where `public.lca_jobs` is absent or ignored | Keep `docs/lca-api-contract.md` and `docs/edge-function-integration.md` aligned with job kind, payload schema, worker_jobs result_ref, and optional legacy `lca_jobs` compatibility expectations. |
 | versioned public-plus-owner-draft snapshot / LCIA evidence | `cargo test -p solver-worker calculation_evidence`; `cargo test -p solver-worker static_lcia_cache`; `cargo test -p solver-worker maps_exact_public_owner_draft_build_v2`; `cargo test -p solver-worker rejects_summary_only_lcia_manifest_before_build_execution`; `cargo test -p solver-worker --bin snapshot_builder`; `cargo check -p solver-worker --all-targets`; baseline hard gates | run ignored `verifies_reviewed_release_bundle_bytes` with `LCIA_STATIC_CACHE_RELEASE_DIR=<next-public-root>` whenever the reviewed static bundle changes; in a non-production environment with DB/S3 available, enqueue one v2 build and verify public `100`, owner `0`, foreign/nonzero/collaboration rejection, snapshot-index source/identity hashes, per-method JSONL gap count, worker-only build result projection, and solve binding drift rejection | Never use a production data mutation as validation. Keep the complete reviewed manifest plus Edge/Next/Worker v2 source, scope, matrix, and release hashes byte-for-byte aligned; reject summary-only manifests during queue payload validation, and reject v1 source/evidence/solve downgrade. |
 | snapshot-builder or provider-matching behavior | baseline gates plus `./scripts/build_snapshot_from_ilcd.sh` when safe | run provider-link diagnostics export helpers when the task changes matching logic | Keep `docs/provider-linking.md` and the implicit regional supply mix docs aligned with runtime semantics. Snapshot and provider diagnostics often need task-specific proof. |

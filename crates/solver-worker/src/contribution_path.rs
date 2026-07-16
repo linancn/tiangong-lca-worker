@@ -670,6 +670,7 @@ mod tests {
             impact_map: vec![SnapshotImpactMapEntry {
                 impact_id,
                 impact_index: 0,
+                impact_version: Some("01.00.000".to_owned()),
                 impact_key: "GWP".to_owned(),
                 impact_name: "Global warming".to_owned(),
                 unit: "kg CO2-eq".to_owned(),

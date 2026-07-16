@@ -276,6 +276,61 @@ impl ObjectStoreClient {
         self.upload_object(key, content_type, bytes, None).await
     }
 
+    /// Uploads a local file to an explicit bucket-relative object key with bounded multipart use.
+    pub async fn upload_object_key_file(
+        &self,
+        key: &str,
+        content_type: &str,
+        file_path: &Path,
+        artifact_byte_size: u64,
+    ) -> anyhow::Result<ObjectUploadResult> {
+        let key = key.trim_start_matches('/');
+        if key.is_empty()
+            || key
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "..")
+        {
+            return Err(anyhow::anyhow!(
+                "object key must be a normalized relative path"
+            ));
+        }
+        let upload_mode = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            "single_put"
+        } else {
+            "multipart"
+        };
+        self.ensure_upload_size_allowed(upload_mode, Some(artifact_byte_size))?;
+        if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            return self
+                .upload_object(
+                    key,
+                    content_type,
+                    std::fs::read(file_path)?,
+                    Some(artifact_byte_size),
+                )
+                .await;
+        }
+        self.upload_object_multipart(key, content_type, file_path, artifact_byte_size)
+            .await
+    }
+
+    /// Returns the configured object-store prefix joined to a normalized relative key.
+    pub fn prefixed_object_key(&self, relative_key: &str) -> anyhow::Result<String> {
+        let relative_key = relative_key.trim_matches('/');
+        if relative_key.is_empty()
+            || relative_key
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "..")
+        {
+            return Err(anyhow::anyhow!("relative object key must be normalized"));
+        }
+        if self.prefix.is_empty() {
+            Ok(relative_key.to_owned())
+        } else {
+            Ok(format!("{}/{relative_key}", self.prefix))
+        }
+    }
+
     /// Uploads one package artifact from a local file and returns upload metadata.
     pub async fn upload_package_artifact_file(
         &self,

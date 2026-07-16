@@ -10,6 +10,13 @@ pub enum CompiledFlowKind {
     Elementary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CompiledExchangeDirection {
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompiledEdgePartition {
@@ -266,6 +273,61 @@ pub struct CompiledGraph {
     pub reference_stats: CompiledReferenceStats,
     pub allocation_stats: CompiledAllocationStats,
     pub matching_stats: CompiledMatchingStats,
+    /// Exact source identities required to materialize directional LCI and one-hop release models.
+    /// Older snapshot artifacts do not contain this additive field and are intentionally not
+    /// eligible for canonical Calculation Bundle generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_evidence: Option<CompiledReleaseEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledReleaseEvidence {
+    pub processes: Vec<CompiledReleaseProcess>,
+    pub inventory_exchanges: Vec<CompiledReleaseInventoryExchange>,
+    pub technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
+    pub biosphere_edges: Vec<CompiledReleaseInventoryExchange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledReleaseProcess {
+    pub process_idx: i32,
+    pub process_id: Uuid,
+    pub process_version: String,
+    pub quantitative_reference_exchange_internal_id: String,
+    pub quantitative_reference_flow_id: Uuid,
+    pub quantitative_reference_flow_version: String,
+    pub reference_unit: String,
+    pub normalized_mean_amount: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledReleaseInventoryExchange {
+    pub process_idx: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_internal_id: Option<String>,
+    pub flow_id: Uuid,
+    pub flow_version: String,
+    pub direction: CompiledExchangeDirection,
+    pub unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    pub normalized_mean_amount: f64,
+    pub allocation_target_internal_id: String,
+    pub allocation_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledReleaseTechnosphereEdge {
+    pub consumer_process_idx: i32,
+    pub consumer_input_exchange_internal_id: String,
+    pub provider_process_idx: i32,
+    pub provider_output_exchange_internal_id: String,
+    pub provider_weight: f64,
+    pub normalized_amount: f64,
+    pub flow_id: Uuid,
+    pub flow_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 #[cfg(test)]
