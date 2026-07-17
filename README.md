@@ -93,6 +93,9 @@ related:
 - 已切换为结果 S3-only：
   - 所有 `solve` 结果统一上传对象存储（HDF5）
   - `lca_results` 仅存 artifact 元数据 + diagnostics（不存 inline payload）
+- `solve_all_unit` 同时生成 canonical `tiangong.calculation-bundle.v1`：
+  - 固定 256-process deterministic gzip NDJSON chunks，保存 exact quantitative reference、direct provider edge、directional LCI 和 reviewed 25-method LCIA
+  - 只在单个 artifact chunk 内临时保留 `x`，不跨 chunk 聚合完整 G/LCI；sidecars 先上传，content-addressed manifest 最后上传
 - 已支持 snapshot artifact-first：
   - builder 直接生成 `M/B/C` 并上传 `HDF5`
   - worker 优先从 `lca_snapshot_artifacts` 下载 artifact，失败才回退到旧 `lca_*_entries` 读取

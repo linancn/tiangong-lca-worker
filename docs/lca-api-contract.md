@@ -22,9 +22,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-12
-lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
-lastReviewedNote: "Reviewed for Issues #116/#118: release-pinned static LCIA source, per-method coverage, worker-only build projection, and exact snapshot diagnostics."
+lastReviewedAt: 2026-07-17
+lastReviewedCommit: 7822f8988e0702faa745c0e97509f851450d81e7
+lastReviewedNote: "Reviewed for Issue #123: immutable Calculation Bundle v1, directional LCI, exact graph identities, and bounded all-unit result chunks."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -142,6 +142,8 @@ legacy `lca_jobs.job_type` 与 worker payload `type` 必须一致。`worker_jobs
 
 - worker 会按 `unit_batch_size` 分块构造单位需求向量（每个 process 一条 `amount=1`）。
 - 为控制结果体积，`solve_all_unit` 仅支持 `return_h=true` 且 `return_x/return_g=false`。
+- 对调用者仍只返回/保留 H；worker 内部会在固定 256-process artifact chunk 内临时请求 `x+h`，用 snapshot 的 exact directional biosphere evidence 计算 LCI，写完该 chunk 后立即释放 `x`。完整 `x`、`G` 或 directional LCI 矩阵不会在内存中跨 chunk 聚合。
+- 每个成功的新 `solve_all_unit` 同时生成不可变 `tiangong.calculation-bundle.v1`。旧 snapshot 若没有 exact release evidence，任务以明确错误要求重建 snapshot；worker 不从 A/B 或数据库当前态猜测 exchange identity。
 
 ### 3.5 兼容字段
 
@@ -235,6 +237,29 @@ legacy pgmq/debug 路径语义：
 - `diagnostics.calculation_evidence`：versioned scoped snapshots 必须为非空，并与 snapshot-index binding 完全一致；legacy snapshots 为 `null`
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
+
+### 5.1 Calculation Bundle v1
+
+`solve_all_unit` 的 canonical release evidence 是 manifest + deterministic gzip NDJSON sidecars：
+
+```text
+calculation-bundle.json
+axes/processes-000000.ndjson.gz
+axes/inventory-000000.ndjson.gz
+graph/technosphere-000000.ndjson.gz
+graph/biosphere-000000.ndjson.gz
+results/lci-000000.ndjson.gz
+results/lcia-000000.ndjson.gz
+evidence/coverage.json
+```
+
+- 每个 canonical chunk 固定覆盖最多 256 个连续 process index；NDJSON record 使用 canonical JSON 和单个换行，gzip 固定 level 6、mtime 0、无文件名/comment。
+- manifest 的 `artifacts[]` 按 path 排序，记录 compressed/uncompressed SHA-256、byte size、record count 与 process-index boundary；`bundleContentHash` 不包含生成时间、对象存储 URL 或自身 hash。
+- process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit 与归一化 amount；inventory axis 逐 exchange 保存 allocation target 与 selected fraction。
+- technosphere evidence 固化 consumer input / provider output exchange internal ID、provider weight、未分摊 normalized input amount、Flow UUID/version 和 location；split-provider 每个最终 provider 一条 edge。
+- directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
+- object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
+- `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。
 
 Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
 

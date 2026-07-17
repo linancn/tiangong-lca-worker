@@ -1579,6 +1579,7 @@ mod tests {
                 reference_stats: CompiledReferenceStats::default(),
                 allocation_stats: CompiledAllocationStats::default(),
                 matching_stats: CompiledMatchingStats::default(),
+                release_evidence: None,
             }),
             target_process_indices: vec![1],
             process_records: vec![
