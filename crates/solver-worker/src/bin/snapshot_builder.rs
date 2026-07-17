@@ -59,12 +59,12 @@ use solver_worker::readiness::{
     MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
 };
 use solver_worker::snapshot_artifacts::{
-    SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage, SnapshotBuildConfig,
-    SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary,
-    SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProcessGapEntry,
-    SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
-    SnapshotSingularRisk, SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary,
-    decode_snapshot_artifact, encode_snapshot_artifact, encode_snapshot_artifact_with_graph,
+    EncodedSnapshotArtifact, SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage,
+    SnapshotBuildConfig, SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary,
+    SnapshotGeographySummary, SnapshotMatchingCoverage, SnapshotMatrixScale,
+    SnapshotProcessGapEntry, SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage,
+    SnapshotResolutionSummary, SnapshotSingularRisk, SnapshotUnmatchedFlowEntry,
+    SnapshotVolumeWeightSummary, decode_snapshot_artifact, encode_snapshot_artifact_with_graph,
 };
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
@@ -996,12 +996,7 @@ async fn main() -> anyhow::Result<()> {
     build_timing.build_sparse_payload_sec = build_started.elapsed().as_secs_f64();
 
     let encode_started = Instant::now();
-    let encoded = encode_snapshot_artifact(
-        snapshot_id,
-        build_config.clone(),
-        built.coverage.clone(),
-        &built.data,
-    )?;
+    let encoded = encode_regular_snapshot_artifact(snapshot_id, &build_config, &built)?;
     build_timing.encode_artifact_sec = encode_started.elapsed().as_secs_f64();
 
     let upload_started = Instant::now();
@@ -1818,6 +1813,20 @@ fn empty_compiled_graph() -> CompiledGraph {
         matching_stats: CompiledMatchingStats::default(),
         release_evidence: None,
     }
+}
+
+fn encode_regular_snapshot_artifact(
+    snapshot_id: Uuid,
+    config: &SnapshotBuildConfig,
+    built: &BuildOutput,
+) -> anyhow::Result<EncodedSnapshotArtifact> {
+    encode_snapshot_artifact_with_graph(
+        snapshot_id,
+        config.clone(),
+        built.coverage.clone(),
+        &built.data,
+        Some(built.compiled_graph.clone()),
+    )
 }
 
 async fn build_review_submit_overlay_graph(
@@ -3548,10 +3557,8 @@ fn build_compiled_release_evidence(
         }
         let reference = reference_exchanges[0];
         let metadata = flow_metadata.get(&reference.flow_id);
-        let reference_unit = metadata
-            .filter(|metadata| metadata.version == reference.flow_version)
-            .and_then(|metadata| metadata.reference_unit.clone())
-            .unwrap_or_default();
+        let (reference_flow_version, reference_unit) =
+            release_flow_identity(&reference.flow_version, metadata);
         release_processes.push(CompiledReleaseProcess {
             process_idx: process.process_idx,
             process_id: process.process_id,
@@ -3561,7 +3568,7 @@ fn build_compiled_release_evidence(
                 .clone()
                 .unwrap_or_default(),
             quantitative_reference_flow_id: reference.flow_id,
-            quantitative_reference_flow_version: reference.flow_version.clone(),
+            quantitative_reference_flow_version: reference_flow_version,
             reference_unit,
             normalized_mean_amount: reference.amount.unwrap_or(f64::NAN),
         });
@@ -3578,15 +3585,12 @@ fn build_compiled_release_evidence(
             continue;
         };
         let metadata = flow_metadata.get(&exchange.flow_id);
-        let unit = metadata
-            .filter(|metadata| metadata.version == exchange.flow_version)
-            .and_then(|metadata| metadata.reference_unit.clone())
-            .unwrap_or_default();
+        let (flow_version, unit) = release_flow_identity(&exchange.flow_version, metadata);
         let release_exchange = CompiledReleaseInventoryExchange {
             process_idx: exchange.process_idx,
             exchange_internal_id: exchange.internal_id.clone(),
             flow_id: exchange.flow_id,
-            flow_version: exchange.flow_version.clone(),
+            flow_version,
             direction,
             unit,
             location: exchange.location.clone(),
@@ -3603,6 +3607,13 @@ fn build_compiled_release_evidence(
     }
     inventory_exchanges.sort_by(compiled_release_inventory_order);
     biosphere_edges.sort_by(compiled_release_inventory_order);
+    for edge in &mut technosphere_edges {
+        if edge.flow_version == "unknown"
+            && let Some(metadata) = flow_metadata.get(&edge.flow_id)
+        {
+            edge.flow_version.clone_from(&metadata.version);
+        }
+    }
     technosphere_edges.sort_by(|left, right| {
         left.consumer_process_idx
             .cmp(&right.consumer_process_idx)
@@ -3619,6 +3630,25 @@ fn build_compiled_release_evidence(
         technosphere_edges,
         biosphere_edges,
     })
+}
+
+fn release_flow_identity(
+    referenced_version: &str,
+    metadata: Option<&FlowReleaseMetadata>,
+) -> (String, String) {
+    let version = if referenced_version == "unknown" {
+        metadata.map_or_else(
+            || referenced_version.to_owned(),
+            |metadata| metadata.version.clone(),
+        )
+    } else {
+        referenced_version.to_owned()
+    };
+    let unit = metadata
+        .filter(|metadata| metadata.version == version)
+        .and_then(|metadata| metadata.reference_unit.clone())
+        .unwrap_or_default();
+    (version, unit)
 }
 
 fn compiled_release_inventory_order(
@@ -6134,10 +6164,12 @@ async fn fetch_flow_release_metadata(
     for (flow_id, flow) in flows {
         let reference_unit = parse_flow_reference_property(&flow.json)
             .and_then(|(property_id, property_version)| {
-                flow_properties.get(&(property_id, property_version))
+                resolve_versioned_json(&flow_properties, property_id, property_version.as_deref())
             })
             .and_then(parse_flow_property_reference_unit_group)
-            .and_then(|unit_group_key| unit_groups.get(&unit_group_key))
+            .and_then(|(unit_group_id, unit_group_version)| {
+                resolve_versioned_json(&unit_groups, unit_group_id, unit_group_version.as_deref())
+            })
             .and_then(parse_unit_group_reference_unit_name);
         out.insert(
             *flow_id,
@@ -6150,7 +6182,7 @@ async fn fetch_flow_release_metadata(
     Ok(out)
 }
 
-fn parse_flow_reference_property(flow_json: &Value) -> Option<(Uuid, String)> {
+fn parse_flow_reference_property(flow_json: &Value) -> Option<(Uuid, Option<String>)> {
     let root = flow_json.get("flowDataSet")?;
     let reference_id = root
         .get("flowInformation")?
@@ -6166,11 +6198,11 @@ fn parse_flow_reference_property(flow_json: &Value) -> Option<(Uuid, String)> {
                 .and_then(Value::as_str)
                 .is_some_and(|value| value.trim() == reference_id)
         })?;
-    parse_exact_global_reference(property.get("referenceToFlowPropertyDataSet")?)
+    parse_global_reference(property.get("referenceToFlowPropertyDataSet")?)
 }
 
-fn parse_flow_property_reference_unit_group(value: &Value) -> Option<(Uuid, String)> {
-    parse_exact_global_reference(
+fn parse_flow_property_reference_unit_group(value: &Value) -> Option<(Uuid, Option<String>)> {
+    parse_global_reference(
         value
             .get("flowPropertyDataSet")?
             .get("flowPropertiesInformation")?
@@ -6197,13 +6229,32 @@ fn parse_unit_group_reference_unit_name(value: &Value) -> Option<String> {
     parse_text_value(unit.get("name")?)
 }
 
-fn parse_exact_global_reference(value: &Value) -> Option<(Uuid, String)> {
+fn parse_global_reference(value: &Value) -> Option<(Uuid, Option<String>)> {
     let id = value
         .get("@refObjectId")?
         .as_str()
         .and_then(|value| Uuid::parse_str(value.trim()).ok())?;
-    let version = value.get("@version")?.as_str()?.trim().to_owned();
-    (!version.is_empty()).then_some((id, version))
+    let version = value
+        .get("@version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some((id, version))
+}
+
+fn resolve_versioned_json<'a>(
+    rows: &'a HashMap<(Uuid, String), Value>,
+    id: Uuid,
+    version: Option<&str>,
+) -> Option<&'a Value> {
+    if let Some(version) = version {
+        return rows.get(&(id, version.to_owned()));
+    }
+    rows.iter()
+        .filter(|((candidate_id, _), _)| *candidate_id == id)
+        .max_by(|((_, left_version), _), ((_, right_version), _)| left_version.cmp(right_version))
+        .map(|(_, value)| value)
 }
 
 fn json_object_or_array_items(value: &Value) -> Vec<&Value> {
@@ -7469,11 +7520,12 @@ mod tests {
         ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, SnapshotBuildConfig,
         SnapshotSelectionMode, SourceSnapshotSummary, accumulate_finite_factor,
         add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
-        biosphere_gross_value, build_lcia_factor_coverage, build_review_submit_overlay_graph,
-        candidate_count_bucket_label, compute_review_submit_overlay_source_hash,
-        compute_scope_hash, compute_source_fingerprint_from_summary, geo_score,
-        location_granularity_label, no_provider_failure_reason, normalize_request_roots,
-        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
+        biosphere_gross_value, build_compiled_release_evidence, build_lcia_factor_coverage,
+        build_review_submit_overlay_graph, candidate_count_bucket_label,
+        compute_review_submit_overlay_source_hash, compute_scope_hash,
+        compute_source_fingerprint_from_summary, geo_score, location_granularity_label,
+        no_provider_failure_reason, normalize_request_roots, parse_number,
+        parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
@@ -7494,7 +7546,7 @@ mod tests {
         CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
         CompiledProviderOutput, CompiledProviderOutputAllocationState,
         CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
-        CompiledReferenceStats,
+        CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseTechnosphereEdge,
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
     use solver_worker::pgbouncer_sqlx::postgres::PgPoolOptions;
@@ -8002,6 +8054,54 @@ mod tests {
         assert_eq!(factor_coverage.counts.matched, 1);
         assert_eq!(factor_coverage.counts.invalid, 1);
         assert_eq!(factor_coverage.record_count, 1);
+    }
+
+    #[test]
+    fn regular_snapshot_artifact_preserves_compiled_release_evidence() {
+        let snapshot_id = Uuid::new_v4();
+        let mut graph = super::empty_compiled_graph();
+        graph.release_evidence = Some(CompiledReleaseEvidence {
+            processes: Vec::new(),
+            inventory_exchanges: Vec::new(),
+            technosphere_edges: Vec::new(),
+            biosphere_edges: Vec::new(),
+        });
+        let method = MethodSelection {
+            has_lcia: false,
+            method_id: None,
+            method_version: None,
+            method_count: 0,
+            factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+        let built = assemble_sparse_payload(
+            snapshot_id,
+            &method,
+            &graph,
+            0.999_999,
+            1e-12,
+            false,
+            &[],
+            &[],
+            false,
+        )
+        .expect("assemble regular snapshot");
+        let encoded = super::encode_regular_snapshot_artifact(
+            snapshot_id,
+            &test_snapshot_build_config("allocation_targeted_v1"),
+            &built,
+        )
+        .expect("encode regular snapshot");
+        let decoded = super::decode_snapshot_artifact(&encoded.bytes).expect("decode snapshot");
+
+        assert!(
+            decoded
+                .compiled_graph
+                .and_then(|graph| graph.release_evidence)
+                .is_some()
+        );
     }
 
     #[test]
@@ -10573,7 +10673,7 @@ mod tests {
         });
         assert_eq!(
             super::parse_flow_reference_property(&flow),
-            Some((property_id, "03.00.003".to_owned()))
+            Some((property_id, Some("03.00.003".to_owned())))
         );
 
         let unit_group = json!({
@@ -10596,7 +10696,8 @@ mod tests {
     }
 
     #[test]
-    fn release_metadata_rejects_unversioned_flow_property_reference() {
+    fn release_metadata_accepts_unversioned_flow_property_reference() {
+        let property_id = Uuid::new_v4();
         let flow = json!({
             "flowDataSet": {
                 "flowInformation": {
@@ -10605,11 +10706,156 @@ mod tests {
                 "flowProperties": {
                     "flowProperty": {
                         "@dataSetInternalID": "0",
-                        "referenceToFlowPropertyDataSet": { "@refObjectId": Uuid::new_v4() }
+                        "referenceToFlowPropertyDataSet": { "@refObjectId": property_id }
                     }
                 }
             }
         });
-        assert!(super::parse_flow_reference_property(&flow).is_none());
+        assert_eq!(
+            super::parse_flow_reference_property(&flow),
+            Some((property_id, None))
+        );
+
+        let unit_group_id = Uuid::new_v4();
+        let flow_property = json!({
+            "flowPropertyDataSet": {
+                "flowPropertiesInformation": {
+                    "quantitativeReference": {
+                        "referenceToReferenceUnitGroup": { "@refObjectId": unit_group_id }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            super::parse_flow_property_reference_unit_group(&flow_property),
+            Some((unit_group_id, None))
+        );
+    }
+
+    #[test]
+    fn release_metadata_resolves_latest_only_for_unversioned_reference() {
+        let id = Uuid::new_v4();
+        let rows = HashMap::from([
+            ((id, "01.00.000".to_owned()), json!({ "name": "old" })),
+            ((id, "03.00.004".to_owned()), json!({ "name": "latest" })),
+        ]);
+
+        assert_eq!(
+            super::resolve_versioned_json(&rows, id, None),
+            rows.get(&(id, "03.00.004".to_owned()))
+        );
+        assert_eq!(
+            super::resolve_versioned_json(&rows, id, Some("01.00.000")),
+            rows.get(&(id, "01.00.000".to_owned()))
+        );
+        assert!(super::resolve_versioned_json(&rows, id, Some("02.00.000")).is_none());
+    }
+
+    #[test]
+    fn release_evidence_resolves_only_omitted_flow_versions_from_metadata() {
+        let process_id = Uuid::new_v4();
+        let product_flow_id = Uuid::new_v4();
+        let co2_flow_id = Uuid::new_v4();
+        let explicitly_versioned_flow_id = Uuid::new_v4();
+        let process = ProcessMeta {
+            process_idx: 0,
+            process_id,
+            process_version: "01.01.000".to_owned(),
+            process_name: Some("alumina production".to_owned()),
+            model_id: None,
+            location: None,
+            reference_year: None,
+            annual_supply_or_production_volume: None,
+        };
+        let exchange =
+            |flow_id, internal_id: &str, flow_version: &str, is_reference| ParsedExchange {
+                process_idx: 0,
+                flow_id,
+                direction: Some(ExchangeDirection::Output),
+                direction_label: "Output".to_owned(),
+                internal_id: Some(internal_id.to_owned()),
+                exchange_id: format!("{process_id}:01.01.000:{internal_id}"),
+                flow_version: flow_version.to_owned(),
+                is_reference_exchange: is_reference,
+                amount: Some(1.0),
+                allocation_state: AllocationFractionState::Present,
+                allocation_fraction: 1.0,
+                allocation_target_internal_id: "0".to_owned(),
+                location: None,
+            };
+        let exchanges = vec![
+            exchange(product_flow_id, "0", "unknown", true),
+            exchange(co2_flow_id, "1", "unknown", false),
+            exchange(explicitly_versioned_flow_id, "2", "01.00.000", false),
+        ];
+        let flow_metadata = HashMap::from([
+            (
+                product_flow_id,
+                super::FlowReleaseMetadata {
+                    version: "01.01.001".to_owned(),
+                    reference_unit: Some("m3".to_owned()),
+                },
+            ),
+            (
+                co2_flow_id,
+                super::FlowReleaseMetadata {
+                    version: "03.00.004".to_owned(),
+                    reference_unit: Some("kg".to_owned()),
+                },
+            ),
+            (
+                explicitly_versioned_flow_id,
+                super::FlowReleaseMetadata {
+                    version: "02.00.000".to_owned(),
+                    reference_unit: Some("m2".to_owned()),
+                },
+            ),
+        ]);
+        let flow_kinds = HashMap::from([
+            (product_flow_id, CompiledFlowKind::Product),
+            (co2_flow_id, CompiledFlowKind::Elementary),
+            (explicitly_versioned_flow_id, CompiledFlowKind::Elementary),
+        ]);
+        let technosphere_edges = vec![CompiledReleaseTechnosphereEdge {
+            consumer_process_idx: 0,
+            consumer_input_exchange_internal_id: "3".to_owned(),
+            provider_process_idx: 1,
+            provider_output_exchange_internal_id: "0".to_owned(),
+            provider_weight: 1.0,
+            normalized_amount: 1.0,
+            flow_id: product_flow_id,
+            flow_version: "unknown".to_owned(),
+            location: None,
+        }];
+
+        let evidence = build_compiled_release_evidence(
+            &[process],
+            &exchanges,
+            &flow_metadata,
+            &flow_kinds,
+            technosphere_edges,
+        )
+        .expect("release evidence");
+
+        assert_eq!(
+            evidence.processes[0].quantitative_reference_flow_version,
+            "01.01.001"
+        );
+        assert_eq!(evidence.processes[0].reference_unit, "m3");
+        let co2 = evidence
+            .inventory_exchanges
+            .iter()
+            .find(|exchange| exchange.flow_id == co2_flow_id)
+            .expect("CO2 exchange");
+        assert_eq!(co2.flow_version, "03.00.004");
+        assert_eq!(co2.unit, "kg");
+        let explicit = evidence
+            .inventory_exchanges
+            .iter()
+            .find(|exchange| exchange.flow_id == explicitly_versioned_flow_id)
+            .expect("explicit exchange");
+        assert_eq!(explicit.flow_version, "01.00.000");
+        assert!(explicit.unit.is_empty());
+        assert_eq!(evidence.technosphere_edges[0].flow_version, "01.01.001");
     }
 }
