@@ -83,6 +83,11 @@ const REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE: &str = "review_submit_baseline";
 const REVIEW_SUBMIT_BASELINE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS: u64 = 900;
 const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
+const PROCESS_FETCH_PAGE_SIZE: usize = 128;
+const PROCESS_FETCH_MAX_ATTEMPTS: u8 = 3;
+const FLOW_FETCH_PAGE_SIZE: usize = 256;
+const DATABASE_READ_MAX_ATTEMPTS: u8 = 3;
+const SOURCE_SUMMARY_FETCH_MAX_ATTEMPTS: u8 = 3;
 const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
 const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -302,6 +307,7 @@ struct ParsedExchange {
 struct ProviderOutputCandidate {
     flow_id: Uuid,
     provider_idx: i32,
+    exchange_direction: ExchangeDirection,
     output_exchange_internal_id: Option<String>,
     output_exchange_is_reference: bool,
     output_normalized_amount: Option<f64>,
@@ -729,7 +735,7 @@ async fn main() -> anyhow::Result<()> {
         process_limit: i32::try_from(cli.process_limit)
             .map_err(|_| anyhow::anyhow!("process_limit overflow"))?,
         provider_rule: cli.provider_rule.clone(),
-        provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+        provider_candidate_eligibility_mode: "flow_kind_directional_reference".to_owned(),
         reference_normalization_mode: cli.reference_normalization_mode.clone(),
         allocation_fraction_mode: cli.allocation_fraction_mode.clone(),
         allocation_semantics_version:
@@ -1901,15 +1907,12 @@ async fn build_review_submit_overlay_graph(
         .iter()
         .map(|flow| (flow.flow_id, flow.kind))
         .collect::<HashMap<_, _>>();
-    reference_flow_kind_by_id.extend(flow_meta.iter().map(|(flow_id, meta)| {
-        let kind = if classify_flow_kind(&meta.json) == "elementary" {
-            CompiledFlowKind::Elementary
-        } else {
-            CompiledFlowKind::Product
-        };
-        (*flow_id, kind)
-    }));
-    validate_reference_product_exchanges(
+    reference_flow_kind_by_id.extend(
+        flow_meta
+            .iter()
+            .map(|(flow_id, meta)| (*flow_id, classify_flow_kind(&meta.json))),
+    );
+    validate_quantitative_reference_exchanges(
         &target_exchanges,
         std::slice::from_ref(&target_meta),
         &reference_flow_kind_by_id,
@@ -1917,14 +1920,11 @@ async fn build_review_submit_overlay_graph(
     for flow_id in missing_flow_ids {
         let flow_idx =
             i32::try_from(graph.flows.len()).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
-        let kind = if flow_meta
+        let kind = flow_meta
             .get(&flow_id)
-            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
-        {
-            CompiledFlowKind::Elementary
-        } else {
-            CompiledFlowKind::Product
-        };
+            .map_or(CompiledFlowKind::Product, |meta| {
+                classify_flow_kind(&meta.json)
+            });
         graph.flows.push(CompiledFlow {
             flow_idx,
             flow_id,
@@ -1939,7 +1939,11 @@ async fn build_review_submit_overlay_graph(
         .collect::<HashSet<_>>();
 
     for ex in &target_exchanges {
-        if ex.direction == Some(ExchangeDirection::Output) {
+        let flow_kind = reference_flow_kind_by_id
+            .get(&ex.flow_id)
+            .copied()
+            .unwrap_or(CompiledFlowKind::Product);
+        if ex.direction == provider_exchange_direction(flow_kind) {
             graph.provider_outputs.push(CompiledProviderOutput {
                 flow_id: ex.flow_id,
                 provider_idx: target_idx,
@@ -1947,11 +1951,9 @@ async fn build_review_submit_overlay_graph(
                 output_exchange_is_reference: ex.is_reference_exchange,
                 output_normalized_amount: ex.amount,
                 output_allocation_state: compiled_allocation_state(ex.allocation_state),
-                eligibility: if ex.is_reference_exchange {
-                    CompiledProviderCandidateEligibility::AcceptedReferenceOutput
-                } else {
-                    CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
-                },
+                eligibility: provider_candidate_eligibility(
+                    &provider_output_candidate_from_exchange(target_idx, ex.flow_id, ex),
+                ),
             });
         }
     }
@@ -1993,10 +1995,11 @@ async fn build_review_submit_overlay_graph(
             }
         }
 
-        if ex.direction != Some(ExchangeDirection::Input) {
-            continue;
-        }
-        let Some(amount) = nonzero_attributed_input_amount(ex) else {
+        let flow_kind = reference_flow_kind_by_id
+            .get(&ex.flow_id)
+            .copied()
+            .unwrap_or(CompiledFlowKind::Product);
+        let Some(amount) = nonzero_attributed_demand_amount(ex, flow_kind) else {
             continue;
         };
         let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
@@ -2722,6 +2725,9 @@ fn provider_output_candidate_from_exchange(
     ProviderOutputCandidate {
         flow_id,
         provider_idx,
+        exchange_direction: exchange
+            .direction
+            .expect("provider candidate exchange direction was validated"),
         output_exchange_internal_id: exchange.internal_id.clone(),
         output_exchange_is_reference: exchange.is_reference_exchange,
         output_normalized_amount: exchange.amount,
@@ -2732,12 +2738,28 @@ fn provider_output_candidate_from_exchange(
 fn provider_output_candidate_from_compiled_output(
     output: &CompiledProviderOutput,
 ) -> ProviderOutputCandidate {
+    let exchange_direction = match output.eligibility {
+        CompiledProviderCandidateEligibility::AcceptedReferenceInput
+        | CompiledProviderCandidateEligibility::RejectedNonReferenceInput => {
+            ExchangeDirection::Input
+        }
+        CompiledProviderCandidateEligibility::Unknown
+        | CompiledProviderCandidateEligibility::AcceptedReferenceOutput
+        | CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
+            ExchangeDirection::Output
+        }
+    };
     ProviderOutputCandidate {
         flow_id: output.flow_id,
         provider_idx: output.provider_idx,
+        exchange_direction,
         output_exchange_internal_id: output.output_exchange_internal_id.clone(),
         output_exchange_is_reference: output.output_exchange_is_reference
-            || output.eligibility == CompiledProviderCandidateEligibility::AcceptedReferenceOutput,
+            || matches!(
+                output.eligibility,
+                CompiledProviderCandidateEligibility::AcceptedReferenceOutput
+                    | CompiledProviderCandidateEligibility::AcceptedReferenceInput
+            ),
         output_normalized_amount: output.output_normalized_amount,
         output_allocation_state: match output.output_allocation_state {
             CompiledProviderOutputAllocationState::Present => AllocationFractionState::Present,
@@ -2778,13 +2800,47 @@ fn eligible_provider_indices(outputs: Option<&Vec<ProviderOutputCandidate>>) -> 
     providers
 }
 
+fn eligible_provider_indices_for_demand_direction(
+    outputs: Option<&Vec<ProviderOutputCandidate>>,
+    demand_direction: Option<ExchangeDirection>,
+) -> Vec<i32> {
+    let Some(demand_direction) = demand_direction else {
+        return Vec::new();
+    };
+    let Some(outputs) = outputs else {
+        return Vec::new();
+    };
+    let mut providers = outputs
+        .iter()
+        .filter_map(|candidate| {
+            (candidate.output_exchange_is_reference
+                && candidate.exchange_direction != demand_direction)
+                .then_some(candidate.provider_idx)
+        })
+        .collect::<Vec<_>>();
+    providers.dedup();
+    providers
+}
+
 fn provider_candidate_eligibility(
     candidate: &ProviderOutputCandidate,
 ) -> CompiledProviderCandidateEligibility {
-    if candidate.output_exchange_is_reference {
-        CompiledProviderCandidateEligibility::AcceptedReferenceOutput
-    } else {
-        CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
+    match (
+        candidate.output_exchange_is_reference,
+        candidate.exchange_direction,
+    ) {
+        (true, ExchangeDirection::Output) => {
+            CompiledProviderCandidateEligibility::AcceptedReferenceOutput
+        }
+        (true, ExchangeDirection::Input) => {
+            CompiledProviderCandidateEligibility::AcceptedReferenceInput
+        }
+        (false, ExchangeDirection::Output) => {
+            CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
+        }
+        (false, ExchangeDirection::Input) => {
+            CompiledProviderCandidateEligibility::RejectedNonReferenceInput
+        }
     }
 }
 
@@ -2800,8 +2856,28 @@ fn compiled_allocation_state(
     }
 }
 
-fn nonzero_attributed_input_amount(exchange: &ParsedExchange) -> Option<f64> {
-    if exchange.direction != Some(ExchangeDirection::Input) {
+fn provider_exchange_direction(flow_kind: CompiledFlowKind) -> Option<ExchangeDirection> {
+    match flow_kind {
+        CompiledFlowKind::Product => Some(ExchangeDirection::Output),
+        CompiledFlowKind::Waste => Some(ExchangeDirection::Input),
+        CompiledFlowKind::Elementary => None,
+    }
+}
+
+fn demand_exchange_direction(flow_kind: CompiledFlowKind) -> Option<ExchangeDirection> {
+    match flow_kind {
+        CompiledFlowKind::Product => Some(ExchangeDirection::Input),
+        CompiledFlowKind::Waste => Some(ExchangeDirection::Output),
+        CompiledFlowKind::Elementary => None,
+    }
+}
+
+fn nonzero_attributed_demand_amount(
+    exchange: &ParsedExchange,
+    flow_kind: CompiledFlowKind,
+) -> Option<f64> {
+    if exchange.direction != demand_exchange_direction(flow_kind) || exchange.is_reference_exchange
+    {
         return None;
     }
     exchange.amount.filter(|amount| *amount != 0.0)
@@ -3021,7 +3097,7 @@ fn parse_process_chunk(
     ))
 }
 
-fn validate_reference_product_exchanges(
+fn validate_quantitative_reference_exchanges(
     exchanges: &[ParsedExchange],
     processes: &[ProcessMeta],
     flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
@@ -3042,16 +3118,16 @@ fn validate_reference_product_exchanges(
             ));
         }
         let reference_exchange = reference_exchanges[0];
-        if reference_exchange.direction != Some(ExchangeDirection::Output) {
+        if reference_exchange.direction.is_none() {
             return Err(anyhow::anyhow!(
-                "quantitative reference must resolve to an Output exchange for process={} version={}",
+                "quantitative reference must resolve to an Input or Output exchange for process={} version={}",
                 process.process_id,
                 process.process_version
             ));
         }
-        if flow_kind_by_id.get(&reference_exchange.flow_id) != Some(&CompiledFlowKind::Product) {
+        if !flow_kind_by_id.contains_key(&reference_exchange.flow_id) {
             return Err(anyhow::anyhow!(
-                "quantitative reference must resolve to a Product flow for process={} version={} flow={}",
+                "quantitative reference flow metadata is missing for process={} version={} flow={}",
                 process.process_id,
                 process.process_version,
                 reference_exchange.flow_id
@@ -3160,14 +3236,7 @@ async fn compile_scope_graph(
     }
     let flow_kind_by_id = flow_meta
         .iter()
-        .map(|(flow_id, meta)| {
-            let kind = if classify_flow_kind(&meta.json) == "elementary" {
-                CompiledFlowKind::Elementary
-            } else {
-                CompiledFlowKind::Product
-            };
-            (*flow_id, kind)
-        })
+        .map(|(flow_id, meta)| (*flow_id, classify_flow_kind(&meta.json)))
         .collect::<HashMap<_, _>>();
     let candidate_flow_ids = if versioned_scope.is_some() {
         let mut ids = flow_meta.keys().copied().collect::<Vec<_>>();
@@ -3181,14 +3250,11 @@ async fn compile_scope_graph(
     let mut elementary_flow_idx = HashSet::new();
     for (idx, flow_id) in candidate_flow_ids.iter().enumerate() {
         let flow_index = i32::try_from(idx).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
-        let kind = if flow_meta
+        let kind = flow_meta
             .get(flow_id)
-            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
-        {
-            CompiledFlowKind::Elementary
-        } else {
-            CompiledFlowKind::Product
-        };
+            .map_or(CompiledFlowKind::Product, |meta| {
+                classify_flow_kind(&meta.json)
+            });
         if kind == CompiledFlowKind::Elementary {
             elementary_flow_idx.insert(flow_index);
         }
@@ -3199,11 +3265,15 @@ async fn compile_scope_graph(
             kind,
         });
     }
-    validate_reference_product_exchanges(&exchanges, &process_meta, &flow_kind_by_id)?;
+    validate_quantitative_reference_exchanges(&exchanges, &process_meta, &flow_kind_by_id)?;
 
     let mut provider_map: ProviderMap = HashMap::new();
     for ex in &exchanges {
-        if ex.direction == Some(ExchangeDirection::Output) {
+        let flow_kind = flow_kind_by_id
+            .get(&ex.flow_id)
+            .copied()
+            .unwrap_or(CompiledFlowKind::Product);
+        if ex.direction == provider_exchange_direction(flow_kind) {
             provider_map.entry(ex.flow_id).or_default().push(
                 provider_output_candidate_from_exchange(ex.process_idx, ex.flow_id, ex),
             );
@@ -3245,11 +3315,11 @@ async fn compile_scope_graph(
             }
         }
 
-        if ex.direction != Some(ExchangeDirection::Input) {
-            continue;
-        }
-
-        let Some(amount) = nonzero_attributed_input_amount(ex) else {
+        let flow_kind = flow_kind_by_id
+            .get(&ex.flow_id)
+            .copied()
+            .unwrap_or(CompiledFlowKind::Product);
+        let Some(amount) = nonzero_attributed_demand_amount(ex, flow_kind) else {
             continue;
         };
         let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
@@ -4300,10 +4370,11 @@ fn resolve_reference_normalization(
         reference_exchange
             .get("exchangeDirection")
             .and_then(Value::as_str),
-    ) != Some(ExchangeDirection::Output)
+    )
+    .is_none()
     {
         return Err(anyhow::anyhow!(
-            "referenceToReferenceFlow={} must identify an Output exchange for process={process_id}",
+            "referenceToReferenceFlow={} must identify an Input or Output exchange for process={process_id}",
             reference_internal_id
         ));
     }
@@ -5203,8 +5274,12 @@ fn provider_candidate_eligibility_label(
         CompiledProviderCandidateEligibility::AcceptedReferenceOutput => {
             "accepted_reference_output"
         }
+        CompiledProviderCandidateEligibility::AcceptedReferenceInput => "accepted_reference_input",
         CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
             "rejected_non_reference_output"
+        }
+        CompiledProviderCandidateEligibility::RejectedNonReferenceInput => {
+            "rejected_non_reference_input"
         }
     }
 }
@@ -5242,6 +5317,7 @@ fn compute_scope_hash(
         "all_states": all_states,
         "process_states": state_codes,
         "include_user_id": include_user_id,
+        "include_user_state_codes": include_user_id.map(|_| vec![0]),
         "request_roots": request_roots,
         "process_limit": process_limit,
         "provider_rule": provider_rule.as_str(),
@@ -5255,7 +5331,7 @@ fn classify_scope_partition(
     row: &ProcessRow,
     include_user_id: Option<Uuid>,
 ) -> ScopeProcessPartition {
-    if row.state_code != 100 && include_user_id.is_some() && row.user_id == include_user_id {
+    if row.state_code == 0 && include_user_id.is_some() && row.user_id == include_user_id {
         ScopeProcessPartition::Private
     } else {
         ScopeProcessPartition::Public
@@ -5359,7 +5435,8 @@ fn resolve_process_selection(
 
     let processes = candidate_processes;
     let mut process_meta = Vec::with_capacity(processes.len());
-    let mut input_exchanges_by_idx = Vec::<Vec<ParsedExchange>>::with_capacity(processes.len());
+    let mut dependency_exchanges_by_idx =
+        Vec::<Vec<ParsedExchange>>::with_capacity(processes.len());
     let mut provider_sets: ProviderMap = HashMap::new();
     let mut process_lookup = HashMap::<(Uuid, String), i32>::with_capacity(processes.len());
 
@@ -5397,7 +5474,7 @@ fn resolve_process_selection(
             ),
         });
 
-        let mut input_exchanges = Vec::new();
+        let mut dependency_exchanges = Vec::new();
         for exchange in exchange_items {
             let direction = match exchange
                 .get("exchangeDirection")
@@ -5417,8 +5494,12 @@ fn resolve_process_selection(
                 continue;
             };
             let internal_id = parse_exchange_internal_id(exchange);
+            let is_reference_exchange = is_reference_internal_exchange(
+                internal_id.as_deref(),
+                reference_internal_id.as_deref(),
+            );
 
-            if direction == ExchangeDirection::Output {
+            if is_reference_exchange {
                 provider_sets.entry(flow_id).or_default().push(
                     provider_output_candidate_from_exchange(
                         process_idx,
@@ -5433,10 +5514,7 @@ fn resolve_process_selection(
                                 .clone()
                                 .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
                             flow_version: "unknown".to_owned(),
-                            is_reference_exchange: is_reference_internal_exchange(
-                                internal_id.as_deref(),
-                                reference_internal_id.as_deref(),
-                            ),
+                            is_reference_exchange,
                             amount: None,
                             allocation_state: AllocationFractionState::Missing,
                             allocation_fraction: 1.0,
@@ -5454,7 +5532,7 @@ fn resolve_process_selection(
                     &valid_output_internal_ids,
                     output_exchange_count,
                 );
-                input_exchanges.push(ParsedExchange {
+                dependency_exchanges.push(ParsedExchange {
                     process_idx,
                     flow_id,
                     direction: Some(direction),
@@ -5464,10 +5542,7 @@ fn resolve_process_selection(
                         .clone()
                         .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
                     flow_version: "unknown".to_owned(),
-                    is_reference_exchange: is_reference_internal_exchange(
-                        internal_id.as_deref(),
-                        reference_internal_id.as_deref(),
-                    ),
+                    is_reference_exchange,
                     amount: allocation_amount,
                     allocation_state,
                     allocation_fraction: allocation_amount.unwrap_or(f64::NAN),
@@ -5478,7 +5553,7 @@ fn resolve_process_selection(
                 });
             }
         }
-        input_exchanges_by_idx.push(input_exchanges);
+        dependency_exchanges_by_idx.push(dependency_exchanges);
     }
 
     let mut provider_map = provider_sets;
@@ -5504,10 +5579,12 @@ fn resolve_process_selection(
     while cursor < queue.len() {
         let current = queue[cursor];
         cursor += 1;
-        let input_exchanges = input_exchanges_by_idx
+        let dependency_exchanges = dependency_exchanges_by_idx
             .get(usize::try_from(current).map_err(|_| anyhow::anyhow!("negative process idx"))?)
-            .ok_or_else(|| anyhow::anyhow!("missing input exchanges for process idx={current}"))?;
-        for exchange in input_exchanges {
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing dependency exchanges for process idx={current}")
+            })?;
+        for exchange in dependency_exchanges {
             if exchange.allocation_state == AllocationFractionState::Invalid {
                 let process = process_meta_for_idx(&process_meta, current)
                     .ok_or_else(|| anyhow::anyhow!("missing process metadata idx={current}"))?;
@@ -5518,11 +5595,14 @@ fn resolve_process_selection(
                     exchange.exchange_id
                 ));
             }
-            if nonzero_attributed_input_amount(exchange).is_none() {
+            let provider_outputs = provider_map.get(&exchange.flow_id);
+            let providers = eligible_provider_indices_for_demand_direction(
+                provider_outputs,
+                exchange.direction,
+            );
+            if providers.is_empty() || exchange.amount == Some(0.0) {
                 continue;
             }
-            let provider_outputs = provider_map.get(&exchange.flow_id);
-            let providers = eligible_provider_indices(provider_outputs);
             let provider_cnt = providers.len();
             let next_indices = if provider_cnt == 1 {
                 providers
@@ -5608,7 +5688,7 @@ async fn compute_source_fingerprint(
     let (process_count, process_max_modified_at_utc) =
         summarize_selected_processes(selected_processes)?;
     let (flow_count, flow_max_modified_at_utc) =
-        fetch_flow_source_summary(pool, versioned_scope).await?;
+        fetch_flow_source_summary_with_retry(pool, versioned_scope).await?;
     let (lciamethod_count, lciamethod_max_modified_at_utc) = if config.has_lcia {
         if versioned_scope.is_some() {
             let method =
@@ -5623,7 +5703,7 @@ async fn compute_source_fingerprint(
                 format!("static:{}", evidence.source_snapshot_sha256),
             )
         } else {
-            fetch_lciamethod_source_summary(pool).await?
+            fetch_lciamethod_source_summary_with_retry(pool).await?
         }
     } else {
         (0, "disabled".to_owned())
@@ -5640,6 +5720,45 @@ async fn compute_source_fingerprint(
 
     let fingerprint = compute_source_fingerprint_from_summary(&summary, config)?;
     Ok((summary, fingerprint))
+}
+
+async fn fetch_flow_source_summary_with_retry(
+    pool: &PgPool,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<(i64, String)> {
+    for attempt in 1..=SOURCE_SUMMARY_FETCH_MAX_ATTEMPTS {
+        match fetch_flow_source_summary(pool, versioned_scope).await {
+            Ok(summary) => return Ok(summary),
+            Err(error) if attempt < SOURCE_SUMMARY_FETCH_MAX_ATTEMPTS => {
+                eprintln!(
+                    "[query_retry] name=snapshot.fetch_flow_source_summary attempt={} error={:#}",
+                    attempt, error
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("source-summary retry loop always returns")
+}
+
+async fn fetch_lciamethod_source_summary_with_retry(
+    pool: &PgPool,
+) -> anyhow::Result<(i64, String)> {
+    for attempt in 1..=SOURCE_SUMMARY_FETCH_MAX_ATTEMPTS {
+        match fetch_lciamethod_source_summary(pool).await {
+            Ok(summary) => return Ok(summary),
+            Err(error) if attempt < SOURCE_SUMMARY_FETCH_MAX_ATTEMPTS => {
+                eprintln!(
+                    "[query_retry] name=snapshot.fetch_lciamethod_source_summary attempt={} error={:#}",
+                    attempt, error
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("LCIA-method source-summary retry loop always returns")
 }
 
 fn compute_source_fingerprint_from_summary(
@@ -5758,8 +5877,27 @@ async fn find_reusable_snapshot(
     source_fingerprint: &str,
     reuse_max_age_seconds: Option<i64>,
 ) -> anyhow::Result<Option<ReuseCandidate>> {
-    find_reusable_snapshot_with_age_basis(pool, source_fingerprint, reuse_max_age_seconds, false)
+    for attempt in 1..=DATABASE_READ_MAX_ATTEMPTS {
+        match find_reusable_snapshot_with_age_basis(
+            pool,
+            source_fingerprint,
+            reuse_max_age_seconds,
+            false,
+        )
         .await
+        {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) if attempt < DATABASE_READ_MAX_ATTEMPTS => {
+                eprintln!(
+                    "[query_retry] name=snapshot.find_reusable_snapshot attempt={} error={:#}",
+                    attempt, error
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("reusable-snapshot retry loop always returns")
 }
 
 async fn find_reusable_snapshot_with_age_basis(
@@ -5899,11 +6037,16 @@ async fn fetch_processes(
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
 ) -> anyhow::Result<Vec<ProcessRow>> {
     let query_started = Instant::now();
-    let rows = if let Some(scope) = versioned_scope {
+    // Keep each PostgreSQL response bounded. The complete public-plus-owner
+    // inventory is tens of megabytes and can be truncated by a WAN/pooler hop
+    // even though every individual process JSON is small. Select the canonical
+    // id@version rows once without transferring JSON, then fetch those IDs in
+    // bounded pages. This preserves the existing DISTINCT ON semantics without
+    // repeating the full version-selection sort for every page.
+    let selected_rows = if let Some(scope) = versioned_scope {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+            SELECT DISTINCT ON (id) id, btrim(version::text) AS version
             FROM public.processes
             WHERE (
                 state_code = 100
@@ -5924,8 +6067,7 @@ async fn fetch_processes(
     } else if all_states {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+            SELECT DISTINCT ON (id) id, btrim(version::text) AS version
             FROM public.processes
             WHERE json ? 'processDataSet'
             ORDER BY id, version DESC
@@ -5936,10 +6078,9 @@ async fn fetch_processes(
     } else if let Some(user_id) = include_user_id {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+            SELECT DISTINCT ON (id) id, btrim(version::text) AS version
             FROM public.processes
-            WHERE (state_code = ANY($1) OR user_id = $2)
+            WHERE (state_code = ANY($1) OR (user_id = $2 AND state_code = 0))
               AND json ? 'processDataSet'
             ORDER BY id, version DESC
             "#,
@@ -5951,8 +6092,7 @@ async fn fetch_processes(
     } else {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+            SELECT DISTINCT ON (id) id, btrim(version::text) AS version
             FROM public.processes
             WHERE state_code = ANY($1)
               AND json ? 'processDataSet'
@@ -5963,6 +6103,151 @@ async fn fetch_processes(
         .fetch_all(pool)
         .await?
     };
+    let selected_versions = selected_rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<Uuid, _>("id")?,
+                row.try_get::<String, _>("version")?,
+            ))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
+    let selected_ids = selected_rows
+        .iter()
+        .map(|row| row.try_get::<Uuid, _>("id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = Vec::with_capacity(selected_ids.len());
+    let mut fetched_ids = HashSet::with_capacity(selected_ids.len());
+
+    for page_ids in selected_ids.chunks(PROCESS_FETCH_PAGE_SIZE) {
+        let page_started = Instant::now();
+        let mut attempts = 0_u8;
+        let page_rows = loop {
+            attempts += 1;
+            let page_result = if let Some(scope) = versioned_scope {
+                sqlx::query(
+                    r#"
+                SELECT
+                  id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+                FROM public.processes
+                WHERE (
+                    state_code = 100
+                    OR (
+                        user_id = $1
+                        AND state_code = 0
+                        AND team_id IS NULL
+                        AND review_id IS NULL
+                    )
+                  )
+                  AND json ? 'processDataSet'
+                  AND id = ANY($2)
+                ORDER BY id, version DESC, modified_at DESC NULLS LAST
+                "#,
+                )
+                .bind(scope.actor_user_id)
+                .bind(page_ids)
+                .fetch_all(pool)
+                .await
+            } else if all_states {
+                sqlx::query(
+                    r#"
+                SELECT
+                  id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+                FROM public.processes
+                WHERE json ? 'processDataSet'
+                  AND id = ANY($1)
+                ORDER BY id, version DESC
+                "#,
+                )
+                .bind(page_ids)
+                .fetch_all(pool)
+                .await
+            } else if let Some(user_id) = include_user_id {
+                sqlx::query(
+                    r#"
+                SELECT
+                  id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+                FROM public.processes
+                WHERE (state_code = ANY($1) OR (user_id = $2 AND state_code = 0))
+                  AND json ? 'processDataSet'
+                  AND id = ANY($3)
+                ORDER BY id, version DESC
+                "#,
+                )
+                .bind(state_codes)
+                .bind(user_id)
+                .bind(page_ids)
+                .fetch_all(pool)
+                .await
+            } else {
+                sqlx::query(
+                    r#"
+                SELECT
+                  id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+                FROM public.processes
+                WHERE state_code = ANY($1)
+                  AND json ? 'processDataSet'
+                  AND id = ANY($2)
+                ORDER BY id, version DESC
+                "#,
+                )
+                .bind(state_codes)
+                .bind(page_ids)
+                .fetch_all(pool)
+                .await
+            };
+
+            match page_result {
+                Ok(page_rows) => break page_rows,
+                Err(error) if attempts < PROCESS_FETCH_MAX_ATTEMPTS => {
+                    eprintln!(
+                        "[query_page_retry] name=snapshot.fetch_processes first_id={} last_id={} attempt={} error={error}",
+                        page_ids
+                            .first()
+                            .map_or_else(|| "none".to_owned(), ToString::to_string),
+                        page_ids
+                            .last()
+                            .map_or_else(|| "none".to_owned(), ToString::to_string),
+                        attempts
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        let mut page_selected = Vec::with_capacity(page_ids.len());
+        for row in page_rows {
+            let id = row.try_get::<Uuid, _>("id")?;
+            let version = row.try_get::<String, _>("version")?.trim().to_owned();
+            if selected_versions.get(&id) == Some(&version) && fetched_ids.insert(id) {
+                page_selected.push(row);
+            }
+        }
+        if page_selected.len() != page_ids.len() {
+            let missing = page_ids
+                .iter()
+                .filter(|id| !fetched_ids.contains(id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            return Err(anyhow::anyhow!(
+                "selected process rows changed or disappeared during paged fetch: {}",
+                missing.join(",")
+            ));
+        }
+        println!(
+            "[query_page] name=snapshot.fetch_processes first_id={} last_id={} rows={} elapsed_seconds={:.3}",
+            page_ids
+                .first()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
+            page_ids
+                .last()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
+            page_selected.len(),
+            page_started.elapsed().as_secs_f64()
+        );
+        rows.extend(page_selected);
+    }
 
     let elapsed = query_started.elapsed();
     let level = if elapsed >= SLOW_QUERY_LOG_THRESHOLD {
@@ -6029,43 +6314,84 @@ async fn fetch_flow_meta(
     }
     let query_started = Instant::now();
     let candidate_ids = flow_candidates.iter().copied().collect::<Vec<_>>();
-    let rows = if let Some(scope) = versioned_scope {
-        sqlx::query(
-            r#"
-            SELECT DISTINCT ON (id)
-              id, version, user_id, state_code, team_id, review_id, json
-            FROM public.flows
-            WHERE id = ANY($1)
-              AND (
-                state_code = 100
-                OR (
-                  user_id = $2
-                  AND state_code = 0
-                  AND team_id IS NULL
-                  AND review_id IS NULL
+    // Flow JSON is another WAN-sized response for a full-library build. Keep
+    // each response bounded and retry a page independently so one expired
+    // pooler connection cannot discard the already parsed process inventory.
+    let mut rows = Vec::with_capacity(candidate_ids.len());
+    for page_ids in candidate_ids.chunks(FLOW_FETCH_PAGE_SIZE) {
+        let page_started = Instant::now();
+        let mut attempts = 0_u8;
+        let page_rows = loop {
+            attempts += 1;
+            let page_result = if let Some(scope) = versioned_scope {
+                sqlx::query(
+                    r#"
+                    SELECT DISTINCT ON (id)
+                      id, version, user_id, state_code, team_id, review_id, json
+                    FROM public.flows
+                    WHERE id = ANY($1)
+                      AND (
+                        state_code = 100
+                        OR (
+                          user_id = $2
+                          AND state_code = 0
+                          AND team_id IS NULL
+                          AND review_id IS NULL
+                        )
+                      )
+                    ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+                    "#,
                 )
-              )
-            ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-            "#,
-        )
-        .bind(&candidate_ids)
-        .bind(scope.actor_user_id)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT DISTINCT ON (id)
-              id, version, user_id, state_code, team_id, review_id, json
-            FROM public.flows
-            WHERE id = ANY($1)
-            ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-            "#,
-        )
-        .bind(&candidate_ids)
-        .fetch_all(pool)
-        .await?
-    };
+                .bind(page_ids)
+                .bind(scope.actor_user_id)
+                .fetch_all(pool)
+                .await
+            } else {
+                sqlx::query(
+                    r#"
+                    SELECT DISTINCT ON (id)
+                      id, version, user_id, state_code, team_id, review_id, json
+                    FROM public.flows
+                    WHERE id = ANY($1)
+                    ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+                    "#,
+                )
+                .bind(page_ids)
+                .fetch_all(pool)
+                .await
+            };
+
+            match page_result {
+                Ok(page_rows) => break page_rows,
+                Err(error) if attempts < DATABASE_READ_MAX_ATTEMPTS => {
+                    eprintln!(
+                        "[query_page_retry] name=snapshot.fetch_flow_meta first_id={} last_id={} attempt={} error={error}",
+                        page_ids
+                            .first()
+                            .map_or_else(|| "none".to_owned(), ToString::to_string),
+                        page_ids
+                            .last()
+                            .map_or_else(|| "none".to_owned(), ToString::to_string),
+                        attempts
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        println!(
+            "[query_page] name=snapshot.fetch_flow_meta first_id={} last_id={} rows={} elapsed_seconds={:.3}",
+            page_ids
+                .first()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
+            page_ids
+                .last()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
+            page_rows.len(),
+            page_started.elapsed().as_secs_f64()
+        );
+        rows.extend(page_rows);
+    }
 
     let elapsed = query_started.elapsed();
     let missing_count = candidate_ids.len().saturating_sub(rows.len());
@@ -6981,7 +7307,20 @@ fn parse_positive_number_prefix(text: &str) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-fn classify_flow_kind(flow_json: &Value) -> &'static str {
+fn classify_flow_kind(flow_json: &Value) -> CompiledFlowKind {
+    let type_of_dataset = flow_json
+        .get("flowDataSet")
+        .and_then(|value| value.get("modellingAndValidation"))
+        .and_then(|value| value.get("LCIMethod"))
+        .and_then(|value| value.get("typeOfDataSet"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+    match type_of_dataset {
+        Some("Elementary flow") => return CompiledFlowKind::Elementary,
+        Some("Waste flow") => return CompiledFlowKind::Waste,
+        _ => {}
+    }
+
     let Some(category) = flow_json
         .get("flowDataSet")
         .and_then(|v| v.get("flowInformation"))
@@ -6990,7 +7329,7 @@ fn classify_flow_kind(flow_json: &Value) -> &'static str {
         .and_then(|v| v.get("common:elementaryFlowCategorization"))
         .and_then(|v| v.get("common:category"))
     else {
-        return "product";
+        return CompiledFlowKind::Product;
     };
 
     let category_text = match category {
@@ -7005,8 +7344,8 @@ fn classify_flow_kind(flow_json: &Value) -> &'static str {
     };
 
     match category_text {
-        "Emissions" | "Resources" | "Land use" => "elementary",
-        _ => "product",
+        "Emissions" | "Resources" | "Land use" => CompiledFlowKind::Elementary,
+        _ => CompiledFlowKind::Product,
     }
 }
 
@@ -7070,6 +7409,7 @@ async fn persist_snapshot_metadata(
             "all_states": false,
             "process_states": state_codes,
             "include_user_id": user_id,
+            "include_user_state_codes": [0],
             "selection_mode": scope_summary.selection_mode,
             "request_roots": scope_summary.roots,
             "scope_hash": scope_summary.scope_hash,
@@ -7979,17 +8319,18 @@ mod tests {
         accumulate_finite_factor, add_technosphere_edge, assemble_sparse_payload,
         attach_artifact_lifecycle, biosphere_gross_value, build_compiled_release_evidence,
         build_lcia_factor_coverage, build_review_submit_overlay_graph,
-        candidate_count_bucket_label, collect_source_dataset_references,
+        candidate_count_bucket_label, classify_scope_partition, collect_source_dataset_references,
         compute_review_submit_overlay_source_hash, compute_scope_hash,
         compute_source_fingerprint_from_summary, geo_score, insert_compiled_source_dataset,
-        location_granularity_label, no_provider_failure_reason, normalize_request_roots,
-        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
-        parse_provider_rule_list, resolve_allocation_fraction, resolve_lcia_method_source_row,
-        resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
-        review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
-        source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
-        time_score, unique_supported_direction_by_flow, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_reference_product_exchanges,
+        location_granularity_label, no_provider_failure_reason, nonzero_attributed_demand_amount,
+        normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
+        parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
+        resolve_lcia_method_source_row, resolve_multi_provider, resolve_process_selection,
+        resolve_reference_normalization, review_submit_root_dependency_fingerprint,
+        snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        validate_flow_row_visibility, validate_process_row_visibility,
+        validate_quantitative_reference_exchanges,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -8030,7 +8371,7 @@ mod tests {
             request_roots: Vec::new(),
             process_limit: 0,
             provider_rule: "split_by_process_volume".to_owned(),
-            provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+            provider_candidate_eligibility_mode: "flow_kind_directional_reference".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             allocation_semantics_version: allocation_semantics_version.to_owned(),
@@ -8648,6 +8989,40 @@ mod tests {
     }
 
     #[test]
+    fn owner_partition_only_treats_state_zero_as_private() {
+        let actor = Uuid::new_v4();
+        let mut row = ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: Some(actor),
+            state_code: 0,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json: json!({"processDataSet": {}}),
+        };
+
+        assert_eq!(
+            classify_scope_partition(&row, Some(actor)),
+            ScopeProcessPartition::Private
+        );
+
+        row.state_code = 101;
+        assert_eq!(
+            classify_scope_partition(&row, Some(actor)),
+            ScopeProcessPartition::Public
+        );
+
+        row.state_code = 0;
+        row.user_id = Some(Uuid::new_v4());
+        assert_eq!(
+            classify_scope_partition(&row, Some(actor)),
+            ScopeProcessPartition::Public
+        );
+    }
+
+    #[test]
     fn geo_score_prefers_subnational_match() {
         assert_close(geo_score(Some("CN-BJ"), Some("CN-BJ")), 1.0);
         assert_close(geo_score(Some("CN-BJ"), Some("CN-SH")), 0.85);
@@ -8685,8 +9060,8 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json(&[
-                        ("Input", fixed_flow_id("public-output")),
                         ("Output", Uuid::new_v4()),
+                        ("Input", fixed_flow_id("public-output")),
                     ]),
                 },
             ],
@@ -8810,7 +9185,10 @@ mod tests {
         )
         .expect("parse sparse-zero root");
         assert_eq!(exchanges[2].amount, Some(0.0));
-        assert!(super::nonzero_attributed_input_amount(&exchanges[2]).is_none());
+        assert!(
+            super::nonzero_attributed_demand_amount(&exchanges[2], CompiledFlowKind::Product,)
+                .is_none()
+        );
     }
 
     #[test]
@@ -9689,7 +10067,11 @@ mod tests {
                     team_id: None,
                     review_id: None,
                     modified_at: Some(Utc::now()),
-                    json: process_json_with_metadata(&[("Input", flow_id)], Some("CN-BJ"), None),
+                    json: process_json_with_metadata(
+                        &[("Output", fixed_flow_id("root-volume")), ("Input", flow_id)],
+                        Some("CN-BJ"),
+                        None,
+                    ),
                 },
                 ProcessRow {
                     id: local_provider_id,
@@ -9761,7 +10143,10 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_exchange_locations(
-                        &[("Input", flow_id, Some("GLO"))],
+                        &[
+                            ("Output", fixed_flow_id("root-location"), None),
+                            ("Input", flow_id, Some("GLO")),
+                        ],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9837,7 +10222,10 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
-                        &[("Input", demanded_flow_id)],
+                        &[
+                            ("Output", fixed_flow_id("root-nonref")),
+                            ("Input", demanded_flow_id),
+                        ],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9918,7 +10306,10 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
-                        &[("Input", demanded_flow_id)],
+                        &[
+                            ("Output", fixed_flow_id("root-missing-ref")),
+                            ("Input", demanded_flow_id),
+                        ],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9977,11 +10368,65 @@ mod tests {
     }
 
     #[test]
+    fn request_roots_closure_links_waste_output_to_reference_input_treatment() {
+        let generator_process_id = Uuid::new_v4();
+        let treatment_process_id = Uuid::new_v4();
+        let product_flow_id = fixed_flow_id("generated-product");
+        let waste_flow_id = fixed_flow_id("generated-waste");
+        let generator = ProcessRow {
+            id: generator_process_id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(&[("Output", product_flow_id), ("Output", waste_flow_id)]),
+        };
+        let treatment = ProcessRow {
+            id: treatment_process_id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(&[("Input", waste_flow_id)]),
+        };
+
+        let selected = resolve_process_selection(
+            vec![generator, treatment],
+            false,
+            &[100],
+            None,
+            &[RequestRootProcess::new(
+                generator_process_id,
+                "01.00.000".to_owned(),
+            )],
+            ProviderRule::StrictUniqueProvider,
+            0,
+        )
+        .expect("resolve waste treatment closure");
+
+        assert_eq!(
+            selected
+                .processes
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![generator_process_id, treatment_process_id]
+        );
+    }
+
+    #[test]
     fn no_provider_reason_distinguishes_rejected_non_reference_only() {
         let flow_id = fixed_flow_id("demanded-flow");
         let rejected = super::ProviderOutputCandidate {
             flow_id,
             provider_idx: 1,
+            exchange_direction: ExchangeDirection::Output,
             output_exchange_internal_id: Some("2".to_owned()),
             output_exchange_is_reference: false,
             output_normalized_amount: Some(100.0),
@@ -10480,7 +10925,91 @@ mod tests {
     }
 
     #[test]
-    fn quantitative_reference_rejects_duplicate_input_and_nonpositive_exchange() {
+    fn quantitative_reference_normalization_accepts_ilcd_incoming_reference_flow() {
+        let process_id = Uuid::new_v4();
+        let process_json = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "quantitativeReference": {
+                        "referenceToReferenceFlow": "1"
+                    }
+                }
+            }
+        });
+        let exchanges = [json!({
+            "@dataSetInternalID": "1",
+            "exchangeDirection": "Input",
+            "resultingAmount": "1000"
+        })];
+        let exchange_refs = exchanges.iter().collect::<Vec<_>>();
+
+        let (scale, stats) = resolve_reference_normalization(
+            process_id,
+            &process_json,
+            exchange_refs.as_slice(),
+            NormalizationMode::Strict,
+        )
+        .expect("ILCD permits an incoming product flow as the quantitative reference");
+
+        assert_close(scale, 0.001);
+        assert_eq!(stats.normalized_processes, 1);
+        assert_eq!(stats.missing_reference, 0);
+        assert_eq!(stats.invalid_reference, 0);
+    }
+
+    #[test]
+    fn quantitative_reference_provider_side_and_elementary_exchanges_are_not_provider_demands() {
+        let mut exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id: Uuid::new_v4(),
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            internal_id: Some("1".to_owned()),
+            exchange_id: "reference-input".to_owned(),
+            flow_version: "01.00.000".to_owned(),
+            is_reference_exchange: true,
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "1".to_owned(),
+            location: None,
+        };
+
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Waste),
+            None
+        );
+        exchange.is_reference_exchange = false;
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Waste),
+            None
+        );
+        exchange.direction = Some(ExchangeDirection::Output);
+        exchange.direction_label = "Output".to_owned();
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Waste),
+            Some(1.0)
+        );
+        exchange.direction = Some(ExchangeDirection::Input);
+        exchange.direction_label = "Input".to_owned();
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Product),
+            Some(1.0)
+        );
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Elementary),
+            None
+        );
+        exchange.direction = Some(ExchangeDirection::Output);
+        exchange.direction_label = "Output".to_owned();
+        assert_eq!(
+            nonzero_attributed_demand_amount(&exchange, CompiledFlowKind::Elementary),
+            None
+        );
+    }
+
+    #[test]
+    fn quantitative_reference_rejects_duplicate_invalid_direction_and_nonpositive_exchange() {
         let process_id = Uuid::new_v4();
         let process_json = json!({
             "processDataSet": {
@@ -10515,7 +11044,6 @@ mod tests {
         for exchange in [
             json!({
                 "@dataSetInternalID": "1",
-                "exchangeDirection": "Input",
                 "resultingAmount": "1"
             }),
             json!({
@@ -10543,7 +11071,7 @@ mod tests {
     }
 
     #[test]
-    fn quantitative_reference_must_point_to_product_flow() {
+    fn quantitative_reference_accepts_resolved_flow_kinds_in_both_directions() {
         let flow_id = Uuid::new_v4();
         let process = test_process_meta(0, None, None);
         let exchange = ParsedExchange {
@@ -10562,22 +11090,29 @@ mod tests {
             location: None,
         };
 
-        validate_reference_product_exchanges(
-            std::slice::from_ref(&exchange),
-            std::slice::from_ref(&process),
-            &HashMap::from([(flow_id, CompiledFlowKind::Product)]),
-        )
-        .expect("product reference");
-        assert!(
-            validate_reference_product_exchanges(
+        let mut incoming_exchange = exchange.clone();
+        incoming_exchange.direction = Some(ExchangeDirection::Input);
+        incoming_exchange.direction_label = "Input".to_owned();
+        for kind in [
+            CompiledFlowKind::Product,
+            CompiledFlowKind::Waste,
+            CompiledFlowKind::Elementary,
+        ] {
+            validate_quantitative_reference_exchanges(
                 std::slice::from_ref(&exchange),
                 std::slice::from_ref(&process),
-                &HashMap::from([(flow_id, CompiledFlowKind::Elementary)]),
+                &HashMap::from([(flow_id, kind)]),
             )
-            .is_err()
-        );
+            .expect("resolved output reference");
+            validate_quantitative_reference_exchanges(
+                std::slice::from_ref(&incoming_exchange),
+                std::slice::from_ref(&process),
+                &HashMap::from([(flow_id, kind)]),
+            )
+            .expect("resolved input reference");
+        }
         assert!(
-            validate_reference_product_exchanges(
+            validate_quantitative_reference_exchanges(
                 std::slice::from_ref(&exchange),
                 std::slice::from_ref(&process),
                 &HashMap::new(),

@@ -207,7 +207,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 - `--process-limit 100`：先做小样本调试 snapshot（正式跑不要加）
 - `--process-states all`：取消 `state_code` 过滤，按所有 `processes` 构建 snapshot
-- `--include-user-id <uuid>`：在 `process_states` 过滤基础上，额外包含该 `user_id` 的 process（并集）
+- `--include-user-id <uuid>`：在 `process_states` 过滤基础上，额外包含该 `user_id` 的 `state_code=0` process（并集）；不会带入该账号处于评审、撤回等其他状态的数据
 - `--root-process <uuid@version>`：显式给出一个或多个 request roots，只构建从这些 roots 可达的 public+private process 闭包
 - `--no-lcia`：先不构建 C 矩阵（只跑到 LCI）
 - `--method-id <uuid> --method-version <ver>`：指定 LCIA 方法

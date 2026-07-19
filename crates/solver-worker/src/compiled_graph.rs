@@ -8,6 +8,7 @@ use crate::graph_types::ScopeProcessPartition;
 #[serde(rename_all = "snake_case")]
 pub enum CompiledFlowKind {
     Product,
+    Waste,
     Elementary,
 }
 
@@ -81,7 +82,9 @@ pub enum CompiledProviderCandidateEligibility {
     #[default]
     Unknown,
     AcceptedReferenceOutput,
+    AcceptedReferenceInput,
     RejectedNonReferenceOutput,
+    RejectedNonReferenceInput,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -266,11 +266,11 @@ evidence/coverage.json
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
 - `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
 
-Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
+Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。该 reference 可以指向已解析 Product、Waste 或 Elementary 的 `Input`/`Output` exchange，参考量必须 finite 且严格大于零。Reference exchange 只归一化当前 process column，不作为上游 provider demand；Product Output 与 Waste Input 可成为 eligible provider，Elementary 永不进入 technosphere provider matching。非 reference co-product exchange 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
 
 Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`。Legacy compatibility 只允许两个有界 fallback：仅 scalar `allocations.allocation = {}` 按 undeclared/fraction `1` 处理；单个 targetless full allocation 仅在 Process 的物理 `Output` 恰好为 `1`、该 Output 的唯一有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时推断 target 为当前 reference、fraction 为 `1`。空数组、`[{}]`、multiple-output / multiple-entry targetless、非 full targetless fraction、无效 Output ID、无法命中 quantitative reference 以及其他无效声明均 fail closed。
 
-当前语义通过 build config 的 `allocation_semantics_version = tidas-quantitative-reference-v2` 记录，并进入 source fingerprint，避免复用 v1 或更早语义 snapshot。
+当前语义通过 build config 的 `allocation_semantics_version = tidas-quantitative-reference-v4` 记录，并进入 source fingerprint，避免复用缺少当前 ILCD reference 与 flow-kind directional-provider 语义的旧 snapshot。
 
 显式零或稀疏零 allocation 得到的 Input 不展开 provider closure、不产生 provider-gap diagnostics，也不写入 `A`；零 attributed elementary exchange 也不写入 `B`，不参与 LCIA direction 与 factor-coverage evidence。它只表示该 exchange 对当前 quantitative reference 没有 attributed burden。
 
@@ -285,17 +285,17 @@ snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linkin
 
 Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 
-- `candidate_summary`：eligible provider candidate 数量分布。自动 provider linking 默认只把 reference output 计入 eligible candidate；同 flow 的非 reference output 通过 `provider_decision_diagnostics.candidate_eligibility_counts` 和逐条 candidate evidence 解释为 rejected diagnostics。
+- `candidate_summary`：eligible provider candidate 数量分布。自动 provider linking 只把 Product reference Output 与 Waste reference Input 计入 eligible candidate；同 flow 的非 reference candidate 通过 `provider_decision_diagnostics.candidate_eligibility_counts` 和逐条 candidate evidence 解释为 rejected diagnostics。
 - `resolution_summary`：resolved strategy 与 unresolved reason 分布。
 - `geography_summary`：地理层级、strategy × geography tier、supply-region anchor 来源、exchange location 覆盖情况和 location 粒度分布。
 - `volume_weight_summary`：基于 `annualSupplyOrProductionVolume` 的权重数据可用性与 fallback-to-one 情况。
 - `gap_summary`：no-provider gap 的 top flows 与 top processes。
 
-`provider_decision_diagnostics` 中与 reference-output eligibility 相关的字段包括：
+`provider_decision_diagnostics` 中与 directional-reference eligibility 相关的字段包括：
 
-- `candidate_eligibility_counts`：provider output evidence 按 `accepted_reference_output`、`rejected_non_reference_output`、`unknown` 统计。
-- `rejected_non_reference_output_count`：同 flow 但未进入自动 provider linking 的 non-reference output 数量。
-- `unresolved_reason_counts.rejected_non_reference_only`：某 input flow 只有 non-reference same-flow outputs、没有 eligible reference-output provider。
+- `candidate_eligibility_counts`：provider evidence 按 `accepted_reference_output`、`accepted_reference_input`、`rejected_non_reference_output`、`rejected_non_reference_input`、`unknown` 统计。
+- `rejected_non_reference_output_count`：兼容字段，统计未进入自动 provider linking 的 non-reference candidate；逐条 eligibility 用 direction 区分 Input/Output。
+- `unresolved_reason_counts.rejected_non_reference_only`：某 technosphere demand 只有 non-reference same-flow candidates、没有 eligible directional-reference provider。
 
 `geography_summary` 中的 canonical 字段包括：
 

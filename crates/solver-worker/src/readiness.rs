@@ -874,8 +874,12 @@ fn provider_candidate_eligibility_label(
         CompiledProviderCandidateEligibility::AcceptedReferenceOutput => {
             "accepted_reference_output"
         }
+        CompiledProviderCandidateEligibility::AcceptedReferenceInput => "accepted_reference_input",
         CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
             "rejected_non_reference_output"
+        }
+        CompiledProviderCandidateEligibility::RejectedNonReferenceInput => {
+            "rejected_non_reference_input"
         }
     }
     .to_owned()
