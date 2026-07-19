@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-17
+lastReviewedAt: 2026-07-18
 lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
-lastReviewedNote: "Reviewed frozen TIDAS source closure evidence and Calculation Bundle export ownership for Issue #127."
+lastReviewedNote: "Reviewed frozen TIDAS source closure evidence, Calculation Bundle export ownership, and ILCD quantitative-reference direction semantics."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

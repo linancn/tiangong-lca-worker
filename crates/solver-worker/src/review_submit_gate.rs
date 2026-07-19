@@ -581,18 +581,24 @@ fn check_flow_semantics(
 
     let mut mismatches = Vec::new();
     for decision in &graph.provider_decisions {
-        if by_flow_id.get(&decision.flow_id) != Some(&CompiledFlowKind::Product) {
+        if !matches!(
+            by_flow_id.get(&decision.flow_id),
+            Some(CompiledFlowKind::Product | CompiledFlowKind::Waste)
+        ) {
             mismatches.push(json!({
-                "kind": "provider_decision_non_product_flow",
+                "kind": "provider_decision_non_technosphere_flow",
                 "consumer_idx": decision.consumer_idx,
                 "flow_id": decision.flow_id
             }));
         }
     }
     for edge in &graph.technosphere_edges {
-        if by_flow_id.get(&edge.flow_id) != Some(&CompiledFlowKind::Product) {
+        if !matches!(
+            by_flow_id.get(&edge.flow_id),
+            Some(CompiledFlowKind::Product | CompiledFlowKind::Waste)
+        ) {
             mismatches.push(json!({
-                "kind": "technosphere_non_product_flow",
+                "kind": "technosphere_non_technosphere_flow",
                 "provider_idx": edge.provider_idx,
                 "consumer_idx": edge.consumer_idx,
                 "flow_id": edge.flow_id
@@ -609,9 +615,12 @@ fn check_flow_semantics(
         }
     }
     for factor in &input.payload.characterization_factors {
-        if by_flow_idx.get(&factor.col) == Some(&CompiledFlowKind::Product) {
+        if matches!(
+            by_flow_idx.get(&factor.col),
+            Some(CompiledFlowKind::Product | CompiledFlowKind::Waste)
+        ) {
             mismatches.push(json!({
-                "kind": "lcia_factor_on_product_flow",
+                "kind": "lcia_factor_on_technosphere_flow",
                 "impact_idx": factor.row,
                 "flow_idx": factor.col
             }));
@@ -834,8 +843,10 @@ fn reference_is_valid(
     let Some(exchange) = matching_exchanges.next() else {
         return false;
     };
+    let Some(_direction) = normalized_direction(&exchange.direction) else {
+        return false;
+    };
     if matching_exchanges.next().is_some()
-        || normalized_direction(&exchange.direction).as_deref() != Some("output")
         || !parse_numeric_text(exchange.amount.as_deref()).is_ok_and(|amount| amount > epsilon)
     {
         return false;
@@ -845,7 +856,7 @@ fn reference_is_valid(
         graph
             .flows
             .iter()
-            .any(|flow| flow.flow_id == exchange.flow_id && flow.kind == CompiledFlowKind::Product)
+            .any(|flow| flow.flow_id == exchange.flow_id)
     })
 }
 
@@ -1238,9 +1249,34 @@ mod tests {
     }
 
     #[test]
-    fn blocks_quantitative_reference_that_is_not_an_output() {
+    fn accepts_quantitative_reference_that_is_an_input() {
         let mut input = clean_input();
+        let waste_flow_id = Uuid::new_v4();
+        input.payload.flow_count += 1;
+        input
+            .compiled_graph
+            .as_mut()
+            .expect("compiled graph")
+            .flows
+            .push(CompiledFlow {
+                flow_idx: 2,
+                flow_id: waste_flow_id,
+                kind: CompiledFlowKind::Waste,
+            });
+        input.process_records[1].exchanges[0].flow_id = waste_flow_id;
         input.process_records[1].exchanges[0].direction = "Input".to_owned();
+
+        let report = verify_review_submit_gate(&input);
+
+        assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
+        assert!(!has_blocker(&report, "missing_or_zero_reference"));
+        assert!(report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_quantitative_reference_with_invalid_direction() {
+        let mut input = clean_input();
+        input.process_records[1].exchanges[0].direction = "Sideways".to_owned();
 
         let report = verify_review_submit_gate(&input);
 
@@ -1249,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_quantitative_reference_to_non_product_flow() {
+    fn accepts_quantitative_reference_to_elementary_flow() {
         let mut input = clean_input();
         let elementary_flow_id = input
             .compiled_graph
@@ -1266,8 +1302,9 @@ mod tests {
 
         let report = verify_review_submit_gate(&input);
 
-        assert!(has_blocker(&report, "missing_or_zero_reference"));
-        assert!(!report.metrics.probe.factorization_checked);
+        assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
+        assert!(!has_blocker(&report, "missing_or_zero_reference"));
+        assert!(report.metrics.probe.factorization_checked);
     }
 
     #[test]

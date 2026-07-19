@@ -63,7 +63,9 @@ product input demand
 - 它们能够提供同一 product/reference flow；
 - 它们处在同一个已选定的供应区域 tier 内。
 
-自动 provider linking 默认只把 process 的 quantitative reference output 视为可供应的 product/reference flow。也就是说，Output exchange 的 `@dataSetInternalID` 必须等于该 process 的 `quantitativeReference.referenceToReferenceFlow`。同 `flow_id` 的非 reference output 只作为 rejected candidate diagnostics 暴露，不自动参与 provider set。
+自动 provider linking 按 flow kind 识别供应侧：Product flow 只接受 quantitative-reference `Output`，Waste flow 只接受 quantitative-reference `Input`；Elementary flow 永不进入 provider set。同 `flow_id` 的非 reference exchange 只作为 rejected candidate diagnostics 暴露，不自动参与 provider set。
+
+ILCD 允许 quantitative reference 指向任一 `Input` 或 `Output`，包括 incoming product flow 与 other flow。Reference exchange 始终定义并归一化 process column，且自身不作为 provider demand。只有 Product `Output` 与 Waste `Input` 授予 provider eligibility；Elementary reference 仅参与归一化与 directional biosphere inventory，不进入 technosphere provider matching。参考 flow metadata 必须可解析，参考量必须 finite 且严格大于零。
 
 在这个范围内，`annualSupplyOrProductionVolume` 可以作为 provider 间相对供应规模的结构化信号。它表达的是 share weight，不是额外的技术投入。
 
@@ -141,17 +143,17 @@ annual volume 只决定一条 demand 在多个 provider 之间如何分摊，不
 
 ## 建模 Link 逻辑
 
-calculator 对每条 product input exchange 执行以下 link 决策。
+calculator 对每条 technosphere demand（Product Input 或 Waste Output）执行以下 link 决策。
 
 ### Step 1: 确定 product/reference flow
 
-从 input exchange 中确定被需求的 product/reference flow `f`。provider candidates 必须能够提供同一 `f`。默认自动链接规则下，只有 reference output 能证明一个 process 可供应该 product/reference flow；非 reference output 即使同 `flow_id`，也不会因为地理位置更近或存在 allocation fraction 而成为 provider。
+从 demand exchange 中确定被需求的 flow `f` 及其 flow kind。provider candidates 必须能够提供同一 `f`：Product demand 由 reference Output 供应，Waste demand 由 reference Input treatment 供应。非 reference exchange 即使同 `flow_id`，也不会因为地理位置更近或存在 allocation fraction 而成为 provider。
 
-如果没有可用 reference-output provider，calculator 不应构造虚拟 provider，也不应回退到任意非 reference output。该 exchange 应进入 provider-link diagnostics，由数据修复、补充 provider，或显式 market/co-product process 建模解决。
+如果没有可用的 flow-kind directional reference provider，calculator 不应构造虚拟 provider，也不应回退到任意非 reference exchange。该 demand 应进入 provider-link diagnostics，由数据修复、补充 provider，或显式 market/co-product/treatment process 建模解决。
 
 ### Step 2: 确定 model-consistent provider scope
 
-在同一 product/reference flow 的 reference-output providers 中，calculator 先判断是否存在与 consumer 同 `model_id` 的 provider。
+在同一 flow 的 eligible directional-reference providers 中，calculator 先判断是否存在与 consumer 同 `model_id` 的 provider。
 
 如果存在，同 model providers 构成后续 regional supply mix 选择的 provider scope。这个 scope 表示当前 lifecycle model 已经显式给出该 input demand 的内部供应来源候选。
 
@@ -292,7 +294,7 @@ normalized exchange amount = calculation amount * reference_scale * selected all
 
 Allocation 可以缩放 input、output 或 elementary exchange 的归属量，但不授予 provider eligibility。一个非 reference output 即使有 amount 与 allocation fraction，也只说明该 exchange 参与当前 Process 的分摊核算；它不等于该 Process 可以自动供应这个 output flow 的 product input demand。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v2`，并将其纳入 source fingerprint 以阻止 v1 或更早语义 snapshot reuse。Coverage schema 仍为 `snapshot_coverage.v2`，但 allocation summary 增加 `legacy_empty_allocation_as_undeclared_count` 与 `legacy_single_output_target_inferred_count` 两个 default-zero 兼容计数，使 fallback 使用情况可审计；旧 artifact 缺少字段时按 `0` 读取。
+Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v4`，并将其纳入 source fingerprint，以阻止复用未实现 ILCD 任意 Input/Output reference 与 flow-kind directional provider 语义的旧 snapshot。Coverage schema 仍为 `snapshot_coverage.v2`，allocation summary 中的 `legacy_empty_allocation_as_undeclared_count` 与 `legacy_single_output_target_inferred_count` 两个 default-zero 兼容计数继续使 fallback 使用情况可审计；旧 artifact 缺少字段时按 `0` 读取。
 
 ## 与显式 Market Process 的关系
 

@@ -69,7 +69,9 @@ Provider-link 的结果直接决定：
 一个完整 TIDAS Process 只代表其 `quantitativeReference.referenceToReferenceFlow`：
 
 - 一个 Process revision 在 snapshot 中只对应一个 process index 和一个矩阵列；
-- 只有 quantitative reference output 能声明该 Process 可供应对应 product flow；
+- quantitative reference 可以按 [ILCD 1.1 Process 格式](https://eplca.jrc.ec.europa.eu/LCDN/downloads/ILCD_Format_1.1_Documentation/ILCD_ProcessDataSet.html) 指向 `Input` 或 `Output` exchange，Product、Waste、Elementary flow 均可作为定量基准；flow metadata 必须可解析，参考量必须 finite、严格大于零；
+- quantitative-reference exchange 自身只负责归一化当前 process column，不作为 provider demand；
+- provider eligibility 独立按 flow kind 与方向判定：Product `Output`、Waste `Input` 可成为 provider，Elementary 永不成为 technosphere provider；
 - 同一 Process 中的非 reference co-product output 只保留为数据集内容和 rejected candidate evidence，不生成额外矩阵列，也不成为 provider；
 - 如果 co-product `B` 需要作为 root 或 provider 参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 TIDAS Process。worker 不从原 Process 临时派生不完整 Process。
 
@@ -94,29 +96,30 @@ normalized exchange amount = calculation amount * reference_scale * selected all
 - 单个 targetless allocation entry 只有在 Process 的物理 `Output` exchange 恰好为 `1`、该 Output 具有唯一有效 internal ID 且该 ID 等于 quantitative reference 时才可推断为当前 reference；其 fraction 必须是 canonical full `100`，或 legacy string 精确为 `"100%"`，推断后的 selected fraction 为 `1`；
 - 除上述两个有界 legacy 例外外，空数组、坏结构、缺失 target/fraction、多 entry targetless、multiple-output targetless、重复或未知 target、非有限/越界 fraction、非 full targetless fraction、总和不闭合都 fail closed，不能在 lenient 路径回退为 `1`。
 
-selected fraction 为显式零或稀疏零的 Input 不进入 request-root provider closure，不计入 provider matching / missing-provider diagnostics，也不写入 `A`；零 attributed elementary exchange 同样不写入 `B`，也不参与 LCIA direction / factor-coverage evidence。否则会把不属于当前 quantitative reference 的零负担分支误判成供应链或 LCIA 缺口。
+selected fraction 为显式零或稀疏零的 Input 不进入 request-root provider closure，不计入 provider matching / missing-provider diagnostics，也不写入 `A`。quantitative reference 本身为 Input 时，无论 selected fraction 如何，它都只作为 process-column 归一化依据，同样不作为 provider demand。零 attributed elementary exchange 不写入 `B`，也不参与 LCIA direction / factor-coverage evidence。否则会把功能流或不属于当前 quantitative reference 的零负担分支误判成供应链或 LCIA 缺口。
 
 Exchange allocation 与下文的 multi-provider share 是两个独立阶段：前者决定 consumer column 的 attributed amount，后者只决定该 amount 在 eligible provider rows 之间的分布。
 
 ## Provider 候选与 eligibility
 
-候选集合按 product/reference `flow_id` 建立：
+候选集合按 technosphere `flow_id` 与 flow kind 建立：
 
 - 遍历 process exchanges；
-- `Output` exchange 进入同 `flow_id` 的 provider candidate set；
-- candidate 保留 output internal id、reference-output 状态、normalized amount、allocation state 等诊断信息。
+- Product `Output` 与 Waste `Input` exchange 进入同 `flow_id` 的 provider candidate set；
+- candidate 保留 exchange direction/internal id、reference 状态、normalized amount、allocation state 等诊断信息。
 
-只有 reference output 是 eligible provider：
+只有方向与 flow kind 匹配、且命中 process quantitative reference 的 exchange 是 eligible provider：
 
 ```text
-Output.@dataSetInternalID == process.quantitativeReference.referenceToReferenceFlow
+Product Output.@dataSetInternalID == process.quantitativeReference.referenceToReferenceFlow
+Waste   Input.@dataSetInternalID == process.quantitativeReference.referenceToReferenceFlow
 ```
 
-同 `flow_id` 的非 reference output 不参与自动 provider linking。它只作为 rejected candidate diagnostics 暴露，failure reason 可表现为 `rejected_non_reference_only`。
+同 `flow_id` 的非 reference candidate 不参与自动 provider linking。它只作为 rejected candidate diagnostics 暴露，failure reason 可表现为 `rejected_non_reference_only`。Elementary exchange 不进入候选集合。
 
 ## Input edge 决策
 
-对每条有 amount 的 `Input` exchange：
+对每条有 amount 的 technosphere demand（Product `Input` 或 Waste `Output`，且不是 quantitative-reference exchange）：
 
 1. 计入 `input_edges_total`。
 2. 查找同 `flow_id` 的 eligible providers。
@@ -150,7 +153,7 @@ provider_rule = split_by_process_volume
 该规则的 multi-provider 决策顺序是：
 
 ```text
-eligible same-flow reference-output providers
+eligible same-flow directional-reference providers
   -> same-model provider subset, if available
   -> supply-region anchor
   -> best non-empty geography tier
@@ -166,7 +169,7 @@ eligible same-flow reference-output providers
 
 这一步是硬过滤，不是权重加成。它发生在 geography tier selection 之前，因此同 model provider 子集存在时，不同 model provider 不会因为地理更近或 annual volume 更大而进入本条 input demand 的 provider mix。
 
-运行时这样处理的语义是：同一 `model_id` 内同时存在需求该 flow 的 consumer input 与供应该 flow 的 reference-output provider，表示模型已经在 product-flow 层面显式给出内部供应关系候选。这里的“显式”不是 exchange-level provider pointer，也不是现实交易证据；它表示 model 内部已经建模出可承担该 input demand 的供给侧 process。
+运行时这样处理的语义是：同一 `model_id` 内同时存在需求该 flow 的 consumer demand 与供应该 flow 的 directional-reference provider，表示模型已经在 technosphere-flow 层面显式给出内部供应关系候选。这里的“显式”不是 exchange-level provider pointer，也不是现实交易证据；它表示 model 内部已经建模出可承担该 demand 的供给侧 process。
 
 ### 2. Supply-region anchor
 
@@ -246,4 +249,4 @@ Provider decisions 至少应支持解释：
 
 Matrix-readiness、diagnostics export 和人工 debug 应消费这些 provider decisions，而不是在外部重写 provider resolution。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v2`。该字段进入 source fingerprint，因此 v2 compatibility semantics 不会复用 v1 或更早语义构建的 snapshot。Coverage schema 保持 `snapshot_coverage.v2`，但 `allocation` summary 增加上述两个 default-zero 兼容计数；旧 artifact 缺少这些字段时按 `0` 读取。
+Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v4`。该字段进入 source fingerprint，因此不会复用缺少 ILCD 任意 Input/Output reference 与 flow-kind directional provider 语义的旧 snapshot。Coverage schema 保持 `snapshot_coverage.v2`，`allocation` summary 中上述两个 default-zero 兼容计数继续用于审计；旧 artifact 缺少这些字段时按 `0` 读取。

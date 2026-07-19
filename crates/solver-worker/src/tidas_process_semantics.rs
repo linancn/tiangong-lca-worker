@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 
 /// Versioned TIDAS process semantics applied by worker calculations.
-pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = "tidas-quantitative-reference-v2";
+pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = "tidas-quantitative-reference-v4";
 
 // TIDAS `Perc` permits at most three decimal places. Allow a one-unit difference
 // in the least-significant percentage digit when checking a closed allocation
@@ -243,7 +243,7 @@ mod tests {
     fn semantics_version_is_stable() {
         assert_eq!(
             TIDAS_PROCESS_SEMANTICS_VERSION,
-            "tidas-quantitative-reference-v2"
+            "tidas-quantitative-reference-v4"
         );
     }
 

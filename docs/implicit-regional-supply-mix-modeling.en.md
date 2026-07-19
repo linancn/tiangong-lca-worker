@@ -62,7 +62,9 @@ The method does not require every provider to be a complete market participant i
 - the providers supply the same product/reference flow;
 - the providers belong to the selected supply-region tier.
 
-Automatic provider linking treats only a process's quantitative reference output as evidence that the process supplies the product/reference flow. In practice, the Output exchange `@dataSetInternalID` must equal the process `quantitativeReference.referenceToReferenceFlow`. Same-`flow_id` non-reference outputs are exposed as rejected candidate diagnostics and do not automatically enter the provider set.
+Automatic provider linking is flow-kind directional: a Product flow requires a quantitative-reference `Output`, a Waste flow requires a quantitative-reference `Input`, and an Elementary flow never enters the provider set. Same-`flow_id` non-reference exchanges are exposed as rejected candidate diagnostics and do not automatically enter the provider set.
+
+ILCD permits a quantitative reference to identify any `Input` or `Output`, including an incoming product flow or other flow. The reference exchange always defines and normalizes the process column and is never itself a provider demand. Only Product `Output` and Waste `Input` references grant provider eligibility; an Elementary reference contributes only normalization and directional biosphere inventory, never technosphere provider matching. Flow metadata must resolve, and the reference amount must remain finite and strictly positive.
 
 Within that scope, `annualSupplyOrProductionVolume` can be used as a structured signal for relative provider supply scale. It is a share weight, not an additional technical input.
 
@@ -140,17 +142,17 @@ Annual volume only determines how one demand is split across providers. It must 
 
 ## Modeling Link Logic
 
-For each product input exchange, the calculator applies the following link decision.
+For each technosphere demand (Product Input or Waste Output), the calculator applies the following link decision.
 
 ### Step 1: Determine the Product/Reference Flow
 
-The calculator identifies the demanded product/reference flow `f` from the input exchange. Provider candidates must provide the same `f`. Under the default automatic linking rule, only a reference output proves that a process supplies that product/reference flow. A non-reference output with the same `flow_id` does not become a provider only because it is geographically closer or has an allocation fraction.
+The calculator identifies flow `f` and its flow kind from the demand exchange. Provider candidates must provide the same `f`: a Product demand is supplied by a reference Output, while a Waste demand is supplied by a reference Input treatment. A non-reference exchange with the same `flow_id` does not become a provider only because it is geographically closer or has an allocation fraction.
 
-If no reference-output provider is available, the calculator should not fabricate one and should not fall back to arbitrary non-reference outputs. The exchange should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market/co-product process modeling.
+If no flow-kind directional reference provider is available, the calculator should not fabricate one and should not fall back to arbitrary non-reference exchanges. The demand should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market/co-product/treatment process modeling.
 
 ### Step 2: Determine the Model-Consistent Provider Scope
 
-Among same-product/reference-flow reference-output providers, the calculator first checks whether any provider belongs to the same `model_id` as the consumer.
+Among same-flow eligible directional-reference providers, the calculator first checks whether any provider belongs to the same `model_id` as the consumer.
 
 If such providers exist, they form the provider scope for the later regional supply mix decision. That scope means the current lifecycle model has explicitly provided internal supplier candidates for this input demand.
 
@@ -291,7 +293,7 @@ All other targetless declarations remain ambiguous and fail closed, including mu
 
 Allocation may scale attributed input, output, or elementary exchange amounts, but it does not grant provider eligibility. A non-reference output with an amount and allocation fraction only shows that the exchange participates in the current Process's allocation accounting; it does not mean that the Process can automatically supply product input demand for that output flow.
 
-Snapshot build config records `allocation_semantics_version = tidas-quantitative-reference-v2` and includes it in the source fingerprint so snapshots built under v1 or earlier semantics are not reused. The coverage schema remains `snapshot_coverage.v2`, with two additive default-zero compatibility counters in its allocation summary: `legacy_empty_allocation_as_undeclared_count` and `legacy_single_output_target_inferred_count`. Older artifacts that omit them deserialize both as `0`.
+Snapshot build config records `allocation_semantics_version = tidas-quantitative-reference-v4` and includes it in the source fingerprint so snapshots built without arbitrary ILCD Input/Output references and flow-kind directional providers are not reused. The coverage schema remains `snapshot_coverage.v2`, with two additive default-zero compatibility counters in its allocation summary: `legacy_empty_allocation_as_undeclared_count` and `legacy_single_output_target_inferred_count`. Older artifacts that omit them deserialize both as `0`.
 
 ## Relationship to an Explicit Market Process
 
