@@ -24,8 +24,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-20
-lastReviewedCommit: 4001a5f367ba1eb3a2405e71042d1fe0987acf88
+lastReviewedAt: 2026-07-21
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

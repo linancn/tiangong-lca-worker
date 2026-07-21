@@ -30,9 +30,9 @@ use solver_worker::calculation_evidence::{
     LcaCalculationEvidence, LcaMethodFactorSourceSnapshot, LciaFactorCoverageCounts,
     LciaFactorCoverageEvidence, LciaMethodFactorCoverage, LciaUncharacterizedEvidenceArtifact,
     LciaUncharacterizedRecord, MISSING_FACTOR_SEMANTICS, PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
-    PublicOwnerDraftBuildRequest, UNCHARACTERIZED_ARTIFACT_FORMAT, ValidatedPublicOwnerDraftScope,
-    canonical_json_bytes, sha256_bytes, validate_calculation_evidence,
-    validate_public_owner_draft_build_request,
+    PublicOwnerDraftBuildRequest, RELEASE_METHOD_IDENTITIES, UNCHARACTERIZED_ARTIFACT_FORMAT,
+    ValidatedPublicOwnerDraftScope, canonical_json_bytes, sha256_bytes,
+    validate_calculation_evidence, validate_public_owner_draft_build_request,
 };
 use solver_worker::compiled_graph::{
     CompiledAllocationStats, CompiledBalanceResolution, CompiledBiosphereEdge,
@@ -259,6 +259,19 @@ struct MethodRow {
     json: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedLciaMethodIdentity {
+    method_id: Uuid,
+    method_version: String,
+    artifact_locator_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLciaMethodRow {
+    identity: ResolvedLciaMethodIdentity,
+    json: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceDatasetReference {
     dataset_type: CompiledReleaseSourceDatasetType,
@@ -422,7 +435,7 @@ struct MethodSelection {
     method_count: i64,
     factor_count: i64,
     source_evidence: Option<LcaMethodFactorSourceSnapshot>,
-    rows: Vec<MethodRow>,
+    rows: Vec<ResolvedLciaMethodRow>,
     static_bundle: Option<VerifiedStaticLciaBundle>,
 }
 
@@ -2245,6 +2258,104 @@ fn sorted_json(value: &Value) -> Value {
     }
 }
 
+fn reviewed_lcia_identity_matches(
+    method_id: Uuid,
+    method_version: &str,
+    artifact_locator_id: Uuid,
+) -> bool {
+    RELEASE_METHOD_IDENTITIES.iter().any(
+        |(reviewed_method_id, reviewed_version, reviewed_locator_id)| {
+            *reviewed_version == method_version
+                && Uuid::parse_str(reviewed_method_id)
+                    .expect("reviewed LCIA method id must be a valid UUID")
+                    == method_id
+                && Uuid::parse_str(reviewed_locator_id)
+                    .expect("reviewed LCIA artifact locator must be a valid UUID")
+                    == artifact_locator_id
+        },
+    )
+}
+
+fn reviewed_lcia_artifact_locator(
+    method_id: Uuid,
+    method_version: &str,
+) -> anyhow::Result<Option<Uuid>> {
+    let mut matches = RELEASE_METHOD_IDENTITIES.iter().filter_map(
+        |(reviewed_method_id, reviewed_version, reviewed_locator_id)| {
+            if *reviewed_version == method_version
+                && Uuid::parse_str(reviewed_method_id)
+                    .expect("reviewed LCIA method id must be a valid UUID")
+                    == method_id
+            {
+                Some(
+                    Uuid::parse_str(reviewed_locator_id)
+                        .expect("reviewed LCIA artifact locator must be a valid UUID"),
+                )
+            } else {
+                None
+            }
+        },
+    );
+    let locator = matches.next();
+    if matches.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "reviewed LCIA method identity is ambiguous: method={method_id}@{method_version}"
+        ));
+    }
+    Ok(locator)
+}
+
+fn resolve_database_lcia_method_row(row: MethodRow) -> anyhow::Result<ResolvedLciaMethodRow> {
+    let method_id =
+        source_dataset_document_id(CompiledReleaseSourceDatasetType::LciaMethod, &row.json)?;
+    if method_id != row.id && !reviewed_lcia_identity_matches(method_id, &row.version, row.id) {
+        return Err(anyhow::anyhow!(
+            "database LCIA method identity alias is not reviewed: method={method_id}@{} locator={}",
+            row.version,
+            row.id
+        ));
+    }
+    Ok(ResolvedLciaMethodRow {
+        identity: ResolvedLciaMethodIdentity {
+            method_id,
+            method_version: row.version,
+            artifact_locator_id: row.id,
+        },
+        json: row.json,
+    })
+}
+
+fn validate_unique_database_lcia_method_identities(
+    rows: &[ResolvedLciaMethodRow],
+) -> anyhow::Result<()> {
+    let mut locators = BTreeMap::<(Uuid, String), Uuid>::new();
+    for row in rows {
+        let key = (row.identity.method_id, row.identity.method_version.clone());
+        if let Some(existing_locator) =
+            locators.insert(key.clone(), row.identity.artifact_locator_id)
+        {
+            return Err(anyhow::anyhow!(
+                "database LCIA method identity resolves more than once: method={}@{} locators={existing_locator},{}",
+                key.0,
+                key.1,
+                row.identity.artifact_locator_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_database_lcia_method_rows(
+    rows: Vec<MethodRow>,
+) -> anyhow::Result<Vec<ResolvedLciaMethodRow>> {
+    let rows = rows
+        .into_iter()
+        .map(resolve_database_lcia_method_row)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    validate_unique_database_lcia_method_identities(&rows)?;
+    Ok(rows)
+}
+
 async fn resolve_method_identity(
     pool: &PgPool,
     cli: &Cli,
@@ -2307,7 +2418,7 @@ async fn resolve_method_identity(
         });
     }
 
-    let rows = fetch_selected_method_rows(pool, cli).await?;
+    let rows = resolve_database_lcia_method_rows(fetch_selected_method_rows(pool, cli).await?)?;
     if rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found"));
     }
@@ -2328,10 +2439,14 @@ async fn resolve_method_identity(
     })?;
     let source_evidence = None;
 
+    let selected_identity = cli
+        .method_id
+        .and_then(|_| rows.first().map(|row| &row.identity));
+
     Ok(MethodSelection {
         has_lcia: true,
-        method_id: cli.method_id,
-        method_version: cli.method_version.clone(),
+        method_id: selected_identity.map(|identity| identity.method_id),
+        method_version: selected_identity.map(|identity| identity.method_version.clone()),
         method_count,
         factor_count,
         source_evidence,
@@ -2343,6 +2458,9 @@ async fn resolve_method_identity(
 async fn fetch_selected_method_rows(pool: &PgPool, cli: &Cli) -> anyhow::Result<Vec<MethodRow>> {
     let rows = match cli.method_id {
         Some(method_id) => {
+            let method_version = cli.method_version.as_deref().unwrap_or_default();
+            let artifact_locator_id =
+                reviewed_lcia_artifact_locator(method_id, method_version)?.unwrap_or(method_id);
             sqlx::query(
                 r#"
                 SELECT id, version, json
@@ -2350,8 +2468,8 @@ async fn fetch_selected_method_rows(pool: &PgPool, cli: &Cli) -> anyhow::Result<
                 WHERE id = $1 AND version = $2::bpchar
                 "#,
             )
-            .bind(method_id)
-            .bind(cli.method_version.clone().unwrap_or_default())
+            .bind(artifact_locator_id)
+            .bind(method_version)
             .fetch_all(pool)
             .await?
         }
@@ -2530,6 +2648,7 @@ fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<Impac
 
     let mut out = Vec::with_capacity(method.rows.len());
     for row in &method.rows {
+        let identity = &row.identity;
         let mut factor_map: HashMap<Uuid, f64> = HashMap::new();
         let mut directional_factor_map: HashMap<(Uuid, ExchangeDirection), f64> = HashMap::new();
         for factor in method_factor_items(&row.json) {
@@ -2552,23 +2671,23 @@ fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<Impac
                     &mut directional_factor_map,
                     (flow_id, direction),
                     value,
-                    row.id,
+                    identity.method_id,
                 )?;
             }
             if value.abs() <= f64::EPSILON {
                 continue;
             }
-            accumulate_finite_factor(&mut factor_map, flow_id, value, row.id)?;
+            accumulate_finite_factor(&mut factor_map, flow_id, value, identity.method_id)?;
         }
         factor_map.retain(|_, value| value.abs() > f64::EPSILON);
 
         out.push(ImpactFactorSet {
-            impact_id: row.id,
-            method_version: row.version.clone(),
-            artifact_locator_id: row.id,
-            impact_key: format!("method:{}", row.id),
+            impact_id: identity.method_id,
+            method_version: identity.method_version.clone(),
+            artifact_locator_id: identity.artifact_locator_id,
+            impact_key: format!("method:{}", identity.method_id),
             impact_name: parse_lcia_method_name(&row.json)
-                .unwrap_or_else(|| format!("LCIA Method {}", row.id)),
+                .unwrap_or_else(|| format!("LCIA Method {}", identity.method_id)),
             unit: parse_lcia_method_unit(&row.json).unwrap_or_else(|| "unknown".to_owned()),
             factors_by_flow: factor_map,
             factors_by_flow_direction: directional_factor_map,
@@ -8363,22 +8482,25 @@ mod tests {
         AllocationFallbackState, AllocationFractionState, AllocationMode, Cli,
         DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
         LciaExchangeObservation, MethodSelection, MultiProviderDecision, NormalizationMode,
-        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, SnapshotBuildConfig,
-        SnapshotSelectionMode, SourceDatasetReference, SourceSnapshotSummary,
-        accumulate_finite_factor, add_technosphere_edge, assemble_sparse_payload,
-        attach_artifact_lifecycle, biosphere_gross_value, build_compiled_release_evidence,
-        build_lcia_factor_coverage, build_review_submit_overlay_graph,
-        candidate_count_bucket_label, collect_source_dataset_references,
-        compute_review_submit_overlay_source_hash, compute_scope_hash,
-        compute_source_fingerprint_from_summary, geo_score, insert_compiled_source_dataset,
-        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
-        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
-        parse_provider_rule_list, resolve_allocation_fraction, resolve_lcia_method_source_row,
-        resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
-        review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
-        source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
-        time_score, unique_supported_direction_by_flow, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_quantitative_references,
+        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, ResolvedLciaMethodIdentity,
+        ResolvedLciaMethodRow, SnapshotBuildConfig, SnapshotSelectionMode, SourceDatasetReference,
+        SourceSnapshotSummary, accumulate_finite_factor, add_technosphere_edge,
+        assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
+        build_compiled_release_evidence, build_lcia_factor_coverage,
+        build_review_submit_overlay_graph, candidate_count_bucket_label,
+        collect_source_dataset_references, compute_review_submit_overlay_source_hash,
+        compute_scope_hash, compute_source_fingerprint_from_summary, geo_score,
+        insert_compiled_source_dataset, load_impact_factor_sets, location_granularity_label,
+        no_balancing_reference_failure_reason, normalize_request_roots, parse_number,
+        parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, resolve_allocation_fraction, resolve_database_lcia_method_row,
+        resolve_database_lcia_method_rows, resolve_lcia_method_source_row, resolve_multi_provider,
+        resolve_process_selection, resolve_reference_normalization,
+        review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
+        snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        validate_flow_row_visibility, validate_process_row_visibility,
+        validate_quantitative_references, validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -12436,6 +12558,116 @@ mod tests {
             resolve_lcia_method_source_row(Uuid::new_v4(), method_version, locator_id, &rows)
                 .expect_err("unreviewed locator/document identity drift must fail closed");
         assert!(mismatch.to_string().contains("identity alias mismatch"));
+    }
+
+    #[test]
+    fn database_lcia_method_loading_normalizes_the_reviewed_locator_alias() {
+        let method_id = Uuid::parse_str("503699e0-eca9-4089-8bf8-e0f49c93e578").expect("method id");
+        let locator_id =
+            Uuid::parse_str("9ec743ea-6b00-400d-a53b-61547a3fc03c").expect("locator id");
+        let method_version = "01.01.000";
+        let document = json!({
+            "LCIAMethodDataSet": {
+                "LCIAMethodInformation": {
+                    "dataSetInformation": {
+                        "common:UUID": method_id.to_string()
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            reviewed_lcia_artifact_locator(method_id, method_version)
+                .expect("reviewed identity lookup"),
+            Some(locator_id)
+        );
+        let rows = resolve_database_lcia_method_rows(vec![super::MethodRow {
+            id: locator_id,
+            version: method_version.to_owned(),
+            json: document,
+        }])
+        .expect("reviewed database alias should normalize");
+        assert_eq!(rows[0].identity.method_id, method_id);
+        assert_eq!(rows[0].identity.method_version, method_version);
+        assert_eq!(rows[0].identity.artifact_locator_id, locator_id);
+
+        let impacts = load_impact_factor_sets(&MethodSelection {
+            has_lcia: true,
+            method_id: None,
+            method_version: None,
+            method_count: 1,
+            factor_count: 0,
+            source_evidence: None,
+            rows,
+            static_bundle: None,
+        })
+        .expect("impact factors should retain normalized identity");
+        assert_eq!(impacts[0].impact_id, method_id);
+        assert_eq!(impacts[0].method_version, method_version);
+        assert_eq!(impacts[0].artifact_locator_id, locator_id);
+        assert_eq!(impacts[0].impact_key, format!("method:{method_id}"));
+    }
+
+    #[test]
+    fn database_lcia_method_loading_accepts_self_identity_and_rejects_unreviewed_aliases() {
+        let method_id = Uuid::new_v4();
+        let method_version = "01.00.000";
+        let method_document = |document_id: Uuid| {
+            json!({
+                "LCIAMethodDataSet": {
+                    "LCIAMethodInformation": {
+                        "dataSetInformation": {
+                            "common:UUID": document_id.to_string()
+                        }
+                    }
+                }
+            })
+        };
+
+        let resolved = resolve_database_lcia_method_row(super::MethodRow {
+            id: method_id,
+            version: method_version.to_owned(),
+            json: method_document(method_id),
+        })
+        .expect("self-identical database method should remain valid");
+        assert_eq!(resolved.identity.method_id, method_id);
+        assert_eq!(resolved.identity.artifact_locator_id, method_id);
+
+        let mismatch = resolve_database_lcia_method_row(super::MethodRow {
+            id: Uuid::new_v4(),
+            version: method_version.to_owned(),
+            json: method_document(method_id),
+        })
+        .expect_err("unreviewed database locator alias must fail closed");
+        assert!(mismatch.to_string().contains("alias is not reviewed"));
+    }
+
+    #[test]
+    fn database_lcia_method_loading_rejects_duplicate_canonical_identities() {
+        let method_id = Uuid::new_v4();
+        let method_version = "01.00.000";
+        let rows = vec![
+            ResolvedLciaMethodRow {
+                identity: ResolvedLciaMethodIdentity {
+                    method_id,
+                    method_version: method_version.to_owned(),
+                    artifact_locator_id: Uuid::new_v4(),
+                },
+                json: json!({}),
+            },
+            ResolvedLciaMethodRow {
+                identity: ResolvedLciaMethodIdentity {
+                    method_id,
+                    method_version: method_version.to_owned(),
+                    artifact_locator_id: Uuid::new_v4(),
+                },
+                json: json!({}),
+            },
+        ];
+
+        let duplicate = validate_unique_database_lcia_method_identities(&rows)
+            .expect_err("duplicate canonical LCIA identities must fail closed");
+        assert!(duplicate.to_string().contains("resolves more than once"));
     }
 
     #[test]
