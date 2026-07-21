@@ -22,8 +22,8 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
+lastReviewedAt: 2026-07-21
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

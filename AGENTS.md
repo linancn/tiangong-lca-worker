@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-20
-lastReviewedCommit: d5c784169496114ef9c77eae61e6937fe6926923
+lastReviewedAt: 2026-07-21
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
 lastReviewedNote: "Reviewed worker ownership, validation, and governance boundaries for exact Flow revision binding and closure pruning in Issue #135; repo boundaries are unchanged."
 related:
   - .docpact/config.yaml

@@ -22,9 +22,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-20
-lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
-lastReviewedNote: "Reviewed shared job/result/status semantics for Issue #133; lifecycle eligibility remains outside the worker numerical report contract."
+lastReviewedAt: 2026-07-21
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedNote: "Documented database-backed LCIA canonical method identity and artifact locator normalization for Issue #137."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -189,6 +189,8 @@ For this scope, `lca.solve_one.request.v2`, `lca.solve_all_unit.request.v2`, and
 
 `lcia_result.package_build` 不是普通求解 API 的用户请求类型，而是 data product manager command 创建的后台构建任务。payload 必须来自数据库/Edge 的 service-role command 边界，包含 `buildId`、`requestedBy`、published-only `inputManifest`、`inputManifestHash`、`coverageMode`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`。worker 只接受 `inputManifest.processes` 中 `stateCode/state_code` 为 `100..199` 的已发布过程；不会纳入 draft data。
 
+该 package build 的 legacy database-backed LCIA 路径在读取 factors 前必须把每个方法归一化为 `(canonical method UUID, exact version, artifact locator UUID)`：文档内 `common:UUID` 是 matrix axis、calculation evidence、result key 和 source-closure identity，`public.lciamethods.id` 只作为精确读取该文档的 artifact locator。Locator 与文档 UUID 相同时可直接使用；不相同时必须与 reviewed `RELEASE_METHOD_IDENTITIES` 中的完整三元组精确匹配，否则在矩阵构建前 fail closed。单方法选择若使用 canonical UUID，worker 可通过同一 reviewed mapping 定位 locator，但写入 snapshot/result 的仍是 canonical UUID。
+
 On success, the worker records a terminal `worker_jobs` result with:
 
 - `result_json.lcaJobId`
@@ -260,7 +262,7 @@ evidence/coverage.json
 - process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit、raw direction/amount/coefficient 与 signed normalized pivot；inventory axis逐 exchange 保存 raw/signed/normalized coefficient、allocation target 与 selected fraction。Snapshot flow axis 使用 `(Flow UUID, resolved version)`；同一 UUID 的多个实际引用 revision 可共存并获得独立连续 `flow_idx`，未被最终 process closure 引用的历史 revision 不进入矩阵或 bundle。
 - 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 及 `source_datasets` 写入 snapshot artifact。source closure 从本次 snapshot 精确选择的 Process/Flow revision 和已审 LCIA Method identity 出发，递归解析 Contact、Flow Property、Source、Unit Group 与 LCIA Method reference；显式版本只允许 exact match，省略的 support version 选择最高 fixed-width ILCD version，缺失、歧义、无效 UUID/version 或同 identity/version 内容漂移均 fail closed。Process/Flow 仍受 snapshot scope 约束；被这些可发布根文档精确引用的 support document 按 UUID/version 展开，不在 solve 时重新查询。
 - 若 exchange 的 Flow 引用省略 `@version`，release evidence 使用本次 snapshot 实际选择并冻结的 Flow metadata version；若引用显式给出版本，则 worker 精确查询并保持该版本绑定，且 unit metadata 只允许来自同一版本，不能静默回退到另一版本。同一 UUID 的不同显式 revision 作为不同 identity 参与 provider lookup 与 flow axis；任何缺失或不可见的 exact revision 都在 snapshot compilation 时 fail closed。
-- 已审 LCIA static-cache 中方法 UUID 与 artifact locator 不同的已知 alias，只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。25 个方法任一 identity/locator/document UUID 不一致都 fail closed。
+- 已审 LCIA 方法中 UUID 与 artifact locator 不同的已知 alias，无论来自 static cache 还是 legacy database-backed package build，都只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。25 个方法任一 identity/version/locator/document UUID 不符合 reviewed mapping 都 fail closed。
 - technosphere evidence 使用中性字段固化 `dependent_process_idx`、`residual_exchange_internal_id`、`balancing_process_idx`、`balancing_reference_exchange_internal_id`、residual/reference coefficient、routing weight、activity requirement、Flow UUID/version 和 location；每个最终 balancing reference port 一条 edge。
 - directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。

@@ -33,8 +33,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-20
-lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedAt: 2026-07-21
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
 lastReviewedNote: "Reviewed review-submit gate ownership for Issue #133; the runtime family and crate map are unchanged."
 related:
   - ../../AGENTS.md
