@@ -16,8 +16,15 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
     calculation_evidence::RELEASE_METHOD_IDENTITIES,
-    db::AppState,
+    db::{
+        AppState, ScopeClosureSnapshotBuilderArgs, ScopeClosureSnapshotBuilderMode,
+        ScopeClosureSnapshotFacts, fetch_scope_closure_snapshot_facts,
+        run_scope_closure_snapshot_builder, scope_closure_evidence_hash,
+    },
+    graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
+    readiness::{MatrixReadinessReport, ReadinessStatus},
+    snapshot_artifacts::ScopeClosureSnapshotBinding,
     worker_jobs::WorkerJobProgress,
 };
 
@@ -1629,10 +1636,21 @@ pub struct ScopeClosureEvidence {
     pub source_fingerprint: String,
     pub resolution_map_hash: String,
     pub closure_bundle_hash: String,
-    pub snapshot_id: Uuid,
-    pub snapshot_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_artifact_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_index_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_build_contract_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_format: Option<String>,
     pub report_artifact_manifest_hash: String,
-    pub evidence_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1677,6 +1695,333 @@ struct TidasBatchValidation {
     describe: Value,
     final_event: Value,
     issue_events: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureDiscoveredProcess {
+    id: Uuid,
+    version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureSnapshotDiscovery {
+    schema_version: String,
+    process_axis: Vec<ScopeClosureDiscoveredProcess>,
+    readiness: MatrixReadinessReport,
+}
+
+async fn scan_and_validate_scope<P: ScopeClosureProvider>(
+    provider: &P,
+    pool: &PgPool,
+    worker_job_id: Uuid,
+    requested_scope: &RequestedScopeManifest,
+) -> anyhow::Result<(ScopeClosureScan, TidasBatchValidation)> {
+    let mut scan = collect_scope_closure(provider, requested_scope).await?;
+    let validation =
+        run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
+    merge_tidas_validation_issues(&mut scan, &validation.issue_events);
+    scan.issues.sort_by_key(canonical_value);
+    Ok((scan, validation))
+}
+
+fn build_closure_bundle(
+    input: &ScopeClosureWorkerInput,
+    validation: &TidasBatchValidation,
+    scan: &ScopeClosureScan,
+) -> anyhow::Result<(Vec<u8>, String)> {
+    let resolution_map = build_resolution_map(&scan.edges, &scan.omitted_version_resolutions);
+    let closure_bundle = json!({
+        "schemaVersion": "lcia.scope-closure-bundle.v1",
+        "requestedScopeHash": input.requested_scope_hash,
+        "policyFingerprint": input.policy_fingerprint,
+        "dataSnapshotToken": input.data_snapshot_token,
+        "validatorScannerFingerprint": input.expected_validator_scanner_fingerprint,
+        "tidasValidation": validation,
+        "scan": scan,
+        "resolutionMap": resolution_map,
+    });
+    let bytes = canonical_json_bytes(&closure_bundle)?;
+    let hash = sha256_hex(&bytes);
+    Ok((bytes, hash))
+}
+
+fn closure_scan_allows_numerical_snapshot(scan: &ScopeClosureScan) -> bool {
+    scan.complete && scan.blocker_codes().is_empty()
+}
+
+fn scope_process_axis(scope: &RequestedScopeManifest) -> Vec<RequestRootProcess> {
+    scope
+        .processes
+        .iter()
+        .map(|process| RequestRootProcess::new(process.id, process.version.clone()))
+        .collect()
+}
+
+fn scope_closure_snapshot_binding(
+    effective_scope: &RequestedScopeManifest,
+    data_snapshot_token: &str,
+    closure_bundle_hash: &str,
+) -> anyhow::Result<ScopeClosureSnapshotBinding> {
+    Ok(ScopeClosureSnapshotBinding {
+        schema_version: "lcia.scope-closure-snapshot-binding.v1".to_owned(),
+        effective_scope_hash: canonical_json_sha256(&serde_json::to_value(effective_scope)?)?,
+        data_snapshot_token: data_snapshot_token.to_owned(),
+        closure_bundle_hash: closure_bundle_hash.to_owned(),
+    })
+}
+
+fn parse_scope_closure_snapshot_discovery(
+    discovery: Option<&Value>,
+) -> anyhow::Result<ScopeClosureSnapshotDiscovery> {
+    let mut discovery: ScopeClosureSnapshotDiscovery = serde_json::from_value(
+        discovery
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("scope closure discovery omitted its result"))?,
+    )?;
+    if discovery.schema_version != "lcia.scope-closure-snapshot-discovery.v1" {
+        return Err(anyhow::anyhow!(
+            "unsupported scope closure discovery schema: {}",
+            discovery.schema_version
+        ));
+    }
+    discovery.process_axis.sort_by(|left, right| {
+        (left.id, left.version.as_str()).cmp(&(right.id, right.version.as_str()))
+    });
+    if discovery.process_axis.is_empty()
+        || discovery
+            .process_axis
+            .iter()
+            .any(|process| process.version.trim().is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "scope closure discovery returned an empty or invalid process axis"
+        ));
+    }
+    let original_len = discovery.process_axis.len();
+    discovery
+        .process_axis
+        .dedup_by(|left, right| left.id == right.id && left.version == right.version);
+    if discovery.process_axis.len() != original_len {
+        return Err(anyhow::anyhow!(
+            "scope closure discovery returned duplicate process identities"
+        ));
+    }
+    Ok(discovery)
+}
+
+fn freeze_discovered_process_axis(
+    requested_scope: &RequestedScopeManifest,
+    process_axis: &[ScopeClosureDiscoveredProcess],
+) -> anyhow::Result<RequestedScopeManifest> {
+    let discovered = process_axis
+        .iter()
+        .map(|process| (process.id, process.version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let missing_roots = requested_scope
+        .processes
+        .iter()
+        .filter(|process| !discovered.contains(&(process.id, process.version.as_str())))
+        .map(|process| format!("{}@{}", process.id, process.version))
+        .collect::<Vec<_>>();
+    if !missing_roots.is_empty() {
+        return Err(anyhow::anyhow!(
+            "scope closure discovery omitted administrative process roots: {}",
+            missing_roots.join(",")
+        ));
+    }
+    let mut frozen = requested_scope.clone();
+    frozen.processes = process_axis
+        .iter()
+        .map(|process| RequestedIdentity {
+            id: process.id,
+            version: process.version.clone(),
+        })
+        .collect();
+    frozen.process_manifest_hash = Some(canonical_json_sha256(&json!({
+        "processes": frozen.processes,
+    }))?);
+    Ok(frozen)
+}
+
+fn add_process_axis_drift_issue(
+    scan: &mut ScopeClosureScan,
+    frozen_axis: &[RequestRootProcess],
+    effective_scope: &RequestedScopeManifest,
+) -> anyhow::Result<()> {
+    let frozen = frozen_axis
+        .iter()
+        .map(|process| (process.process_id, process.process_version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let observed = effective_scope
+        .processes
+        .iter()
+        .map(|process| (process.id, process.version.as_str()))
+        .collect::<BTreeSet<_>>();
+    if frozen == observed {
+        return Ok(());
+    }
+    let details = json!({
+        "missing": frozen
+            .difference(&observed)
+            .map(|(id, version)| format!("{id}@{version}"))
+            .collect::<Vec<_>>(),
+        "unexpected": observed
+            .difference(&frozen)
+            .map(|(id, version)| format!("{id}@{version}"))
+            .collect::<Vec<_>>(),
+    });
+    scan.issues.push(ClosureIssue {
+        issue_key: format!(
+            "scope_closure_process_axis_drift:{}",
+            canonical_json_sha256(&details)?
+        ),
+        severity: "error".to_owned(),
+        blocking: true,
+        issue_code: "scope_closure_process_axis_drift".to_owned(),
+        source: None,
+        json_path: None,
+        reference_role: Some("signed_flow_process_axis".to_owned()),
+        requested_target_type: Some("processes".to_owned()),
+        requested_target_id: None,
+        requested_target_version: None,
+        message: "The administrative rescan did not preserve the frozen signed-flow process axis."
+            .to_owned(),
+        suggested_action: Some(
+            "Repair the frozen release references or provider closure before retrying.".to_owned(),
+        ),
+        occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: "scope_closure_process_axis_drift".to_owned(),
+            source: None,
+            json_path: None,
+            reference_role: Some("signed_flow_process_axis".to_owned()),
+            details,
+        }],
+        affected_roots: scan.roots.clone(),
+        affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+        witness_path: Vec::new(),
+    });
+    Ok(())
+}
+
+fn merge_matrix_readiness_blockers(
+    scan: &mut ScopeClosureScan,
+    readiness: &MatrixReadinessReport,
+) -> anyhow::Result<()> {
+    if readiness.status == ReadinessStatus::Passed && readiness.blockers.is_empty() {
+        return Ok(());
+    }
+    for blocker in &readiness.blockers {
+        let details = json!({
+            "readinessSchemaVersion": readiness.schema_version,
+            "nextAction": readiness.next_action,
+            "finding": blocker,
+        });
+        scan.issues.push(ClosureIssue {
+            issue_key: format!(
+                "matrix_readiness:{}:{}",
+                blocker.code,
+                canonical_json_sha256(&details)?
+            ),
+            severity: "error".to_owned(),
+            blocking: true,
+            issue_code: format!("matrix_readiness_{}", blocker.code),
+            source: None,
+            json_path: None,
+            reference_role: Some("numerical_snapshot_readiness".to_owned()),
+            requested_target_type: None,
+            requested_target_id: None,
+            requested_target_version: None,
+            message: blocker.message.clone(),
+            suggested_action: Some(readiness.next_action.clone()),
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: format!("matrix_readiness_{}", blocker.code),
+                source: None,
+                json_path: None,
+                reference_role: Some("numerical_snapshot_readiness".to_owned()),
+                details,
+            }],
+            affected_roots: scan.roots.clone(),
+            affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+            witness_path: Vec::new(),
+        });
+    }
+    if readiness.status == ReadinessStatus::Failed && readiness.blockers.is_empty() {
+        scan.issues.push(ClosureIssue {
+            issue_key: "matrix_readiness_failed_without_blockers".to_owned(),
+            severity: "error".to_owned(),
+            blocking: true,
+            issue_code: "matrix_readiness_failed_without_blockers".to_owned(),
+            source: None,
+            json_path: None,
+            reference_role: Some("numerical_snapshot_readiness".to_owned()),
+            requested_target_type: None,
+            requested_target_id: None,
+            requested_target_version: None,
+            message: "Matrix readiness failed without a machine-readable blocker.".to_owned(),
+            suggested_action: Some(readiness.next_action.clone()),
+            occurrence_count: 1,
+            occurrences: Vec::new(),
+            affected_roots: scan.roots.clone(),
+            affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+            witness_path: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+fn administrative_only_evidence(
+    source_fingerprint: String,
+    resolution_map_hash: String,
+    closure_bundle_hash: String,
+    report_artifact_manifest_hash: String,
+) -> ScopeClosureEvidence {
+    ScopeClosureEvidence {
+        schema_version: "lcia.scope-closure-evidence.v2".to_owned(),
+        source_fingerprint,
+        resolution_map_hash,
+        closure_bundle_hash,
+        snapshot_id: None,
+        snapshot_hash: None,
+        snapshot_artifact_id: None,
+        snapshot_index_sha256: None,
+        snapshot_build_contract_hash: None,
+        artifact_format: None,
+        report_artifact_manifest_hash,
+        evidence_hash: None,
+    }
+}
+
+fn evidence_from_snapshot_facts(
+    source_fingerprint: String,
+    resolution_map_hash: String,
+    closure_bundle_hash: String,
+    report_artifact_manifest_hash: String,
+    facts: &ScopeClosureSnapshotFacts,
+) -> ScopeClosureEvidence {
+    let evidence_hash = scope_closure_evidence_hash(
+        source_fingerprint.as_str(),
+        resolution_map_hash.as_str(),
+        closure_bundle_hash.as_str(),
+        facts,
+    );
+    ScopeClosureEvidence {
+        schema_version: "lcia.scope-closure-evidence.v2".to_owned(),
+        source_fingerprint,
+        resolution_map_hash,
+        closure_bundle_hash,
+        snapshot_id: Some(facts.snapshot_id),
+        snapshot_hash: Some(facts.snapshot_hash.clone()),
+        snapshot_artifact_id: Some(facts.snapshot_artifact_id),
+        snapshot_index_sha256: Some(facts.snapshot_index_sha256.clone()),
+        snapshot_build_contract_hash: Some(facts.snapshot_build_contract_hash.clone()),
+        artifact_format: Some(facts.artifact_format.clone()),
+        report_artifact_manifest_hash,
+        evidence_hash: Some(evidence_hash),
+    }
 }
 
 /// Executes a leased closure job and atomically projects its terminal result.
@@ -1780,7 +2125,13 @@ pub async fn execute_scope_closure_job(
         lease_token,
         lease_seconds,
     );
-    let mut scan = collect_scope_closure(&provider, &input.requested_scope).await?;
+    let (mut scan, mut validation) = scan_and_validate_scope(
+        &provider,
+        &state.pool,
+        worker_job_id,
+        &input.requested_scope,
+    )
+    .await?;
 
     progress
         .heartbeat(
@@ -1796,9 +2147,6 @@ pub async fn execute_scope_closure_job(
             })),
         )
         .await?;
-    let validation =
-        run_tidas_batch_validation_cached(&state.pool, worker_job_id, &scan.documents).await?;
-    merge_tidas_validation_issues(&mut scan, &validation.issue_events);
 
     progress
         .heartbeat(
@@ -1816,77 +2164,86 @@ pub async fn execute_scope_closure_job(
         .await?;
     scan.issues.sort_by_key(canonical_value);
 
-    progress
-        .heartbeat(
-            "validate_link_readiness",
-            0.72,
-            Some(json!({
-                "closureCheckId": closure_check_id,
-                "progressCounters": {
-                    "scanned": scan.documents.len(),
-                    "total": scan.documents.len(),
-                    "unit": "datasets"
-                },
-            })),
+    let mut effective_scope =
+        build_effective_scope_manifest(&input.requested_scope, &scan.documents);
+    let mut frozen_process_axis = scope_process_axis(&effective_scope);
+
+    if closure_scan_allows_numerical_snapshot(&scan) {
+        let (_, administrative_bundle_hash) = build_closure_bundle(&input, &validation, &scan)?;
+        let discovery_binding = scope_closure_snapshot_binding(
+            &effective_scope,
+            input.data_snapshot_token.as_str(),
+            administrative_bundle_hash.as_str(),
+        )?;
+        progress
+            .heartbeat(
+                "discover_signed_flow_providers",
+                0.72,
+                Some(json!({
+                    "closureCheckId": closure_check_id,
+                    "progressCounters": {
+                        "scanned": frozen_process_axis.len(),
+                        "total": frozen_process_axis.len(),
+                        "unit": "administrativeProcessRoots"
+                    },
+                })),
+            )
+            .await?;
+        let discovery_execution = run_scope_closure_snapshot_builder(
+            state,
+            deterministic_uuid_from_hash(administrative_bundle_hash.as_str())?,
+            frozen_process_axis.as_slice(),
+            &ScopeClosureSnapshotBuilderArgs {
+                mode: ScopeClosureSnapshotBuilderMode::Discovery,
+                binding: serde_json::to_value(discovery_binding)?,
+                data_snapshot: input.data_snapshot_manifest.clone(),
+            },
         )
         .await?;
-    let effective_scope = build_effective_scope_manifest(&input.requested_scope, &scan.documents);
+        let discovery = parse_scope_closure_snapshot_discovery(
+            discovery_execution.scope_closure_discovery.as_ref(),
+        )?;
+        let final_requested_scope =
+            freeze_discovered_process_axis(&input.requested_scope, &discovery.process_axis)?;
+        frozen_process_axis = scope_process_axis(&final_requested_scope);
+
+        progress
+            .heartbeat(
+                "scan_discovered_provider_processes",
+                0.79,
+                Some(json!({
+                    "closureCheckId": closure_check_id,
+                    "progressCounters": {
+                        "scanned": 0,
+                        "total": frozen_process_axis.len(),
+                        "unit": "frozenProcessAxis"
+                    },
+                })),
+            )
+            .await?;
+        (scan, validation) = scan_and_validate_scope(
+            &provider,
+            &state.pool,
+            worker_job_id,
+            &final_requested_scope,
+        )
+        .await?;
+        effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
+        add_process_axis_drift_issue(&mut scan, frozen_process_axis.as_slice(), &effective_scope)?;
+        merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
+        scan.issues.sort_by_key(canonical_value);
+    }
+
+    let (closure_bundle_bytes, closure_bundle_hash) =
+        build_closure_bundle(&input, &validation, &scan)?;
     let source_fingerprint = source_fingerprint(&scan.documents)?;
     let resolution_map = build_resolution_map(&scan.edges, &scan.omitted_version_resolutions);
     let resolution_map_hash = canonical_json_sha256(&resolution_map)?;
-    let closure_bundle = json!({
-        "schemaVersion": "lcia.scope-closure-bundle.v1",
-        "requestedScopeHash": input.requested_scope_hash,
-        "policyFingerprint": input.policy_fingerprint,
-        "dataSnapshotToken": input.data_snapshot_token,
-        "validatorScannerFingerprint": input.expected_validator_scanner_fingerprint,
-        "tidasValidation": validation,
-        "scan": scan,
-        "resolutionMap": resolution_map,
-    });
-    let closure_bundle_bytes = canonical_json_bytes(&closure_bundle)?;
-    let closure_bundle_hash = sha256_hex(&closure_bundle_bytes);
-    let snapshot_id = deterministic_uuid_from_hash(&closure_bundle_hash)?;
-    let snapshot = json!({
-        "schemaVersion": "lcia.scope-closure-snapshot.v1",
-        "snapshotId": snapshot_id,
-        "dataSnapshotToken": input.data_snapshot_token,
-        "effectiveScope": effective_scope,
-        "sourceFingerprint": source_fingerprint,
-        "resolutionMapHash": resolution_map_hash,
-        "closureBundleHash": closure_bundle_hash,
-    });
-    let snapshot_bytes = canonical_json_bytes(&snapshot)?;
-    let snapshot_hash = sha256_hex(&snapshot_bytes);
     let issue_jsonl = build_issue_jsonl(&scan.issues)?;
     let xlsx_report = build_xlsx_report(closure_check_id, &scan.issues)?;
 
-    let mut artifacts = vec![
-        prepare_artifact(
-            "closure_bundle",
-            "closure-bundle-v1.json",
-            "application/json",
-            closure_bundle_bytes,
-        ),
-        prepare_artifact(
-            "closure_snapshot",
-            "closure-snapshot-v1.json",
-            "application/json",
-            snapshot_bytes,
-        ),
-        prepare_artifact(
-            "closure_issues_jsonl",
-            "closure-issues-v1.jsonl",
-            "application/x-ndjson",
-            issue_jsonl,
-        ),
-        prepare_artifact(
-            "closure_report_xlsx",
-            "closure-report-v1.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            xlsx_report,
-        ),
-    ];
+    let mut artifacts =
+        prepare_closure_content_artifacts(closure_bundle_bytes, issue_jsonl, xlsx_report);
     artifacts.sort_by(|left, right| {
         left.descriptor
             .artifact_type
@@ -1924,26 +2281,85 @@ pub async fn execute_scope_closure_job(
         .get("closure_report_xlsx")
         .copied()
         .ok_or_else(|| anyhow::anyhow!("closure XLSX report artifact was not persisted"))?;
+    let closure_bundle_artifact_id = persisted
+        .get("closure_bundle")
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("closure bundle artifact was not persisted"))?;
     let report_artifact_manifest_hash =
         report_artifact_manifest_hash(&state.pool, report_artifact_id).await?;
-    let evidence_without_hash = json!({
-        "schemaVersion": "lcia.scope-closure-evidence.v1",
-        "sourceFingerprint": source_fingerprint,
-        "resolutionMapHash": resolution_map_hash,
-        "closureBundleHash": closure_bundle_hash,
-        "snapshotId": snapshot_id,
-        "snapshotHash": snapshot_hash,
-    });
-    let evidence_hash = canonical_json_sha256(&evidence_without_hash)?;
-    let evidence = ScopeClosureEvidence {
-        schema_version: "lcia.scope-closure-evidence.v1".to_owned(),
-        source_fingerprint,
-        resolution_map_hash,
-        closure_bundle_hash,
-        snapshot_id,
-        snapshot_hash,
-        report_artifact_manifest_hash,
-        evidence_hash,
+    let mut blocker_codes = scan.blocker_codes();
+    if !scan.complete {
+        blocker_codes.push("scope_closure_scan_incomplete".to_owned());
+        blocker_codes.sort();
+        blocker_codes.dedup();
+    }
+    let status = if scan.complete && blocker_codes.is_empty() {
+        "passed"
+    } else {
+        "blocked"
+    };
+    let scan_completeness = if scan.complete {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    let (evidence, snapshot_artifact_id) = if status == "passed" {
+        progress
+            .heartbeat(
+                "build_bound_numerical_snapshot",
+                0.9,
+                Some(json!({
+                    "closureCheckId": closure_check_id,
+                    "progressCounters": {
+                        "scanned": 0,
+                        "total": frozen_process_axis.len(),
+                        "unit": "frozenProcessAxis"
+                    },
+                })),
+            )
+            .await?;
+        let binding = scope_closure_snapshot_binding(
+            &effective_scope,
+            input.data_snapshot_token.as_str(),
+            closure_bundle_hash.as_str(),
+        )?;
+        let requested_snapshot_id = deterministic_uuid_from_hash(closure_bundle_hash.as_str())?;
+        let built = run_scope_closure_snapshot_builder(
+            state,
+            requested_snapshot_id,
+            frozen_process_axis.as_slice(),
+            &ScopeClosureSnapshotBuilderArgs {
+                mode: ScopeClosureSnapshotBuilderMode::Build,
+                binding: serde_json::to_value(&binding)?,
+                data_snapshot: input.data_snapshot_manifest.clone(),
+            },
+        )
+        .await?;
+        let facts = fetch_scope_closure_snapshot_facts(
+            state,
+            built.resolved_snapshot_id,
+            &binding,
+            frozen_process_axis.as_slice(),
+        )
+        .await?;
+        let evidence = evidence_from_snapshot_facts(
+            source_fingerprint,
+            resolution_map_hash,
+            closure_bundle_hash,
+            report_artifact_manifest_hash,
+            &facts,
+        );
+        (evidence, Some(facts.snapshot_artifact_id))
+    } else {
+        (
+            administrative_only_evidence(
+                source_fingerprint,
+                resolution_map_hash,
+                closure_bundle_hash,
+                report_artifact_manifest_hash,
+            ),
+            None,
+        )
     };
 
     progress
@@ -1960,17 +2376,6 @@ pub async fn execute_scope_closure_job(
             })),
         )
         .await?;
-    let blocker_codes = scan.blocker_codes();
-    let status = if blocker_codes.is_empty() {
-        "passed"
-    } else {
-        "blocked"
-    };
-    let scan_completeness = if scan.complete {
-        "complete"
-    } else {
-        "incomplete"
-    };
     let result_summary = json!({
         "schemaVersion": "lcia.scope-closure-summary.v1",
         "documentCount": scan.documents.len(),
@@ -1979,9 +2384,13 @@ pub async fn execute_scope_closure_job(
         "blockerCount": scan.issues.iter().filter(|issue| issue.blocking).count(),
         "evidenceHash": evidence.evidence_hash,
         "snapshotId": evidence.snapshot_id,
+        "snapshotHash": evidence.snapshot_hash,
+        "snapshotArtifactId": evidence.snapshot_artifact_id,
+        "snapshotIndexSha256": evidence.snapshot_index_sha256,
+        "snapshotBuildContractHash": evidence.snapshot_build_contract_hash,
         "artifacts": persisted,
     });
-    let rpc_result = record_scope_closure_result_v2(
+    let rpc_result = record_scope_closure_result_v3(
         &state.pool,
         closure_check_id,
         worker_job_id,
@@ -1994,6 +2403,8 @@ pub async fn execute_scope_closure_job(
         &scan.issues,
         &blocker_codes,
         report_artifact_id,
+        closure_bundle_artifact_id,
+        snapshot_artifact_id,
     )
     .await?;
     let certificate_hash = rpc_result
@@ -2135,14 +2546,23 @@ async fn reuse_completed_scan_execution(
         .get("evidence")
         .ok_or_else(|| anyhow::anyhow!("reusable scan omitted evidence"))?;
     let evidence = ScopeClosureEvidence {
-        schema_version: "lcia.scope-closure-evidence.v1".to_owned(),
+        schema_version: "lcia.scope-closure-evidence.v2".to_owned(),
         source_fingerprint: required_json_text(evidence_json, "sourceFingerprint")?,
         resolution_map_hash: required_json_text(evidence_json, "resolutionMapHash")?,
         closure_bundle_hash: required_json_text(evidence_json, "closureBundleHash")?,
-        snapshot_id: required_json_text(evidence_json, "snapshotId")?.parse()?,
-        snapshot_hash: required_json_text(evidence_json, "snapshotHash")?,
+        snapshot_id: Some(required_json_text(evidence_json, "snapshotId")?.parse()?),
+        snapshot_hash: Some(required_json_text(evidence_json, "snapshotHash")?),
+        snapshot_artifact_id: Some(
+            required_json_text(evidence_json, "snapshotArtifactId")?.parse()?,
+        ),
+        snapshot_index_sha256: Some(required_json_text(evidence_json, "snapshotIndexSha256")?),
+        snapshot_build_contract_hash: Some(required_json_text(
+            evidence_json,
+            "snapshotBuildContractHash",
+        )?),
+        artifact_format: Some(required_json_text(evidence_json, "artifactFormat")?),
         report_artifact_manifest_hash: report_hash,
-        evidence_hash: required_json_text(evidence_json, "evidenceHash")?,
+        evidence_hash: Some(required_json_text(evidence_json, "evidenceHash")?),
     };
     let status = required_json_text(&data, "status")?;
     let scan_completeness = required_json_text(&data, "scanCompleteness")?;
@@ -2401,7 +2821,7 @@ pub async fn record_scope_closure_failure(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_scope_closure_result_v2(
+async fn record_scope_closure_result_v3(
     pool: &PgPool,
     closure_check_id: Uuid,
     worker_job_id: Uuid,
@@ -2414,9 +2834,11 @@ async fn record_scope_closure_result_v2(
     issues: &[ClosureIssue],
     blocker_codes: &[String],
     report_artifact_id: Uuid,
+    closure_bundle_artifact_id: Uuid,
+    snapshot_artifact_id: Option<Uuid>,
 ) -> anyhow::Result<Value> {
     let issues = issues.iter().map(issue_rpc_projection).collect::<Vec<_>>();
-    record_scope_closure_result_v2_raw(
+    record_scope_closure_result_v3_raw(
         pool,
         closure_check_id,
         worker_job_id,
@@ -2429,12 +2851,14 @@ async fn record_scope_closure_result_v2(
         &serde_json::to_value(issues)?,
         blocker_codes,
         Some(report_artifact_id),
+        Some(closure_bundle_artifact_id),
+        snapshot_artifact_id,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_scope_closure_result_v2_raw(
+async fn record_scope_closure_result_v3_raw(
     pool: &PgPool,
     closure_check_id: Uuid,
     worker_job_id: Uuid,
@@ -2447,15 +2871,17 @@ async fn record_scope_closure_result_v2_raw(
     issues: &Value,
     blocker_codes: &[String],
     report_artifact_id: Option<Uuid>,
+    closure_bundle_artifact_id: Option<Uuid>,
+    snapshot_artifact_id: Option<Uuid>,
 ) -> anyhow::Result<Value> {
     let row = sqlx::query(
         r"
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_check_record_result_v2(
+        SELECT public.svc_lcia_scope_closure_check_record_result_v3(
             $1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb,
-            $9::jsonb, $10::text[], $11
+            $9::jsonb, $10::text[], $11, $12, $13
         ) AS result
         FROM _service_role
         ",
@@ -2471,10 +2897,12 @@ async fn record_scope_closure_result_v2_raw(
     .bind(issues)
     .bind(blocker_codes)
     .bind(report_artifact_id)
+    .bind(closure_bundle_artifact_id)
+    .bind(snapshot_artifact_id)
     .fetch_one(pool)
     .await?;
     let result = row.try_get::<Value, _>("result")?;
-    ensure_rpc_ok(&result, "svc_lcia_scope_closure_check_record_result_v2")?;
+    ensure_rpc_ok(&result, "svc_lcia_scope_closure_check_record_result_v3")?;
     Ok(result)
 }
 
@@ -2622,6 +3050,33 @@ fn prepare_artifact(
         },
         bytes,
     }
+}
+
+fn prepare_closure_content_artifacts(
+    closure_bundle_bytes: Vec<u8>,
+    issue_jsonl: Vec<u8>,
+    xlsx_report: Vec<u8>,
+) -> Vec<PreparedArtifact> {
+    vec![
+        prepare_artifact(
+            "closure_bundle",
+            "closure-bundle-v1.json",
+            "application/json",
+            closure_bundle_bytes,
+        ),
+        prepare_artifact(
+            "closure_issues_jsonl",
+            "closure-issues-v1.jsonl",
+            "application/x-ndjson",
+            issue_jsonl,
+        ),
+        prepare_artifact(
+            "closure_report_xlsx",
+            "closure-report-v1.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            xlsx_report,
+        ),
+    ]
 }
 
 async fn persist_closure_artifacts(
@@ -4216,5 +4671,141 @@ mod tests {
             .unwrap(),
             ScanExecutionClaim::Completed { completed_check_id }
         );
+    }
+
+    #[test]
+    fn blocked_closure_has_no_numerical_snapshot_or_pseudo_snapshot_artifact() {
+        let missing = identity(
+            DatasetCategory::Processes,
+            "91919191-9191-9191-9191-919191919191",
+        );
+        let scan = ScopeClosureScan {
+            schema_version: "lcia.scope-closure-scan.v1".to_owned(),
+            complete: true,
+            roots: vec![missing.clone()],
+            documents: Vec::new(),
+            edges: Vec::new(),
+            resolved_references: Vec::new(),
+            omitted_version_resolutions: Vec::new(),
+            issues: vec![missing_dataset_issue(&missing, true)],
+            frontier: Vec::new(),
+            provider_universe: Vec::new(),
+        };
+        assert!(!closure_scan_allows_numerical_snapshot(&scan));
+
+        let evidence = administrative_only_evidence(
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+        );
+        assert_eq!(evidence.snapshot_id, None);
+        assert_eq!(evidence.snapshot_hash, None);
+        assert_eq!(evidence.snapshot_artifact_id, None);
+        assert_eq!(evidence.snapshot_index_sha256, None);
+        assert_eq!(evidence.snapshot_build_contract_hash, None);
+        assert_eq!(evidence.evidence_hash, None);
+
+        let artifacts = prepare_closure_content_artifacts(
+            br#"{"schemaVersion":"lcia.scope-closure-bundle.v1"}"#.to_vec(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let names = artifacts
+            .iter()
+            .map(|artifact| artifact.descriptor.file_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "closure-bundle-v1.json",
+                "closure-issues-v1.jsonl",
+                "closure-report-v1.xlsx",
+            ])
+        );
+        assert!(!names.contains("closure-snapshot-v1.json"));
+    }
+
+    #[test]
+    fn passed_evidence_is_bound_to_persisted_snapshot_builder_facts() {
+        let facts = ScopeClosureSnapshotFacts {
+            snapshot_id: id("92929292-9292-9292-9292-929292929292"),
+            snapshot_hash: "5".repeat(64),
+            snapshot_artifact_id: id("93939393-9393-9393-9393-939393939393"),
+            snapshot_index_sha256: "6".repeat(64),
+            snapshot_build_contract_hash: "7".repeat(64),
+            artifact_format: "snapshot-hdf5:v1".to_owned(),
+        };
+        let source_fingerprint = "1".repeat(64);
+        let resolution_map_hash = "2".repeat(64);
+        let closure_bundle_hash = "3".repeat(64);
+        let evidence = evidence_from_snapshot_facts(
+            source_fingerprint.clone(),
+            resolution_map_hash.clone(),
+            closure_bundle_hash.clone(),
+            "4".repeat(64),
+            &facts,
+        );
+
+        assert_eq!(evidence.schema_version, "lcia.scope-closure-evidence.v2");
+        assert_eq!(evidence.snapshot_id, Some(facts.snapshot_id));
+        assert_eq!(
+            evidence.snapshot_hash.as_deref(),
+            Some(facts.snapshot_hash.as_str())
+        );
+        assert_eq!(
+            evidence.snapshot_artifact_id,
+            Some(facts.snapshot_artifact_id)
+        );
+        assert_eq!(
+            evidence.snapshot_index_sha256.as_deref(),
+            Some(facts.snapshot_index_sha256.as_str())
+        );
+        assert_eq!(
+            evidence.snapshot_build_contract_hash.as_deref(),
+            Some(facts.snapshot_build_contract_hash.as_str())
+        );
+        assert_eq!(
+            evidence.artifact_format.as_deref(),
+            Some("snapshot-hdf5:v1")
+        );
+        assert_eq!(
+            evidence.evidence_hash,
+            Some(scope_closure_evidence_hash(
+                source_fingerprint.as_str(),
+                resolution_map_hash.as_str(),
+                closure_bundle_hash.as_str(),
+                &facts,
+            ))
+        );
+    }
+
+    #[test]
+    fn discovered_provider_processes_freeze_the_final_exact_axis() {
+        let root = identity(
+            DatasetCategory::Processes,
+            "94949494-9494-9494-9494-949494949494",
+        );
+        let provider = identity(
+            DatasetCategory::Processes,
+            "95959595-9595-9595-9595-959595959595",
+        );
+        let frozen = freeze_discovered_process_axis(
+            &manifest(vec![root.clone()]),
+            &[
+                ScopeClosureDiscoveredProcess {
+                    id: root.id,
+                    version: root.version,
+                },
+                ScopeClosureDiscoveredProcess {
+                    id: provider.id,
+                    version: provider.version,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(frozen.processes.len(), 2);
+        assert!(frozen.process_manifest_hash.is_some());
+        assert_eq!(scope_process_axis(&frozen).len(), 2);
     }
 }

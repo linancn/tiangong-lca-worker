@@ -105,14 +105,25 @@ The scan never short-circuits after the first broken reference or invalid docume
 
 ## Evidence and artifacts
 
-Each fresh scan produces deterministic content artifacts:
+Closure production runs in this fail-closed order:
+
+1. complete the administrative exact-version closure against the frozen release manifest;
+2. run signed-flow provider discovery against that same manifest without persisting a snapshot;
+3. freeze the discovered exact Process axis and administratively scan the added provider processes;
+4. evaluate the discovered matrix, provider-link, factorization, and LCIA readiness evidence;
+5. only when every scan is complete and no blocker remains, run the frozen snapshot builder in persisted build mode.
+
+Each fresh scan produces deterministic administrative artifacts:
 
 - `closure-bundle-v1.json`: requested bindings, TIDAS validation evidence, scan, and resolution map;
-- `closure-snapshot-v1.json`: effective scope and immutable evidence hashes;
 - `closure-issues-v1.jsonl`: one canonical issue per line;
 - `closure-report-v1.xlsx`: a valid workbook tagged with the current `closureCheckId`.
 
-Artifacts are uploaded and persisted before terminal projection. The report artifact manifest hash is recomputed from persisted database metadata. `evidenceHash` binds the immutable scan evidence but intentionally excludes the run-specific report artifact manifest. A certificate additionally binds the current closure check and its current report artifact manifest, so copied or stale reports cannot be substituted.
+`closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
+
+For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real `snapshot-hdf5:v1` artifact and snapshot-index sidecar through `lca_network_snapshots` and `lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`; its exact compiled Process axis must match the frozen discovered axis. Generic live-snapshot reuse cannot substitute an artifact that lacks this binding.
+
+Administrative artifacts are uploaded before terminal projection. The report artifact manifest hash is recomputed from persisted database metadata. `evidenceHash` is `lcia.scope-closure-evidence.v2` and binds the immutable scan hashes plus the persisted numerical snapshot identity and hashes, while intentionally excluding the run-specific report artifact manifest. A certificate additionally binds the current closure check and its current report artifact manifest, so copied or stale reports cannot be substituted.
 
 A certificate is available only for `status=passed` and `scanCompleteness=complete`. Domain blockers produce a complete blocked result. Cancellation, lease loss, validator failure, source drift, or another system failure cannot produce a valid certificate.
 
@@ -138,6 +149,9 @@ The database Build V2 command atomically enqueues `lcia_result.package_build` wi
 - `data_snapshot_token`
 - `snapshot_id`
 - `snapshot_hash`
+- `snapshot_artifact_id`
+- `snapshot_index_sha256`
+- `snapshot_build_contract_hash`
 - `closure_bundle_hash`
 - `report_artifact_manifest_hash`
 
