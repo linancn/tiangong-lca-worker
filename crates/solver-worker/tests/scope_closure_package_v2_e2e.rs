@@ -101,6 +101,41 @@ fn repeated(character: char) -> String {
     std::iter::repeat_n(character, 64).collect()
 }
 
+fn expected_h_matrix_for_axis(
+    process_axis: &[Value],
+    fixture_processes: [Uuid; 2],
+) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        process_axis.len() == fixture_processes.len(),
+        "certified process axis has an unexpected cardinality"
+    );
+    let mut seen = BTreeSet::new();
+    let rows = process_axis
+        .iter()
+        .map(|process| -> anyhow::Result<Vec<f64>> {
+            let process_id = process
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("certified process axis entry omitted id"))?
+                .parse::<Uuid>()?;
+            anyhow::ensure!(
+                seen.insert(process_id),
+                "certified process axis repeated process {process_id}"
+            );
+            if process_id == fixture_processes[0] {
+                // 3 units of the elementary flow multiplied by a CF of 2.
+                Ok(vec![6.0; RELEASE_METHOD_IDENTITIES.len()])
+            } else if process_id == fixture_processes[1] {
+                // (5 direct + 0.2 * 3 upstream) units multiplied by a CF of 2.
+                Ok(vec![11.2; RELEASE_METHOD_IDENTITIES.len()])
+            } else {
+                anyhow::bail!("certified process axis contains unexpected process {process_id}")
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(json!(rows))
+}
+
 fn start_worker(state: Arc<AppState>, label: &str) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_solver_worker_jobs_loop(
         state,
@@ -1021,7 +1056,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
         .await?;
     let before_query: Value = serde_json::from_slice(&before_query)?;
     let after_query: Value = serde_json::from_slice(&after_query)?;
-    let expected_h = json!(vec![vec![6.0; 25], vec![11.2; 25]]);
+    let expected_h = expected_h_matrix_for_axis(expected_axis, fixture.processes)?;
     anyhow::ensure!(before_query["h_matrix"] == expected_h);
     anyhow::ensure!(before_query["h_matrix"] == after_query["h_matrix"]);
     anyhow::ensure!(
@@ -1122,4 +1157,19 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     anyhow::ensure!(certificate.snapshot_artifact_id != Uuid::nil());
     anyhow::ensure!(!certificate.snapshot_build_contract_hash.is_empty());
     Ok(())
+}
+
+#[test]
+fn numerical_oracle_follows_certified_process_axis() {
+    let first = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let second = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let reversed_axis = vec![json!({"id": second}), json!({"id": first})];
+
+    assert_eq!(
+        expected_h_matrix_for_axis(&reversed_axis, [first, second]).unwrap(),
+        json!(vec![
+            vec![11.2; RELEASE_METHOD_IDENTITIES.len()],
+            vec![6.0; RELEASE_METHOD_IDENTITIES.len()]
+        ])
+    );
 }
