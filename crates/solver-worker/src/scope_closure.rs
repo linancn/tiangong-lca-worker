@@ -1800,14 +1800,28 @@ fn scope_process_axis(scope: &RequestedScopeManifest) -> Vec<RequestRootProcess>
         .collect()
 }
 
-fn scope_closure_snapshot_binding(
+async fn scope_closure_snapshot_binding(
+    pool: &PgPool,
     effective_scope: &RequestedScopeManifest,
     data_snapshot_token: &str,
     closure_bundle_hash: &str,
 ) -> anyhow::Result<ScopeClosureSnapshotBinding> {
+    let effective_scope_json = serde_json::to_value(effective_scope)?;
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
+        FROM _service_role
+        ",
+    )
+    .bind(&effective_scope_json)
+    .fetch_one(pool)
+    .await?;
     Ok(ScopeClosureSnapshotBinding {
         schema_version: "lcia.scope-closure-snapshot-binding.v1".to_owned(),
-        effective_scope_hash: canonical_json_sha256(&serde_json::to_value(effective_scope)?)?,
+        effective_scope_hash: row.try_get("effective_scope_hash")?,
         data_snapshot_token: data_snapshot_token.to_owned(),
         closure_bundle_hash: closure_bundle_hash.to_owned(),
     })
@@ -2217,10 +2231,12 @@ pub async fn execute_scope_closure_job(
     if closure_scan_allows_numerical_snapshot(&scan) {
         let (_, administrative_bundle_hash) = build_closure_bundle(&input, &validation, &scan)?;
         let discovery_binding = scope_closure_snapshot_binding(
+            &state.pool,
             &effective_scope,
             input.data_snapshot_token.as_str(),
             administrative_bundle_hash.as_str(),
-        )?;
+        )
+        .await?;
         progress
             .heartbeat(
                 "discover_signed_flow_providers",
@@ -2367,10 +2383,12 @@ pub async fn execute_scope_closure_job(
             )
             .await?;
         let binding = scope_closure_snapshot_binding(
+            &state.pool,
             &effective_scope,
             input.data_snapshot_token.as_str(),
             closure_bundle_hash.as_str(),
-        )?;
+        )
+        .await?;
         let built = run_scope_closure_snapshot_builder(
             state,
             input.numerical_snapshot_id,
