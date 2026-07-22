@@ -61,18 +61,20 @@ use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use solver_worker::readiness::{
     MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
 };
+use solver_worker::scope_closure::{DataSnapshotManifest, DatasetCategory};
 use solver_worker::signed_flow::{
     ReferencePivot, SIGNED_FLOW_CLOSURE_TOLERANCE, SignedFlowDirection, TechnosphereBoundaryPolicy,
     WeightedReferencePort, normalize_reference_coefficient, resolve_weighted_balance,
     signed_coefficient,
 };
 use solver_worker::snapshot_artifacts::{
-    EncodedSnapshotArtifact, SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage,
-    SnapshotBuildConfig, SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary,
-    SnapshotGeographySummary, SnapshotMatchingCoverage, SnapshotMatrixScale,
-    SnapshotProcessGapEntry, SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage,
-    SnapshotResolutionSummary, SnapshotSingularRisk, SnapshotUnmatchedFlowEntry,
-    SnapshotVolumeWeightSummary, decode_snapshot_artifact, encode_snapshot_artifact_with_graph,
+    EncodedSnapshotArtifact, SNAPSHOT_ARTIFACT_FORMAT, ScopeClosureSnapshotBinding,
+    SnapshotAllocationCoverage, SnapshotBuildConfig, SnapshotCandidateSummary,
+    SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary, SnapshotMatchingCoverage,
+    SnapshotMatrixScale, SnapshotProcessGapEntry, SnapshotProviderDecisionDiagnostics,
+    SnapshotReferenceCoverage, SnapshotResolutionSummary, SnapshotSingularRisk,
+    SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
+    encode_snapshot_artifact_with_graph,
 };
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
@@ -155,6 +157,12 @@ struct Cli {
     lcia_method_factor_source_json: Option<String>,
     #[arg(long)]
     lcia_factor_coverage_contract_json: Option<String>,
+    #[arg(long)]
+    scope_closure_binding_json: Option<String>,
+    #[arg(long)]
+    scope_closure_data_snapshot_json: Option<String>,
+    #[arg(long)]
+    scope_closure_mode: Option<String>,
     #[arg(long, env = "LCIA_STATIC_CACHE_DIR")]
     lcia_static_cache_dir: Option<PathBuf>,
     #[arg(long, env = "LCIA_STATIC_CACHE_BASE_URL")]
@@ -706,11 +714,65 @@ fn parse_required_json_arg(value: Option<&str>, name: &str) -> anyhow::Result<Va
     serde_json::from_str(value).map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
 }
 
+fn parse_scope_closure_snapshot_args(
+    cli: &Cli,
+) -> anyhow::Result<Option<(ScopeClosureSnapshotBinding, DataSnapshotManifest, &str)>> {
+    match (
+        cli.scope_closure_binding_json.as_deref(),
+        cli.scope_closure_data_snapshot_json.as_deref(),
+    ) {
+        (None, None) if cli.scope_closure_mode.is_none() => Ok(None),
+        (Some(binding), Some(snapshot)) => {
+            let mode = cli.scope_closure_mode.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--scope-closure-mode is required for frozen closure builds")
+            })?;
+            if !matches!(mode, "discovery" | "build") {
+                return Err(anyhow::anyhow!(
+                    "unsupported --scope-closure-mode={mode}; expected discovery or build"
+                ));
+            }
+            let binding: ScopeClosureSnapshotBinding =
+                serde_json::from_str(binding).map_err(|error| {
+                    anyhow::anyhow!("invalid --scope-closure-binding-json: {error}")
+                })?;
+            let snapshot: DataSnapshotManifest =
+                serde_json::from_str(snapshot).map_err(|error| {
+                    anyhow::anyhow!("invalid --scope-closure-data-snapshot-json: {error}")
+                })?;
+            if binding.schema_version != "lcia.scope-closure-snapshot-binding.v1"
+                || binding.effective_scope_hash.trim().is_empty()
+                || binding.data_snapshot_token.trim().is_empty()
+                || binding.closure_bundle_hash.trim().is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "invalid certificate-grade scope closure snapshot binding"
+                ));
+            }
+            if snapshot.schema_version != "lcia.scope-closure-data-snapshot.v2" {
+                return Err(anyhow::anyhow!(
+                    "unsupported scope closure data snapshot schema: {}",
+                    snapshot.schema_version
+                ));
+            }
+            Ok(Some((binding, snapshot, mode)))
+        }
+        _ => Err(anyhow::anyhow!(
+            "--scope-closure-binding-json and --scope-closure-data-snapshot-json must be supplied together"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let total_started = Instant::now();
     let cli = Cli::parse();
     let versioned_scope = validate_versioned_scope_cli(&cli)?;
+    let scope_closure_snapshot = parse_scope_closure_snapshot_args(&cli)?;
+    if versioned_scope.is_some() && scope_closure_snapshot.is_some() {
+        return Err(anyhow::anyhow!(
+            "versioned owner-draft and scope-closure frozen snapshot modes are mutually exclusive"
+        ));
+    }
     let provider_rule = ProviderRule::parse(&cli.provider_rule)?;
     let reference_normalization_mode = NormalizationMode::parse(&cli.reference_normalization_mode)?;
     let allocation_mode = AllocationMode::parse(&cli.allocation_fraction_mode)?;
@@ -763,7 +825,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut build_timing = BuildTimingSec::default();
     let method_started = Instant::now();
-    let method = resolve_method_identity(&pool, &cli, versioned_scope.as_ref()).await?;
+    let method = resolve_method_identity(
+        &pool,
+        &cli,
+        versioned_scope.as_ref(),
+        scope_closure_snapshot
+            .as_ref()
+            .map(|(_, snapshot, _)| snapshot),
+    )
+    .await?;
     build_timing.resolve_method_identity_sec = method_started.elapsed().as_secs_f64();
     let artifact_expires_in_seconds = positive_seconds(cli.artifact_expires_in_seconds);
     let reuse_max_age_seconds = positive_seconds(cli.reuse_max_age_seconds);
@@ -776,6 +846,9 @@ async fn main() -> anyhow::Result<()> {
         scope_manifest_sha256: versioned_scope
             .as_ref()
             .map(|scope| scope.scope_manifest_sha256.clone()),
+        scope_closure_binding: scope_closure_snapshot
+            .as_ref()
+            .map(|(binding, _, _)| binding.clone()),
         lcia_method_factor_source: method.source_evidence.clone(),
         selection_mode,
         request_roots: request_roots.clone(),
@@ -807,6 +880,9 @@ async fn main() -> anyhow::Result<()> {
         &state_codes,
         cli.include_user_id,
         versioned_scope.as_ref(),
+        scope_closure_snapshot
+            .as_ref()
+            .map(|(_, snapshot, _)| snapshot),
     )
     .await?;
     let request_scope_flow_requests = collect_process_flow_reference_requests(&candidate_processes);
@@ -983,8 +1059,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let reuse_lookup_started = Instant::now();
-    let reused_candidate =
-        find_reusable_snapshot(&pool, &source_fingerprint, reuse_max_age_seconds).await?;
+    let reused_candidate = if scope_closure_snapshot.is_some() {
+        None
+    } else {
+        find_reusable_snapshot(&pool, &source_fingerprint, reuse_max_age_seconds).await?
+    };
     build_timing.reuse_lookup_sec = reuse_lookup_started.elapsed().as_secs_f64();
 
     if let Some(reused) = reused_candidate {
@@ -1078,6 +1157,47 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     build_timing.build_sparse_payload_sec = build_started.elapsed().as_secs_f64();
 
+    if let Some((_, frozen_snapshot, "build")) = scope_closure_snapshot.as_ref() {
+        let source_datasets = built
+            .compiled_graph
+            .release_evidence
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scope-closure numerical snapshot lacks immutable source-dataset evidence"
+                )
+            })?
+            .source_datasets
+            .as_slice();
+        validate_compiled_sources_against_frozen_manifest(source_datasets, frozen_snapshot)?;
+    }
+
+    if scope_closure_snapshot
+        .as_ref()
+        .is_some_and(|(_, _, mode)| *mode == "discovery")
+    {
+        let process_axis = built
+            .compiled_graph
+            .processes
+            .iter()
+            .map(|process| {
+                serde_json::json!({
+                    "id": process.process_id,
+                    "version": process.process_version,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "[scope_closure_discovery] {}",
+            serde_json::to_string(&serde_json::json!({
+                "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
+                "processAxis": process_axis,
+                "readiness": built.readiness,
+            }))?
+        );
+        return Ok(());
+    }
+
     let encode_started = Instant::now();
     let encoded = encode_regular_snapshot_artifact(snapshot_id, &build_config, &built)?;
     build_timing.encode_artifact_sec = encode_started.elapsed().as_secs_f64();
@@ -1103,6 +1223,10 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let snapshot_index_bytes = serde_json::to_vec(&built.snapshot_index)?;
+    let snapshot_index_sha256 = sha256_bytes(snapshot_index_bytes.as_slice());
+    let snapshot_build_contract_hash = build_config.scope_closure_binding.as_ref().map(|binding| {
+        scope_closure_snapshot_build_contract_hash(binding, snapshot_id, SNAPSHOT_ARTIFACT_FORMAT)
+    });
     let upload_snapshot_index_started = Instant::now();
     let snapshot_index_url = store
         .upload_snapshot_index(snapshot_id, snapshot_index_bytes)
@@ -1128,6 +1252,9 @@ async fn main() -> anyhow::Result<()> {
         encoded.format,
         cli.artifact_purpose.as_deref(),
         artifact_expires_in_seconds,
+        snapshot_index_sha256.as_str(),
+        snapshot_build_contract_hash.as_deref(),
+        build_config.scope_closure_binding.as_ref(),
     )
     .await?;
     build_timing.persist_metadata_sec = persist_started.elapsed().as_secs_f64();
@@ -1851,6 +1978,7 @@ async fn persist_built_snapshot_artifact(
     build_timing.upload_artifact_sec += upload_started.elapsed().as_secs_f64();
 
     let snapshot_index_bytes = serde_json::to_vec(&built.snapshot_index)?;
+    let snapshot_index_sha256 = sha256_bytes(snapshot_index_bytes.as_slice());
     let upload_snapshot_index_started = Instant::now();
     store
         .upload_snapshot_index(snapshot_id, snapshot_index_bytes)
@@ -1876,6 +2004,9 @@ async fn persist_built_snapshot_artifact(
         encoded.format,
         config.artifact_purpose.as_deref(),
         artifact_expires_in_seconds,
+        snapshot_index_sha256.as_str(),
+        None,
+        None,
     )
     .await?;
     build_timing.persist_metadata_sec += persist_started.elapsed().as_secs_f64();
@@ -2241,6 +2372,24 @@ fn stable_json_sha256(value: &Value) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn scope_closure_snapshot_build_contract_hash(
+    binding: &ScopeClosureSnapshotBinding,
+    snapshot_id: Uuid,
+    artifact_format: &str,
+) -> String {
+    sha256_bytes(
+        format!(
+            "lcia.numerical-snapshot-build-contract.v1\n{}\n{}\n{}\n{}\n{}",
+            binding.effective_scope_hash,
+            binding.data_snapshot_token,
+            binding.closure_bundle_hash,
+            snapshot_id,
+            artifact_format,
+        )
+        .as_bytes(),
+    )
+}
+
 fn sorted_json(value: &Value) -> Value {
     match value {
         Value::Array(items) => Value::Array(items.iter().map(sorted_json).collect()),
@@ -2360,6 +2509,7 @@ async fn resolve_method_identity(
     pool: &PgPool,
     cli: &Cli,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+    scope_closure_snapshot: Option<&DataSnapshotManifest>,
 ) -> anyhow::Result<MethodSelection> {
     if cli.no_lcia {
         return Ok(MethodSelection {
@@ -2418,7 +2568,47 @@ async fn resolve_method_identity(
         });
     }
 
-    let rows = resolve_database_lcia_method_rows(fetch_selected_method_rows(pool, cli).await?)?;
+    let rows = resolve_database_lcia_method_rows(
+        fetch_selected_method_rows(pool, cli, scope_closure_snapshot).await?,
+    )?;
+    if let Some(snapshot) = scope_closure_snapshot {
+        let expected = snapshot
+            .datasets
+            .iter()
+            .filter(|entry| entry.dataset_type == DatasetCategory::Lciamethods)
+            .map(|entry| {
+                (
+                    (entry.dataset_id, entry.dataset_version.clone()),
+                    entry.canonical_content_hash.as_str(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if rows.len() != snapshot.requested_scope.lcia_methods.len() {
+            return Err(anyhow::anyhow!(
+                "scope-closure method axis is incomplete: expected={} actual={}",
+                snapshot.requested_scope.lcia_methods.len(),
+                rows.len()
+            ));
+        }
+        for row in &rows {
+            let identity = (row.identity.method_id, row.identity.method_version.clone());
+            let expected_hash = expected.get(&identity).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scope-closure method is outside frozen manifest: {}@{}",
+                    row.identity.method_id,
+                    row.identity.method_version
+                )
+            })?;
+            let observed_hash = stable_json_sha256(&row.json)?;
+            if observed_hash != **expected_hash {
+                return Err(anyhow::anyhow!(
+                    "scope-closure method content drift: {}@{}",
+                    row.identity.method_id,
+                    row.identity.method_version
+                ));
+            }
+        }
+    }
     if rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found"));
     }
@@ -2455,8 +2645,45 @@ async fn resolve_method_identity(
     })
 }
 
-async fn fetch_selected_method_rows(pool: &PgPool, cli: &Cli) -> anyhow::Result<Vec<MethodRow>> {
-    let rows = match cli.method_id {
+async fn fetch_selected_method_rows(
+    pool: &PgPool,
+    cli: &Cli,
+    scope_closure_snapshot: Option<&DataSnapshotManifest>,
+) -> anyhow::Result<Vec<MethodRow>> {
+    let rows = if let Some(snapshot) = scope_closure_snapshot {
+        if cli.method_id.is_some() || cli.method_version.is_some() {
+            return Err(anyhow::anyhow!(
+                "scope-closure snapshot build takes its exact method set from the frozen manifest"
+            ));
+        }
+        let methods = &snapshot.requested_scope.lcia_methods;
+        let ids = methods
+            .iter()
+            .map(|method| {
+                reviewed_lcia_artifact_locator(method.id, method.version.as_str())
+                    .map(|locator| locator.unwrap_or(method.id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let versions = methods
+            .iter()
+            .map(|method| method.version.clone())
+            .collect::<Vec<_>>();
+        sqlx::query(
+            r#"
+            SELECT m.id, btrim(m.version::text) AS version, m.json
+            FROM public.lciamethods m
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = m.id
+             AND requested.version = btrim(m.version::text)
+            ORDER BY m.id, btrim(m.version::text)
+            "#,
+        )
+        .bind(&ids)
+        .bind(&versions)
+        .fetch_all(pool)
+        .await?
+    } else {
+        match cli.method_id {
         Some(method_id) => {
             let method_version = cli.method_version.as_deref().unwrap_or_default();
             let artifact_locator_id =
@@ -2484,6 +2711,7 @@ async fn fetch_selected_method_rows(pool: &PgPool, cli: &Cli) -> anyhow::Result<
             )
             .fetch_all(pool)
             .await?
+        }
         }
     };
 
@@ -6264,9 +6492,43 @@ async fn fetch_processes(
     state_codes: &[i32],
     include_user_id: Option<Uuid>,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+    scope_closure_snapshot: Option<&DataSnapshotManifest>,
 ) -> anyhow::Result<Vec<ProcessRow>> {
     let query_started = Instant::now();
-    let rows = if let Some(scope) = versioned_scope {
+    let rows = if let Some(snapshot) = scope_closure_snapshot {
+        let processes = snapshot
+            .datasets
+            .iter()
+            .filter(|entry| {
+                entry.dataset_type == DatasetCategory::Processes && entry.role == "unit_process"
+            })
+            .collect::<Vec<_>>();
+        let ids = processes
+            .iter()
+            .map(|entry| entry.dataset_id)
+            .collect::<Vec<_>>();
+        let versions = processes
+            .iter()
+            .map(|entry| entry.dataset_version.clone())
+            .collect::<Vec<_>>();
+        sqlx::query(
+            r#"
+            SELECT p.id, btrim(p.version::text) AS version, p.model_id, p.user_id,
+                   p.state_code, p.team_id, p.review_id, p.modified_at, p.json
+            FROM public.processes p
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = p.id
+             AND requested.version = btrim(p.version::text)
+            WHERE p.state_code BETWEEN 100 AND 199
+              AND p.json ? 'processDataSet'
+            ORDER BY p.id, btrim(p.version::text)
+            "#,
+        )
+        .bind(&ids)
+        .bind(&versions)
+        .fetch_all(pool)
+        .await?
+    } else if let Some(scope) = versioned_scope {
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
@@ -6361,7 +6623,47 @@ async fn fetch_processes(
         if let Some(scope) = versioned_scope {
             validate_process_row_visibility(&process, scope.actor_user_id)?;
         }
+        if let Some(snapshot) = scope_closure_snapshot {
+            let expected = snapshot
+                .datasets
+                .iter()
+                .find(|entry| {
+                    entry.dataset_type == DatasetCategory::Processes
+                        && entry.dataset_id == process.id
+                        && entry.dataset_version == process.version
+                        && entry.role == "unit_process"
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "scope-closure process is outside frozen manifest: {}@{}",
+                        process.id,
+                        process.version
+                    )
+                })?;
+            if stable_json_sha256(&process.json)? != expected.canonical_content_hash {
+                return Err(anyhow::anyhow!(
+                    "scope-closure process content drift: {}@{}",
+                    process.id,
+                    process.version
+                ));
+            }
+        }
         out.push(process);
+    }
+    if let Some(snapshot) = scope_closure_snapshot {
+        let expected_count = snapshot
+            .datasets
+            .iter()
+            .filter(|entry| {
+                entry.dataset_type == DatasetCategory::Processes && entry.role == "unit_process"
+            })
+            .count();
+        if out.len() != expected_count {
+            return Err(anyhow::anyhow!(
+                "scope-closure process universe is incomplete: expected={expected_count} actual={}",
+                out.len()
+            ));
+        }
     }
     Ok(out)
 }
@@ -6989,6 +7291,81 @@ async fn build_frozen_source_datasets(
     ))
 }
 
+fn compiled_source_dataset_category(
+    dataset_type: CompiledReleaseSourceDatasetType,
+) -> DatasetCategory {
+    match dataset_type {
+        CompiledReleaseSourceDatasetType::Contact => DatasetCategory::Contacts,
+        CompiledReleaseSourceDatasetType::Flow => DatasetCategory::Flows,
+        CompiledReleaseSourceDatasetType::FlowProperty => DatasetCategory::Flowproperties,
+        CompiledReleaseSourceDatasetType::LciaMethod => DatasetCategory::Lciamethods,
+        CompiledReleaseSourceDatasetType::Process => DatasetCategory::Processes,
+        CompiledReleaseSourceDatasetType::Source => DatasetCategory::Sources,
+        CompiledReleaseSourceDatasetType::UnitGroup => DatasetCategory::Unitgroups,
+    }
+}
+
+fn normalize_frozen_source_version(value: &str) -> String {
+    let trimmed = value.trim();
+    let parts = trimmed.split('.').collect::<Vec<_>>();
+    if let [major, minor] = parts.as_slice()
+        && [major, minor]
+            .into_iter()
+            .all(|part| !part.is_empty() && part.chars().all(|char| char.is_ascii_digit()))
+    {
+        return format!("{major:0>2}.{minor:0>2}.000");
+    }
+    solver_worker::package_execution::normalize_version_string(trimmed)
+}
+
+fn validate_compiled_sources_against_frozen_manifest(
+    source_datasets: &[CompiledReleaseSourceDataset],
+    frozen_snapshot: &DataSnapshotManifest,
+) -> anyhow::Result<()> {
+    if source_datasets.is_empty() {
+        return Err(anyhow::anyhow!(
+            "scope-closure numerical snapshot has no immutable source-dataset evidence"
+        ));
+    }
+    let allowlist = frozen_snapshot
+        .datasets
+        .iter()
+        .map(|entry| {
+            (
+                (
+                    entry.dataset_type,
+                    entry.dataset_id,
+                    normalize_frozen_source_version(entry.dataset_version.as_str()),
+                ),
+                entry.canonical_content_hash.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for source in source_datasets {
+        let category = compiled_source_dataset_category(source.dataset_type);
+        let version = normalize_frozen_source_version(source.dataset_version.as_str());
+        let key = (category, source.dataset_id, version);
+        let expected_hash = allowlist.get(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "scope-closure numerical snapshot selected a source outside the frozen manifest: {}:{}@{}",
+                source.dataset_type.as_str(),
+                source.dataset_id,
+                source.dataset_version
+            )
+        })?;
+        if source.document_sha256 != **expected_hash {
+            return Err(anyhow::anyhow!(
+                "scope-closure numerical snapshot source content drift: {}:{}@{}",
+                source.dataset_type.as_str(),
+                source.dataset_id,
+                source.dataset_version
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_flow_release_metadata(
     pool: &PgPool,
     flows: &HashMap<FlowLinkIdentity, FlowRow>,
@@ -7517,6 +7894,9 @@ async fn persist_snapshot_metadata(
     artifact_format: &str,
     artifact_purpose: Option<&str>,
     artifact_expires_in_seconds: Option<i64>,
+    snapshot_index_sha256: &str,
+    snapshot_build_contract_hash: Option<&str>,
+    scope_closure_binding: Option<&ScopeClosureSnapshotBinding>,
 ) -> anyhow::Result<()> {
     let artifact_expires_at_utc = artifact_expires_at_utc(artifact_expires_in_seconds)?;
     let mut process_filter = if let Some(versioned_scope) = versioned_scope {
@@ -7638,7 +8018,8 @@ async fn persist_snapshot_metadata(
             a_nnz,
             b_nnz,
             c_nnz,
-            coverage,
+            coverage, snapshot_index_sha256, snapshot_build_contract_hash,
+            effective_scope_hash, data_snapshot_token, closure_bundle_hash,
             status,
             created_at,
             updated_at
@@ -7646,7 +8027,7 @@ async fn persist_snapshot_metadata(
         VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10, $11,
-            $12::jsonb, 'ready', NOW(), NOW()
+            $12::jsonb, $13, $14, $15, $16, $17, 'ready', NOW(), NOW()
         )
         ON CONFLICT (snapshot_id, artifact_format)
         DO UPDATE SET
@@ -7660,6 +8041,11 @@ async fn persist_snapshot_metadata(
             b_nnz = EXCLUDED.b_nnz,
             c_nnz = EXCLUDED.c_nnz,
             coverage = EXCLUDED.coverage,
+            snapshot_index_sha256 = EXCLUDED.snapshot_index_sha256,
+            snapshot_build_contract_hash = EXCLUDED.snapshot_build_contract_hash,
+            effective_scope_hash = EXCLUDED.effective_scope_hash,
+            data_snapshot_token = EXCLUDED.data_snapshot_token,
+            closure_bundle_hash = EXCLUDED.closure_bundle_hash,
             status = EXCLUDED.status,
             updated_at = NOW()
         "#,
@@ -7676,6 +8062,11 @@ async fn persist_snapshot_metadata(
     .bind(built.coverage.matrix_scale.b_nnz)
     .bind(built.coverage.matrix_scale.c_nnz)
     .bind(serde_json::to_value(&built.coverage)?)
+    .bind(snapshot_index_sha256)
+    .bind(snapshot_build_contract_hash)
+    .bind(scope_closure_binding.map(|binding| binding.effective_scope_hash.as_str()))
+    .bind(scope_closure_binding.map(|binding| binding.data_snapshot_token.as_str()))
+    .bind(scope_closure_binding.map(|binding| binding.closure_bundle_hash.as_str()))
     .execute(&mut *tx)
     .await?;
 
@@ -8499,8 +8890,9 @@ mod tests {
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
         snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
         summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_flow_row_visibility, validate_process_row_visibility,
-        validate_quantitative_references, validate_unique_database_lcia_method_identities,
+        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
+        validate_process_row_visibility, validate_quantitative_references,
+        validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -8536,6 +8928,7 @@ mod tests {
             include_user_id: None,
             data_scope: None,
             scope_manifest_sha256: None,
+            scope_closure_binding: None,
             lcia_method_factor_source: None,
             selection_mode: SnapshotSelectionMode::FilteredLibrary,
             request_roots: Vec::new(),
@@ -12480,6 +12873,74 @@ mod tests {
         )
         .expect_err("same identity/version content drift must fail closed");
         assert!(drift.to_string().contains("document drift"));
+    }
+
+    #[test]
+    fn certificate_snapshot_rejects_manifest_external_source_version_or_content() {
+        let flow_id = Uuid::new_v4();
+        let frozen: solver_worker::scope_closure::DataSnapshotManifest =
+            serde_json::from_value(json!({
+                "schemaVersion": "lcia.scope-closure-data-snapshot.v2",
+                "requestedScope": {
+                    "schemaVersion": "lcia.scope-closure-requested-scope.v1",
+                    "coverageMode": "subset",
+                    "eligibilityPredicateVersion": "published-state-code-100-199:v1",
+                    "processes": [],
+                    "lciaMethods": [],
+                    "versionResolutionPolicy": "reference-version-resolution-v1",
+                    "legacyOmittedVersionPolicy": "latest_eligible",
+                    "certificateFreshnessPolicy": "current-membership-required-v1",
+                    "linkPolicy": {
+                        "linkSemanticsVersion": "signed-flow-v1",
+                        "flowIdentityPolicy": "exact-flow-version-reference-unit-v1",
+                        "allocationSemanticsVersion": "strict-v1",
+                        "technosphereBoundaryPolicy": "closed",
+                        "providerUniversePolicy": "frozen-public-release-v1"
+                    }
+                },
+                "currentPublicRelease": {
+                    "publicationId": Uuid::new_v4(),
+                    "releaseRunId": Uuid::new_v4(),
+                    "releaseVersion": "test",
+                    "publishedAt": "2026-07-22T00:00:00Z",
+                    "releaseManifestHash": "release-hash"
+                },
+                "datasets": [{
+                    "datasetType": "flows",
+                    "datasetId": flow_id,
+                    "datasetVersion": "01.00",
+                    "role": "support",
+                    "versionSignificantHash": "version-hash",
+                    "semanticHash": "semantic-hash",
+                    "canonicalContentHash": "frozen-content-hash"
+                }]
+            }))
+            .expect("frozen manifest");
+        let mut selected = CompiledReleaseSourceDataset {
+            dataset_type: CompiledReleaseSourceDatasetType::Flow,
+            role: CompiledReleaseSourceDatasetRole::Support,
+            dataset_id: flow_id,
+            dataset_version: "01.00.000".to_owned(),
+            document_sha256: "frozen-content-hash".to_owned(),
+            document: json!({}),
+        };
+
+        validate_compiled_sources_against_frozen_manifest(std::slice::from_ref(&selected), &frozen)
+            .expect("normalized exact frozen source");
+
+        selected.dataset_version = "02.00.000".to_owned();
+        let external = validate_compiled_sources_against_frozen_manifest(
+            std::slice::from_ref(&selected),
+            &frozen,
+        )
+        .expect_err("new live version outside frozen manifest must fail closed");
+        assert!(external.to_string().contains("outside the frozen manifest"));
+
+        selected.dataset_version = "01.00.000".to_owned();
+        selected.document_sha256 = "mutated-live-content".to_owned();
+        let drift = validate_compiled_sources_against_frozen_manifest(&[selected], &frozen)
+            .expect_err("frozen exact version content drift must fail closed");
+        assert!(drift.to_string().contains("source content drift"));
     }
 
     #[test]

@@ -260,6 +260,15 @@ pub enum JobPayload {
         /// Persisted report artifact metadata hash bound by the certificate.
         #[serde(default)]
         report_artifact_manifest_hash: Option<String>,
+        /// Exact ready numerical snapshot artifact row certified by the preflight.
+        #[serde(default)]
+        snapshot_artifact_id: Option<Uuid>,
+        /// SHA-256 of the certified snapshot index sidecar.
+        #[serde(default)]
+        snapshot_index_sha256: Option<String>,
+        /// Hash of the numerical snapshot build contract.
+        #[serde(default)]
+        snapshot_build_contract_hash: Option<String>,
     },
     /// Validate and freeze one immutable data-product scope closure.
     ScopeClosureCheck {

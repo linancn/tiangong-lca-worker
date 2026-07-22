@@ -8,6 +8,7 @@ use std::{
 
 use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, Row, Transaction};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
     SolveOptions, SolveResult, SolverService, SparseTriplet,
@@ -33,7 +34,9 @@ use crate::{
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
     graph_types::RequestRootProcess,
-    snapshot_artifacts::{DecodedSnapshotArtifact, decode_snapshot_artifact},
+    snapshot_artifacts::{
+        DecodedSnapshotArtifact, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
+    },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::ObjectStoreClient,
     types::{JobPayload, SolveOptionsPayload},
@@ -910,6 +913,13 @@ async fn fetch_decoded_snapshot_artifact_from_meta(
     meta: &SnapshotArtifactMeta,
 ) -> anyhow::Result<DecodedSnapshotArtifact> {
     let bytes = state.object_store.download_object_url(&meta.url).await?;
+    let observed_sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
+    if observed_sha256 != meta.sha256 {
+        return Err(anyhow::anyhow!(
+            "snapshot artifact hash mismatch: snapshot={snapshot_id} expected={} observed={observed_sha256}",
+            meta.sha256
+        ));
+    }
 
     let decoded = decode_snapshot_artifact(bytes.as_slice())?;
     if decoded.snapshot_id != snapshot_id {
@@ -1593,6 +1603,7 @@ async fn handle_job_payload_with_worker_lease(
                 None,
                 None,
                 versioned_builder_args.as_ref(),
+                None,
                 no_lcia.unwrap_or(false),
             );
             let executed_result = match build_snapshot_worker_lease.as_ref() {
@@ -2040,6 +2051,8 @@ pub(crate) struct SnapshotBuilderExecution {
     pub(crate) exit_code: i32,
     pub(crate) stdout_tail: String,
     pub(crate) stderr_tail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope_closure_discovery: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -2060,6 +2073,28 @@ struct VersionedSnapshotBuilderArgs {
     scope_manifest_sha256: String,
     lcia_method_factor_source: Value,
     lcia_factor_coverage_contract: Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScopeClosureSnapshotBuilderArgs {
+    pub(crate) mode: ScopeClosureSnapshotBuilderMode,
+    pub(crate) binding: Value,
+    pub(crate) data_snapshot: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeClosureSnapshotBuilderMode {
+    Discovery,
+    Build,
+}
+
+impl ScopeClosureSnapshotBuilderMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Build => "build",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2102,6 +2137,7 @@ pub(crate) async fn run_review_submit_gate_snapshot_builder(
         Some(REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS),
         Some(revision_checksum),
         None,
+        None,
         true,
     )
     .await;
@@ -2128,6 +2164,64 @@ pub(crate) async fn run_review_submit_gate_snapshot_builder(
     }
 }
 
+pub(crate) async fn run_scope_closure_snapshot_builder(
+    state: &AppState,
+    requested_snapshot_id: Uuid,
+    request_roots: &[RequestRootProcess],
+    scope_closure: &ScopeClosureSnapshotBuilderArgs,
+) -> anyhow::Result<SnapshotBuilderExecution> {
+    let process_states = crate::default_snapshot_process_states_arg();
+    let lock_guard = acquire_build_snapshot_lock(
+        &state.pool,
+        state.build_snapshot_max_concurrency,
+        state.build_snapshot_lock_poll_interval,
+    )
+    .await?;
+    let executed_result = run_snapshot_builder_job(
+        requested_snapshot_id,
+        Some(process_states.as_str()),
+        None,
+        Some(request_roots),
+        Some("split_by_process_volume"),
+        Some("strict"),
+        Some("strict"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("scope_closure_preflight"),
+        None,
+        None,
+        None,
+        None,
+        Some(scope_closure),
+        false,
+    )
+    .await;
+    let release_result = lock_guard.release().await;
+    match executed_result {
+        Ok(executed) => {
+            release_result.map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to release build_snapshot lock after scope closure build: {error}"
+                )
+            })?;
+            Ok(executed)
+        }
+        Err(error) => {
+            if let Err(release_error) = release_result {
+                warn!(
+                    error = %release_error,
+                    "failed to release build_snapshot lock after scope closure failure"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_lcia_result_package_build_worker_job(
     state: &AppState,
     build_worker_job_id: Uuid,
@@ -2146,6 +2240,9 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         snapshot_hash: closure_snapshot_hash,
         closure_bundle_hash,
         report_artifact_manifest_hash,
+        snapshot_artifact_id,
+        snapshot_index_sha256,
+        snapshot_build_contract_hash,
         ..
     } = payload
     else {
@@ -2154,16 +2251,71 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         ));
     };
 
-    let requested_snapshot_id = *build_id;
     let result_job_id = *build_id;
     let request_roots = lcia_result_package_request_roots(input_manifest)?;
-    let (executed, build_snapshot_lock) = run_lcia_result_package_snapshot_builder(
-        state,
-        requested_snapshot_id,
-        request_roots.as_slice(),
-    )
-    .await?;
-    let snapshot_id = executed.resolved_snapshot_id;
+    let (snapshot_id, snapshot_source) = if package_snapshot_execution_mode(*closure_check_id)
+        == PackageSnapshotExecutionMode::CertifiedReuse
+    {
+        let snapshot_id = closure_snapshot_id
+            .ok_or_else(|| anyhow::anyhow!("certified package payload omitted snapshot_id"))?;
+        let snapshot_hash = closure_snapshot_hash
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("certified package payload omitted snapshot_hash"))?;
+        let effective_scope_hash = effective_scope_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted effective_scope_hash")
+        })?;
+        let data_snapshot_token = data_snapshot_token.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted data_snapshot_token")
+        })?;
+        let closure_bundle_hash = closure_bundle_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted closure_bundle_hash")
+        })?;
+        let snapshot_artifact_id = snapshot_artifact_id.ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted snapshot_artifact_id")
+        })?;
+        let snapshot_index_sha256 = snapshot_index_sha256.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted snapshot_index_sha256")
+        })?;
+        let snapshot_build_contract_hash =
+            snapshot_build_contract_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted snapshot_build_contract_hash")
+            })?;
+        prepare_certified_package_snapshot(
+            state,
+            snapshot_id,
+            snapshot_hash,
+            effective_scope_hash,
+            data_snapshot_token,
+            closure_bundle_hash,
+            snapshot_artifact_id,
+            snapshot_index_sha256,
+            snapshot_build_contract_hash,
+            request_roots.as_slice(),
+        )
+        .await?;
+        (
+            snapshot_id,
+            serde_json::json!({
+                "mode": "certified_snapshot_reuse_v1",
+                "snapshotId": snapshot_id,
+                "snapshotHash": snapshot_hash,
+                "liveSnapshotBuilderInvoked": false,
+            }),
+        )
+    } else {
+        let (executed, build_snapshot_lock) =
+            run_lcia_result_package_snapshot_builder(state, *build_id, request_roots.as_slice())
+                .await?;
+        (
+            executed.resolved_snapshot_id,
+            serde_json::json!({
+                "mode": "legacy_live_snapshot_build_v1",
+                "snapshotBuilder": executed,
+                "buildSnapshotLock": build_snapshot_lock,
+                "liveSnapshotBuilderInvoked": true,
+            }),
+        )
+    };
     let artifacts =
         persist_lcia_result_package_all_unit_artifacts(state, result_job_id, snapshot_id).await?;
     link_lcia_result_package_worker_job_domain_refs(
@@ -2176,8 +2328,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     let artifact_manifest = serde_json::json!({
         "artifactManifestVersion": "lcia-result-package-worker.v1",
         "inputManifestHash": input_manifest_hash,
-        "snapshotBuilder": executed,
-        "buildSnapshotLock": build_snapshot_lock,
+        "snapshotSource": snapshot_source,
         "resultDiagnostics": artifacts.result_diag.clone(),
         "queryArtifact": {
             "artifactUrl": artifacts.query_artifact_meta.url.clone(),
@@ -2233,6 +2384,267 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     Ok(mark_ready)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageSnapshotExecutionMode {
+    CertifiedReuse,
+    LegacyLiveBuild,
+}
+
+fn package_snapshot_execution_mode(closure_check_id: Option<Uuid>) -> PackageSnapshotExecutionMode {
+    if closure_check_id.is_some() {
+        PackageSnapshotExecutionMode::CertifiedReuse
+    } else {
+        PackageSnapshotExecutionMode::LegacyLiveBuild
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_certified_package_snapshot(
+    state: &AppState,
+    snapshot_id: Uuid,
+    expected_snapshot_hash: &str,
+    expected_effective_scope_hash: &str,
+    expected_data_snapshot_token: &str,
+    expected_closure_bundle_hash: &str,
+    expected_snapshot_artifact_id: Uuid,
+    expected_snapshot_index_sha256: &str,
+    expected_snapshot_build_contract_hash: &str,
+    request_roots: &[RequestRootProcess],
+) -> anyhow::Result<()> {
+    let binding = ScopeClosureSnapshotBinding {
+        schema_version: "lcia.scope-closure-snapshot-binding.v1".to_owned(),
+        effective_scope_hash: expected_effective_scope_hash.to_owned(),
+        data_snapshot_token: expected_data_snapshot_token.to_owned(),
+        closure_bundle_hash: expected_closure_bundle_hash.to_owned(),
+    };
+    let (facts, decoded) =
+        load_scope_closure_snapshot_facts(state, snapshot_id, &binding, request_roots).await?;
+    if facts.snapshot_hash != expected_snapshot_hash
+        || facts.snapshot_artifact_id != expected_snapshot_artifact_id
+        || facts.snapshot_index_sha256 != expected_snapshot_index_sha256
+        || facts.snapshot_build_contract_hash != expected_snapshot_build_contract_hash
+    {
+        return Err(anyhow::anyhow!("certified_snapshot_evidence_mismatch"));
+    }
+    state
+        .solver
+        .prepare(&decoded.payload, NumericOptions::default())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScopeClosureSnapshotFacts {
+    pub(crate) snapshot_id: Uuid,
+    pub(crate) snapshot_hash: String,
+    pub(crate) snapshot_artifact_id: Uuid,
+    pub(crate) snapshot_index_sha256: String,
+    pub(crate) snapshot_build_contract_hash: String,
+    pub(crate) artifact_format: String,
+}
+
+pub(crate) async fn fetch_scope_closure_snapshot_facts(
+    state: &AppState,
+    snapshot_id: Uuid,
+    binding: &ScopeClosureSnapshotBinding,
+    expected_axis: &[RequestRootProcess],
+) -> anyhow::Result<ScopeClosureSnapshotFacts> {
+    load_scope_closure_snapshot_facts(state, snapshot_id, binding, expected_axis)
+        .await
+        .map(|(facts, _)| facts)
+}
+
+async fn load_scope_closure_snapshot_facts(
+    state: &AppState,
+    snapshot_id: Uuid,
+    binding: &ScopeClosureSnapshotBinding,
+    expected_axis: &[RequestRootProcess],
+) -> anyhow::Result<(ScopeClosureSnapshotFacts, DecodedSnapshotArtifact)> {
+    let row = sqlx::query(
+        r"
+        SELECT s.status AS snapshot_status,
+               a.id AS snapshot_artifact_id, a.artifact_url,
+               a.artifact_format, a.artifact_sha256,
+               a.snapshot_index_sha256, a.snapshot_build_contract_hash,
+               a.effective_scope_hash, a.data_snapshot_token, a.closure_bundle_hash
+        FROM public.lca_network_snapshots s
+        JOIN public.lca_snapshot_artifacts a
+          ON a.snapshot_id = s.id AND a.status = 'ready'
+        WHERE s.id = $1
+          AND a.artifact_format = 'snapshot-hdf5:v1'
+        ORDER BY a.created_at DESC
+        LIMIT 1
+        ",
+    )
+    .bind(snapshot_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("certified_snapshot_artifact_not_found"))?;
+    if row.try_get::<String, _>("snapshot_status")? != "ready" {
+        return Err(anyhow::anyhow!("certified_snapshot_not_ready"));
+    }
+    let artifact_format = row.try_get::<String, _>("artifact_format")?;
+    let artifact_sha256 = row.try_get::<String, _>("artifact_sha256")?;
+    let snapshot_index_sha256 = row.try_get::<String, _>("snapshot_index_sha256")?;
+    let snapshot_build_contract_hash = row.try_get::<String, _>("snapshot_build_contract_hash")?;
+    if row.try_get::<String, _>("effective_scope_hash")? != binding.effective_scope_hash
+        || row.try_get::<String, _>("data_snapshot_token")? != binding.data_snapshot_token
+        || row.try_get::<String, _>("closure_bundle_hash")? != binding.closure_bundle_hash
+    {
+        return Err(anyhow::anyhow!("certified_snapshot_contract_mismatch"));
+    }
+    let expected_build_contract =
+        scope_closure_snapshot_build_contract_hash(binding, snapshot_id, artifact_format.as_str());
+    if snapshot_build_contract_hash != expected_build_contract {
+        return Err(anyhow::anyhow!(
+            "certified_snapshot_build_contract_mismatch"
+        ));
+    }
+    let meta = SnapshotArtifactMeta {
+        url: row.try_get("artifact_url")?,
+        format: artifact_format.clone(),
+        sha256: artifact_sha256.clone(),
+    };
+    let decoded = fetch_decoded_snapshot_artifact_from_meta(state, snapshot_id, &meta).await?;
+    validate_certified_snapshot_contract(
+        &decoded,
+        binding.effective_scope_hash.as_str(),
+        binding.data_snapshot_token.as_str(),
+        binding.closure_bundle_hash.as_str(),
+        expected_axis,
+    )?;
+
+    let snapshot_index_url = derive_snapshot_index_url(meta.url.as_str());
+    let snapshot_index_bytes = state
+        .object_store
+        .download_object_url(snapshot_index_url.as_str())
+        .await?;
+    let observed_index_sha256 = hex::encode(Sha256::digest(snapshot_index_bytes.as_slice()));
+    if observed_index_sha256 != snapshot_index_sha256 {
+        return Err(anyhow::anyhow!("certified_snapshot_index_hash_mismatch"));
+    }
+    let snapshot_index: SnapshotIndexDocument = serde_json::from_slice(&snapshot_index_bytes)?;
+    if snapshot_index.snapshot_id != snapshot_id {
+        return Err(anyhow::anyhow!(
+            "certified_snapshot_index_identity_mismatch"
+        ));
+    }
+
+    Ok((
+        ScopeClosureSnapshotFacts {
+            snapshot_id,
+            snapshot_hash: artifact_sha256,
+            snapshot_artifact_id: row.try_get("snapshot_artifact_id")?,
+            snapshot_index_sha256,
+            snapshot_build_contract_hash,
+            artifact_format,
+        },
+        decoded,
+    ))
+}
+
+pub(crate) fn scope_closure_snapshot_build_contract_hash(
+    binding: &ScopeClosureSnapshotBinding,
+    snapshot_id: Uuid,
+    artifact_format: &str,
+) -> String {
+    hex::encode(Sha256::digest(
+        format!(
+            "lcia.numerical-snapshot-build-contract.v1\n{}\n{}\n{}\n{}\n{}",
+            binding.effective_scope_hash,
+            binding.data_snapshot_token,
+            binding.closure_bundle_hash,
+            snapshot_id,
+            artifact_format,
+        )
+        .as_bytes(),
+    ))
+}
+
+pub(crate) fn scope_closure_evidence_hash(
+    source_fingerprint: &str,
+    resolution_map_hash: &str,
+    closure_bundle_hash: &str,
+    facts: &ScopeClosureSnapshotFacts,
+) -> String {
+    hex::encode(Sha256::digest(
+        format!(
+            "lcia.scope-closure-evidence.v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            source_fingerprint,
+            resolution_map_hash,
+            closure_bundle_hash,
+            facts.snapshot_id,
+            facts.snapshot_hash,
+            facts.snapshot_artifact_id,
+            facts.snapshot_index_sha256,
+            facts.snapshot_build_contract_hash,
+        )
+        .as_bytes(),
+    ))
+}
+
+fn validate_certified_snapshot_contract(
+    decoded: &DecodedSnapshotArtifact,
+    expected_effective_scope_hash: &str,
+    expected_data_snapshot_token: &str,
+    expected_closure_bundle_hash: &str,
+    request_roots: &[RequestRootProcess],
+) -> anyhow::Result<()> {
+    let binding = decoded
+        .config
+        .scope_closure_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("certified snapshot lacks scope closure binding"))?;
+    if binding.schema_version != "lcia.scope-closure-snapshot-binding.v1"
+        || binding.effective_scope_hash != expected_effective_scope_hash
+        || binding.data_snapshot_token != expected_data_snapshot_token
+        || binding.closure_bundle_hash != expected_closure_bundle_hash
+    {
+        return Err(anyhow::anyhow!("certified_snapshot_contract_mismatch"));
+    }
+    let graph = decoded.compiled_graph.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("certified snapshot lacks compiled graph and exact process axis evidence")
+    })?;
+    let process_axis = graph
+        .processes
+        .iter()
+        .map(|process| (process.process_id, process.process_version.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    validate_certified_process_axis(&process_axis, decoded.payload.process_count, request_roots)
+}
+
+fn validate_certified_process_axis(
+    process_axis: &std::collections::BTreeSet<(Uuid, String)>,
+    payload_process_count: i32,
+    request_roots: &[RequestRootProcess],
+) -> anyhow::Result<()> {
+    let requested_axis = request_roots
+        .iter()
+        .map(|root| (root.process_id, root.process_version.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if process_axis != &requested_axis {
+        let missing = requested_axis
+            .difference(process_axis)
+            .map(|(id, version)| format!("{id}@{version}"))
+            .collect::<Vec<_>>();
+        let unexpected = process_axis
+            .difference(&requested_axis)
+            .map(|(id, version)| format!("{id}@{version}"))
+            .collect::<Vec<_>>();
+        return Err(anyhow::anyhow!(
+            "certified_snapshot_axis_mismatch: missing={} unexpected={}",
+            missing.join(","),
+            unexpected.join(",")
+        ));
+    }
+    if payload_process_count != i32::try_from(process_axis.len())? {
+        return Err(anyhow::anyhow!(
+            "certified_snapshot_axis_mismatch: payload process count differs from compiled graph"
+        ));
+    }
+    Ok(())
+}
+
 async fn run_lcia_result_package_snapshot_builder(
     state: &AppState,
     requested_snapshot_id: Uuid,
@@ -2260,6 +2672,7 @@ async fn run_lcia_result_package_snapshot_builder(
         None,
         None,
         Some("lcia_result_package"),
+        None,
         None,
         None,
         None,
@@ -2579,6 +2992,7 @@ async fn run_snapshot_builder_job(
     reuse_max_age_seconds: Option<i64>,
     review_submit_revision_checksum: Option<&str>,
     versioned_scope: Option<&VersionedSnapshotBuilderArgs>,
+    scope_closure: Option<&ScopeClosureSnapshotBuilderArgs>,
     no_lcia: bool,
 ) -> anyhow::Result<SnapshotBuilderExecution> {
     let mut builder_args = vec![
@@ -2676,6 +3090,14 @@ async fn run_snapshot_builder_job(
         builder_args.push("--lcia-factor-coverage-contract-json".to_owned());
         builder_args.push(serde_json::to_string(&scope.lcia_factor_coverage_contract)?);
     }
+    if let Some(scope) = scope_closure {
+        builder_args.push("--scope-closure-mode".to_owned());
+        builder_args.push(scope.mode.as_str().to_owned());
+        builder_args.push("--scope-closure-binding-json".to_owned());
+        builder_args.push(serde_json::to_string(&scope.binding)?);
+        builder_args.push("--scope-closure-data-snapshot-json".to_owned());
+        builder_args.push(serde_json::to_string(&scope.data_snapshot)?);
+    }
 
     let candidates = snapshot_builder_candidates(builder_args);
     let mut last_not_found = false;
@@ -2718,12 +3140,16 @@ async fn run_snapshot_builder_job(
             ));
         }
 
-        let resolved_snapshot_id = parse_snapshot_builder_resolved_snapshot_id(&stdout)
-            .ok_or_else(|| {
+        let discovery = parse_scope_closure_discovery(&stdout)?;
+        let resolved_snapshot_id = if discovery.is_some() {
+            snapshot_id
+        } else {
+            parse_snapshot_builder_resolved_snapshot_id(&stdout).ok_or_else(|| {
                 anyhow::anyhow!(
                     "snapshot_builder succeeded but did not report resolved snapshot id"
                 )
-            })?;
+            })?
+        };
 
         return Ok(SnapshotBuilderExecution {
             requested_snapshot_id: snapshot_id,
@@ -2733,6 +3159,7 @@ async fn run_snapshot_builder_job(
             exit_code: output.status.code().unwrap_or(0),
             stdout_tail: tail_text(&stdout, 4000),
             stderr_tail: tail_text(&stderr, 2000),
+            scope_closure_discovery: discovery,
         });
     }
 
@@ -2813,6 +3240,19 @@ fn parse_snapshot_builder_resolved_snapshot_id(stdout: &str) -> Option<Uuid> {
         .rev()
         .find_map(|line| line.strip_prefix("[resolved_snapshot_id] "))
         .and_then(|value| Uuid::parse_str(value.trim()).ok())
+}
+
+fn parse_scope_closure_discovery(stdout: &str) -> anyhow::Result<Option<Value>> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("[scope_closure_discovery] "))
+        .map(|value| {
+            serde_json::from_str(value.trim()).map_err(|error| {
+                anyhow::anyhow!("snapshot_builder emitted invalid scope closure discovery: {error}")
+            })
+        })
+        .transpose()
 }
 
 fn parse_snapshot_builder_build_timing(stdout: &str) -> Option<Value> {
@@ -3170,15 +3610,19 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SolveOptionsPayload, acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
+        PackageSnapshotExecutionMode, SolveOptionsPayload,
+        acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
         build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
-        normalize_all_unit_batch_size, parse_snapshot_builder_build_timing,
-        parse_snapshot_builder_resolved_snapshot_id, resolve_solve_all_unit_options,
+        normalize_all_unit_batch_size, package_snapshot_execution_mode,
+        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
+        resolve_solve_all_unit_options, validate_certified_process_axis,
     };
     use serde_json::json;
-    use std::time::Duration;
+    use std::{collections::BTreeSet, time::Duration};
     use uuid::Uuid;
+
+    use crate::graph_types::RequestRootProcess;
 
     #[test]
     fn build_snapshot_worker_jobs_slot_sql_uses_short_transaction_and_lease_fencing() {
@@ -3205,6 +3649,35 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(build_snapshot_heartbeat_interval(1), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn certified_snapshot_axis_must_exactly_match_effective_package_axis() {
+        let root = RequestRootProcess::new(Uuid::new_v4(), "01.00.000");
+        let provider = RequestRootProcess::new(Uuid::new_v4(), "02.00.000");
+        let exact = BTreeSet::from([(root.process_id, root.process_version.clone())]);
+        validate_certified_process_axis(&exact, 1, std::slice::from_ref(&root)).unwrap();
+
+        let expanded = BTreeSet::from([
+            (root.process_id, root.process_version.clone()),
+            (provider.process_id, provider.process_version.clone()),
+        ]);
+        assert!(
+            validate_certified_process_axis(&expanded, 2, std::slice::from_ref(&root)).is_err()
+        );
+        assert!(validate_certified_process_axis(&exact, 2, &[root]).is_err());
+    }
+
+    #[test]
+    fn certified_package_execution_plan_never_invokes_live_snapshot_builder() {
+        assert_eq!(
+            package_snapshot_execution_mode(Some(Uuid::new_v4())),
+            PackageSnapshotExecutionMode::CertifiedReuse
+        );
+        assert_eq!(
+            package_snapshot_execution_mode(None),
+            PackageSnapshotExecutionMode::LegacyLiveBuild
+        );
     }
 
     #[test]

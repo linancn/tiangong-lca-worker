@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::pgbouncer_sqlx::{self as sqlx, Row};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
@@ -18,14 +19,33 @@ use crate::{
         update_job_status,
     },
     scope_closure::{
-        PackageClosureBinding, SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION,
-        execute_scope_closure_job, record_scope_closure_failure, validate_package_closure_binding,
+        SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION, execute_scope_closure_job,
+        record_scope_closure_failure,
     },
     types::JobPayload,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
 
 const SOLVER_WORKER_QUEUE: &str = "solver";
+
+const LCIA_RESULT_PACKAGE_BUILD_V2: &str = "lcia_result.package_build.request.v2";
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthoritativePackageClosureBinding {
+    closure_check_id: Uuid,
+    certificate_hash: String,
+    effective_scope_hash: String,
+    data_snapshot_token: String,
+    snapshot_id: Uuid,
+    snapshot_hash: String,
+    closure_bundle_hash: String,
+    report_artifact_manifest_hash: String,
+    snapshot_artifact_id: Uuid,
+    snapshot_index_sha256: String,
+    snapshot_build_contract_hash: String,
+    effective_scope: Value,
+}
 
 fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
     match payload {
@@ -424,53 +444,17 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
     }
 
     let execution_result = match &payload {
-        JobPayload::LciaResultPackageBuild {
-            closure_check_id,
-            closure_certificate_hash,
-            effective_scope_hash,
-            data_snapshot_token,
-            snapshot_id,
-            snapshot_hash,
-            closure_bundle_hash,
-            report_artifact_manifest_hash,
-            ..
-        } => {
-            let closure_binding_result = if let (
-                Some(closure_check_id),
-                Some(closure_certificate_hash),
-                Some(effective_scope_hash),
-                Some(data_snapshot_token),
-                Some(snapshot_id),
-                Some(snapshot_hash),
-                Some(closure_bundle_hash),
-                Some(report_artifact_manifest_hash),
-            ) = (
-                closure_check_id,
-                closure_certificate_hash.as_deref(),
-                effective_scope_hash.as_deref(),
-                data_snapshot_token.as_deref(),
-                snapshot_id,
-                snapshot_hash.as_deref(),
-                closure_bundle_hash.as_deref(),
-                report_artifact_manifest_hash.as_deref(),
-            ) {
-                validate_package_closure_binding(
-                    &state.pool,
-                    &PackageClosureBinding {
-                        closure_check_id: *closure_check_id,
-                        closure_certificate_hash,
-                        effective_scope_hash,
-                        data_snapshot_token,
-                        snapshot_id: *snapshot_id,
-                        snapshot_hash,
-                        closure_bundle_hash,
-                        report_artifact_manifest_hash,
-                    },
-                )
-                .await
-            } else {
-                Ok(())
-            };
+        JobPayload::LciaResultPackageBuild { .. } => {
+            let closure_binding_result =
+                if job.payload_schema_version == LCIA_RESULT_PACKAGE_BUILD_V2 {
+                    fetch_authoritative_package_closure_binding(&state.pool, job.id)
+                        .await
+                        .and_then(|binding| {
+                            validate_authoritative_package_closure_binding(&payload, &binding)
+                        })
+                } else {
+                    Ok(())
+                };
             match closure_binding_result {
                 Ok(()) => handle_lcia_result_package_build_worker_job(state, job.id, &payload)
                     .await
@@ -500,6 +484,94 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 .await;
         }
     }
+}
+
+async fn fetch_authoritative_package_closure_binding(
+    pool: &sqlx::PgPool,
+    build_worker_job_id: Uuid,
+) -> anyhow::Result<AuthoritativePackageClosureBinding> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_build_binding($1) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(build_worker_job_id)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow::anyhow!(
+            "svc_lcia_scope_closure_build_binding returned non-ok result: {result}"
+        ));
+    }
+    let data = result
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("scope closure build binding RPC omitted data"))?;
+    Ok(serde_json::from_value(data)?)
+}
+
+fn validate_authoritative_package_closure_binding(
+    payload: &JobPayload,
+    binding: &AuthoritativePackageClosureBinding,
+) -> anyhow::Result<()> {
+    let JobPayload::LciaResultPackageBuild {
+        closure_check_id,
+        closure_certificate_hash,
+        effective_scope_hash,
+        data_snapshot_token,
+        snapshot_id,
+        snapshot_hash,
+        closure_bundle_hash,
+        report_artifact_manifest_hash,
+        snapshot_artifact_id,
+        snapshot_index_sha256,
+        snapshot_build_contract_hash,
+        input_manifest,
+        ..
+    } = payload
+    else {
+        return Err(anyhow::anyhow!(
+            "authoritative package closure binding requires a package-build payload"
+        ));
+    };
+
+    let matches_binding = closure_check_id == &Some(binding.closure_check_id)
+        && closure_certificate_hash.as_deref() == Some(binding.certificate_hash.as_str())
+        && effective_scope_hash.as_deref() == Some(binding.effective_scope_hash.as_str())
+        && data_snapshot_token.as_deref() == Some(binding.data_snapshot_token.as_str())
+        && snapshot_id == &Some(binding.snapshot_id)
+        && snapshot_hash.as_deref() == Some(binding.snapshot_hash.as_str())
+        && closure_bundle_hash.as_deref() == Some(binding.closure_bundle_hash.as_str())
+        && report_artifact_manifest_hash.as_deref()
+            == Some(binding.report_artifact_manifest_hash.as_str())
+        && snapshot_artifact_id == &Some(binding.snapshot_artifact_id)
+        && snapshot_index_sha256.as_deref() == Some(binding.snapshot_index_sha256.as_str())
+        && snapshot_build_contract_hash.as_deref()
+            == Some(binding.snapshot_build_contract_hash.as_str());
+    if !matches_binding {
+        return Err(anyhow::anyhow!(
+            "package-build payload differs from authoritative scope-closure binding"
+        ));
+    }
+
+    let effective_processes = binding
+        .effective_scope
+        .get("processes")
+        .ok_or_else(|| anyhow::anyhow!("authoritative effective scope omitted processes"))?;
+    let input_processes = input_manifest
+        .get("processes")
+        .ok_or_else(|| anyhow::anyhow!("package input manifest omitted processes"))?;
+    if input_processes != effective_processes {
+        return Err(anyhow::anyhow!(
+            "package input process axis differs from authoritative effective scope"
+        ));
+    }
+    Ok(())
 }
 
 async fn record_invalid_solver_worker_job_payload(
@@ -1225,6 +1297,13 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
         "reportArtifactManifestHash",
         "report_artifact_manifest_hash",
     );
+    copy_alias(&mut payload, "snapshotArtifactId", "snapshot_artifact_id");
+    copy_alias(&mut payload, "snapshotIndexSha256", "snapshot_index_sha256");
+    copy_alias(
+        &mut payload,
+        "snapshotBuildContractHash",
+        "snapshot_build_contract_hash",
+    );
     copy_alias(&mut payload, "requestedScopeHash", "requested_scope_hash");
     copy_alias(&mut payload, "policyFingerprint", "policy_fingerprint");
     copy_alias(
@@ -1286,7 +1365,7 @@ fn payload_schema_supported_for_job_kind(job_kind: &str, schema: &str) -> bool {
             )
             | (
                 "lcia_result.package_build",
-                "lcia_result.package_build.request.v1"
+                "lcia_result.package_build.request.v1" | "lcia_result.package_build.request.v2"
             )
             | (SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION)
     )
@@ -1423,6 +1502,9 @@ fn validate_versioned_payload_contract(
                 snapshot_hash,
                 closure_bundle_hash,
                 report_artifact_manifest_hash,
+                snapshot_artifact_id,
+                snapshot_index_sha256,
+                snapshot_build_contract_hash,
                 ..
             },
         ) => {
@@ -1435,13 +1517,55 @@ fn validate_versioned_payload_contract(
                 snapshot_hash.is_some(),
                 closure_bundle_hash.is_some(),
                 report_artifact_manifest_hash.is_some(),
+                snapshot_artifact_id.is_some(),
+                snapshot_index_sha256.is_some(),
+                snapshot_build_contract_hash.is_some(),
             ]
             .into_iter()
             .filter(|present| *present)
             .count();
-            if binding_count != 0 && binding_count != 8 {
+            if binding_count != 0 {
                 return Err(anyhow::anyhow!(
-                    "lcia result package closure evidence binding must be all-or-none"
+                    "legacy lcia result package v1 payload cannot carry closure evidence; use request.v2"
+                ));
+            }
+        }
+        (
+            "lcia_result.package_build.request.v2",
+            JobPayload::LciaResultPackageBuild {
+                closure_check_id,
+                closure_certificate_hash,
+                effective_scope_hash,
+                data_snapshot_token,
+                snapshot_id,
+                snapshot_hash,
+                closure_bundle_hash,
+                report_artifact_manifest_hash,
+                snapshot_artifact_id,
+                snapshot_index_sha256,
+                snapshot_build_contract_hash,
+                ..
+            },
+        ) => {
+            let binding_count = [
+                closure_check_id.is_some(),
+                closure_certificate_hash.is_some(),
+                effective_scope_hash.is_some(),
+                data_snapshot_token.is_some(),
+                snapshot_id.is_some(),
+                snapshot_hash.is_some(),
+                closure_bundle_hash.is_some(),
+                report_artifact_manifest_hash.is_some(),
+                snapshot_artifact_id.is_some(),
+                snapshot_index_sha256.is_some(),
+                snapshot_build_contract_hash.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if binding_count != 11 {
+                return Err(anyhow::anyhow!(
+                    "lcia result package v2 requires the complete closure evidence binding"
                 ));
             }
         }
@@ -1648,9 +1772,11 @@ mod tests {
             method_factor_source_contract_fixture,
         },
         queue::{
-            lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
-            payload_type_name, result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
+            AuthoritativePackageClosureBinding, lcia_result_package_worker_result_ref,
+            parse_build_snapshot_worker_projection, payload_type_name,
+            result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
             solver_worker_job_payload, solver_worker_result_ref,
+            validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
         worker_jobs::WorkerJob,
@@ -2188,13 +2314,13 @@ mod tests {
     }
 
     #[test]
-    fn package_closure_binding_is_all_or_none_and_result_ref_preserves_check_id() {
+    fn package_v2_requires_complete_closure_binding_and_preserves_check_id() {
         let closure_check_id = Uuid::new_v4();
         let snapshot_id = Uuid::new_v4();
         let requested_by = Uuid::new_v4();
         let full = worker_job(
             "lcia_result.package_build",
-            "lcia_result.package_build.request.v1",
+            "lcia_result.package_build.request.v2",
             json!({
                 "build_id": Uuid::new_v4(),
                 "requested_by": requested_by,
@@ -2212,6 +2338,9 @@ mod tests {
                 "snapshot_hash": "snapshot-hash",
                 "closure_bundle_hash": "bundle-hash",
                 "report_artifact_manifest_hash": "report-hash",
+                "snapshot_artifact_id": Uuid::new_v4(),
+                "snapshot_index_sha256": "index-hash",
+                "snapshot_build_contract_hash": "build-contract-hash",
             }),
         );
         assert!(solver_worker_job_payload(&full).is_ok());
@@ -2226,7 +2355,7 @@ mod tests {
             solver_worker_job_payload(&partial)
                 .unwrap_err()
                 .to_string()
-                .contains("all-or-none")
+                .contains("complete closure evidence binding")
         );
 
         let result_ref = lcia_result_package_worker_result_ref(
@@ -2236,6 +2365,78 @@ mod tests {
             Some(closure_check_id),
         );
         assert_eq!(result_ref["closureCheckId"], json!(closure_check_id));
+    }
+
+    #[test]
+    fn package_v2_requires_exact_authoritative_binding_and_process_axis() {
+        let closure_check_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let snapshot_artifact_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let process_axis = json!([{
+            "id": process_id,
+            "version": "01.00.000",
+            "stateCode": 100,
+        }]);
+        let job = worker_job(
+            "lcia_result.package_build",
+            "lcia_result.package_build.request.v2",
+            json!({
+                "build_id": Uuid::new_v4(),
+                "requested_by": Uuid::new_v4(),
+                "coverage_mode": "subset",
+                "eligible_input_count": 1,
+                "included_input_count": 1,
+                "input_manifest_hash": "input-hash",
+                "input_manifest": {"processes": process_axis.clone()},
+                "lcia_method_set": [],
+                "closure_check_id": closure_check_id,
+                "closure_certificate_hash": "certificate-hash",
+                "effective_scope_hash": "scope-hash",
+                "data_snapshot_token": "snapshot-token",
+                "snapshot_id": snapshot_id,
+                "snapshot_hash": "snapshot-hash",
+                "closure_bundle_hash": "bundle-hash",
+                "report_artifact_manifest_hash": "report-hash",
+                "snapshot_artifact_id": snapshot_artifact_id,
+                "snapshot_index_sha256": "index-hash",
+                "snapshot_build_contract_hash": "build-contract-hash",
+            }),
+        );
+        let payload = solver_worker_job_payload(&job).expect("valid v2 payload");
+        let mut binding = AuthoritativePackageClosureBinding {
+            closure_check_id,
+            certificate_hash: "certificate-hash".to_owned(),
+            effective_scope_hash: "scope-hash".to_owned(),
+            data_snapshot_token: "snapshot-token".to_owned(),
+            snapshot_id,
+            snapshot_hash: "snapshot-hash".to_owned(),
+            closure_bundle_hash: "bundle-hash".to_owned(),
+            report_artifact_manifest_hash: "report-hash".to_owned(),
+            snapshot_artifact_id,
+            snapshot_index_sha256: "index-hash".to_owned(),
+            snapshot_build_contract_hash: "build-contract-hash".to_owned(),
+            effective_scope: json!({"processes": process_axis}),
+        };
+
+        validate_authoritative_package_closure_binding(&payload, &binding)
+            .expect("exact authoritative binding");
+
+        binding.snapshot_hash = "tampered".to_owned();
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from authoritative")
+        );
+        binding.snapshot_hash = "snapshot-hash".to_owned();
+        binding.effective_scope = json!({"processes": []});
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("process axis differs")
+        );
     }
 
     #[test]
