@@ -19,7 +19,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: a85efb2e08166aba49c6241df034d24948d3b5df
+lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
 lastReviewedNote: "Clarified that Issue #139 certificate-bound LCIA result builds consume closure evidence without changing import/export package-worker semantics."
 related:
   - AGENTS.md

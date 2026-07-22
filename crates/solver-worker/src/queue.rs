@@ -39,11 +39,15 @@ struct AuthoritativePackageClosureBinding {
     data_snapshot_token: String,
     snapshot_id: Uuid,
     snapshot_hash: String,
-    closure_bundle_hash: String,
-    report_artifact_manifest_hash: String,
     snapshot_artifact_id: Uuid,
     snapshot_index_sha256: String,
     snapshot_build_contract_hash: String,
+    closure_bundle_artifact_id: Uuid,
+    closure_bundle_hash: String,
+    coverage_mode: String,
+    lcia_method_set: Value,
+    input_manifest: Value,
+    input_manifest_hash: String,
     effective_scope: Value,
 }
 
@@ -526,12 +530,15 @@ fn validate_authoritative_package_closure_binding(
         data_snapshot_token,
         snapshot_id,
         snapshot_hash,
-        closure_bundle_hash,
-        report_artifact_manifest_hash,
         snapshot_artifact_id,
         snapshot_index_sha256,
         snapshot_build_contract_hash,
+        closure_bundle_artifact_id,
+        closure_bundle_hash,
+        coverage_mode,
+        input_manifest_hash,
         input_manifest,
+        lcia_method_set,
         ..
     } = payload
     else {
@@ -546,13 +553,16 @@ fn validate_authoritative_package_closure_binding(
         && data_snapshot_token.as_deref() == Some(binding.data_snapshot_token.as_str())
         && snapshot_id == &Some(binding.snapshot_id)
         && snapshot_hash.as_deref() == Some(binding.snapshot_hash.as_str())
-        && closure_bundle_hash.as_deref() == Some(binding.closure_bundle_hash.as_str())
-        && report_artifact_manifest_hash.as_deref()
-            == Some(binding.report_artifact_manifest_hash.as_str())
         && snapshot_artifact_id == &Some(binding.snapshot_artifact_id)
         && snapshot_index_sha256.as_deref() == Some(binding.snapshot_index_sha256.as_str())
         && snapshot_build_contract_hash.as_deref()
-            == Some(binding.snapshot_build_contract_hash.as_str());
+            == Some(binding.snapshot_build_contract_hash.as_str())
+        && closure_bundle_artifact_id == &Some(binding.closure_bundle_artifact_id)
+        && closure_bundle_hash.as_deref() == Some(binding.closure_bundle_hash.as_str())
+        && coverage_mode == &binding.coverage_mode
+        && input_manifest_hash == &binding.input_manifest_hash
+        && input_manifest == &binding.input_manifest
+        && lcia_method_set == &binding.lcia_method_set;
     if !matches_binding {
         return Err(anyhow::anyhow!(
             "package-build payload differs from authoritative scope-closure binding"
@@ -1294,6 +1304,11 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
     copy_alias(&mut payload, "closureBundleHash", "closure_bundle_hash");
     copy_alias(
         &mut payload,
+        "closureBundleArtifactId",
+        "closure_bundle_artifact_id",
+    );
+    copy_alias(
+        &mut payload,
         "reportArtifactManifestHash",
         "report_artifact_manifest_hash",
     );
@@ -1500,6 +1515,7 @@ fn validate_versioned_payload_contract(
                 data_snapshot_token,
                 snapshot_id,
                 snapshot_hash,
+                closure_bundle_artifact_id,
                 closure_bundle_hash,
                 report_artifact_manifest_hash,
                 snapshot_artifact_id,
@@ -1515,6 +1531,7 @@ fn validate_versioned_payload_contract(
                 data_snapshot_token.is_some(),
                 snapshot_id.is_some(),
                 snapshot_hash.is_some(),
+                closure_bundle_artifact_id.is_some(),
                 closure_bundle_hash.is_some(),
                 report_artifact_manifest_hash.is_some(),
                 snapshot_artifact_id.is_some(),
@@ -1539,6 +1556,7 @@ fn validate_versioned_payload_contract(
                 data_snapshot_token,
                 snapshot_id,
                 snapshot_hash,
+                closure_bundle_artifact_id,
                 closure_bundle_hash,
                 report_artifact_manifest_hash,
                 snapshot_artifact_id,
@@ -1554,6 +1572,7 @@ fn validate_versioned_payload_contract(
                 data_snapshot_token.is_some(),
                 snapshot_id.is_some(),
                 snapshot_hash.is_some(),
+                closure_bundle_artifact_id.is_some(),
                 closure_bundle_hash.is_some(),
                 report_artifact_manifest_hash.is_some(),
                 snapshot_artifact_id.is_some(),
@@ -1563,7 +1582,7 @@ fn validate_versioned_payload_contract(
             .into_iter()
             .filter(|present| *present)
             .count();
-            if binding_count != 11 {
+            if binding_count != 12 {
                 return Err(anyhow::anyhow!(
                     "lcia result package v2 requires the complete closure evidence binding"
                 ));
@@ -2318,6 +2337,7 @@ mod tests {
         let closure_check_id = Uuid::new_v4();
         let snapshot_id = Uuid::new_v4();
         let requested_by = Uuid::new_v4();
+        let closure_bundle_artifact_id = Uuid::new_v4();
         let full = worker_job(
             "lcia_result.package_build",
             "lcia_result.package_build.request.v2",
@@ -2336,6 +2356,7 @@ mod tests {
                 "data_snapshot_token": "snapshot-token",
                 "snapshot_id": snapshot_id,
                 "snapshot_hash": "snapshot-hash",
+                "closure_bundle_artifact_id": closure_bundle_artifact_id,
                 "closure_bundle_hash": "bundle-hash",
                 "report_artifact_manifest_hash": "report-hash",
                 "snapshot_artifact_id": Uuid::new_v4(),
@@ -2372,6 +2393,7 @@ mod tests {
         let closure_check_id = Uuid::new_v4();
         let snapshot_id = Uuid::new_v4();
         let snapshot_artifact_id = Uuid::new_v4();
+        let closure_bundle_artifact_id = Uuid::new_v4();
         let process_id = Uuid::new_v4();
         let process_axis = json!([{
             "id": process_id,
@@ -2396,6 +2418,7 @@ mod tests {
                 "data_snapshot_token": "snapshot-token",
                 "snapshot_id": snapshot_id,
                 "snapshot_hash": "snapshot-hash",
+                "closure_bundle_artifact_id": closure_bundle_artifact_id,
                 "closure_bundle_hash": "bundle-hash",
                 "report_artifact_manifest_hash": "report-hash",
                 "snapshot_artifact_id": snapshot_artifact_id,
@@ -2411,11 +2434,15 @@ mod tests {
             data_snapshot_token: "snapshot-token".to_owned(),
             snapshot_id,
             snapshot_hash: "snapshot-hash".to_owned(),
-            closure_bundle_hash: "bundle-hash".to_owned(),
-            report_artifact_manifest_hash: "report-hash".to_owned(),
             snapshot_artifact_id,
             snapshot_index_sha256: "index-hash".to_owned(),
             snapshot_build_contract_hash: "build-contract-hash".to_owned(),
+            closure_bundle_artifact_id,
+            closure_bundle_hash: "bundle-hash".to_owned(),
+            coverage_mode: "subset".to_owned(),
+            lcia_method_set: json!([]),
+            input_manifest: json!({"processes": process_axis.clone()}),
+            input_manifest_hash: "input-hash".to_owned(),
             effective_scope: json!({"processes": process_axis}),
         };
 
@@ -2430,6 +2457,22 @@ mod tests {
                 .contains("differs from authoritative")
         );
         binding.snapshot_hash = "snapshot-hash".to_owned();
+        binding.closure_bundle_artifact_id = Uuid::new_v4();
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from authoritative")
+        );
+        binding.closure_bundle_artifact_id = closure_bundle_artifact_id;
+        binding.input_manifest_hash = "tampered-input".to_owned();
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from authoritative")
+        );
+        binding.input_manifest_hash = "input-hash".to_owned();
         binding.effective_scope = json!({"processes": []});
         assert!(
             validate_authoritative_package_closure_binding(&payload, &binding)

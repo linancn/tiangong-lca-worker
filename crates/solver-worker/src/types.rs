@@ -257,6 +257,9 @@ pub enum JobPayload {
         /// Hash of the closure bundle used to produce the snapshot.
         #[serde(default)]
         closure_bundle_hash: Option<String>,
+        /// Exact administrative closure-bundle artifact certified by the database.
+        #[serde(default)]
+        closure_bundle_artifact_id: Option<Uuid>,
         /// Persisted report artifact metadata hash bound by the certificate.
         #[serde(default)]
         report_artifact_manifest_hash: Option<String>,

@@ -35,7 +35,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: 9990d44
+lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
 lastReviewedNote: "Added the Issue #139 scope-closure runtime family, frozen-release source boundary, and certificate-bound package flow."
 related:
   - ../../AGENTS.md

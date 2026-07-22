@@ -2238,6 +2238,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         data_snapshot_token,
         snapshot_id: closure_snapshot_id,
         snapshot_hash: closure_snapshot_hash,
+        closure_bundle_artifact_id,
         closure_bundle_hash,
         report_artifact_manifest_hash,
         snapshot_artifact_id,
@@ -2270,6 +2271,11 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         let closure_bundle_hash = closure_bundle_hash.as_deref().ok_or_else(|| {
             anyhow::anyhow!("certified package payload omitted closure_bundle_hash")
         })?;
+        let closure_bundle_artifact_id = closure_bundle_artifact_id.ok_or_else(|| {
+            anyhow::anyhow!("certified package payload omitted closure_bundle_artifact_id")
+        })?;
+        let closure_check_id = closure_check_id
+            .ok_or_else(|| anyhow::anyhow!("certified package payload omitted closure_check_id"))?;
         let snapshot_artifact_id = snapshot_artifact_id.ok_or_else(|| {
             anyhow::anyhow!("certified package payload omitted snapshot_artifact_id")
         })?;
@@ -2282,11 +2288,13 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             })?;
         prepare_certified_package_snapshot(
             state,
+            closure_check_id,
             snapshot_id,
             snapshot_hash,
             effective_scope_hash,
             data_snapshot_token,
             closure_bundle_hash,
+            closure_bundle_artifact_id,
             snapshot_artifact_id,
             snapshot_index_sha256,
             snapshot_build_contract_hash,
@@ -2345,9 +2353,47 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             "snapshotId": closure_snapshot_id,
             "snapshotHash": closure_snapshot_hash,
             "closureBundleHash": closure_bundle_hash,
+            "closureBundleArtifactId": closure_bundle_artifact_id,
             "reportArtifactManifestHash": report_artifact_manifest_hash,
         })),
     });
+
+    // Close the object-store TOCTOU window as far as the worker can immediately before the
+    // database performs its final lease, revocation, and authoritative-metadata checks.
+    if let Some(closure_check_id) = closure_check_id {
+        verify_certified_package_snapshot(
+            state,
+            *closure_check_id,
+            closure_snapshot_id
+                .ok_or_else(|| anyhow::anyhow!("certified package payload omitted snapshot_id"))?,
+            closure_snapshot_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted snapshot_hash")
+            })?,
+            effective_scope_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted effective_scope_hash")
+            })?,
+            data_snapshot_token.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted data_snapshot_token")
+            })?,
+            closure_bundle_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted closure_bundle_hash")
+            })?,
+            closure_bundle_artifact_id.ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted closure_bundle_artifact_id")
+            })?,
+            snapshot_artifact_id.ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted snapshot_artifact_id")
+            })?,
+            snapshot_index_sha256.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted snapshot_index_sha256")
+            })?,
+            snapshot_build_contract_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("certified package payload omitted snapshot_build_contract_hash")
+            })?,
+            request_roots.as_slice(),
+        )
+        .await?;
+    }
 
     let mark_ready = mark_lcia_result_package_ready(
         &state.pool,
@@ -2401,24 +2447,76 @@ fn package_snapshot_execution_mode(closure_check_id: Option<Uuid>) -> PackageSna
 #[allow(clippy::too_many_arguments)]
 async fn prepare_certified_package_snapshot(
     state: &AppState,
+    closure_check_id: Uuid,
     snapshot_id: Uuid,
     expected_snapshot_hash: &str,
     expected_effective_scope_hash: &str,
     expected_data_snapshot_token: &str,
     expected_closure_bundle_hash: &str,
+    expected_closure_bundle_artifact_id: Uuid,
     expected_snapshot_artifact_id: Uuid,
     expected_snapshot_index_sha256: &str,
     expected_snapshot_build_contract_hash: &str,
     request_roots: &[RequestRootProcess],
 ) -> anyhow::Result<()> {
+    let decoded = verify_certified_package_snapshot(
+        state,
+        closure_check_id,
+        snapshot_id,
+        expected_snapshot_hash,
+        expected_effective_scope_hash,
+        expected_data_snapshot_token,
+        expected_closure_bundle_hash,
+        expected_closure_bundle_artifact_id,
+        expected_snapshot_artifact_id,
+        expected_snapshot_index_sha256,
+        expected_snapshot_build_contract_hash,
+        request_roots,
+    )
+    .await?;
+    state
+        .solver
+        .prepare(&decoded.payload, NumericOptions::default())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_certified_package_snapshot(
+    state: &AppState,
+    closure_check_id: Uuid,
+    snapshot_id: Uuid,
+    expected_snapshot_hash: &str,
+    expected_effective_scope_hash: &str,
+    expected_data_snapshot_token: &str,
+    expected_closure_bundle_hash: &str,
+    expected_closure_bundle_artifact_id: Uuid,
+    expected_snapshot_artifact_id: Uuid,
+    expected_snapshot_index_sha256: &str,
+    expected_snapshot_build_contract_hash: &str,
+    request_roots: &[RequestRootProcess],
+) -> anyhow::Result<DecodedSnapshotArtifact> {
+    verify_certified_closure_bundle_artifact(
+        state,
+        closure_check_id,
+        expected_closure_bundle_artifact_id,
+        expected_closure_bundle_hash,
+        expected_data_snapshot_token,
+    )
+    .await?;
     let binding = ScopeClosureSnapshotBinding {
         schema_version: "lcia.scope-closure-snapshot-binding.v1".to_owned(),
         effective_scope_hash: expected_effective_scope_hash.to_owned(),
         data_snapshot_token: expected_data_snapshot_token.to_owned(),
         closure_bundle_hash: expected_closure_bundle_hash.to_owned(),
     };
-    let (facts, decoded) =
-        load_scope_closure_snapshot_facts(state, snapshot_id, &binding, request_roots).await?;
+    let (facts, decoded) = load_scope_closure_snapshot_facts(
+        state,
+        snapshot_id,
+        &binding,
+        request_roots,
+        Some(expected_snapshot_artifact_id),
+    )
+    .await?;
     if facts.snapshot_hash != expected_snapshot_hash
         || facts.snapshot_artifact_id != expected_snapshot_artifact_id
         || facts.snapshot_index_sha256 != expected_snapshot_index_sha256
@@ -2426,9 +2524,69 @@ async fn prepare_certified_package_snapshot(
     {
         return Err(anyhow::anyhow!("certified_snapshot_evidence_mismatch"));
     }
-    state
-        .solver
-        .prepare(&decoded.payload, NumericOptions::default())?;
+    Ok(decoded)
+}
+
+async fn verify_certified_closure_bundle_artifact(
+    state: &AppState,
+    expected_closure_check_id: Uuid,
+    expected_artifact_id: Uuid,
+    expected_bundle_hash: &str,
+    expected_data_snapshot_token: &str,
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        r"
+        SELECT artifact_type, storage_path, content_type, byte_size,
+               checksum_sha256, metadata
+        FROM public.worker_job_artifacts
+        WHERE id = $1
+        ",
+    )
+    .bind(expected_artifact_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("certified_closure_bundle_artifact_not_found"))?;
+
+    let artifact_type = row.try_get::<String, _>("artifact_type")?;
+    let storage_path = row.try_get::<String, _>("storage_path")?;
+    let content_type = row.try_get::<String, _>("content_type")?;
+    let byte_size = row.try_get::<i64, _>("byte_size")?;
+    let checksum_sha256 = row.try_get::<String, _>("checksum_sha256")?;
+    let metadata = row.try_get::<Value, _>("metadata")?;
+    let expected_closure_check_id = expected_closure_check_id.to_string();
+    if artifact_type != "closure_bundle"
+        || content_type != "application/json"
+        || checksum_sha256 != expected_bundle_hash
+        || metadata.get("schemaVersion").and_then(Value::as_str)
+            != Some("lcia.scope-closure-artifact.v1")
+        || metadata.get("closureCheckId").and_then(Value::as_str)
+            != Some(expected_closure_check_id.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "certified_closure_bundle_artifact_metadata_mismatch"
+        ));
+    }
+
+    let bytes = state
+        .object_store
+        .download_object_key(storage_path.as_str())
+        .await?;
+    if i64::try_from(bytes.len())? != byte_size
+        || hex::encode(Sha256::digest(bytes.as_slice())) != expected_bundle_hash
+    {
+        return Err(anyhow::anyhow!(
+            "certified_closure_bundle_artifact_content_mismatch"
+        ));
+    }
+    let bundle = serde_json::from_slice::<Value>(bytes.as_slice())?;
+    if bundle.get("schemaVersion").and_then(Value::as_str) != Some("lcia.scope-closure-bundle.v1")
+        || bundle.get("dataSnapshotToken").and_then(Value::as_str)
+            != Some(expected_data_snapshot_token)
+    {
+        return Err(anyhow::anyhow!(
+            "certified_closure_bundle_artifact_binding_mismatch"
+        ));
+    }
     Ok(())
 }
 
@@ -2449,7 +2607,7 @@ pub(crate) async fn fetch_scope_closure_snapshot_facts(
     binding: &ScopeClosureSnapshotBinding,
     expected_axis: &[RequestRootProcess],
 ) -> anyhow::Result<ScopeClosureSnapshotFacts> {
-    load_scope_closure_snapshot_facts(state, snapshot_id, binding, expected_axis)
+    load_scope_closure_snapshot_facts(state, snapshot_id, binding, expected_axis, None)
         .await
         .map(|(facts, _)| facts)
 }
@@ -2459,6 +2617,7 @@ async fn load_scope_closure_snapshot_facts(
     snapshot_id: Uuid,
     binding: &ScopeClosureSnapshotBinding,
     expected_axis: &[RequestRootProcess],
+    expected_artifact_id: Option<Uuid>,
 ) -> anyhow::Result<(ScopeClosureSnapshotFacts, DecodedSnapshotArtifact)> {
     let row = sqlx::query(
         r"
@@ -2471,12 +2630,14 @@ async fn load_scope_closure_snapshot_facts(
         JOIN public.lca_snapshot_artifacts a
           ON a.snapshot_id = s.id AND a.status = 'ready'
         WHERE s.id = $1
+          AND ($2::uuid IS NULL OR a.id = $2)
           AND a.artifact_format = 'snapshot-hdf5:v1'
         ORDER BY a.created_at DESC
         LIMIT 1
         ",
     )
     .bind(snapshot_id)
+    .bind(expected_artifact_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| anyhow::anyhow!("certified_snapshot_artifact_not_found"))?;
@@ -2529,6 +2690,7 @@ async fn load_scope_closure_snapshot_facts(
             "certified_snapshot_index_identity_mismatch"
         ));
     }
+    validate_certified_snapshot_index(&snapshot_index, &decoded, expected_axis)?;
 
     Ok((
         ScopeClosureSnapshotFacts {
@@ -2608,39 +2770,84 @@ fn validate_certified_snapshot_contract(
     let process_axis = graph
         .processes
         .iter()
-        .map(|process| (process.process_id, process.process_version.clone()))
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|process| {
+            (
+                process.process_idx,
+                process.process_id,
+                process.process_version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     validate_certified_process_axis(&process_axis, decoded.payload.process_count, request_roots)
 }
 
 fn validate_certified_process_axis(
-    process_axis: &std::collections::BTreeSet<(Uuid, String)>,
+    process_axis: &[(i32, Uuid, String)],
     payload_process_count: i32,
     request_roots: &[RequestRootProcess],
 ) -> anyhow::Result<()> {
     let requested_axis = request_roots
         .iter()
         .map(|root| (root.process_id, root.process_version.clone()))
-        .collect::<std::collections::BTreeSet<_>>();
-    if process_axis != &requested_axis {
-        let missing = requested_axis
-            .difference(process_axis)
-            .map(|(id, version)| format!("{id}@{version}"))
-            .collect::<Vec<_>>();
-        let unexpected = process_axis
-            .difference(&requested_axis)
-            .map(|(id, version)| format!("{id}@{version}"))
-            .collect::<Vec<_>>();
+        .collect::<Vec<_>>();
+    let observed_axis = process_axis
+        .iter()
+        .map(|(_, id, version)| (*id, version.clone()))
+        .collect::<Vec<_>>();
+    let contiguous_indices = process_axis
+        .iter()
+        .enumerate()
+        .all(|(index, (process_idx, _, _))| i32::try_from(index) == Ok(*process_idx));
+    if observed_axis != requested_axis || !contiguous_indices {
         return Err(anyhow::anyhow!(
-            "certified_snapshot_axis_mismatch: missing={} unexpected={}",
-            missing.join(","),
-            unexpected.join(",")
+            "certified_snapshot_axis_mismatch: artifact evidence must preserve the exact ordered effective process axis"
         ));
     }
     if payload_process_count != i32::try_from(process_axis.len())? {
         return Err(anyhow::anyhow!(
             "certified_snapshot_axis_mismatch: payload process count differs from compiled graph"
         ));
+    }
+    Ok(())
+}
+
+fn validate_certified_snapshot_index(
+    snapshot_index: &SnapshotIndexDocument,
+    decoded: &DecodedSnapshotArtifact,
+    expected_axis: &[RequestRootProcess],
+) -> anyhow::Result<()> {
+    let graph = decoded.compiled_graph.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("certified snapshot lacks compiled graph and exact process axis evidence")
+    })?;
+    if snapshot_index.process_count != decoded.payload.process_count
+        || snapshot_index.impact_count != decoded.payload.impact_count
+        || snapshot_index.process_map.len() != expected_axis.len()
+        || snapshot_index.process_map.len() != graph.processes.len()
+        || usize::try_from(snapshot_index.impact_count)? != snapshot_index.impact_map.len()
+    {
+        return Err(anyhow::anyhow!("certified_snapshot_index_axis_mismatch"));
+    }
+
+    let index_axis = snapshot_index
+        .process_map
+        .iter()
+        .map(|entry| {
+            (
+                entry.process_index,
+                entry.process_id,
+                entry.process_version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    validate_certified_process_axis(&index_axis, snapshot_index.process_count, expected_axis)
+        .map_err(|_| anyhow::anyhow!("certified_snapshot_index_axis_mismatch"))?;
+    if !snapshot_index
+        .impact_map
+        .iter()
+        .enumerate()
+        .all(|(index, entry)| i32::try_from(index) == Ok(entry.impact_index))
+    {
+        return Err(anyhow::anyhow!("certified_snapshot_index_axis_mismatch"));
     }
     Ok(())
 }
@@ -3619,7 +3826,7 @@ mod tests {
         resolve_solve_all_unit_options, validate_certified_process_axis,
     };
     use serde_json::json;
-    use std::{collections::BTreeSet, time::Duration};
+    use std::time::Duration;
     use uuid::Uuid;
 
     use crate::graph_types::RequestRootProcess;
@@ -3655,17 +3862,30 @@ mod tests {
     fn certified_snapshot_axis_must_exactly_match_effective_package_axis() {
         let root = RequestRootProcess::new(Uuid::new_v4(), "01.00.000");
         let provider = RequestRootProcess::new(Uuid::new_v4(), "02.00.000");
-        let exact = BTreeSet::from([(root.process_id, root.process_version.clone())]);
+        let exact = vec![(0, root.process_id, root.process_version.clone())];
         validate_certified_process_axis(&exact, 1, std::slice::from_ref(&root)).unwrap();
 
-        let expanded = BTreeSet::from([
-            (root.process_id, root.process_version.clone()),
-            (provider.process_id, provider.process_version.clone()),
-        ]);
+        let expanded = vec![
+            (0, root.process_id, root.process_version.clone()),
+            (1, provider.process_id, provider.process_version.clone()),
+        ];
         assert!(
             validate_certified_process_axis(&expanded, 2, std::slice::from_ref(&root)).is_err()
         );
-        assert!(validate_certified_process_axis(&exact, 2, &[root]).is_err());
+        assert!(validate_certified_process_axis(&exact, 2, std::slice::from_ref(&root)).is_err());
+
+        let expected = vec![root.clone(), provider.clone()];
+        let reordered = vec![
+            (0, provider.process_id, provider.process_version.clone()),
+            (1, root.process_id, root.process_version.clone()),
+        ];
+        assert!(validate_certified_process_axis(&reordered, 2, &expected).is_err());
+
+        let non_contiguous = vec![
+            (1, root.process_id, root.process_version.clone()),
+            (0, provider.process_id, provider.process_version.clone()),
+        ];
+        assert!(validate_certified_process_axis(&non_contiguous, 2, &expected).is_err());
     }
 
     #[test]

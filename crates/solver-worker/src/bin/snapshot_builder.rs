@@ -754,12 +754,67 @@ fn parse_scope_closure_snapshot_args(
                     snapshot.schema_version
                 ));
             }
+            let link_policy = &snapshot.requested_scope.link_policy;
+            if link_policy.link_semantics_version != "signed-flow-balance-v1"
+                || link_policy.flow_identity_policy != "exact-flow-version-reference-unit-v2"
+                || link_policy.allocation_semantics_version != "tidas-reference-allocation-v3"
+                || !matches!(
+                    link_policy.technosphere_boundary_policy.as_str(),
+                    "closed" | "open" | "cutoff"
+                )
+                || !matches!(
+                    link_policy.provider_universe_policy.as_str(),
+                    "scope_only" | "eligible_transitive_expansion-v1"
+                )
+            {
+                return Err(anyhow::anyhow!(
+                    "scope closure data snapshot contains an unsupported link policy"
+                ));
+            }
             Ok(Some((binding, snapshot, mode)))
         }
         _ => Err(anyhow::anyhow!(
             "--scope-closure-binding-json and --scope-closure-data-snapshot-json must be supplied together"
         )),
     }
+}
+
+fn scope_closure_candidate_process_axis(
+    scope_closure_snapshot: Option<&(ScopeClosureSnapshotBinding, DataSnapshotManifest, &str)>,
+    request_roots: &[RequestRootProcess],
+) -> Option<BTreeSet<(Uuid, String)>> {
+    let (_, snapshot, mode) = scope_closure_snapshot?;
+    if *mode != "build"
+        && snapshot
+            .requested_scope
+            .link_policy
+            .provider_universe_policy
+            != "scope_only"
+    {
+        return None;
+    }
+    Some(
+        request_roots
+            .iter()
+            .map(|root| (root.process_id, root.process_version.clone()))
+            .collect(),
+    )
+}
+
+fn scope_closure_boundary_policy(
+    cli_policy: &str,
+    scope_closure_snapshot: Option<&(ScopeClosureSnapshotBinding, DataSnapshotManifest, &str)>,
+) -> String {
+    scope_closure_snapshot.map_or_else(
+        || cli_policy.to_owned(),
+        |(_, snapshot, _)| {
+            snapshot
+                .requested_scope
+                .link_policy
+                .technosphere_boundary_policy
+                .clone()
+        },
+    )
 }
 
 #[tokio::main]
@@ -776,8 +831,13 @@ async fn main() -> anyhow::Result<()> {
     let provider_rule = ProviderRule::parse(&cli.provider_rule)?;
     let reference_normalization_mode = NormalizationMode::parse(&cli.reference_normalization_mode)?;
     let allocation_mode = AllocationMode::parse(&cli.allocation_fraction_mode)?;
-    let technosphere_boundary_policy =
-        TechnosphereBoundaryPolicy::parse(&cli.technosphere_boundary_policy)?;
+    let technosphere_boundary_policy = TechnosphereBoundaryPolicy::parse(
+        scope_closure_boundary_policy(
+            &cli.technosphere_boundary_policy,
+            scope_closure_snapshot.as_ref(),
+        )
+        .as_str(),
+    )?;
     let report_policy = snapshot_report_policy(&cli)?;
 
     let db_url = cli
@@ -823,6 +883,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         SnapshotSelectionMode::RequestRootsClosure
     };
+    let scope_closure_candidate_axis =
+        scope_closure_candidate_process_axis(scope_closure_snapshot.as_ref(), &request_roots);
     let mut build_timing = BuildTimingSec::default();
     let method_started = Instant::now();
     let method = resolve_method_identity(
@@ -883,6 +945,7 @@ async fn main() -> anyhow::Result<()> {
         scope_closure_snapshot
             .as_ref()
             .map(|(_, snapshot, _)| snapshot),
+        scope_closure_candidate_axis.as_ref(),
     )
     .await?;
     let request_scope_flow_requests = collect_process_flow_reference_requests(&candidate_processes);
@@ -6493,6 +6556,7 @@ async fn fetch_processes(
     include_user_id: Option<Uuid>,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     scope_closure_snapshot: Option<&DataSnapshotManifest>,
+    scope_closure_candidate_axis: Option<&BTreeSet<(Uuid, String)>>,
 ) -> anyhow::Result<Vec<ProcessRow>> {
     let query_started = Instant::now();
     let rows = if let Some(snapshot) = scope_closure_snapshot {
@@ -6500,7 +6564,11 @@ async fn fetch_processes(
             .datasets
             .iter()
             .filter(|entry| {
-                entry.dataset_type == DatasetCategory::Processes && entry.role == "unit_process"
+                entry.dataset_type == DatasetCategory::Processes
+                    && entry.role == "unit_process"
+                    && scope_closure_candidate_axis.is_none_or(|axis| {
+                        axis.contains(&(entry.dataset_id, entry.dataset_version.clone()))
+                    })
             })
             .collect::<Vec<_>>();
         let ids = processes
@@ -6655,7 +6723,11 @@ async fn fetch_processes(
             .datasets
             .iter()
             .filter(|entry| {
-                entry.dataset_type == DatasetCategory::Processes && entry.role == "unit_process"
+                entry.dataset_type == DatasetCategory::Processes
+                    && entry.role == "unit_process"
+                    && scope_closure_candidate_axis.is_none_or(|axis| {
+                        axis.contains(&(entry.dataset_id, entry.dataset_version.clone()))
+                    })
             })
             .count();
         if out.len() != expected_count {
@@ -8888,6 +8960,7 @@ mod tests {
         resolve_database_lcia_method_rows, resolve_lcia_method_source_row, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
+        scope_closure_boundary_policy, scope_closure_candidate_process_axis,
         snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
         summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
         validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
@@ -8913,6 +8986,9 @@ mod tests {
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
     use solver_worker::pgbouncer_sqlx::postgres::PgPoolOptions;
+    use solver_worker::scope_closure::DataSnapshotManifest;
+    use solver_worker::signed_flow::TechnosphereBoundaryPolicy;
+    use solver_worker::snapshot_artifacts::ScopeClosureSnapshotBinding;
 
     fn assert_close(actual: f64, expected: f64) {
         let delta = (actual - expected).abs();
@@ -8920,6 +8996,53 @@ mod tests {
             delta <= 1e-12,
             "expected {expected}, got {actual}, delta={delta}"
         );
+    }
+
+    fn frozen_scope_closure_snapshot(
+        provider_universe_policy: &str,
+        boundary_policy: &str,
+        mode: &'static str,
+    ) -> (
+        ScopeClosureSnapshotBinding,
+        DataSnapshotManifest,
+        &'static str,
+    ) {
+        let binding = ScopeClosureSnapshotBinding {
+            schema_version: "lcia.scope-closure-snapshot-binding.v1".to_owned(),
+            effective_scope_hash: "effective-scope".to_owned(),
+            data_snapshot_token: "snapshot-token".to_owned(),
+            closure_bundle_hash: "bundle-hash".to_owned(),
+        };
+        let snapshot = serde_json::from_value(json!({
+            "schemaVersion": "lcia.scope-closure-data-snapshot.v2",
+            "requestedScope": {
+                "schemaVersion": "lcia.scope-closure-requested-scope.v1",
+                "coverageMode": "subset",
+                "eligibilityPredicateVersion": "published-state-code-100-199:v1",
+                "processes": [],
+                "lciaMethods": [],
+                "versionResolutionPolicy": "reference-version-resolution-v1",
+                "legacyOmittedVersionPolicy": "latest_eligible",
+                "certificateFreshnessPolicy": "current-membership-required-v1",
+                "linkPolicy": {
+                    "linkSemanticsVersion": "signed-flow-balance-v1",
+                    "flowIdentityPolicy": "exact-flow-version-reference-unit-v2",
+                    "allocationSemanticsVersion": "tidas-reference-allocation-v3",
+                    "technosphereBoundaryPolicy": boundary_policy,
+                    "providerUniversePolicy": provider_universe_policy
+                }
+            },
+            "currentPublicRelease": {
+                "publicationId": Uuid::new_v4(),
+                "releaseRunId": Uuid::new_v4(),
+                "releaseVersion": "test",
+                "publishedAt": "2026-07-22T00:00:00Z",
+                "releaseManifestHash": "release-hash"
+            },
+            "datasets": []
+        }))
+        .expect("frozen scope closure snapshot");
+        (binding, snapshot, mode)
     }
 
     fn test_snapshot_build_config(allocation_semantics_version: &str) -> SnapshotBuildConfig {
@@ -10004,6 +10127,114 @@ mod tests {
         .expect("right hash");
 
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn scope_only_frozen_universe_excludes_implicit_external_provider() {
+        let root_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let roots = [RequestRootProcess::new(root_id, "01.00.000")];
+        let frozen = frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let candidate_axis = scope_closure_candidate_process_axis(Some(&frozen), &roots)
+            .expect("scope_only must restrict discovery candidates");
+
+        assert_eq!(
+            candidate_axis,
+            BTreeSet::from([(root_id, "01.00.000".to_owned())])
+        );
+        assert!(
+            !candidate_axis.contains(&(provider_id, "01.00.000".to_owned())),
+            "an implicit provider outside requested roots must remain unresolved, not enter the certified axis"
+        );
+    }
+
+    #[test]
+    fn eligible_transitive_frozen_universe_allows_multi_hop_cycle_discovery() {
+        let root_id = Uuid::new_v4();
+        let intermediate_provider_id = Uuid::new_v4();
+        let terminal_provider_id = Uuid::new_v4();
+        let root_flow = Uuid::new_v4();
+        let flow_a = Uuid::new_v4();
+        let flow_b = Uuid::new_v4();
+        let roots = [RequestRootProcess::new(root_id, "01.00.000")];
+        let frozen = frozen_scope_closure_snapshot(
+            "eligible_transitive_expansion-v1",
+            "closed",
+            "discovery",
+        );
+        assert_eq!(
+            scope_closure_candidate_process_axis(Some(&frozen), &roots),
+            None,
+            "eligible discovery may search the frozen release provider universe"
+        );
+
+        let row = |id, exchanges| ProcessRow {
+            id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(exchanges),
+        };
+        let selected = resolve_process_selection(
+            vec![
+                row(root_id, &[("Output", root_flow), ("Input", flow_a)]),
+                row(
+                    intermediate_provider_id,
+                    &[("Output", flow_a), ("Input", flow_b)],
+                ),
+                row(
+                    terminal_provider_id,
+                    &[("Output", flow_b), ("Input", root_flow)],
+                ),
+            ],
+            false,
+            &[100],
+            None,
+            &roots,
+            ProviderRule::StrictUniqueProvider,
+            0,
+            None,
+        )
+        .expect("resolve multi-hop cycle against frozen candidates");
+        assert_eq!(
+            selected
+                .processes
+                .iter()
+                .map(|process| process.id)
+                .collect::<Vec<_>>(),
+            vec![root_id, intermediate_provider_id, terminal_provider_id]
+        );
+
+        let build =
+            frozen_scope_closure_snapshot("eligible_transitive_expansion-v1", "closed", "build");
+        assert_eq!(
+            scope_closure_candidate_process_axis(Some(&build), &roots),
+            Some(BTreeSet::from([(root_id, "01.00.000".to_owned())])),
+            "the certified build must use only its already-frozen effective axis"
+        );
+    }
+
+    #[test]
+    fn frozen_open_and_cutoff_boundary_policies_override_cli_default() {
+        for expected in ["open", "cutoff"] {
+            let frozen = frozen_scope_closure_snapshot("scope_only", expected, "discovery");
+            assert_eq!(
+                scope_closure_boundary_policy("closed", Some(&frozen)),
+                expected
+            );
+            assert_eq!(
+                TechnosphereBoundaryPolicy::parse(
+                    scope_closure_boundary_policy("closed", Some(&frozen)).as_str()
+                )
+                .expect("supported frozen boundary")
+                .as_str(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: 1a4c44b92ca4ca52c49760722cc2123c141c0f72
+lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
 lastReviewedNote: "Reviewed certificate snapshot exact-version/source-hash enforcement; provider eligibility and routing order are unchanged."
 related:
   - AGENTS.md

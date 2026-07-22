@@ -473,6 +473,16 @@ impl ObjectStoreClient {
         ))
     }
 
+    /// Downloads bytes from an explicit bucket-relative object key.
+    pub async fn download_object_key(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        let key = object_key.trim_start_matches('/');
+        if key.trim().is_empty() {
+            return Err(anyhow::anyhow!("object key must not be empty"));
+        }
+        let object_url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+        self.download_object_url(&object_url).await
+    }
+
     fn package_object_key(&self, job_id: Uuid, suffix: &str, extension: &str) -> String {
         if self.prefix.is_empty() {
             format!("packages/jobs/{job_id}/{suffix}.{extension}")

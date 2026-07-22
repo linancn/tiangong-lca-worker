@@ -152,10 +152,10 @@ The database Build V2 command atomically enqueues `lcia_result.package_build` wi
 - `snapshot_artifact_id`
 - `snapshot_index_sha256`
 - `snapshot_build_contract_hash`
+- `closure_bundle_artifact_id`
 - `closure_bundle_hash`
-- `report_artifact_manifest_hash`
 
-The Worker accepts this binding only all-or-none and validates every field against a currently valid, complete, passed closure check before package execution. It consumes the certificate and frozen snapshot; it does not rerun administrative closure.
+The Worker accepts this authoritative eleven-field binding only all-or-none and validates every field against a currently valid, complete, passed closure check before package execution. It downloads the exact closure-bundle artifact and numerical snapshot artifact by their certified IDs, recomputes their hashes, and requires the HDF5 compiled graph plus snapshot-index sidecar to preserve the exact ordered effective Process axis. `report_artifact_manifest_hash` remains certificate/audit evidence in the job payload, but it is not a substitute for the exact closure-bundle artifact identity. The Worker consumes the certificate and frozen snapshot; it does not rerun administrative closure.
 
 Closure binding changes provenance and eligibility, not numerical computation. The existing package snapshot build, all-unit solve, result artifact, and ready-marking path remains unchanged. Result JSON, result refs, persisted package metadata, and audit context preserve `closureCheckId` so downstream consumers can prove which certificate authorized the unchanged numerical output.
 
