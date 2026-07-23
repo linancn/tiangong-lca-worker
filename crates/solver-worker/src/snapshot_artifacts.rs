@@ -28,6 +28,16 @@ pub const SNAPSHOT_ARTIFACT_CONTENT_TYPE: &str = "application/x-hdf5";
 /// Snapshot coverage JSON schema identifier.
 pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v3";
 
+/// Certificate-grade scope binding embedded inside a numerical snapshot artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeClosureSnapshotBinding {
+    pub schema_version: String,
+    pub effective_scope_hash: String,
+    pub data_snapshot_token: String,
+    pub closure_bundle_hash: String,
+}
+
 /// Snapshot build options persisted in artifact metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotBuildConfig {
@@ -42,6 +52,9 @@ pub struct SnapshotBuildConfig {
     /// Canonical visibility manifest binding, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_manifest_sha256: Option<String>,
+    /// Immutable scope-closure evidence consumed by package Build V2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_closure_binding: Option<ScopeClosureSnapshotBinding>,
     /// Exact database method/factor snapshot proof used by the build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lcia_method_factor_source: Option<LcaMethodFactorSourceSnapshot>,
@@ -513,6 +526,7 @@ mod tests {
             include_user_id: None,
             data_scope: None,
             scope_manifest_sha256: None,
+            scope_closure_binding: None,
             lcia_method_factor_source: None,
             selection_mode: SnapshotSelectionMode::FilteredLibrary,
             request_roots: Vec::new(),

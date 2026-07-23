@@ -236,6 +236,62 @@ pub enum JobPayload {
         /// Post-processing manifest, no-op for the MVP package build.
         #[serde(default)]
         postprocess_manifest: Option<Value>,
+        /// Scope-closure certificate consumed without re-running administrative closure.
+        #[serde(default)]
+        closure_check_id: Option<Uuid>,
+        /// Certificate hash calculated and stored by the database completion RPC.
+        #[serde(default)]
+        closure_certificate_hash: Option<String>,
+        /// Hash of the original requested scope bound into the certificate.
+        #[serde(default)]
+        requested_scope_hash: Option<String>,
+        /// Fingerprint of the policy used to evaluate scope closure.
+        #[serde(default)]
+        policy_fingerprint: Option<String>,
+        /// Hash of the effective exact-version manifest certified by the preflight.
+        #[serde(default)]
+        effective_scope_hash: Option<String>,
+        /// Complete effective exact-version manifest certified by the preflight.
+        #[serde(default)]
+        effective_scope: Option<Value>,
+        /// Frozen membership token bound into closure evidence.
+        #[serde(default)]
+        data_snapshot_token: Option<String>,
+        /// Immutable administrative closure snapshot identity.
+        #[serde(default)]
+        snapshot_id: Option<Uuid>,
+        /// Hash of the immutable administrative closure snapshot.
+        #[serde(default)]
+        snapshot_hash: Option<String>,
+        /// Hash of the closure bundle used to produce the snapshot.
+        #[serde(default)]
+        closure_bundle_hash: Option<String>,
+        /// Exact administrative closure-bundle artifact certified by the database.
+        #[serde(default)]
+        closure_bundle_artifact_id: Option<Uuid>,
+        /// Persisted report artifact metadata hash bound by the certificate.
+        #[serde(default)]
+        report_artifact_manifest_hash: Option<String>,
+        /// Exact ready numerical snapshot artifact row certified by the preflight.
+        #[serde(default)]
+        snapshot_artifact_id: Option<Uuid>,
+        /// SHA-256 of the certified snapshot index sidecar.
+        #[serde(default)]
+        snapshot_index_sha256: Option<String>,
+        /// Hash of the numerical snapshot build contract.
+        #[serde(default)]
+        snapshot_build_contract_hash: Option<String>,
+    },
+    /// Validate and freeze one immutable data-product scope closure.
+    ScopeClosureCheck {
+        /// Domain identifier in `lcia_scope_closure_checks`.
+        closure_check_id: Uuid,
+        /// Shared immutable scan execution selected by the database request RPC.
+        scan_execution_id: Uuid,
+        /// Frozen membership token included in the job envelope for drift checks.
+        data_snapshot_token: String,
+        /// Stable fingerprint over the complete request contract.
+        request_fingerprint: String,
     },
 }
 

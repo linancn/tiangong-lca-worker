@@ -24,8 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-07-21
-lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedAt: 2026-07-22
+lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
+lastReviewedNote: "Reviewed certificate-bound discovery/build readiness integration; blocker semantics and report schema are unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

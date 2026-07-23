@@ -24,8 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-21
-lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedAt: 2026-07-22
+lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
+lastReviewedNote: "Reviewed frozen-manifest source validation for certificate snapshots; signed-flow routing theory is unchanged."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
