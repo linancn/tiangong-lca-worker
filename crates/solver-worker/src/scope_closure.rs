@@ -898,28 +898,46 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         }
     }
 
+    tokio::task::yield_now().await;
+    let scan = finalize_scope_closure_scan(
+        edges,
+        resolved_references,
+        omitted_version_resolutions,
+        raw_issues,
+        &roots,
+        &graph,
+        complete,
+        documents,
+        scheduled,
+    );
+    Ok(scan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_scope_closure_scan(
+    mut edges: Vec<ReferenceEdge>,
+    mut resolved_references: Vec<ResolvedReference>,
+    mut omitted_version_resolutions: Vec<Value>,
+    raw_issues: Vec<ClosureIssue>,
+    roots: &[ExactDatasetIdentity],
+    graph: &BTreeMap<ExactDatasetIdentity, BTreeSet<ExactDatasetIdentity>>,
+    complete: bool,
+    documents: BTreeMap<ExactDatasetIdentity, ClosureDocument>,
+    scheduled: BTreeSet<ExactDatasetIdentity>,
+) -> ScopeClosureScan {
     edges.sort_by_key(canonical_value);
     resolved_references.sort();
     omitted_version_resolutions.sort_by_key(canonical_value);
+    let mut raw_issues = raw_issues;
     attach_reference_occurrences(&mut raw_issues, &resolved_references);
     let mut issues = coalesce_issues(raw_issues);
-    for issue in &mut issues {
-        if let Some(source) = issue.source.as_ref() {
-            let (affected, witnesses) = affected_roots_and_witness(&roots, &graph, source);
-            issue.affected_roots = affected;
-            issue.witness_path = witnesses.first().cloned().unwrap_or_default();
-            issue.affected_root_witness_paths = witnesses;
-        }
-    }
+    compute_affected_roots_batch(&mut issues, roots, graph);
     issues.sort_by_key(canonical_value);
 
-    Ok(ScopeClosureScan {
+    ScopeClosureScan {
         schema_version: "lcia.scope-closure-scan.v1".to_owned(),
-        // A row absent from the frozen release is a complete negative finding.
-        // An allowlisted row that is missing or hash-drifted is incomplete because
-        // the claimed immutable source could not actually be observed.
         complete,
-        roots,
+        roots: roots.to_vec(),
         documents: documents.into_values().collect(),
         edges,
         resolved_references,
@@ -927,10 +945,17 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         issues,
         frontier: Vec::new(),
         provider_universe: scheduled.into_iter().collect(),
-    })
+    }
 }
 
 fn attach_reference_occurrences(issues: &mut [ClosureIssue], references: &[ResolvedReference]) {
+    let mut by_target: BTreeMap<&ExactDatasetIdentity, Vec<&ResolvedReference>> = BTreeMap::new();
+    for reference in references {
+        by_target
+            .entry(&reference.target)
+            .or_default()
+            .push(reference);
+    }
     for issue in issues {
         let Some(target) = issue.source.as_ref().filter(|source| {
             issue.requested_target_id == Some(source.id)
@@ -938,9 +963,9 @@ fn attach_reference_occurrences(issues: &mut [ClosureIssue], references: &[Resol
         }) else {
             continue;
         };
-        let mut occurrences = references
+        let matches = by_target.get(target).map_or(&[] as &[_], |v| v.as_slice());
+        let mut occurrences = matches
             .iter()
-            .filter(|reference| &reference.target == target)
             .map(|reference| ClosureIssueOccurrence {
                 occurrence_key: canonical_json_sha256(&json!({
                     "issueKey": issue.issue_key,
@@ -970,35 +995,87 @@ fn attach_reference_occurrences(issues: &mut [ClosureIssue], references: &[Resol
     }
 }
 
-fn affected_roots_and_witness(
+fn compute_affected_roots_batch(
+    issues: &mut [ClosureIssue],
     roots: &[ExactDatasetIdentity],
     graph: &BTreeMap<ExactDatasetIdentity, BTreeSet<ExactDatasetIdentity>>,
-    target: &ExactDatasetIdentity,
+) {
+    let root_set: BTreeSet<&ExactDatasetIdentity> = roots.iter().collect();
+
+    let mut reverse_graph: BTreeMap<&ExactDatasetIdentity, Vec<&ExactDatasetIdentity>> =
+        BTreeMap::new();
+    for (source, targets) in graph {
+        for target in targets {
+            reverse_graph.entry(target).or_default().push(source);
+        }
+    }
+
+    let mut cache: BTreeMap<
+        ExactDatasetIdentity,
+        (Vec<ExactDatasetIdentity>, Vec<Vec<ExactDatasetIdentity>>),
+    > = BTreeMap::new();
+
+    for issue in issues {
+        let Some(source) = issue.source.as_ref() else {
+            continue;
+        };
+        let (affected, witnesses) = cache
+            .entry(source.clone())
+            .or_insert_with(|| {
+                compute_single_source_affected_roots(source, &root_set, &reverse_graph)
+            })
+            .clone();
+        issue.affected_roots = affected;
+        issue.witness_path = witnesses.first().cloned().unwrap_or_default();
+        issue.affected_root_witness_paths = witnesses;
+    }
+}
+
+fn compute_single_source_affected_roots(
+    source: &ExactDatasetIdentity,
+    root_set: &BTreeSet<&ExactDatasetIdentity>,
+    reverse_graph: &BTreeMap<&ExactDatasetIdentity, Vec<&ExactDatasetIdentity>>,
 ) -> (Vec<ExactDatasetIdentity>, Vec<Vec<ExactDatasetIdentity>>) {
-    let mut affected = Vec::new();
-    let mut witnesses = Vec::new();
-    for root in roots {
-        let mut queue = VecDeque::from([(root.clone(), vec![root.clone()])]);
-        let mut visited = BTreeSet::new();
-        while let Some((node, path)) = queue.pop_front() {
-            if !visited.insert(node.clone()) {
-                continue;
-            }
-            if &node == target {
-                affected.push(root.clone());
-                witnesses.push(path);
-                break;
-            }
-            if let Some(children) = graph.get(&node) {
-                for child in children {
-                    let mut next_path = path.clone();
-                    next_path.push(child.clone());
-                    queue.push_back((child.clone(), next_path));
+    let mut parent: BTreeMap<&ExactDatasetIdentity, Option<&ExactDatasetIdentity>> =
+        BTreeMap::new();
+    parent.insert(source, None);
+    let mut queue: VecDeque<&ExactDatasetIdentity> = VecDeque::from([source]);
+
+    while let Some(node) = queue.pop_front() {
+        if let Some(predecessors) = reverse_graph.get(node) {
+            for &pred in predecessors {
+                if !parent.contains_key(pred) {
+                    parent.insert(pred, Some(node));
+                    queue.push_back(pred);
                 }
             }
         }
     }
+
+    let mut affected = Vec::new();
+    let mut witnesses = Vec::new();
+    for root in root_set {
+        if parent.contains_key(root) {
+            affected.push((*root).clone());
+            let path = reconstruct_witness_path(root, &parent);
+            witnesses.push(path);
+        }
+    }
     (affected, witnesses)
+}
+
+fn reconstruct_witness_path(
+    root: &ExactDatasetIdentity,
+    parent: &BTreeMap<&ExactDatasetIdentity, Option<&ExactDatasetIdentity>>,
+) -> Vec<ExactDatasetIdentity> {
+    let mut path = Vec::new();
+    let mut current: Option<&ExactDatasetIdentity> = Some(root);
+    while let Some(node) = current {
+        path.push(node.clone());
+        current = parent.get(node).copied().flatten();
+    }
+    path.reverse();
+    path
 }
 
 fn populate_affected_roots(scan: &mut ScopeClosureScan) {
@@ -1009,14 +1086,7 @@ fn populate_affected_roots(scan: &mut ScopeClosureScan) {
             .or_default()
             .insert(reference.target.clone());
     }
-    for issue in &mut scan.issues {
-        if let Some(source) = issue.source.as_ref() {
-            let (affected, witnesses) = affected_roots_and_witness(&scan.roots, &graph, source);
-            issue.affected_roots = affected;
-            issue.witness_path = witnesses.first().cloned().unwrap_or_default();
-            issue.affected_root_witness_paths = witnesses;
-        }
-    }
+    compute_affected_roots_batch(&mut scan.issues, &scan.roots, &graph);
     scan.issues.sort_by_key(canonical_value);
 }
 
@@ -1481,21 +1551,21 @@ fn coalesce_issues(issues: Vec<ClosureIssue>) -> Vec<ClosureIssue> {
         issue
             .occurrences
             .dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
-        issue.occurrence_count = u32::try_from(issue.occurrences.len()).unwrap_or(u32::MAX);
         output
             .entry(issue.issue_key.clone())
             .and_modify(|existing| {
                 existing.occurrences.extend(issue.occurrences.clone());
-                existing
-                    .occurrences
-                    .sort_by(|left, right| left.occurrence_key.cmp(&right.occurrence_key));
-                existing
-                    .occurrences
-                    .dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
-                existing.occurrence_count =
-                    u32::try_from(existing.occurrences.len()).unwrap_or(u32::MAX);
             })
             .or_insert(issue);
+    }
+    for issue in output.values_mut() {
+        issue
+            .occurrences
+            .sort_by(|left, right| left.occurrence_key.cmp(&right.occurrence_key));
+        issue
+            .occurrences
+            .dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
+        issue.occurrence_count = u32::try_from(issue.occurrences.len()).unwrap_or(u32::MAX);
     }
     output.into_values().collect()
 }
@@ -1762,8 +1832,13 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     let mut scan = collect_scope_closure(provider, requested_scope).await?;
     let validation =
         run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
-    merge_tidas_validation_issues(&mut scan, &validation.issue_events);
-    scan.issues.sort_by_key(canonical_value);
+    let issue_events = validation.issue_events.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        merge_tidas_validation_issues(&mut scan, &issue_events);
+        scan.issues.sort_by_key(canonical_value);
+        scan
+    })
+    .await?;
     Ok((scan, validation))
 }
 
@@ -5070,5 +5145,114 @@ mod tests {
         )
         .expect_err("builder identity drift must fail closed");
         assert!(error.to_string().contains("database-preallocated identity"));
+    }
+
+    #[tokio::test]
+    async fn large_root_set_completes_within_time_budget() {
+        let num_roots: u128 = 5605;
+        let num_support: u128 = 2000;
+        let num_issues: u128 = 1000;
+
+        let roots = (0..num_roots)
+            .map(|i| ExactDatasetIdentity {
+                category: DatasetCategory::Processes,
+                id: Uuid::from_u128(i + 1),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+
+        let support_docs = (0..num_support)
+            .map(|i| ExactDatasetIdentity {
+                category: DatasetCategory::Sources,
+                id: Uuid::from_u128(num_roots + i + 1),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut documents = BTreeMap::new();
+        for root in &roots {
+            let target = &support_docs[root.id.as_u128() as usize % num_support as usize];
+            documents.insert(
+                root.clone(),
+                ClosureDocument {
+                    identity: root.clone(),
+                    payload: json!({
+                        "referenceToSource": reference("source", target.id, Some("01.00.000"))
+                    }),
+                },
+            );
+        }
+        for support in &support_docs {
+            documents.insert(
+                support.clone(),
+                ClosureDocument {
+                    identity: support.clone(),
+                    payload: json!({}),
+                },
+            );
+        }
+
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+
+        let start = std::time::Instant::now();
+        let scan = collect_scope_closure(&provider, &manifest(roots.clone()))
+            .await
+            .expect("scan must complete");
+        let elapsed = start.elapsed();
+
+        assert!(scan.documents.len() >= num_roots as usize);
+        assert!(
+            elapsed.as_secs() < 30,
+            "scan took {elapsed:?}, expected under 30s"
+        );
+
+        let mut graph: BTreeMap<ExactDatasetIdentity, BTreeSet<ExactDatasetIdentity>> =
+            BTreeMap::new();
+        for reference in &scan.resolved_references {
+            graph
+                .entry(reference.source.clone())
+                .or_default()
+                .insert(reference.target.clone());
+        }
+
+        let mut issues: Vec<ClosureIssue> = (0..num_issues)
+            .map(|i| {
+                let source = &roots[i as usize % num_roots as usize];
+                ClosureIssue {
+                    issue_key: format!("test_issue_{i}"),
+                    severity: "warning".to_owned(),
+                    blocking: false,
+                    issue_code: "test_missing".to_owned(),
+                    source: Some(source.clone()),
+                    json_path: None,
+                    reference_role: None,
+                    requested_target_type: None,
+                    requested_target_id: None,
+                    requested_target_version: None,
+                    message: "test issue".to_owned(),
+                    suggested_action: None,
+                    occurrence_count: 0,
+                    occurrences: Vec::new(),
+                    affected_roots: Vec::new(),
+                    affected_root_witness_paths: Vec::new(),
+                    witness_path: Vec::new(),
+                }
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        compute_affected_roots_batch(&mut issues, &roots, &graph);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "affected_roots took {elapsed:?}, expected under 10s"
+        );
+        for issue in &issues {
+            assert!(!issue.affected_roots.is_empty());
+        }
     }
 }
