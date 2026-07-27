@@ -2,9 +2,11 @@
 //!
 //! Run only through `scripts/run_scope_closure_package_v2_e2e.sh`. The harness resets a local
 //! Supabase database, uses its S3-compatible Storage endpoint, builds the real snapshot-builder
-//! binary, and supplies a deterministic TIDAS process-protocol seam. The seam deliberately does
-//! not claim to validate TIDAS semantics; every database, Worker, snapshot, HDF5, solve, package,
-//! object-storage, tamper, and revocation boundary exercised below is real.
+//! binary, and invokes the selected published Rust `tidas` binary. Every database, Worker,
+//! snapshot, HDF5, solve, package, object-storage, tamper, and revocation boundary exercised
+//! below is real.
+
+#![allow(clippy::needless_raw_string_hashes, clippy::too_many_lines)]
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 

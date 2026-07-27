@@ -4,7 +4,6 @@ use std::{
     fs::{self, File},
     io::{Cursor, Read, Seek, Write, copy},
     path::Path,
-    process::Command,
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -29,6 +28,7 @@ use crate::{
         PACKAGE_EXPORT_WORKER_JOB_KIND, PACKAGE_WORKER_QUEUE, PACKAGE_ZIP_ARTIFACT_FORMAT,
         PackageArtifactKind, PackageExportScope, PackageRootRef, PackageRootTable,
     },
+    tidas_cli,
 };
 
 const OPEN_DATA_STATE_CODE_START: i32 = 100;
@@ -47,6 +47,7 @@ const EXPORT_ITEM_INSERT_CHUNK_SIZE: usize = 500;
 const EXPORT_BATCHES_PER_PASS: usize = 6;
 const EXPORT_PASS_TIME_BUDGET: Duration = Duration::from_secs(20);
 const EXPORT_SEED_SCAN_SLOW_BATCH_THRESHOLD: Duration = Duration::from_secs(5);
+const VALIDATION_ISSUE_SAMPLE_LIMIT: usize = 1_000;
 
 const SUPPORTED_PACKAGE_TABLES: [PackageRootTable; 7] = [
     PackageRootTable::Contacts,
@@ -186,25 +187,19 @@ struct ValidationIssueDetail {
     context: Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_field_names)]
 struct TidasValidationSummary {
-    #[serde(default)]
     issue_count: usize,
-    #[serde(default)]
     error_count: usize,
-    #[serde(default)]
     warning_count: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 struct TidasValidationReport {
-    #[serde(default)]
-    ok: bool,
-    #[serde(default)]
     summary: TidasValidationSummary,
-    #[serde(default)]
     issues: Vec<ValidationIssueDetail>,
+    issues_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +210,8 @@ struct ImportReportDocument {
     summary: ImportReportSummary,
     filtered_open_data: Vec<ConflictRecord>,
     user_conflicts: Vec<ConflictRecord>,
+    validation_issue_sample_limit: usize,
+    validation_issues_truncated: bool,
     validation_issues: Vec<ValidationIssueDetail>,
 }
 
@@ -1862,34 +1859,6 @@ fn is_undefined_table(err: &sqlx::Error) -> bool {
     }
 }
 
-fn validator_command_candidates(input_dir: &Path) -> Vec<(String, Vec<String>)> {
-    let mut candidates = Vec::new();
-    let base_args = vec![
-        "--input-dir".to_owned(),
-        input_dir.display().to_string(),
-        "--format".to_owned(),
-        "json".to_owned(),
-    ];
-
-    if let Ok(custom) = std::env::var("TIDAS_VALIDATE_BIN")
-        && !custom.trim().is_empty()
-    {
-        candidates.push((custom, base_args.clone()));
-    }
-
-    let mut python3_args = vec!["-m".to_owned(), "tidas_tools.validate".to_owned()];
-    python3_args.extend(base_args.clone());
-    candidates.push(("python3".to_owned(), python3_args));
-
-    let mut python_args = vec!["-m".to_owned(), "tidas_tools.validate".to_owned()];
-    python_args.extend(base_args.clone());
-    candidates.push(("python".to_owned(), python_args));
-
-    candidates.push(("tidas-validate".to_owned(), base_args));
-
-    candidates
-}
-
 fn extract_package_zip_to_tempdir(zip_bytes: &[u8]) -> anyhow::Result<TempDir> {
     let tempdir = tempfile::tempdir().context("create temp dir for package validation")?;
     let cursor = Cursor::new(zip_bytes.to_vec());
@@ -1931,80 +1900,117 @@ fn normalize_validation_issue_paths(report: &mut TidasValidationReport, root: &P
     }
 }
 
-fn parse_tidas_validation_report(raw_output: &str) -> anyhow::Result<TidasValidationReport> {
-    let mut report: TidasValidationReport =
-        serde_json::from_str(raw_output).context("parse TIDAS validator JSON report")?;
-
-    if report.summary.issue_count == 0 && !report.issues.is_empty() {
-        report.summary.issue_count = report.issues.len();
+fn parse_tidas_validation_report(
+    validation: &Value,
+    issue_events: Vec<Value>,
+    verified_issue_count: usize,
+    input_dir: &Path,
+) -> anyhow::Result<TidasValidationReport> {
+    let issues = issue_events
+        .into_iter()
+        .map(|event| {
+            serde_json::from_value::<ValidationIssueDetail>(
+                event.get("issue").cloned().ok_or_else(|| {
+                    anyhow::anyhow!("tidas_spool_invalid: issue event omitted issue")
+                })?,
+            )
+            .context("tidas_spool_invalid: parse validation issue")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let reported_issue_count = validation
+        .get("issue_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(verified_issue_count);
+    if reported_issue_count != verified_issue_count {
+        return Err(anyhow::anyhow!(
+            "tidas_spool_count_mismatch: validation summary reported {reported_issue_count}, verified spool contained {verified_issue_count}"
+        ));
     }
-    if report.summary.error_count == 0 {
-        report.summary.error_count = report
-            .issues
-            .iter()
-            .filter(|issue| issue.severity.eq_ignore_ascii_case("error"))
-            .count();
+    let mut report = TidasValidationReport {
+        summary: TidasValidationSummary {
+            issue_count: reported_issue_count,
+            error_count: validation
+                .get("error_count")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default(),
+            warning_count: validation
+                .get("warning_count")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default(),
+        },
+        issues,
+        issues_truncated: verified_issue_count > VALIDATION_ISSUE_SAMPLE_LIMIT,
+    };
+    if report.issues.len() != verified_issue_count.min(VALIDATION_ISSUE_SAMPLE_LIMIT) {
+        return Err(anyhow::anyhow!(
+            "tidas_spool_count_mismatch: expected {} retained issue samples, got {}",
+            verified_issue_count.min(VALIDATION_ISSUE_SAMPLE_LIMIT),
+            report.issues.len()
+        ));
     }
-    if report.summary.warning_count == 0 {
-        report.summary.warning_count = report
-            .issues
-            .iter()
-            .filter(|issue| issue.severity.eq_ignore_ascii_case("warning"))
-            .count();
-    }
-    if report.summary.issue_count > 0 {
-        report.ok = report.summary.error_count == 0;
-    }
-
+    normalize_validation_issue_paths(&mut report, input_dir);
     Ok(report)
 }
 
 fn run_tidas_validation(input_dir: &Path) -> anyhow::Result<TidasValidationReport> {
-    let mut last_not_found = false;
-
-    for (program, args) in validator_command_candidates(input_dir) {
-        let output = match Command::new(&program).args(&args).output() {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = true;
-                continue;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("execute TIDAS validator via {program}"));
-            }
-        };
-
-        let stdout =
-            String::from_utf8(output.stdout).context("decode validator stdout as UTF-8")?;
-        let stderr =
-            String::from_utf8(output.stderr).context("decode validator stderr as UTF-8")?;
-        if stdout.trim().is_empty() {
-            continue;
-        }
-
-        let mut report = parse_tidas_validation_report(stdout.as_str()).with_context(|| {
-            format!("parse TIDAS validator JSON output from {program} (stderr: {stderr})")
+    let handshake = tidas_cli::handshake()?;
+    let temp = TempDir::new().context("create bounded tidas package validation spool")?;
+    let issues_path = temp.path().join("validation-issues.jsonl");
+    let input_arg = input_dir.to_string_lossy().into_owned();
+    let issues_arg = issues_path.to_string_lossy().into_owned();
+    let output = tidas_cli::run_json(&[
+        "validate",
+        input_arg.as_str(),
+        "--input-format",
+        "tidas-json",
+        "--issues",
+        issues_arg.as_str(),
+        "--format",
+        "json",
+        "--progress",
+        "never",
+    ])?;
+    if output.report.get("command").and_then(Value::as_str) != Some("validate")
+        || output.report.get("completeness").and_then(Value::as_str) != Some("complete")
+    {
+        return Err(anyhow::anyhow!(
+            "tidas_report_invalid: package validation did not return a complete validate report"
+        ));
+    }
+    let validation = output
+        .report
+        .pointer("/summary/validation")
+        .ok_or_else(|| {
+            anyhow::anyhow!("tidas_report_invalid: package validation omitted summary.validation")
         })?;
-        normalize_validation_issue_paths(&mut report, input_dir);
-
-        let has_validation_issues = report.summary.issue_count > 0 || !report.issues.is_empty();
-        if output.status.success() || has_validation_issues {
-            return Ok(report);
+    if validation.get("asset_fingerprint") != handshake.validation_describe.get("asset_fingerprint")
+    {
+        return Err(anyhow::anyhow!(
+            "tidas_handshake_mismatch: validation asset fingerprint changed after handshake"
+        ));
+    }
+    let spool = validation.get("issue_spool").ok_or_else(|| {
+        anyhow::anyhow!("tidas_report_invalid: package validation omitted issue_spool")
+    })?;
+    let verified_issue_count = spool
+        .get("event_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("tidas_report_invalid: issue spool omitted usable event_count")
+        })?;
+    let mut issue_events =
+        Vec::with_capacity(verified_issue_count.min(VALIDATION_ISSUE_SAMPLE_LIMIT));
+    tidas_cli::visit_verified_jsonl(&issues_path, spool, |event| {
+        if issue_events.len() < VALIDATION_ISSUE_SAMPLE_LIMIT {
+            issue_events.push(event);
         }
-
-        return Err(anyhow::anyhow!(
-            "TIDAS validator {program} exited unsuccessfully without a validation report: {stderr}"
-        ));
-    }
-
-    if last_not_found {
-        return Err(anyhow::anyhow!(
-            "TIDAS validator command not found; set TIDAS_VALIDATE_BIN or install tidas-tools with python3/tidas-validate available"
-        ));
-    }
-
-    Err(anyhow::anyhow!("failed to execute TIDAS validator"))
+        Ok(())
+    })?;
+    parse_tidas_validation_report(validation, issue_events, verified_issue_count, input_dir)
 }
 
 fn report_from_validation_failure(
@@ -2027,6 +2033,8 @@ fn report_from_validation_failure(
         },
         filtered_open_data: Vec::new(),
         user_conflicts: Vec::new(),
+        validation_issue_sample_limit: VALIDATION_ISSUE_SAMPLE_LIMIT,
+        validation_issues_truncated: validation_report.issues_truncated,
         validation_issues: validation_report.issues.clone(),
     }
 }
@@ -2081,7 +2089,9 @@ pub async fn execute_import_package(
         .download_object_url(&source_artifact.artifact_url)
         .await?;
     let extracted_dir = extract_package_zip_to_tempdir(zip_bytes.as_slice())?;
-    let validation_report = run_tidas_validation(extracted_dir.path())?;
+    let validation_input = extracted_dir.path().to_path_buf();
+    let validation_report =
+        tokio::task::spawn_blocking(move || run_tidas_validation(&validation_input)).await??;
     let package_entries = parse_package_entries(zip_bytes.as_slice())?;
     if let Some(report_document) =
         preflight_import_validation(&package_entries, &validation_report)?
@@ -2185,6 +2195,8 @@ pub async fn execute_import_package(
         },
         filtered_open_data: conflicts.open_data_conflicts.clone(),
         user_conflicts: conflicts.user_conflicts.clone(),
+        validation_issue_sample_limit: VALIDATION_ISSUE_SAMPLE_LIMIT,
+        validation_issues_truncated: validation_report.issues_truncated,
         validation_issues: validation_report.issues.clone(),
     };
     let report_artifact = encode_import_report_artifact(job_id, &report_document)?;
@@ -4373,6 +4385,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         io::{Cursor, Write},
+        path::Path,
     };
 
     use serde_json::{Value, json};
@@ -4381,14 +4394,14 @@ mod tests {
 
     use super::{
         ConflictRow, ExportTraversalCache, PackageEntry, PackageManifest, PackageManifestEntry,
-        ReferenceTarget, clear_runtime_export_traversal_cache, extract_model_submodels_from_value,
-        extract_package_zip_to_tempdir, load_runtime_export_traversal_cache,
-        normalize_json_ordered_for_insert, normalize_version_string, parse_package_entries,
-        parse_tidas_validation_report, partition_conflicts_from_rows, plan_reference_resolution,
-        preflight_import_validation, remember_root_in_traversal_cache,
-        report_from_validation_failure, resolve_exact_or_latest_roots,
-        resolve_referenced_entries_from_rows, select_package_job_diagnostics_for_resume,
-        store_runtime_export_traversal_cache,
+        ReferenceTarget, VALIDATION_ISSUE_SAMPLE_LIMIT, clear_runtime_export_traversal_cache,
+        extract_model_submodels_from_value, extract_package_zip_to_tempdir,
+        load_runtime_export_traversal_cache, normalize_json_ordered_for_insert,
+        normalize_version_string, parse_package_entries, parse_tidas_validation_report,
+        partition_conflicts_from_rows, plan_reference_resolution, preflight_import_validation,
+        remember_root_in_traversal_cache, report_from_validation_failure,
+        resolve_exact_or_latest_roots, resolve_referenced_entries_from_rows,
+        select_package_job_diagnostics_for_resume, store_runtime_export_traversal_cache,
     };
     use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
 
@@ -4961,13 +4974,12 @@ mod tests {
         let report = parse_tidas_validation_report(
             &json!({
                 "ok": false,
-                "summary": {
-                    "issue_count": 2,
-                    "error_count": 1,
-                    "warning_count": 1
-                },
-                "issues": [
-                    {
+                "issue_count": 2,
+                "error_count": 1,
+                "warning_count": 1
+            }),
+            vec![
+                json!({"issue": {
                         "issue_code": "schema_error",
                         "severity": "error",
                         "category": "sources",
@@ -4975,8 +4987,8 @@ mod tests {
                         "location": "root/path",
                         "message": "bad schema",
                         "context": {"validator": "required"}
-                    },
-                    {
+                }}),
+                json!({"issue": {
                         "issue_code": "localized_text_language_error",
                         "severity": "warning",
                         "category": "processes",
@@ -4984,10 +4996,10 @@ mod tests {
                         "path": "processDataSet/name/baseName/0",
                         "message": "language mismatch",
                         "context": {}
-                    }
-                ]
-            })
-            .to_string(),
+                }}),
+            ],
+            2,
+            Path::new("."),
         )
         .expect("parse report");
 
@@ -4996,6 +5008,46 @@ mod tests {
         assert_eq!(report.summary.warning_count, 1);
         assert_eq!(report.issues[0].location, "root/path");
         assert_eq!(report.issues[1].location, "processDataSet/name/baseName/0");
+        assert!(!report.issues_truncated);
+    }
+
+    #[test]
+    fn parse_tidas_validation_report_keeps_a_bounded_deterministic_sample() {
+        let events = (0..VALIDATION_ISSUE_SAMPLE_LIMIT)
+            .map(|index| {
+                json!({"issue": {
+                    "issue_code": format!("schema_error_{index}"),
+                    "severity": "error",
+                    "category": "sources",
+                    "file_path": format!("sources/{index}.json"),
+                    "location": "<root>",
+                    "message": "bad schema",
+                    "context": {}
+                }})
+            })
+            .collect();
+        let verified_issue_count = VALIDATION_ISSUE_SAMPLE_LIMIT + 5;
+        let report = parse_tidas_validation_report(
+            &json!({
+                "ok": false,
+                "issue_count": verified_issue_count,
+                "error_count": verified_issue_count,
+                "warning_count": 0
+            }),
+            events,
+            verified_issue_count,
+            Path::new("."),
+        )
+        .expect("parse bounded report sample");
+
+        assert_eq!(report.summary.issue_count, verified_issue_count);
+        assert_eq!(report.issues.len(), VALIDATION_ISSUE_SAMPLE_LIMIT);
+        assert!(report.issues_truncated);
+        assert_eq!(report.issues[0].issue_code, "schema_error_0");
+        assert_eq!(
+            report.issues[VALIDATION_ISSUE_SAMPLE_LIMIT - 1].issue_code,
+            format!("schema_error_{}", VALIDATION_ISSUE_SAMPLE_LIMIT - 1)
+        );
     }
 
     #[test]
@@ -5034,12 +5086,11 @@ mod tests {
         let validation = parse_tidas_validation_report(
             &json!({
                 "ok": false,
-                "summary": {
-                    "issue_count": 1,
-                    "error_count": 1,
-                    "warning_count": 0
-                },
-                "issues": [{
+                "issue_count": 1,
+                "error_count": 1,
+                "warning_count": 0
+            }),
+            vec![json!({"issue": {
                     "issue_code": "schema_error",
                     "severity": "error",
                     "category": "sources",
@@ -5047,14 +5098,13 @@ mod tests {
                     "location": "<root>",
                     "message": "schema failure",
                     "context": {}
-                }]
-            })
-            .to_string(),
+            }})],
+            1,
+            Path::new("."),
         )
         .expect("parse report");
 
         let report = report_from_validation_failure(7, &validation);
-        assert!(!report.ok);
         assert_eq!(report.code, "VALIDATION_FAILED");
         assert_eq!(report.summary.total_entries, 7);
         assert_eq!(report.summary.validation_issue_count, 1);
@@ -5065,6 +5115,11 @@ mod tests {
         assert_eq!(report.summary.importable_count, 0);
         assert_eq!(report.summary.imported_count, 0);
         assert_eq!(report.validation_issues.len(), 1);
+        assert_eq!(
+            report.validation_issue_sample_limit,
+            VALIDATION_ISSUE_SAMPLE_LIMIT
+        );
+        assert!(!report.validation_issues_truncated);
     }
 
     #[test]
@@ -5072,12 +5127,11 @@ mod tests {
         let validation = parse_tidas_validation_report(
             &json!({
                 "ok": false,
-                "summary": {
-                    "issue_count": 1,
-                    "error_count": 1,
-                    "warning_count": 0
-                },
-                "issues": [{
+                "issue_count": 1,
+                "error_count": 1,
+                "warning_count": 0
+            }),
+            vec![json!({"issue": {
                     "issue_code": "manifest_missing",
                     "severity": "error",
                     "category": "package",
@@ -5085,9 +5139,9 @@ mod tests {
                     "location": "<root>",
                     "message": "manifest is missing",
                     "context": {}
-                }]
-            })
-            .to_string(),
+            }})],
+            1,
+            Path::new("."),
         )
         .expect("parse report");
 

@@ -24,9 +24,9 @@ checkPaths:
   - docs/tidas-package-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: 9990d44
-lastReviewedNote: "Added the Issue #139 certificate-grade scope-closure executor and package-build evidence binding."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedNote: "Cut scope closure over to the version-pinned Rust tidas CLI and verified file-spool protocol for Issue #144."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -87,15 +87,17 @@ An exact reference never falls back to another version. A missing exact identity
 
 Reference extraction in `scope_closure.rs` mirrors the public `tidas.reference-extraction-result.v1` contract and is locked by the shared golden fixture under `crates/solver-worker/tests/fixtures/reference_extraction_v1/`.
 
-Document validation uses only public TIDAS CLI surfaces:
+Document validation uses only the published unified Rust `tidas` CLI selected by `TIDAS_BIN` (default `tidas`). No Python entrypoint, legacy binary name, or ordered command-candidate fallback is permitted:
 
-1. `--describe --format json` verifies support for `document-validation-batch.v1`.
-2. Uncached documents are spooled as canonical JSON plus an exact JSONL input manifest.
-3. The Worker invokes profile `tidas-document-conformance.v1`.
-4. JSONL stdout is consumed line by line, providing bounded pipe backpressure.
-5. A nonzero command exit, malformed event, or missing final event is a system failure; document issues are domain blockers.
+1. `version --format json --progress never` must equal `TIDAS_EXPECTED_VERSION` (default `0.1.0`).
+2. `validate --describe --format json --progress never` must advertise `document-validation-batch.v1`, `tidas-document-conformance.v1`, the validation report schema, and an immutable asset fingerprint.
+3. Uncached documents are spooled as canonical JSON plus an exact JSONL input manifest.
+4. The Worker invokes profile `tidas-document-conformance.v1` with bounded memory/queue configuration inherited by the binary.
+5. Validation events are written to a file spool and the bounded operation report is captured as JSON. Worker verifies spool SHA-256/byte size, final-event equality, report completeness, and asset fingerprint before accepting evidence.
+6. While traversal/validation is active, the leased Worker executor refreshes its lease every one-third lease interval. Lease loss or cancellation rejects the operation future and no validation evidence may reach certificate projection.
+7. A command timeout, unsupported version/protocol, malformed report/event, spool mismatch, or missing final event is a system failure; document issues remain domain blockers.
 
-Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine fingerprint, and TIDAS schema-lock hash. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
+Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
 
 ## Issues and affected roots
 
@@ -171,4 +173,4 @@ For changes to this contract, run the repo baseline plus focused closure tests. 
 - all-or-none package binding and database certificate mismatch rejection;
 - shared-scan target-specific report/finalizer behavior.
 
-Live integration proof, when available, must use isolated non-production database and object-storage state. Do not deploy or mutate production data as validation.
+Live integration proof, when available, must use isolated non-production database and object-storage state. Before any server execution, validate the largest available package locally with the exact published binary and bounded memory/queue settings. Do not deploy or mutate production data as validation.

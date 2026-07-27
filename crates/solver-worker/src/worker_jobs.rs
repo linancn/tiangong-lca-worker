@@ -221,6 +221,12 @@ impl<'a> WorkerJobProgress<'a> {
     }
 }
 
+#[must_use]
+pub fn lease_heartbeat_period(lease_seconds: i32) -> std::time::Duration {
+    let lease_seconds = u64::try_from(lease_seconds.max(3)).unwrap_or(3);
+    std::time::Duration::from_secs((lease_seconds / 3).max(1))
+}
+
 pub async fn claim_worker_jobs(
     pool: &PgPool,
     worker_queue: &str,
@@ -382,8 +388,15 @@ mod tests {
 
     use super::{
         REVIEW_SUBMIT_GATE_JOB_KIND, REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
-        REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob,
+        REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
     };
+
+    #[test]
+    fn lease_heartbeat_period_refreshes_before_expiry() {
+        assert_eq!(lease_heartbeat_period(900).as_secs(), 300);
+        assert_eq!(lease_heartbeat_period(2).as_secs(), 1);
+        assert_eq!(lease_heartbeat_period(-1).as_secs(), 1);
+    }
 
     #[test]
     fn parses_review_submit_gate_worker_job_payload() {

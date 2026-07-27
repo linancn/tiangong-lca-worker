@@ -2464,6 +2464,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn package_v2_requires_exact_authoritative_binding_and_process_axis() {
         let closure_check_id = Uuid::new_v4();
         let snapshot_id = Uuid::new_v4();

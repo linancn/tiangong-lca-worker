@@ -24,7 +24,11 @@ export S3_ACCESS_KEY_ID="$S3_PROTOCOL_ACCESS_KEY_ID"
 export S3_SECRET_ACCESS_KEY="$S3_PROTOCOL_ACCESS_KEY_SECRET"
 export SNAPSHOT_BUILDER_BIN="$worker_root/target/debug/snapshot_builder"
 export SNAPSHOT_REPORT_MODE="disabled"
-export TIDAS_VALIDATE_BIN="$worker_root/crates/solver-worker/tests/fixtures/tidas_validate_e2e_stub.py"
+export TIDAS_BIN="${TIDAS_BIN:-tidas}"
+export TIDAS_EXPECTED_VERSION="${TIDAS_EXPECTED_VERSION:-0.1.0}"
+
+"$TIDAS_BIN" version --format json --progress never >/dev/null
+"$TIDAS_BIN" validate --describe --format json --progress never >/dev/null
 
 cd "$worker_root"
 cargo build -p solver-worker --bin snapshot_builder
