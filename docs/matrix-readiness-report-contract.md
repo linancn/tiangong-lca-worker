@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
-lastReviewedNote: "Reviewed certificate-bound discovery/build readiness integration; blocker semantics and report schema are unchanged."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
+lastReviewedNote: "Issue #146 adds selected LCIA-factor Flow source-closure policy to build identity; readiness schema and blocker semantics are unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -116,7 +116,7 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 
 单个 targetless full allocation 只有在 Process 有唯一 reference exchange、其有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时才推断为 factor `1.0`，并计入 `legacy_single_reference_target_inferred_count`。旧 `legacy_single_output_target_inferred_count` 仅为兼容字段。方向不参与该推断。
 
-Snapshot build config 使用 `allocation_semantics_version = tidas-reference-allocation-v3` 与 `link_semantics_version = signed-flow-balance-v1`。这两个版本、boundary 和 flow identity policy 均进入 source/review fingerprint，所以 readiness 不会把旧语义 snapshot 当作同一构建身份复用。
+Snapshot build config 使用 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1` 与 `source_closure_policy = selected-lcia-factor-flow-support-v1`。这些版本、boundary 和 flow identity policy 均进入 source/review fingerprint，所以 readiness 不会把旧语义或 exchange-only source closure snapshot 当作同一构建身份复用。LCIA-factor-only support Flow 不进入 readiness 的 B/C 或 provider 指标。
 
 `provider_closure_reference_provider_missing` 只针对实际 input provider decision，不会因为 Process 中一个没有被 demand 的 co-product 本身而触发。其 `details.examples[]` 必须给出 consumer index / ID / version / name、`flow_id`、`flow_version`、candidate provider index / ID / process name、output exchange internal ID、是否为 reference output、normalized amount、allocation state 与 eligibility。它可以与通用的 `provider_closure_unmatched` 同时出现：前者解释“为什么没有合法 provider”，后者仍表达 coverage policy 失败。
 

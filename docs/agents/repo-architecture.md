@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-27
-lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
-lastReviewedNote: "Added the Issue #144 unified Rust tidas adapter and its ownership, handshake, spool, and failure boundaries."
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
+lastReviewedNote: "Issue #146 separates selected LCIA-factor source support from inventory-derived matrix and provider Flow selection."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -127,7 +127,7 @@ The process-column contract is one complete TIDAS Process revision per snapshot 
 
 `crates/solver-worker/src/signed_flow.rs` owns the direction-neutral math: `coefficient = direction_sign * amount`, signed unit reference pivots, opposite-sign weighted balance, non-negative activity requirements, closure checks, and explicit `closed/open/cutoff` boundary identifiers. `snapshot_builder` maps Product/Waste to technosphere, Elementary to biosphere, and Other to reporting; full snapshots, request-root closure, and review-submit overlays share the same technosphere balance compiler. Candidate eligibility is exact same-flow, different-process, quantitative-reference, and opposite-sign—not Product/Waste or Input/Output semantics.
 
-`crates/solver-worker/src/tidas_process_semantics.rs` owns target-aware allocation. Targets may identify any known exchange internal ID; the reference pivot is never multiplied by allocation, while non-reference residuals are. A scalar `{}` remains the bounded undeclared fallback, and one full targetless entry is inferred only when the reference exchange/ID is unique. Multiple quantitative references are explicitly unsupported. Snapshot compilation keys version-sensitive metadata, reference ports, flow axes, and diagnostics by `(Flow UUID, resolved version)`, while pruning unreferenced historical revisions before compact indexing. Build identity records `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, boundary policy, and `exact-flow-version-reference-unit-v2`; coverage is `snapshot_coverage.v3`.
+`crates/solver-worker/src/tidas_process_semantics.rs` owns target-aware allocation. Targets may identify any known exchange internal ID; the reference pivot is never multiplied by allocation, while non-reference residuals are. A scalar `{}` remains the bounded undeclared fallback, and one full targetless entry is inferred only when the reference exchange/ID is unique. Multiple quantitative references are explicitly unsupported. Snapshot compilation keys version-sensitive metadata, reference ports, flow axes, and diagnostics by `(Flow UUID, resolved version)`, while pruning unreferenced historical revisions before compact indexing. Selected LCIA Method factor references are resolved separately in bounded batches: factor-only Elementary Flow revisions enter frozen source closure as support and recursively close their supporting documents, but never enter the inventory-derived matrix/provider Flow universe. Build identity records `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, boundary policy, `exact-flow-version-reference-unit-v2`, and `selected-lcia-factor-flow-support-v1`; coverage is `snapshot_coverage.v3`.
 
 `crates/solver-worker/src/readiness.rs` owns the worker-side verification gate for automated data production. It turns coverage, sparse payloads, and optional reference-port/balance evidence into `matrix_readiness_report.v2`. `closed` boundaries block unresolved technosphere coefficients; explicit `open/cutoff` boundaries retain them as auditable warnings. Callers must not reimplement balance/routing, singular-risk, LCIA, or factorization checks outside the worker.
 

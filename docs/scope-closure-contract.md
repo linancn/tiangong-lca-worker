@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-27
-lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
-lastReviewedNote: "Cut scope closure over to the version-pinned Rust tidas CLI and verified file-spool protocol for Issue #144."
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
+lastReviewedNote: "Issue #146 clarifies the boundary between administrative closure, numerical inventory axes, and selected LCIA-factor source support."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -114,6 +114,8 @@ Closure production runs in this fail-closed order:
 3. freeze the discovered exact Process axis and administratively scan the added provider processes;
 4. evaluate the discovered matrix, provider-link, factorization, and LCIA readiness evidence;
 5. only when every scan is complete and no blocker remains, run the frozen snapshot builder in persisted build mode.
+
+Administrative closure and numerical Flow selection remain distinct. During the persisted snapshot build, every Elementary Flow referenced by a selected LCIA Method factor is additionally frozen as source-closure `support`, with exact/once-resolved version and recursive support-document closure. A factor-only Flow does not enter the inventory-derived B/C axes, compiled graph, provider discovery, or provider universe. Product, Waste, or Other factor targets are semantic failures; they never cause technosphere expansion.
 
 Each fresh scan produces deterministic administrative artifacts:
 
