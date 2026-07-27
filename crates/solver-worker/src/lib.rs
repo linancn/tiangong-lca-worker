@@ -39,6 +39,7 @@ pub mod snapshot_index;
 pub mod snapshot_retention;
 pub mod static_lcia_cache;
 pub mod storage;
+pub mod tidas_cli;
 pub mod tidas_process_semantics;
 pub mod types;
 pub mod worker_jobs;

@@ -24,10 +24,10 @@ use solver_worker::{
     storage::ObjectStoreUploadError,
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
-        record_worker_job_result,
+        lease_heartbeat_period, record_worker_job_result,
     },
 };
-use tokio::time::sleep;
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -322,7 +322,9 @@ async fn process_package_worker_job(
     }
 
     loop {
-        match handle_package_job_payload_once(state, payload.clone()).await {
+        match handle_package_job_payload_once_with_heartbeat(state, &job, &payload, lease_seconds)
+            .await
+        {
             Ok(PackageJobContinuation::Complete) => {
                 record_package_worker_job_success(state, &job, &payload).await;
                 return;
@@ -355,6 +357,39 @@ async fn process_package_worker_job(
             Err(err) => {
                 record_package_worker_job_failure(state, &job, &payload, &err).await;
                 return;
+            }
+        }
+    }
+}
+
+async fn handle_package_job_payload_once_with_heartbeat(
+    state: &AppState,
+    job: &WorkerJob,
+    payload: &PackageJobPayload,
+    lease_seconds: i32,
+) -> anyhow::Result<PackageJobContinuation> {
+    let operation = handle_package_job_payload_once(state, payload.clone());
+    tokio::pin!(operation);
+    let mut heartbeat = interval(lease_heartbeat_period(lease_seconds));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = heartbeat.tick() => {
+                heartbeat_package_worker_job(
+                    state,
+                    job,
+                    payload,
+                    lease_seconds,
+                    Some(json!({
+                        "packageJobId": extract_package_job_id(payload),
+                        "payloadType": package_payload_type_name(payload),
+                        "longRunningOperation": true,
+                    })),
+                    0.15,
+                )
+                .await?;
             }
         }
     }
@@ -890,6 +925,16 @@ fn build_package_job_failure_diagnostics(
             "is_oversize": upload_err.is_oversize(),
         });
     }
+    if let Some(error_code) = tidas_error_code(err) {
+        return json!({
+            "phase": phase,
+            "stage": "tidas_validation",
+            "result": "failed",
+            "error_code": error_code,
+            "message": message,
+            "error": err.to_string(),
+        });
+    }
 
     json!({
         "phase": phase,
@@ -902,8 +947,31 @@ fn build_package_job_failure_diagnostics(
 }
 
 fn package_request_cache_error_code(err: &anyhow::Error) -> &'static str {
-    find_object_store_upload_error(err)
-        .map_or("job_execution_failed", ObjectStoreUploadError::error_code)
+    if let Some(upload) = find_object_store_upload_error(err) {
+        upload.error_code()
+    } else {
+        tidas_error_code(err).unwrap_or("job_execution_failed")
+    }
+}
+
+fn tidas_error_code(err: &anyhow::Error) -> Option<&'static str> {
+    let message = err
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(":");
+    [
+        ("tidas_binary_unavailable", "tidas_binary_unavailable"),
+        ("tidas_version_mismatch", "tidas_version_mismatch"),
+        ("tidas_protocol_mismatch", "tidas_protocol_mismatch"),
+        ("tidas_handshake", "tidas_handshake_failed"),
+        ("tidas_timeout", "tidas_timeout"),
+        ("tidas_spool", "tidas_spool_invalid"),
+        ("tidas_report_invalid", "tidas_report_invalid"),
+        ("tidas_execution_failed", "tidas_execution_failed"),
+    ]
+    .into_iter()
+    .find_map(|(needle, code)| message.contains(needle).then_some(code))
 }
 
 fn package_request_cache_error_message(payload: &PackageJobPayload, err: &anyhow::Error) -> String {

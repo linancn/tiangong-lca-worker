@@ -34,9 +34,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: ba78268a2b5352058ac0ed7287841cb0615f6ce1
-lastReviewedNote: "Added the Issue #139 scope-closure runtime family, frozen-release source boundary, and certificate-bound package flow."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedNote: "Added the Issue #144 unified Rust tidas adapter and its ownership, handshake, spool, and failure boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -74,6 +74,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-core/**` | matrix build, factorization cache, solve orchestration, provider matching |
 | `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, evidence artifacts, scan reuse, and package certificate verification |
+| `crates/solver-worker/src/tidas_cli.rs` | single-binary Rust tidas version/protocol handshake, bounded command execution, report validation, and spool hash/count verification |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
 | `tools/bw25-validator/**` | manual Brightway comparison tooling |
@@ -113,7 +114,7 @@ The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND
 
 `crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope.
 
-The same module invokes TIDAS `document-validation-batch.v1`, keys reusable document evidence by full content and validator fingerprints, writes deterministic bundle/JSONL/XLSX administrative artifacts, and coordinates lease-fenced shared scan reuse. It uses the snapshot builder first for non-persisting signed-flow discovery and only after the discovered Process axis is administratively rescanned and blocker-free does it persist a bound HDF5 numerical snapshot. Blocked or incomplete checks produce no numerical snapshot or certificate. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/HDF5/index/build-contract/bundle/report binding against the database. The package numerical path is otherwise unchanged. See `docs/scope-closure-contract.md` for the exact contract.
+The same module invokes TIDAS `document-validation-batch.v1` through `tidas_cli.rs`. The adapter accepts one `TIDAS_BIN`, requires the exact expected Rust release version, verifies `validate --describe`, writes events and the final report to bounded files, and rejects any SHA-256/byte/count or asset-fingerprint drift. It keys reusable document evidence by full content and validator fingerprints, writes deterministic bundle/JSONL/XLSX administrative artifacts, and coordinates lease-fenced shared scan reuse. It uses the snapshot builder first for non-persisting signed-flow discovery and only after the discovered Process axis is administratively rescanned and blocker-free does it persist a bound HDF5 numerical snapshot. Blocked or incomplete checks produce no numerical snapshot or certificate. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/HDF5/index/build-contract/bundle/report binding against the database. The package numerical path is otherwise unchanged. See `docs/scope-closure-contract.md` for the exact contract.
 
 Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limited to process/flow rows and load LCIA methods from the reviewed, release-pinned static cache through `crates/solver-worker/src/static_lcia_cache.rs`. That module owns trusted-base retrieval, byte/decompression limits, raw and canonical hash verification, method/locator alias validation, and streaming factor normalization. `calculation_evidence.rs` owns the v2 source/bundle/25-method coverage binding. Gap evidence is deterministically spooled as JSONL rather than retained as an exchange-by-method object graph. Build-snapshot terminal projection comes from canonical `worker_jobs` diagnostics, including reuse-resolved snapshot ID and evidence, so optional `lca_jobs` is never required. Singular/factorization diagnostics use only the exact process/version pairs in the snapshot index.
 
@@ -152,7 +153,7 @@ The package worker handles:
 - `export_package`
 - `import_package`
 
-It also owns package-job artifacts and diagnostics. The default `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and links package artifacts / export items / request-cache rows back to the canonical `worker_jobs` id. Optional `lca_package_jobs` rows are best-effort compatibility only; production worker_jobs paths must run when `public.lca_package_jobs` is absent. The `PACKAGE_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `lca_package_jobs`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+It also owns package-job artifacts and diagnostics. Import validation uses the same `tidas_cli.rs` adapter and a streaming hash/count-verified issue spool before conflict checks or inserts; the report retains a deterministic bounded issue sample plus complete counts, never the entire large spool in memory. There is no Python validator or command fallback. The default `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and links package artifacts / export items / request-cache rows back to the canonical `worker_jobs` id. Optional `lca_package_jobs` rows are best-effort compatibility only; production worker_jobs paths must run when `public.lca_package_jobs` is absent. The `PACKAGE_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `lca_package_jobs`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
 
 ### Result persistence
 
@@ -171,6 +172,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.
 - Worker-owned DB pools set explicit PostgreSQL `application_name` values for observability. `snapshot_builder` also applies `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS` as a bounded statement timeout; `0` is reserved for targeted manual recovery, not normal production operation.
+- TIDAS validation semantics belong to the published Rust tool. Worker retains lease/heartbeat/cancellation, timeout, deterministic evidence, and terminal error projection; it never reimplements those operations in deployment or API repositories.
 
 ## Runtime SQL Boundary
 

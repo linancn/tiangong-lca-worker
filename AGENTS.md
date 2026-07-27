@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: ba78268a2b5352058ac0ed7287841cb0615f6ce1
-lastReviewedNote: "Added the Issue #139 certificate-grade scope-closure execution, immutable public-release boundary, and package-build evidence-binding contract."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedNote: "Reviewed for Issue #144: the Worker now consumes only the version-pinned unified Rust tidas CLI contract with verified bounded spools."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -128,6 +128,7 @@ Keep these entry-level facts in `AGENTS.md`. Use `README.md` and `docs/agents/re
   - `./scripts/build_snapshot_from_ilcd.sh`
   - `./scripts/run_full_compute_debug.sh`
   - `./scripts/run_bw25_validation.sh`
+  - `./scripts/run_scope_closure_package_v2_e2e.sh` (requires the real Rust `tidas` binary)
   - `./scripts/validate_additive_migration.sh`
 
 ## Ownership Boundaries
@@ -171,6 +172,8 @@ Route those tasks to:
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
+- package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION`, verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; Python validators and command-candidate fallback are not runtime paths
+- the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 
 ## Documentation Update Rules
 

@@ -23,9 +23,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: ba78268a2b5352058ac0ed7287841cb0615f6ce1
-lastReviewedNote: "Added Issue #139 scope-closure job/result semantics and certificate-bound package Build V2 consumption."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedNote: "Reviewed shared failure semantics for the Issue #144 unified Rust tidas cutover."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -201,6 +201,8 @@ terminal result 使用 `lcia.scope_closure_check.result.v1`，并保留 `closure
 数据库 Build V2 command 原子创建 `lcia_result.package_build` job，并返回权威十一字段 closure binding：`closure_check_id`、`closure_certificate_hash`、`effective_scope_hash`、`data_snapshot_token`、`snapshot_id`、`snapshot_hash`、`snapshot_artifact_id`、`snapshot_index_sha256`、`snapshot_build_contract_hash`、`closure_bundle_artifact_id`、`closure_bundle_hash`。`report_artifact_manifest_hash` 仍保留在 job payload 和 certificate audit evidence 中，但不能替代 closure bundle 的精确 artifact identity。Worker 对权威 binding 和请求 manifest 执行全量相等校验，并在运行数值构建前按精确 artifact ID 下载、重算哈希，逐项核对当前 passed/complete/valid certificate、HDF5 embedded binding、exact ordered Process axis、snapshot index 与 build-contract hash；在最终 ready RPC 前再次验证对象内容，DB 再执行 lease、revocation、metadata freshness 的最终检查。它直接消费已签名 snapshot/evidence，不重复运行 administrative closure。数值 snapshot/all-unit solve/artifact 路径保持原样；result JSON、result_ref、package metadata 与 audit 保留 `closureCheckId`。
 
 完整 traversal、artifact、reuse 和 failure 契约见 `docs/scope-closure-contract.md`。
+
+TIDAS system failures 在 Worker diagnostic / request-cache boundary 使用稳定 code：`tidas_binary_unavailable`、`tidas_version_mismatch`、`tidas_protocol_mismatch`、`tidas_handshake_failed`、`tidas_timeout`、`tidas_report_invalid`、`tidas_spool_invalid`、`tidas_execution_failed`。这些 code 表示 Worker 无法获得完整可信的 validator evidence，不得转换为 domain blocker、成功 certificate 或部分 import。大 package import report 只保留确定性有界 issue sample，同时保存完整 issue/severity counts；spool 自身按流式 SHA-256/bytes/event count 验证，不进入 API payload。具体 report/spool 契约分别见 scope-closure 与 TIDAS package contract。
 
 该 package build 的 legacy database-backed LCIA 路径在读取 factors 前必须把每个方法归一化为 `(canonical method UUID, exact version, artifact locator UUID)`：文档内 `common:UUID` 是 matrix axis、calculation evidence、result key 和 source-closure identity，`public.lciamethods.id` 只作为精确读取该文档的 artifact locator。Locator 与文档 UUID 相同时可直接使用；不相同时必须与 reviewed `RELEASE_METHOD_IDENTITIES` 中的完整三元组精确匹配，否则在矩阵构建前 fail closed。单方法选择若使用 canonical UUID，worker 可通过同一 reviewed mapping 定位 locator，但写入 snapshot/result 的仍是 canonical UUID。
 

@@ -18,9 +18,9 @@ checkPaths:
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
-lastReviewedNote: "Clarified that Issue #139 certificate-bound LCIA result builds consume closure evidence without changing import/export package-worker semantics."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedNote: "Cut import validation over to the version-pinned unified Rust tidas binary with verified bounded evidence for Issue #144."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -139,13 +139,15 @@ payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_
 
 1. 下载上传 ZIP artifact；
 2. 解压到临时目录；
-3. 调用 `python3 -m tidas_tools.validate --input-dir <dir> --format json`（允许按运行环境 fallback 到其他等价命令）；
-4. 解析结构化 JSON 校验报告；
+3. 使用唯一 `TIDAS_BIN`（默认 `tidas`）执行 `version` 与 `validate --describe` 握手，要求精确匹配 `TIDAS_EXPECTED_VERSION`（默认 `0.1.0`）、公开 validation protocol/profile 和 asset fingerprint；
+4. 通过 `tidas validate <dir> --input-format tidas-json --issues <spool> --format json --progress never` 执行结构化校验；issue 必须写入临时文件型有界 spool，operation report 作为有界 JSON 捕获，Worker 对 report schema、完整性、asset fingerprint 以及 spool SHA-256/bytes/event count 全量复核；
 5. 若 `summary.error_count > 0`，直接产出 import report：
    - `code = VALIDATION_FAILED`
    - 不执行 conflict checks
    - 不执行任何 inserts
 6. 若无校验错误，再执行现有冲突检测和导入流程。
+
+运行时不得探测 Python module、`tidas-validate` 或其他候选命令。统一 binary 无法启动、版本/协议不匹配、超时、report/spool 不完整或 hash/count 不一致时，任务必须 fail closed，并映射为稳定的 `tidas_*` error code；这些 system failures 不能伪装为数据 validation issue。Worker 继续独立持有 job lease、heartbeat、取消检查、request-cache 状态和 terminal result projection，`tidas` 不接管这些行为。等待长时 validation 时，worker-jobs executor 每个 lease 的三分之一周期续租；heartbeat 被拒绝即丢弃当前 operation future，禁止继续接受或投影 validator evidence。
 
 ## 7. Artifact 契约
 
@@ -220,6 +222,8 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `summary.validation_issue_count`
 - `summary.error_count`
 - `summary.warning_count`
+- `validation_issue_sample_limit`（固定 `1000`）
+- `validation_issues_truncated`
 - `validation_issues[]`
 
 `validation_issues[]` 每条包含：
@@ -232,7 +236,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `message`
 - `context`
 
-无论最终结果是 `IMPORTED` / `USER_DATA_CONFLICT` / `VALIDATION_FAILED`，report 都会携带校验统计；当 `VALIDATION_FAILED` 时，还会包含导致阻断导入的校验问题详情。
+无论最终结果是 `IMPORTED` / `USER_DATA_CONFLICT` / `VALIDATION_FAILED`，report 都会携带完整校验统计。`validation_issues[]` 是按确定性 spool 顺序保留的前 `validation_issue_sample_limit` 条样本；总数大于样本上限时 `validation_issues_truncated=true`，完整事实仍由 `summary.validation_issue_count`、severity counts 以及已验证的原始 spool hash/bytes/event count 约束。Worker 必须流式验证 spool，不得把大包的完整 JSONL 或全部反序列化 issue 同时保留在内存。
 
 ### 7.3 与 certificate-bound LCIA result package 的边界
 

@@ -3,8 +3,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::{BufRead, BufReader, Cursor, Read, Write},
-    process::{Command, Stdio},
+    io::{Cursor, Write},
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,15 +25,16 @@ use crate::{
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
     readiness::{MatrixReadinessReport, ReadinessStatus},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
-    worker_jobs::WorkerJobProgress,
+    tidas_cli,
+    worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
 
 pub const SCOPE_CLOSURE_JOB_KIND: &str = "lcia.scope_closure_check";
 pub const SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION: &str = "lcia.scope_closure_check.request.v1";
 pub const SCOPE_CLOSURE_RESULT_SCHEMA_VERSION: &str = "lcia.scope_closure_check.result.v1";
 pub const SCOPE_CLOSURE_SCANNER_VERSION: &str = "scope-closure-scanner.v1";
-pub const TIDAS_BATCH_PROTOCOL: &str = "document-validation-batch.v1";
-pub const TIDAS_BATCH_PROFILE: &str = "tidas-document-conformance.v1";
+pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
+pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
 pub const REFERENCE_ISSUE_SCHEMA_VERSION: &str = "tidas.reference-extraction-issue.v1";
 const FETCH_BATCH_SIZE: usize = 96;
@@ -2260,13 +2261,38 @@ pub async fn execute_scope_closure_job(
         lease_token,
         lease_seconds,
     );
-    let (mut scan, mut validation) = scan_and_validate_scope(
+    let scan_operation = scan_and_validate_scope(
         &provider,
         &state.pool,
         worker_job_id,
         &input.requested_scope,
-    )
-    .await?;
+    );
+    tokio::pin!(scan_operation);
+    let mut scan_heartbeat = tokio::time::interval(lease_heartbeat_period(lease_seconds));
+    scan_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    scan_heartbeat.tick().await;
+    let (mut scan, mut validation) = loop {
+        tokio::select! {
+            result = &mut scan_operation => break result?,
+            _ = scan_heartbeat.tick() => {
+                progress
+                    .heartbeat(
+                        "discover_and_validate_scope",
+                        0.4,
+                        Some(json!({
+                            "closureCheckId": closure_check_id,
+                            "longRunningOperation": true,
+                            "progressCounters": {
+                                "scanned": 0,
+                                "total": input.requested_scope.roots().len(),
+                                "unit": "scopeRoots"
+                            },
+                        })),
+                    )
+                    .await?;
+            }
+        }
+    };
 
     progress
         .heartbeat(
@@ -3381,21 +3407,17 @@ async fn run_tidas_batch_validation_cached(
     worker_job_id: Uuid,
     documents: &[ClosureDocument],
 ) -> anyhow::Result<TidasBatchValidation> {
-    let describe_output = run_tidas_command(&["--describe", "--format", "json"])?;
-    let describe: Value = serde_json::from_str(describe_output.trim())?;
-    if !describe
-        .get("protocols")
-        .and_then(Value::as_array)
-        .is_some_and(|protocols| protocols.iter().any(|item| item == TIDAS_BATCH_PROTOCOL))
-    {
-        return Err(anyhow::anyhow!(
-            "installed tidas-tools does not support {TIDAS_BATCH_PROTOCOL}"
-        ));
-    }
-    let cache_keys = documents
-        .iter()
-        .map(|document| document_validation_cache_key(document, &describe))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let handshake = tokio::task::spawn_blocking(tidas_cli::handshake).await??;
+    let describe = handshake.validation_describe;
+    let documents_for_keys = documents.to_vec();
+    let describe_for_keys = describe.clone();
+    let cache_keys = tokio::task::spawn_blocking(move || {
+        documents_for_keys
+            .iter()
+            .map(|document| document_validation_cache_key(document, &describe_for_keys))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await??;
     let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
     let cached_by_key = cached
         .into_iter()
@@ -3431,7 +3453,12 @@ async fn run_tidas_batch_validation_cached(
         }
     }
 
-    let uncached = run_tidas_batch_validation(&missing, describe.clone())?;
+    let missing_for_validation = missing.clone();
+    let describe_for_validation = describe.clone();
+    let uncached = tokio::task::spawn_blocking(move || {
+        run_tidas_batch_validation(&missing_for_validation, describe_for_validation)
+    })
+    .await??;
     issue_events.extend(uncached.issue_events.clone());
     if !missing.is_empty() {
         let records = missing
@@ -3514,42 +3541,52 @@ fn run_tidas_batch_validation(
             issue_events: Vec::new(),
         });
     }
-    let temp = TempDir::new()?;
-    let input_dir = temp.path().join("documents");
-    fs::create_dir(&input_dir)?;
-    let manifest_path = temp.path().join("manifest.jsonl");
-    let mut manifest = Vec::new();
-    for (index, document) in documents.iter().enumerate() {
-        let file_name = format!("{index:08}.json");
-        let document_bytes = canonical_json_bytes(&document.payload)?;
-        fs::write(input_dir.join(&file_name), &document_bytes)?;
-        manifest.extend(canonical_json_bytes(&json!({
-            "document_key": document.identity.document_key(),
-            "category": document.identity.category.table_name(),
-            "relative_path": file_name,
-            "content_sha256": sha256_hex(&document_bytes),
-            "identity": {
-                "dataset_type": document.identity.category.table_name(),
-                "dataset_id": document.identity.id,
-                "dataset_version": document.identity.version,
-            },
-        }))?);
-        manifest.push(b'\n');
-    }
-    fs::write(&manifest_path, manifest)?;
-
+    let (temp, input_dir, manifest_path) = spool_tidas_batch_documents(documents)?;
     let input_dir_arg = input_dir.to_string_lossy().into_owned();
     let manifest_arg = manifest_path.to_string_lossy().into_owned();
-    let events = run_tidas_batch_events(&[
+    let events_path = temp.path().join("events.jsonl");
+    let events_arg = events_path.to_string_lossy().into_owned();
+    let output = tidas_cli::run_json(&[
+        "validate",
+        input_dir_arg.as_str(),
         "--protocol",
         TIDAS_BATCH_PROTOCOL,
-        "--profile",
-        TIDAS_BATCH_PROFILE,
-        "--input-dir",
-        input_dir_arg.as_str(),
         "--input-manifest",
         manifest_arg.as_str(),
+        "--events",
+        events_arg.as_str(),
+        "--format",
+        "json",
+        "--progress",
+        "never",
     ])?;
+    if output.report.get("command").and_then(Value::as_str) != Some("validate")
+        || output.report.get("status").and_then(Value::as_str) != Some("succeeded")
+        || output.report.get("completeness").and_then(Value::as_str) != Some("complete")
+    {
+        return Err(anyhow::anyhow!(
+            "tidas_report_invalid: document batch did not return a complete successful validate report"
+        ));
+    }
+    let artifact = output
+        .report
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|artifacts| {
+            artifacts.iter().find(|artifact| {
+                artifact.get("media_type").and_then(Value::as_str) == Some("application/x-ndjson")
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("tidas_report_invalid: document batch omitted event spool artifact")
+        })?;
+    tidas_cli::verify_artifact(&events_path, artifact)?;
+    let events = tidas_cli::read_jsonl(&events_path)?;
+    if output.report.pointer("/summary/validation_batch_final") != events.last() {
+        return Err(anyhow::anyhow!(
+            "tidas_spool_final_mismatch: operation report final event differs from event spool"
+        ));
+    }
     let final_positions = events
         .iter()
         .enumerate()
@@ -3579,6 +3616,35 @@ fn run_tidas_batch_validation(
         final_event,
         issue_events,
     })
+}
+
+fn spool_tidas_batch_documents(
+    documents: &[ClosureDocument],
+) -> anyhow::Result<(TempDir, PathBuf, PathBuf)> {
+    let temp = TempDir::new()?;
+    let input_dir = temp.path().join("documents");
+    fs::create_dir(&input_dir)?;
+    let manifest_path = temp.path().join("manifest.jsonl");
+    let mut manifest = Vec::new();
+    for (index, document) in documents.iter().enumerate() {
+        let file_name = format!("{index:08}.json");
+        let document_bytes = canonical_json_bytes(&document.payload)?;
+        fs::write(input_dir.join(&file_name), &document_bytes)?;
+        manifest.extend(canonical_json_bytes(&json!({
+            "document_key": document.identity.document_key(),
+            "category": document.identity.category.table_name(),
+            "relative_path": file_name,
+            "content_sha256": sha256_hex(&document_bytes),
+            "identity": {
+                "dataset_type": document.identity.category.table_name(),
+                "dataset_id": document.identity.id,
+                "dataset_version": document.identity.version,
+            },
+        }))?);
+        manifest.push(b'\n');
+    }
+    fs::write(&manifest_path, manifest)?;
+    Ok((temp, input_dir, manifest_path))
 }
 
 fn validate_tidas_final_event(
@@ -3616,87 +3682,6 @@ fn validate_tidas_final_event(
     Ok(())
 }
 
-fn tidas_command_candidates() -> impl Iterator<Item = (String, Vec<String>)> {
-    std::env::var("TIDAS_VALIDATE_BIN")
-        .ok()
-        .into_iter()
-        .map(|program| (program, Vec::<String>::new()))
-        .chain([
-            ("tidas-validate".to_owned(), Vec::new()),
-            (
-                "python3".to_owned(),
-                vec!["-m".to_owned(), "tidas_tools.validate".to_owned()],
-            ),
-            (
-                "python".to_owned(),
-                vec!["-m".to_owned(), "tidas_tools.validate".to_owned()],
-            ),
-        ])
-}
-
-/// Read the validator JSONL stream one event at a time.  This keeps the pipe
-/// bounded by the operating system and applies natural backpressure to a fast
-/// validator instead of first buffering its entire output in memory.
-fn run_tidas_batch_events(args: &[&str]) -> anyhow::Result<Vec<Value>> {
-    let mut missing = Vec::new();
-    for (program, prefix) in tidas_command_candidates() {
-        let child = Command::new(&program)
-            .args(prefix)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match child {
-            Ok(child) => child,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(program);
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("TIDAS validator stdout was not captured"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("TIDAS validator stderr was not captured"))?;
-        let stderr_reader = std::thread::spawn(move || {
-            let mut output = String::new();
-            stderr.read_to_string(&mut output).map(|_| output)
-        });
-        let events = BufReader::new(stdout)
-            .lines()
-            .filter_map(|line| match line {
-                Ok(line) if line.trim().is_empty() => None,
-                other => Some(other),
-            })
-            .map(|line| {
-                let line = line?;
-                serde_json::from_str::<Value>(&line).map_err(std::io::Error::other)
-            })
-            .collect::<std::io::Result<Vec<_>>>();
-        if events.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait()?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("TIDAS validator stderr reader panicked"))??;
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "TIDAS validator failed via {program}: {stderr}"
-            ));
-        }
-        return Ok(events?);
-    }
-    Err(anyhow::anyhow!(
-        "TIDAS validator is unavailable; tried {}",
-        missing.join(", ")
-    ))
-}
-
 fn document_validation_cache_key(
     document: &ClosureDocument,
     describe: &Value,
@@ -3707,11 +3692,29 @@ fn document_validation_cache_key(
         .ok_or_else(|| anyhow::anyhow!("TIDAS validator describe omitted package version"))?;
     let engines = describe
         .get("engines")
-        .ok_or_else(|| anyhow::anyhow!("TIDAS validator describe omitted engines"))?;
-    let schema_lock = describe
-        .get("tidas_schema_lock_sha256")
+        .ok_or_else(|| anyhow::anyhow!("tidas_handshake_invalid: describe omitted engines"))?;
+    let ruleset_catalog = describe.get("ruleset_catalog").ok_or_else(|| {
+        anyhow::anyhow!("tidas_handshake_invalid: describe omitted ruleset catalog")
+    })?;
+    let asset_fingerprint = describe
+        .get("asset_fingerprint")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("TIDAS validator describe omitted schema lock hash"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("tidas_handshake_invalid: describe omitted asset fingerprint")
+        })?;
+    if !describe
+        .get("report_schema_versions")
+        .and_then(Value::as_array)
+        .is_some_and(|schemas| {
+            schemas
+                .iter()
+                .any(|schema| schema.as_str() == Some("tidas.validation-report.v1"))
+        })
+    {
+        return Err(anyhow::anyhow!(
+            "tidas_protocol_mismatch: describe omitted tidas.validation-report.v1"
+        ));
+    }
     Ok(json!({
         "datasetType": document.identity.category.table_name(),
         "datasetId": document.identity.id,
@@ -3720,8 +3723,13 @@ fn document_validation_cache_key(
         "documentValidatorVersion": package_version,
         "documentValidationProfile": TIDAS_BATCH_PROFILE,
         "validationReportSchemaVersion": "tidas.validation-report.v1",
-        "validatorEngineFingerprint": canonical_json_sha256(engines)?,
-        "tidasSchemaLockSha256": schema_lock,
+        "validatorEngineFingerprint": canonical_json_sha256(&json!({
+            "engines": engines,
+            "rulesetCatalog": ruleset_catalog,
+        }))?,
+        // The v0.1 Rust CLI publishes one fingerprint over all bundled schemas,
+        // indexes, methodologies, rulesets, XSD, and XSLT assets.
+        "tidasSchemaLockSha256": asset_fingerprint,
     }))
 }
 
@@ -3791,30 +3799,6 @@ async fn record_document_validation_evidence(
     .await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_rpc_ok(&result, "svc_lcia_document_validation_evidence_record")
-}
-
-fn run_tidas_command(args: &[&str]) -> anyhow::Result<String> {
-    let mut missing = Vec::new();
-    for (program, prefix) in tidas_command_candidates() {
-        let output = Command::new(&program).args(prefix).args(args).output();
-        match output {
-            Ok(output) if output.status.success() => {
-                return Ok(String::from_utf8(output.stdout)?);
-            }
-            Ok(output) => {
-                return Err(anyhow::anyhow!(
-                    "TIDAS validator failed via {program}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(program),
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "TIDAS validator is unavailable; tried {}",
-        missing.join(", ")
-    ))
 }
 
 fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) {

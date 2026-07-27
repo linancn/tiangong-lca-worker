@@ -302,6 +302,10 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
 - `WORKER_POLL_MS`（默认 `1000`）
 - `WORKER_VT_SECONDS`（默认 `30`；生产 `build_snapshot` 队列建议按最长任务耗时设置，例如 `1800`）
+- `TIDAS_BIN`（统一 Rust `tidas` binary；默认通过 `PATH` 查找 `tidas`，生产建议使用原子切换的绝对路径）
+- `TIDAS_EXPECTED_VERSION`（必须与 binary `version` 及 validation describe package version 精确匹配，默认 `0.1.0`）
+- `TIDAS_TIMEOUT_SECONDS`（单次 `tidas` 子进程上限，默认 `1800`）
+- `TIDAS_MEMORY_BUDGET_MIB` / `TIDAS_QUEUE_CAPACITY`（由 `tidas` 消费的有界资源配置；package 与 scope-closure 子进程继承）
 
 数据库连接池与 `build_snapshot` 并发：
 
@@ -468,6 +472,9 @@ cargo run -p solver-worker --bin solver-worker --release -- --mode worker
 
 ```bash
 set -a && source .env && set +a
+tidas_bin="${TIDAS_BIN:-tidas}"
+test "$("$tidas_bin" version --format json --progress never | jq -r '.summary.binary_version')" = "${TIDAS_EXPECTED_VERSION:-0.1.0}"
+"$tidas_bin" validate --describe --format json --progress never | jq -e '.summary.validation_describe.protocols | index("document-validation-batch.v1")'
 cargo run -p solver-worker --bin package_worker --release
 ```
 
@@ -648,7 +655,7 @@ sudo systemctl restart solver-worker@1 solver-worker@2
 
 ### 6.4 TIDAS Package Worker 常驻（systemd，推荐）
 
-若前端需要异步导入/导出 TIDAS package，建议单独用 `systemd` 托管 `package_worker`，避免与 `solver-worker` 共用同一进程。
+若前端需要异步导入/导出 TIDAS package，建议单独用 `systemd` 托管 `package_worker`，避免与 `solver-worker` 共用同一进程。主机必须先按运维仓库的 checksum/provenance/atomic-install runbook 安装 Rust `tidas`；Worker 不安装或回退到 Python validator。
 
 构建：
 
@@ -672,6 +679,8 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
 Environment=RUST_LOG=info
+Environment=TIDAS_BIN=/home/ubuntu/.runtime/tidas/current/bin/tidas
+Environment=TIDAS_EXPECTED_VERSION=0.1.0
 ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/package_worker
 Restart=always
 RestartSec=2
