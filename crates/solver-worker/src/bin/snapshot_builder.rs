@@ -91,6 +91,7 @@ const REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE: &str = "review_submit_baseline";
 const REVIEW_SUBMIT_BASELINE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS: u64 = 900;
 const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
+const SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE: usize = 1_024;
 const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
 const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -926,6 +927,7 @@ async fn main() -> anyhow::Result<()> {
             solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION.to_owned(),
         technosphere_boundary_policy: technosphere_boundary_policy.as_str().to_owned(),
         flow_identity_policy: "exact-flow-version-reference-unit-v2".to_owned(),
+        source_closure_policy: "selected-lcia-factor-flow-support-v1".to_owned(),
         biosphere_sign_mode: "gross".to_owned(),
         self_loop_cutoff: cli.self_loop_cutoff,
         singular_eps: cli.singular_eps,
@@ -4008,9 +4010,14 @@ async fn compile_scope_graph(
     let flow_meta = fetch_flow_meta(pool, &flow_requests, versioned_scope).await?;
     resolve_requested_flow_versions(&mut exchanges, &flow_meta)?;
     let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta.by_identity).await?;
-    let source_datasets =
-        build_frozen_source_datasets(pool, &processes, &flow_meta.by_identity, impact_factor_sets)
-            .await?;
+    let source_datasets = build_frozen_source_datasets(
+        pool,
+        &processes,
+        &flow_meta.by_identity,
+        impact_factor_sets,
+        versioned_scope,
+    )
+    .await?;
     for exchange in &exchanges {
         let identity = flow_link_identity(exchange);
         if !flow_meta.by_identity.contains_key(&identity) {
@@ -6920,6 +6927,68 @@ async fn fetch_flow_meta(
     Ok(out)
 }
 
+fn merge_resolved_flow_metadata(
+    target: &mut ResolvedFlowMetadata,
+    source: ResolvedFlowMetadata,
+) -> anyhow::Result<()> {
+    for (identity, flow) in source.by_identity {
+        if let Some(existing) = target.by_identity.get(&identity)
+            && (existing.id != flow.id
+                || existing.version != flow.version
+                || existing.json != flow.json)
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting Flow metadata while resolving source closure: {}@{}",
+                identity.flow_id,
+                identity.flow_version
+            ));
+        }
+        target.by_identity.insert(identity, flow);
+    }
+    for (flow_id, version) in source.omitted_version_by_id {
+        if let Some(existing) = target.omitted_version_by_id.get(&flow_id)
+            && existing != &version
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting omitted-version Flow resolution while resolving source closure: {flow_id}@{existing} != {version}"
+            ));
+        }
+        target.omitted_version_by_id.insert(flow_id, version);
+    }
+    Ok(())
+}
+
+async fn fetch_flow_meta_batched(
+    pool: &PgPool,
+    requests: &FlowReferenceRequests,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<ResolvedFlowMetadata> {
+    let mut resolved = ResolvedFlowMetadata::default();
+    let exact = requests.exact.iter().cloned().collect::<Vec<_>>();
+    for chunk in exact.chunks(SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE) {
+        let batch = FlowReferenceRequests {
+            exact: chunk.iter().cloned().collect(),
+            omitted: BTreeSet::new(),
+        };
+        merge_resolved_flow_metadata(
+            &mut resolved,
+            fetch_flow_meta(pool, &batch, versioned_scope).await?,
+        )?;
+    }
+    let omitted = requests.omitted.iter().copied().collect::<Vec<_>>();
+    for chunk in omitted.chunks(SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE) {
+        let batch = FlowReferenceRequests {
+            exact: BTreeSet::new(),
+            omitted: chunk.iter().copied().collect(),
+        };
+        merge_resolved_flow_metadata(
+            &mut resolved,
+            fetch_flow_meta(pool, &batch, versioned_scope).await?,
+        )?;
+    }
+    Ok(resolved)
+}
+
 fn source_dataset_type_from_reference(value: &str) -> Option<CompiledReleaseSourceDatasetType> {
     match value
         .split_whitespace()
@@ -7015,6 +7084,120 @@ fn collect_source_dataset_references(
         _ => {}
     }
     Ok(())
+}
+
+fn collect_lcia_factor_flow_references(
+    method_document: &Value,
+    references: &mut BTreeSet<SourceDatasetReference>,
+) -> anyhow::Result<()> {
+    for factor in method_factor_items(method_document) {
+        let reference = factor
+            .get("referenceToFlowDataSet")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LCIA factor is missing a referenceToFlowDataSet object in source closure"
+                )
+            })?;
+        let id_value = reference
+            .get("@refObjectId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LCIA factor Flow reference is missing @refObjectId in source closure"
+                )
+            })?;
+        let id = Uuid::parse_str(id_value).map_err(|_| {
+            anyhow::anyhow!(
+                "LCIA factor Flow reference has invalid UUID in source closure: {id_value}"
+            )
+        })?;
+        let version = match reference.get("@version") {
+            None => None,
+            Some(Value::String(value)) => {
+                let value = value.trim();
+                if !valid_source_dataset_version(value) {
+                    return Err(anyhow::anyhow!(
+                        "LCIA factor Flow reference has invalid version in source closure: {value}"
+                    ));
+                }
+                Some(value.to_owned())
+            }
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "LCIA factor Flow reference version must be a string in source closure"
+                ));
+            }
+        };
+        references.insert(SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::Flow,
+            id,
+            version,
+        });
+    }
+    Ok(())
+}
+
+fn flow_reference_requests_from_source_references(
+    references: &BTreeSet<SourceDatasetReference>,
+) -> FlowReferenceRequests {
+    let mut requests = FlowReferenceRequests::default();
+    for reference in references {
+        if reference.dataset_type != CompiledReleaseSourceDatasetType::Flow {
+            continue;
+        }
+        insert_flow_reference_request(
+            &mut requests,
+            reference.id,
+            reference.version.as_deref().unwrap_or("unknown"),
+        );
+    }
+    requests
+}
+
+fn resolve_lcia_support_flows<'a>(
+    references: &BTreeSet<SourceDatasetReference>,
+    flow_meta: &'a ResolvedFlowMetadata,
+) -> anyhow::Result<Vec<&'a FlowRow>> {
+    let mut identities = BTreeSet::new();
+    for reference in references {
+        let version = match &reference.version {
+            Some(version) => version,
+            None => flow_meta
+                .omitted_version_by_id
+                .get(&reference.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "LCIA factor Flow reference could not resolve omitted version: {}",
+                        reference.id
+                    )
+                })?,
+        };
+        let identity = flow_link_identity_from_parts(reference.id, version);
+        let flow = flow_meta.by_identity.get(&identity).ok_or_else(|| {
+            anyhow::anyhow!(
+                "LCIA factor Flow reference could not resolve exact dataset: {}@{}",
+                identity.flow_id,
+                identity.flow_version
+            )
+        })?;
+        let source_type = classify_source_flow_type(&flow.json);
+        if source_type != CompiledSourceFlowType::Elementary {
+            return Err(anyhow::anyhow!(
+                "lcia_factor_non_elementary_flow: LCIA factor Flow must be Elementary and cannot expand matrix/provider scope: {}@{} resolved as {:?}",
+                identity.flow_id,
+                identity.flow_version,
+                source_type
+            ));
+        }
+        identities.insert(identity);
+    }
+    Ok(identities
+        .iter()
+        .filter_map(|identity| flow_meta.by_identity.get(identity))
+        .collect())
 }
 
 fn source_reference_is_satisfied(
@@ -7219,6 +7402,7 @@ async fn build_frozen_source_datasets(
     processes: &[ProcessRow],
     flows: &HashMap<FlowLinkIdentity, FlowRow>,
     impact_factor_sets: &[ImpactFactorSet],
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
 ) -> anyhow::Result<Vec<CompiledReleaseSourceDataset>> {
     let mut datasets = BTreeMap::<
         (CompiledReleaseSourceDatasetType, Uuid, String),
@@ -7289,6 +7473,28 @@ async fn build_frozen_source_datasets(
                 &row.json,
             )?;
         }
+    }
+
+    let mut lcia_factor_flow_references = BTreeSet::new();
+    for dataset in datasets
+        .values()
+        .filter(|dataset| dataset.dataset_type == CompiledReleaseSourceDatasetType::LciaMethod)
+    {
+        collect_lcia_factor_flow_references(&dataset.document, &mut lcia_factor_flow_references)?;
+    }
+    let lcia_flow_requests =
+        flow_reference_requests_from_source_references(&lcia_factor_flow_references);
+    let lcia_flow_meta =
+        fetch_flow_meta_batched(pool, &lcia_flow_requests, versioned_scope).await?;
+    for flow in resolve_lcia_support_flows(&lcia_factor_flow_references, &lcia_flow_meta)? {
+        insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Flow,
+            CompiledReleaseSourceDatasetRole::Support,
+            flow.id,
+            flow.version.clone(),
+            &flow.json,
+        )?;
     }
 
     for _ in 0..16 {
@@ -8361,6 +8567,10 @@ fn write_report_files(
         config.flow_identity_policy
     ));
     md.push_str(&format!(
+        "- source_closure_policy: `{}`\n",
+        config.source_closure_policy
+    ));
+    md.push_str(&format!(
         "- biosphere_sign_mode: `{}`\n",
         config.biosphere_sign_mode
     ));
@@ -8951,18 +9161,20 @@ mod tests {
         assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
         build_compiled_release_evidence, build_lcia_factor_coverage,
         build_review_submit_overlay_graph, candidate_count_bucket_label,
-        collect_source_dataset_references, compute_review_submit_overlay_source_hash,
-        compute_scope_hash, compute_source_fingerprint_from_summary, geo_score,
-        insert_compiled_source_dataset, load_impact_factor_sets, location_granularity_label,
-        no_balancing_reference_failure_reason, normalize_request_roots, parse_number,
-        parse_process_annual_supply_or_production_volume, parse_process_states,
+        collect_lcia_factor_flow_references, collect_source_dataset_references,
+        compute_review_submit_overlay_source_hash, compute_scope_hash,
+        compute_source_fingerprint_from_summary, flow_reference_requests_from_source_references,
+        geo_score, insert_compiled_source_dataset, load_impact_factor_sets,
+        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
+        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_database_lcia_method_row,
-        resolve_database_lcia_method_rows, resolve_lcia_method_source_row, resolve_multi_provider,
-        resolve_process_selection, resolve_reference_normalization,
-        review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
-        scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
-        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        resolve_database_lcia_method_rows, resolve_lcia_method_source_row,
+        resolve_lcia_support_flows, resolve_multi_provider, resolve_process_selection,
+        resolve_reference_normalization, review_submit_root_dependency_fingerprint,
+        reviewed_lcia_artifact_locator, scope_closure_boundary_policy,
+        scope_closure_candidate_process_axis, snapshot_db_statement_timeout,
+        source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
+        time_score, unique_supported_direction_by_flow,
         validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
         validate_process_row_visibility, validate_quantitative_references,
         validate_unique_database_lcia_method_identities,
@@ -9066,6 +9278,7 @@ mod tests {
                     .to_owned(),
             technosphere_boundary_policy: "closed".to_owned(),
             flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
+            source_closure_policy: "snapshot-exchange-flows-only-v0".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -9173,6 +9386,19 @@ mod tests {
             overlay_hash,
             compute_review_submit_overlay_source_hash("baseline", &config)
                 .expect("v2 Flow identity overlay fingerprint")
+        );
+
+        config.flow_identity_policy = "exact-flow-version-reference-unit-v1".to_owned();
+        config.source_closure_policy = "selected-lcia-factor-flow-support-v1".to_owned();
+        assert_ne!(
+            snapshot_hash,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("LCIA factor Flow source-closure fingerprint")
+        );
+        assert_ne!(
+            overlay_hash,
+            compute_review_submit_overlay_source_hash("baseline", &config)
+                .expect("LCIA factor Flow overlay fingerprint")
         );
     }
 
@@ -13049,6 +13275,152 @@ mod tests {
         let error = collect_source_dataset_references(&document, &mut BTreeSet::new())
             .expect_err("recognized malformed reference must fail closed");
         assert!(error.to_string().contains("invalid UUID"));
+    }
+
+    #[test]
+    fn lcia_factor_flow_collection_preserves_exact_and_omitted_versions() {
+        let exact_flow_id = Uuid::new_v4();
+        let omitted_flow_id = Uuid::new_v4();
+        let method = json!({
+            "LCIAMethodDataSet": {
+                "characterisationFactors": {
+                    "factor": [
+                        {
+                            "referenceToFlowDataSet": {
+                                "@refObjectId": exact_flow_id,
+                                "@version": "01.02.003"
+                            },
+                            "meanValue": 1.0
+                        },
+                        {
+                            "referenceToFlowDataSet": {
+                                "@refObjectId": omitted_flow_id
+                            },
+                            "meanValue": 0.0
+                        }
+                    ]
+                }
+            }
+        });
+        let mut references = BTreeSet::new();
+        collect_lcia_factor_flow_references(&method, &mut references)
+            .expect("collect LCIA factor Flow references");
+        let requests = flow_reference_requests_from_source_references(&references);
+
+        assert!(requests.exact.contains(&super::FlowLinkIdentity {
+            flow_id: exact_flow_id,
+            flow_version: "01.02.003".to_owned(),
+        }));
+        assert!(requests.omitted.contains(&omitted_flow_id));
+        assert_eq!(references.len(), 2, "zero factors remain source evidence");
+    }
+
+    #[test]
+    fn lcia_factor_support_resolution_is_separate_from_inventory_flow_axis() {
+        let inventory_flow_id = Uuid::new_v4();
+        let factor_only_flow_id = Uuid::new_v4();
+        let inventory_identity = super::FlowLinkIdentity {
+            flow_id: inventory_flow_id,
+            flow_version: "01.00.000".to_owned(),
+        };
+        let factor_identity = super::FlowLinkIdentity {
+            flow_id: factor_only_flow_id,
+            flow_version: "02.00.000".to_owned(),
+        };
+        let inventory_flows = HashMap::from([(
+            inventory_identity.clone(),
+            super::FlowRow {
+                id: inventory_flow_id,
+                version: inventory_identity.flow_version.clone(),
+                user_id: None,
+                state_code: 100,
+                team_id: None,
+                review_id: None,
+                json: json!({}),
+            },
+        )]);
+        let factor_flow = super::FlowRow {
+            id: factor_only_flow_id,
+            version: factor_identity.flow_version.clone(),
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            json: json!({
+                "flowDataSet": {
+                    "modellingAndValidation": {
+                        "LCIMethod": {
+                            "typeOfDataSet": "Elementary flow"
+                        }
+                    }
+                }
+            }),
+        };
+        let metadata = super::ResolvedFlowMetadata {
+            by_identity: HashMap::from([(factor_identity.clone(), factor_flow)]),
+            omitted_version_by_id: HashMap::new(),
+        };
+        let references = BTreeSet::from([SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::Flow,
+            id: factor_only_flow_id,
+            version: Some(factor_identity.flow_version.clone()),
+        }]);
+
+        let support = resolve_lcia_support_flows(&references, &metadata)
+            .expect("resolve factor-only elementary Flow");
+        assert_eq!(support.len(), 1);
+        assert_eq!(support[0].id, factor_only_flow_id);
+        assert_eq!(
+            inventory_flows.keys().collect::<Vec<_>>(),
+            vec![&inventory_identity],
+            "factor-only support must not mutate the inventory/matrix Flow set"
+        );
+    }
+
+    #[test]
+    fn lcia_factor_non_elementary_flow_fails_without_expanding_provider_scope() {
+        let flow_id = Uuid::new_v4();
+        let identity = super::FlowLinkIdentity {
+            flow_id,
+            flow_version: "01.00.000".to_owned(),
+        };
+        let metadata = super::ResolvedFlowMetadata {
+            by_identity: HashMap::from([(
+                identity.clone(),
+                super::FlowRow {
+                    id: flow_id,
+                    version: identity.flow_version.clone(),
+                    user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
+                    json: json!({
+                        "flowDataSet": {
+                            "modellingAndValidation": {
+                                "LCIMethod": {
+                                    "typeOfDataSet": "Product flow"
+                                }
+                            }
+                        }
+                    }),
+                },
+            )]),
+            omitted_version_by_id: HashMap::new(),
+        };
+        let references = BTreeSet::from([SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::Flow,
+            id: flow_id,
+            version: Some(identity.flow_version),
+        }]);
+
+        let error = resolve_lcia_support_flows(&references, &metadata)
+            .expect_err("non-elementary factor targets must fail closed");
+        assert!(error.to_string().contains("must be Elementary"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot expand matrix/provider scope")
+        );
     }
 
     #[test]

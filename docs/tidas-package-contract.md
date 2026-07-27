@@ -19,7 +19,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-27
-lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
 lastReviewedNote: "Cut import validation over to the version-pinned unified Rust tidas binary with verified bounded evidence for Issue #144."
 related:
   - AGENTS.md

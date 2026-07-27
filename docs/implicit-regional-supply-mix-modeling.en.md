@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
-lastReviewedNote: "Reviewed frozen-manifest source validation for certificate snapshots; signed-flow routing theory is unchanged."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
+lastReviewedNote: "Reviewed for Issue #146: LCIA-factor source support is separate from implicit signed-flow routing and provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -156,7 +156,7 @@ Allocation fraction and routing weight are different: the former changes residua
 
 Snapshot, release, and readiness evidence retain flow UUID/version/reference unit, flow space/source type, raw direction/amount/coefficient, normalized reference/residual coefficient, candidate eligibility, routing strategy/weight, activity requirement, closure residual, boundary policy, and unresolved reason.
 
-Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, and `exact-flow-version-reference-unit-v2`. Exact Flow identity is `(UUID, resolved version)`, and compilation retains only revisions referenced by the final Process closure. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
+Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, `exact-flow-version-reference-unit-v2`, and `selected-lcia-factor-flow-support-v1`. Exact Flow identity is `(UUID, resolved version)`, and matrix/provider compilation retains only revisions referenced by final Process-closure exchanges. Selected LCIA-factor-only Elementary Flows enter frozen source closure only and do not participate in the implicit mix. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
 
 ## Limitation
 

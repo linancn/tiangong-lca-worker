@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-27
-lastReviewedCommit: 31bd931cf0e6e0b1b0a71992257fbe4075c4b777
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
 lastReviewedNote: "Reviewed for Issue #144: the Worker now consumes only the version-pinned unified Rust tidas CLI contract with verified bounded spools."
 related:
   - .docpact/config.yaml

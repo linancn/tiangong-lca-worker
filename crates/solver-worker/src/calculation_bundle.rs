@@ -56,6 +56,7 @@ fn calculation_solver_contract(config: &SnapshotBuildConfig) -> Value {
             "technosphereBoundary": config.technosphere_boundary_policy,
             "flowIdentity": config.flow_identity_policy,
         },
+        "sourceClosurePolicy": config.source_closure_policy,
         "zeroPolicy": {
             "directionalLci": "retain_finite_nonzero",
             "lcia": "retain_finite_including_zero",

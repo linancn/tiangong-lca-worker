@@ -22,9 +22,9 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-22
-lastReviewedCommit: c105801e3a1893eb988851e8071b2615197ab68c
-lastReviewedNote: "Reviewed certificate snapshot exact-version/source-hash enforcement; provider eligibility and routing order are unchanged."
+lastReviewedAt: 2026-07-27
+lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
+lastReviewedNote: "Issue #146 separates selected LCIA-factor Flow source evidence from the inventory-derived matrix and provider Flow universe."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md
@@ -114,7 +114,9 @@ Flow 的 ILCD/TIDAS source type 先映射到计算空间：
 
 Technosphere 候选集合按 exact flow identity `(Flow UUID, resolved version)` 建立。Exchange 显式给出 `@version` 时只查询并绑定该 revision；省略版本时才按 snapshot visibility 规则确定一个版本，并在后续 compilation、artifact 与 release evidence 中冻结。一个 snapshot 可以同时包含同一 UUID 的多个被引用 revision，reference-port lookup、flow metadata、flow axis 和 diagnostics 都不得退化为 UUID-only key，也禁止跨 revision 或不兼容单位链接。
 
-Exact identity 不表示加载数据库中的全部历史版本。Worker 先按 request/process closure 收集 exchange 实际引用的 identity；显式版本使用精确 `(UUID, version)` 查询，省略版本只查询一次 deterministic selected revision。最终 closure 确定后，仅保留其中 distinct referenced identities，再分配连续 `flow_idx`。未被 exchange 引用的历史 revision、以及只有 LCIA factor 但没有 inventory exchange 的 Flow，不进入 `B/C` axis、compiled graph、source closure 或 bundle。
+Exact identity 不表示加载数据库中的全部历史版本。Worker 先按 request/process closure 收集 exchange 实际引用的 inventory identity；显式版本使用精确 `(UUID, version)` 查询，省略版本只查询一次 deterministic selected revision。最终 closure 确定后，仅对 distinct inventory identities 分配连续 `flow_idx`。未被 exchange 引用的历史 revision 不进入任何集合；只有 selected LCIA Method factor 引用、没有 inventory exchange 的 Elementary Flow 则只进入 frozen source closure 与 Calculation Bundle 的 `support` 文档，不进入 `B/C` axis、compiled graph、reference-port/provider lookup。
+
+LCIA support Flow 收集与矩阵 Flow 收集是两条独立路径。Worker 一次扫描 selected LCIA Method 的全部 `referenceToFlowDataSet`（包括数值为零的 factor），按 exact UUID/version 去重，并以 bounded batches 读取；省略版本只解析一次并冻结。目标必须解析为 Elementary Flow；Product、Waste 或 Other factor target 会 fail closed，绝不能借 LCIA factor 扩大 technosphere/provider universe。每个已选 support Flow 继续递归闭合它引用的 Flow Property、Unit Group、Source 与 Contact。
 
 Reference ports 使用 `HashMap<(UUID, version), candidates>` 分桶。每条 residual 只访问同 identity 的候选列表，避免逐 residual 扫描所有 Process；矩阵 `A` 仍是 Process × Process 的稀疏矩阵，其存储与 assembly 由实际 non-zero balance edge 决定，而不是由 Flow 历史版本数决定。
 
@@ -280,4 +282,4 @@ Compiled graph 和 readiness 至少应支持解释：
 
 Matrix-readiness、diagnostics export 和人工 debug 应消费这些 provider decisions，而不是在外部重写 provider resolution。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy` 和 `flow_identity_policy = exact-flow-version-reference-unit-v2`。v2 表示 exact revision 可共存、按最终引用集合剪枝并进入 flow axis/diagnostics；这些字段进入 source/review fingerprint，UUID-only 旧 snapshot 不会被复用。Coverage schema 为 `snapshot_coverage.v3`；readiness input/report 为 v2。Calculation bundle 为 `tiangong.calculation-bundle.v2`，technosphere release edge 使用 residual/balancing/reference/activity 的中性字段。
+Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy`、`flow_identity_policy = exact-flow-version-reference-unit-v2` 和 `source_closure_policy = selected-lcia-factor-flow-support-v1`。Flow identity v2 表示 exact inventory revision 可共存、按最终 exchange 引用集合剪枝并进入 flow axis/diagnostics；source-closure v1 表示 selected LCIA factor Flow 只作为 support evidence 闭合。所有字段进入 source/review fingerprint，因此旧的 exchange-only source closure snapshot 不会被复用。Coverage schema 为 `snapshot_coverage.v3`；readiness input/report 为 v2。Calculation bundle 为 `tiangong.calculation-bundle.v2`，technosphere release edge 使用 residual/balancing/reference/activity 的中性字段。

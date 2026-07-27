@@ -89,6 +89,9 @@ pub struct SnapshotBuildConfig {
     /// Versioned exact flow identity and unit compatibility policy.
     #[serde(default = "default_flow_identity_policy")]
     pub flow_identity_policy: String,
+    /// Versioned policy for freezing LCIA-factor Flow documents into source closure.
+    #[serde(default = "default_source_closure_policy")]
+    pub source_closure_policy: String,
     /// Biosphere sign convention (`signed`/`gross`).
     #[serde(default = "default_biosphere_sign_mode")]
     pub biosphere_sign_mode: String,
@@ -341,6 +344,10 @@ fn default_flow_identity_policy() -> String {
     "exact-flow-version-reference-unit-v1".to_owned()
 }
 
+fn default_source_closure_policy() -> String {
+    "snapshot-exchange-flows-only-v0".to_owned()
+}
+
 fn default_biosphere_sign_mode() -> String {
     "signed".to_owned()
 }
@@ -539,6 +546,7 @@ mod tests {
             link_semantics_version: "legacy-directional-link-v0".to_owned(),
             technosphere_boundary_policy: "closed".to_owned(),
             flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
+            source_closure_policy: "snapshot-exchange-flows-only-v0".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
