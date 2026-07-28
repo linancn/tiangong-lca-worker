@@ -1,10 +1,18 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+};
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::{Method, StatusCode, Url};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
+
+use crate::resource::{CancellationToken, ResourceError};
 
 const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGV4_SERVICE: &str = "s3";
@@ -12,6 +20,8 @@ const SIGV4_TERMINATOR: &str = "aws4_request";
 const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MULTIPART_UPLOAD_PART_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const XML_CONTENT_TYPE: &str = "application/xml";
+const DEFAULT_OBJECT_TRANSFER_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 const EMPTY_PAYLOAD_SHA256: &str =
@@ -36,6 +46,50 @@ pub struct ObjectUploadResult {
     pub object_url: String,
     pub upload_mode: &'static str,
     pub part_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectTransferOptions {
+    pub max_bytes: u64,
+    pub expected_sha256: Option<String>,
+    pub cancellation: CancellationToken,
+}
+
+impl ObjectTransferOptions {
+    #[must_use]
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            expected_sha256: None,
+            cancellation: CancellationToken::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_expected_sha256(mut self, expected_sha256: impl Into<String>) -> Self {
+        self.expected_sha256 = Some(expected_sha256.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectTransferResult {
+    pub object_url: String,
+    pub byte_size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectFileUploadResult {
+    pub upload: ObjectUploadResult,
+    pub byte_size: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +338,33 @@ impl ObjectStoreClient {
         file_path: &Path,
         artifact_byte_size: u64,
     ) -> anyhow::Result<ObjectUploadResult> {
+        let actual_byte_size = std::fs::metadata(file_path)?.len();
+        if actual_byte_size != artifact_byte_size {
+            return Err(anyhow::anyhow!(
+                "declared artifact byte size does not match file metadata declared={artifact_byte_size} actual={actual_byte_size}"
+            ));
+        }
+        let max_bytes = self
+            .max_upload_bytes
+            .unwrap_or(DEFAULT_OBJECT_TRANSFER_LIMIT_BYTES);
+        self.upload_object_key_file_bounded(
+            key,
+            content_type,
+            file_path,
+            ObjectTransferOptions::new(max_bytes),
+        )
+        .await
+        .map(|result| result.upload)
+    }
+
+    /// Uploads a local file with byte admission, SHA-256 verification, and cancellation.
+    pub async fn upload_object_key_file_bounded(
+        &self,
+        key: &str,
+        content_type: &str,
+        file_path: &Path,
+        options: ObjectTransferOptions,
+    ) -> anyhow::Result<ObjectFileUploadResult> {
         let key = key.trim_start_matches('/');
         if key.is_empty()
             || key
@@ -294,24 +375,48 @@ impl ObjectStoreClient {
                 "object key must be a normalized relative path"
             ));
         }
+        validate_transfer_options(&options)?;
+        options.cancellation.check("upload_preflight")?;
+        let artifact_byte_size = std::fs::metadata(file_path)?.len();
+        let max_bytes = self
+            .max_upload_bytes
+            .map_or(options.max_bytes, |configured| {
+                configured.min(options.max_bytes)
+            });
+        ensure_artifact_limit("objectUploadBytes", artifact_byte_size, max_bytes)?;
+        let sha256 = hash_file(file_path, &options.cancellation)?;
+        verify_expected_sha256(options.expected_sha256.as_deref(), &sha256)?;
+
         let upload_mode = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
             "single_put"
         } else {
             "multipart"
         };
         self.ensure_upload_size_allowed(upload_mode, Some(artifact_byte_size))?;
-        if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
-            return self
-                .upload_object(
-                    key,
-                    content_type,
-                    std::fs::read(file_path)?,
-                    Some(artifact_byte_size),
-                )
-                .await;
-        }
-        self.upload_object_multipart(key, content_type, file_path, artifact_byte_size)
-            .await
+        let upload = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            options.cancellation.check("upload_single_put")?;
+            self.upload_object(
+                key,
+                content_type,
+                std::fs::read(file_path)?,
+                Some(artifact_byte_size),
+            )
+            .await?
+        } else {
+            self.upload_object_multipart_with_cancellation(
+                key,
+                content_type,
+                file_path,
+                artifact_byte_size,
+                &options.cancellation,
+            )
+            .await?
+        };
+        Ok(ObjectFileUploadResult {
+            upload,
+            byte_size: artifact_byte_size,
+            sha256,
+        })
     }
 
     /// Returns the configured object-store prefix joined to a normalized relative key.
@@ -425,12 +530,72 @@ impl ObjectStoreClient {
 
     /// Downloads bytes from object URL.
     pub async fn download_object_url(&self, object_url: &str) -> anyhow::Result<Vec<u8>> {
+        let temp_dir = tempfile::tempdir()?;
+        let target = temp_dir.path().join("object.download");
+        self.download_object_url_to_file(
+            object_url,
+            &target,
+            ObjectTransferOptions::new(DEFAULT_OBJECT_TRANSFER_LIMIT_BYTES),
+        )
+        .await?;
+        Ok(std::fs::read(target)?)
+    }
+
+    /// Downloads an object to a file through a fixed-memory stream.
+    ///
+    /// The destination is atomically persisted only after byte-limit and hash checks pass.
+    pub async fn download_object_url_to_file(
+        &self,
+        object_url: &str,
+        destination: &Path,
+        options: ObjectTransferOptions,
+    ) -> anyhow::Result<ObjectTransferResult> {
+        validate_transfer_options(&options)?;
+        options.cancellation.check("download_preflight")?;
+        let mut response = self.download_response(object_url).await?;
+        if let Some(content_length) = response.content_length() {
+            ensure_artifact_limit("objectDownloadBytes", content_length, options.max_bytes)?;
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "download destination must have a parent: {}",
+                destination.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut partial = NamedTempFile::new_in(parent)?;
+        let mut hasher = Sha256::new();
+        let mut byte_size = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            options.cancellation.check("download_stream")?;
+            byte_size = byte_size
+                .checked_add(u64::try_from(chunk.len())?)
+                .ok_or_else(|| anyhow::anyhow!("object download byte counter overflow"))?;
+            ensure_artifact_limit("objectDownloadBytes", byte_size, options.max_bytes)?;
+            partial.write_all(&chunk)?;
+            hasher.update(&chunk);
+        }
+        options.cancellation.check("download_finalize")?;
+        let sha256 = hex::encode(hasher.finalize());
+        verify_expected_sha256(options.expected_sha256.as_deref(), &sha256)?;
+        partial.flush()?;
+        partial
+            .persist(destination)
+            .map_err(|err| anyhow::Error::new(err.error))?;
+        Ok(ObjectTransferResult {
+            object_url: object_url.to_owned(),
+            byte_size,
+            sha256,
+        })
+    }
+
+    async fn download_response(&self, object_url: &str) -> anyhow::Result<reqwest::Response> {
         let url = Url::parse(object_url)
             .map_err(|err| anyhow::anyhow!("invalid object URL {object_url}: {err}"))?;
         let host = canonical_host(&url)?;
         let unsigned_response = self.client.get(url.clone()).send().await?;
         if unsigned_response.status().is_success() {
-            return Ok(unsigned_response.bytes().await?.to_vec());
+            return Ok(unsigned_response);
         }
 
         // Retry with SigV4 for private buckets.
@@ -462,7 +627,7 @@ impl ObjectStoreClient {
 
         let response = request.send().await?;
         if response.status().is_success() {
-            return Ok(response.bytes().await?.to_vec());
+            return Ok(response);
         }
 
         let status = response.status();
@@ -589,7 +754,26 @@ impl ObjectStoreClient {
         file_path: &Path,
         object_byte_size: u64,
     ) -> anyhow::Result<ObjectUploadResult> {
+        self.upload_object_multipart_with_cancellation(
+            key,
+            content_type,
+            file_path,
+            object_byte_size,
+            &CancellationToken::default(),
+        )
+        .await
+    }
+
+    async fn upload_object_multipart_with_cancellation(
+        &self,
+        key: &str,
+        content_type: &str,
+        file_path: &Path,
+        object_byte_size: u64,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<ObjectUploadResult> {
         self.ensure_upload_size_allowed("multipart", Some(object_byte_size))?;
+        cancellation.check("upload_create_multipart")?;
         let upload_id = self
             .create_multipart_upload(key, content_type, object_byte_size)
             .await?;
@@ -599,6 +783,10 @@ impl ObjectStoreClient {
         let mut buffer = vec![0_u8; MULTIPART_UPLOAD_PART_SIZE_BYTES];
 
         loop {
+            if let Err(err) = cancellation.check("upload_read_part") {
+                let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+                return Err(err.into());
+            }
             let read_len = file.read(buffer.as_mut_slice())?;
             if read_len == 0 {
                 break;
@@ -631,6 +819,10 @@ impl ObjectStoreClient {
             ));
         }
 
+        if let Err(err) = cancellation.check("upload_complete_multipart") {
+            let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+            return Err(err.into());
+        }
         if let Err(err) = self
             .complete_multipart_upload(key, upload_id.as_str(), parts.as_slice(), object_byte_size)
             .await
@@ -1010,6 +1202,63 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(body[content_start..content_start + end].trim().to_owned())
 }
 
+fn validate_transfer_options(options: &ObjectTransferOptions) -> anyhow::Result<()> {
+    if options.max_bytes == 0 {
+        return Err(ResourceError::InvalidProfile(
+            "object transfer max_bytes must be greater than zero".to_owned(),
+        )
+        .into());
+    }
+    if let Some(expected) = options.expected_sha256.as_deref() {
+        let normalized = expected.trim().to_ascii_lowercase();
+        if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow::anyhow!(
+                "expected SHA-256 must be 64 hexadecimal characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_artifact_limit(resource: &'static str, observed: u64, limit: u64) -> anyhow::Result<()> {
+    if observed > limit {
+        return Err(ResourceError::ArtifactLimitExceeded {
+            resource,
+            observed,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path, cancellation: &CancellationToken) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; FILE_HASH_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        cancellation.check("upload_hash")?;
+        let read_len = file.read(&mut buffer)?;
+        if read_len == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read_len]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn verify_expected_sha256(expected: Option<&str>, observed: &str) -> anyhow::Result<()> {
+    if let Some(expected) = expected
+        && !expected.trim().eq_ignore_ascii_case(observed)
+    {
+        return Err(anyhow::anyhow!(
+            "artifact SHA-256 mismatch expected={} observed={observed}",
+            expected.trim()
+        ));
+    }
+    Ok(())
+}
+
 fn object_upload_error(
     stage: &'static str,
     upload_mode: &'static str,
@@ -1096,16 +1345,23 @@ fn hmac_sha256_hex(key: &[u8], data: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::Duration,
+    };
 
     use reqwest::StatusCode;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
     use uuid::Uuid;
 
     use super::{
         MULTIPART_UPLOAD_THRESHOLD_BYTES, ObjectDeleteOutcome, ObjectStoreClient,
-        ObjectStoreUploadError, extract_xml_tag, object_delete_outcome, object_upload_error,
+        ObjectStoreUploadError, ObjectTransferOptions, extract_xml_tag, object_delete_outcome,
+        object_upload_error,
     };
+    use crate::resource::{CancellationToken, ResourceError};
 
     #[test]
     fn delete_treats_success_statuses_as_deleted() {
@@ -1204,5 +1460,206 @@ mod tests {
         );
         assert!(upload_err.is_oversize());
         assert_eq!(upload_err.error_code(), "artifact_too_large");
+    }
+
+    fn test_client(endpoint: &str) -> ObjectStoreClient {
+        ObjectStoreClient::new(endpoint, "test", "bucket", "", "key", "secret", None)
+            .expect("test client")
+    }
+
+    fn serve_without_content_length(chunks: Vec<Vec<u8>>, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .expect("write response header");
+            for chunk in chunks {
+                stream.write_all(&chunk).expect("write response chunk");
+                stream.flush().expect("flush response chunk");
+                thread::sleep(delay);
+            }
+        });
+        format!("http://{address}/bucket/object")
+    }
+
+    fn serve_with_content_length(content_length: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write response header");
+            stream.flush().expect("flush response header");
+        });
+        format!("http://{address}/bucket/object")
+    }
+
+    #[tokio::test]
+    async fn download_content_length_rejects_cap_before_body_transfer() {
+        let url = serve_with_content_length(11);
+        let temp = tempdir().expect("temp directory");
+        let destination = temp.path().join("download.bin");
+        let endpoint = url.split("/bucket/").next().expect("endpoint");
+        let err = test_client(endpoint)
+            .download_object_url_to_file(&url, &destination, ObjectTransferOptions::new(10))
+            .await
+            .expect_err("content length must reject cap before body transfer");
+        assert_eq!(
+            err.downcast_ref::<ResourceError>()
+                .expect("resource limit error")
+                .error_code(),
+            "artifact_limit_exceeded"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp directory")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn download_without_content_length_enforces_cap_and_cleans_partial_file() {
+        let url = serve_without_content_length(
+            vec![vec![b'a'; 6], vec![b'b'; 6]],
+            Duration::from_millis(5),
+        );
+        let temp = tempdir().expect("temp directory");
+        let destination = temp.path().join("download.bin");
+        let endpoint = url.split("/bucket/").next().expect("endpoint");
+        let err = test_client(endpoint)
+            .download_object_url_to_file(&url, &destination, ObjectTransferOptions::new(10))
+            .await
+            .expect_err("stream must exceed cap");
+        let resource = err
+            .downcast_ref::<ResourceError>()
+            .expect("resource limit error");
+        assert_eq!(resource.error_code(), "artifact_limit_exceeded");
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp directory")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_never_persists_destination() {
+        let url = serve_without_content_length(
+            vec![vec![b'a'; 1024], vec![b'b'; 1024]],
+            Duration::from_millis(100),
+        );
+        let temp = tempdir().expect("temp directory");
+        let destination = temp.path().join("download.bin");
+        let cancellation = CancellationToken::default();
+        let canceller = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+        let endpoint = url.split("/bucket/").next().expect("endpoint");
+        let err = test_client(endpoint)
+            .download_object_url_to_file(
+                &url,
+                &destination,
+                ObjectTransferOptions::new(4096).with_cancellation(cancellation),
+            )
+            .await
+            .expect_err("cancelled download");
+        cancel_task.await.expect("cancel task");
+        assert_eq!(
+            err.downcast_ref::<ResourceError>()
+                .expect("cancellation error")
+                .error_code(),
+            "operation_cancelled"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp directory")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn download_hash_mismatch_cleans_partial_file() {
+        let url = serve_without_content_length(vec![b"payload".to_vec()], Duration::from_millis(0));
+        let temp = tempdir().expect("temp directory");
+        let destination = temp.path().join("download.bin");
+        let endpoint = url.split("/bucket/").next().expect("endpoint");
+        let err = test_client(endpoint)
+            .download_object_url_to_file(
+                &url,
+                &destination,
+                ObjectTransferOptions::new(100).with_expected_sha256("0".repeat(64)),
+            )
+            .await
+            .expect_err("hash mismatch");
+        assert!(err.to_string().contains("SHA-256 mismatch"));
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp directory")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_file_rejects_byte_cap_before_network_transfer() {
+        let temp = tempdir().expect("temp directory");
+        let source = temp.path().join("upload.bin");
+        std::fs::write(&source, [7_u8; 11]).expect("write upload fixture");
+        let err = test_client("http://127.0.0.1:9")
+            .upload_object_key_file_bounded(
+                "bounded/upload.bin",
+                "application/octet-stream",
+                &source,
+                ObjectTransferOptions::new(10),
+            )
+            .await
+            .expect_err("upload preflight must reject cap");
+        assert_eq!(
+            err.downcast_ref::<ResourceError>()
+                .expect("resource limit error")
+                .error_code(),
+            "artifact_limit_exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_file_stops_before_network_transfer() {
+        let temp = tempdir().expect("temp directory");
+        let source = temp.path().join("upload.bin");
+        std::fs::write(&source, [7_u8; 11]).expect("write upload fixture");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let err = test_client("http://127.0.0.1:9")
+            .upload_object_key_file_bounded(
+                "bounded/upload.bin",
+                "application/octet-stream",
+                &source,
+                ObjectTransferOptions::new(100).with_cancellation(cancellation),
+            )
+            .await
+            .expect_err("cancelled upload");
+        assert_eq!(
+            err.downcast_ref::<ResourceError>()
+                .expect("cancellation error")
+                .error_code(),
+            "operation_cancelled"
+        );
     }
 }

@@ -429,6 +429,23 @@ Edge/API 不直接运行数值 gate。legacy 路径中，Edge 通过数据库 RP
 
 稳定 blocker code、policy 默认值、快速验证顺序和 caller consumption 约束由 `docs/review-submit-fast-gate-contract.md` 维护。Edge 或 Next 在提交审核链路中应消费 DB gate result 里的 status、blockingReasons 和 calculatorReport，不应直接把 `matrix_readiness_report.v2` 的 blocker 当成提交审核结论。
 
+### 5.3 Worker resource 与 object file I/O 内部契约
+
+Worker 重任务可使用共享 `worker.resource-profile.v1` primitive 声明并在阶段开始前检查：
+
+- owned memory estimate 与 soft/hard memory limit；
+- temporary、object download/upload、cache 与 stage-window bytes；
+- maximum concurrency。
+
+稳定资源错误类为 `resource_admission_rejected`、`artifact_limit_exceeded` 与 `operation_cancelled`。阶段 telemetry 分开记录 owned estimate、process RSS、Linux cgroup v2 anon/file/current/peak、temp/object/cache bytes、rows 与 nnz；RSS/cgroup 是最终安全边界，不替代 owned admission。
+
+对象存储的新重任务迁移面使用 file API：
+
+- `download_object_url_to_file`：必须传显式 byte cap；即使响应没有 `Content-Length` 也在每个 chunk 后执行累计上限检查；可校验 SHA-256 和 cooperative cancellation；只有完整成功后才原子发布目标文件。
+- `upload_object_key_file_bounded`：在网络传输前按文件 metadata 拒绝超限、流式计算/校验 SHA-256，并在每个 multipart boundary 检查 cancellation；失败或取消会 abort 已创建的 multipart upload。
+
+旧 `download_object_url -> Vec<u8>`、`download_object_key -> Vec<u8>` 与现有 file-upload 方法保留作兼容面；新迁移的 snapshot、package、graph-cache 或 solve 路径不得继续采用完整对象内存物化。具体算法迁移由 #162 的后续独立交付完成，不改变本节现有 jobs/results consumer schema。
+
 ## 6. 幂等与请求缓存（建议约束）
 
 - `worker_jobs.idempotency_key` / `worker_jobs.request_hash`：同一业务请求重试时复用，避免重复创建 canonical worker job。

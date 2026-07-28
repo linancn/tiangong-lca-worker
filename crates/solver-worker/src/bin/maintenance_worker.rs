@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{
+    io::Read,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use clap::Parser;
 use serde_json::{Map, Value, json};
@@ -29,6 +34,7 @@ const RESULT_GC_RESULT_SCHEMA_VERSION: &str = "lca.result_gc.result.v1";
 const PACKAGE_ARTIFACT_GC_RESULT_SCHEMA_VERSION: &str = "tidas.package_artifact_gc.result.v1";
 const PROCESS_FLOW_GRAPH_CACHE_RESULT_SCHEMA_VERSION: &str =
     "national_carbon.process_flow_graph_cache_build.result.v1";
+const MAINTENANCE_LOG_CAPTURE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "maintenance-worker")]
@@ -117,6 +123,63 @@ struct MaintenanceCommandOutput {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Debug)]
+struct BoundedLogCapture {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+    max_bytes: usize,
+}
+
+impl BoundedLogCapture {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if chunk.len() >= self.max_bytes {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&chunk[chunk.len() - self.max_bytes..]);
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(self.max_bytes);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn finish(self) -> CapturedLog {
+        CapturedLog {
+            text: String::from_utf8_lossy(&self.bytes).into_owned(),
+            total_bytes: self.total_bytes,
+            truncated: self.total_bytes > u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CapturedLog {
+    text: String,
+    total_bytes: u64,
+    truncated: bool,
 }
 
 #[tokio::main]
@@ -217,6 +280,10 @@ async fn process_maintenance_worker_job(pool: &sqlx::PgPool, job: WorkerJob, lea
                 code: None,
                 stdout: String::new(),
                 stderr: err.to_string(),
+                stdout_bytes: 0,
+                stderr_bytes: u64::try_from(err.to_string().len()).unwrap_or(u64::MAX),
+                stdout_truncated: false,
+                stderr_truncated: false,
             };
             record_maintenance_failure(pool, &job, &command, output).await;
         }
@@ -227,17 +294,60 @@ async fn run_maintenance_command(
     command: MaintenanceCommand,
 ) -> anyhow::Result<MaintenanceCommandOutput> {
     tokio::task::spawn_blocking(move || {
-        let output = Command::new(&command.binary_path)
+        let mut child = Command::new(&command.binary_path)
             .args(&command.args)
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("maintenance child stdout pipe unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("maintenance child stderr pipe unavailable"))?;
+        let stdout_thread =
+            std::thread::spawn(move || capture_bounded_log(stdout, MAINTENANCE_LOG_CAPTURE_BYTES));
+        let stderr_thread =
+            std::thread::spawn(move || capture_bounded_log(stderr, MAINTENANCE_LOG_CAPTURE_BYTES));
+        let status = child.wait()?;
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("maintenance stdout capture thread panicked"))??;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("maintenance stderr capture thread panicked"))??;
         Ok::<_, anyhow::Error>(MaintenanceCommandOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            success: status.success(),
+            code: status.code(),
+            stdout: stdout.text,
+            stderr: stderr.text,
+            stdout_bytes: stdout.total_bytes,
+            stderr_bytes: stderr.total_bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
         })
     })
     .await?
+}
+
+fn capture_bounded_log(mut reader: impl Read, max_bytes: usize) -> anyhow::Result<CapturedLog> {
+    if max_bytes == 0 {
+        return Err(anyhow::anyhow!(
+            "maintenance log capture limit must be greater than zero"
+        ));
+    }
+    let mut capture = BoundedLogCapture::new(max_bytes);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_len = reader.read(&mut buffer)?;
+        if read_len == 0 {
+            break;
+        }
+        capture.push(&buffer[..read_len]);
+    }
+    Ok(capture.finish())
 }
 
 async fn record_invalid_maintenance_job(pool: &sqlx::PgPool, job: &WorkerJob, err_message: &str) {
@@ -380,6 +490,13 @@ async fn insert_maintenance_report_artifact(
         "summary": summary,
         "stdoutTail": tail_lines(&output.stdout, 200),
         "stderrTail": tail_lines(&output.stderr, 200),
+        "logCapture": {
+            "maxBytesPerStream": MAINTENANCE_LOG_CAPTURE_BYTES,
+            "stdoutBytes": output.stdout_bytes,
+            "stderrBytes": output.stderr_bytes,
+            "stdoutTruncated": output.stdout_truncated,
+            "stderrTruncated": output.stderr_truncated,
+        },
     });
 
     let row = sqlx::query(
@@ -420,6 +537,16 @@ fn maintenance_diagnostics(
     diagnostics.insert(
         "stderrTail".to_owned(),
         json!(tail_lines(&output.stderr, 100)),
+    );
+    diagnostics.insert(
+        "logCapture".to_owned(),
+        json!({
+            "maxBytesPerStream": MAINTENANCE_LOG_CAPTURE_BYTES,
+            "stdoutBytes": output.stdout_bytes,
+            "stderrBytes": output.stderr_bytes,
+            "stdoutTruncated": output.stdout_truncated,
+            "stderrTruncated": output.stderr_truncated,
+        }),
     );
     if let Some(error) = report_artifact_error {
         diagnostics.insert("reportArtifactError".to_owned(), json!(error));
@@ -755,10 +882,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PACKAGE_ARTIFACT_GC_JOB_KIND, PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION,
-        PROCESS_FLOW_GRAPH_CACHE_JOB_KIND, PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
-        RESULT_GC_JOB_KIND, RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND,
-        SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION, maintenance_command_for_job, parse_summary_line,
+        BoundedLogCapture, PACKAGE_ARTIFACT_GC_JOB_KIND,
+        PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION, PROCESS_FLOW_GRAPH_CACHE_JOB_KIND,
+        PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION, RESULT_GC_JOB_KIND,
+        RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND, SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION,
+        maintenance_command_for_job, parse_summary_line,
     };
     use solver_worker::worker_jobs::WorkerJob;
     use uuid::Uuid;
@@ -778,6 +906,27 @@ mod tests {
             lease_token: Uuid::new_v4(),
             attempt_count: 1,
         }
+    }
+
+    #[test]
+    fn bounded_log_capture_retains_only_configured_tail() {
+        let mut capture = BoundedLogCapture::new(8);
+        capture.push(b"12345");
+        capture.push(b"67890");
+        let captured = capture.finish();
+        assert_eq!(captured.text, "34567890");
+        assert_eq!(captured.total_bytes, 10);
+        assert!(captured.truncated);
+    }
+
+    #[test]
+    fn bounded_log_capture_handles_single_chunk_larger_than_limit() {
+        let mut capture = BoundedLogCapture::new(4);
+        capture.push(b"abcdefgh");
+        let captured = capture.finish();
+        assert_eq!(captured.text, "efgh");
+        assert_eq!(captured.total_bytes, 8);
+        assert!(captured.truncated);
     }
 
     #[test]
