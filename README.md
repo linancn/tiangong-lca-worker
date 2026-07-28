@@ -311,6 +311,8 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `TIDAS_MEMORY_BUDGET_MIB` / `TIDAS_QUEUE_CAPACITY`（由 `tidas` 消费的有界资源配置；package 与 scope-closure 子进程继承）
 - `SCOPE_CLOSURE_MEMORY_BUDGET_MIB`（Linux Worker scope-closure RSS 上限，默认 `2048` MiB；遍历、图收尾、验证与 issue 合并阶段超限时 fail closed）
 
+scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果写入 `manifest.json` 指向的确定性 NDJSON+zstd partitions；每个 partition 最多 25,000 条或 8 MiB 未压缩内容。XLSX 仅包含精确摘要、artifact index 与有界样本（5,000 issues、10,000 occurrences、10,000 affected roots），并在写 ZIP 前检查 worksheet 行数、单 member 和总未压缩体积；需要完整明细的消费者必须读取 manifest/partitions。
+
 数据库连接池与 `build_snapshot` 并发：
 
 - `DB_MAX_CONNECTIONS`（worker 进程连接池上限，默认 `8`）

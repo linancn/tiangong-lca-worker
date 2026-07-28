@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Reviewed for Issue #165 bounded all-unit result delivery; closure traversal, evidence, and certificate semantics remain unchanged."
+lastReviewedNote: "Updated for Issues #163 and #165: complete issue relations are deterministic manifest-addressed NDJSON+zstd partitions with bounded RPC/XLSX compatibility views; bounded all-unit result delivery does not change closure traversal, evidence, or certificate semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -109,7 +109,9 @@ On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and
 
 ## Issues and affected roots
 
-The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status. Graph analysis records every affected root and a deterministic witness path specific to that root. Result projection stores primary issues, occurrences, and affected-root rows through the database's V2 result RPC.
+The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Duplicate occurrences are eliminated during merge rather than appended and deduplicated after the complete event stream is resident. Document lookup uses the sorted compact document index rather than rebuilding a full identity map. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status.
+
+Graph analysis records an exact affected-root count plus at most 100 roots and witness paths per issue in the inline compatibility view. The complete issue, occurrence, and affected-root/witness relations are the manifest-addressed partitions described below. The V3 result RPC receives exact counts, at most 5,000 issue summaries, and at most 100 occurrences/affected roots per projected issue; `issueDetailsTruncated` and the per-issue truncation flags make sampling explicit. Consumers that require every issue or relationship must read the manifest rather than infer completeness from inline arrays.
 
 The scan never short-circuits after the first broken reference or invalid document. This gives the operator one stable issue set for the entire requested union.
 
@@ -122,7 +124,7 @@ Closure production runs in this fail-closed order:
 3. freeze the discovered exact Process axis and administratively scan the added provider processes;
 4. evaluate the discovered matrix, provider-link, factorization, and LCIA readiness evidence;
 
-Administrative and final closure bundles, document/edge/reference evidence, issue JSONL, XLSX worksheets, and object-store uploads are file-backed. Canonical V1 arrays are emitted incrementally from indexed or sorted spools; the Worker does not reconstruct the complete document, reference-edge, TIDAS issue, or resolution-map collection as `Vec<Value>`. Temporary directories own every intermediate spool/run/artifact and remove them on success, failure, cancellation, or lease loss after the bounded blocking task exits. Lease heartbeats remain active during both administrative and final artifact preparation.
+Administrative and final closure bundles, document/edge/reference evidence, issue JSONL, partitioned issue relations, XLSX worksheets, and object-store uploads are file-backed. Canonical V1 arrays are emitted incrementally from indexed or sorted spools; the Worker does not reconstruct the complete document, reference-edge, TIDAS issue, affected-root relation, or resolution-map collection as `Vec<Value>`. Temporary directories own every intermediate spool/run/artifact and remove them on success, failure, cancellation, or lease loss after the bounded blocking task exits. Lease heartbeats remain active during administrative/final artifact preparation and before every artifact upload. Memory-budget checks run after merge, after artifact preparation, and around terminal result projection.
 5. only when every scan is complete and no blocker remains, run the frozen snapshot builder in persisted build mode.
 
 Administrative closure and numerical Flow selection remain distinct. During the persisted snapshot build, every Elementary Flow referenced by a selected LCIA Method factor is additionally frozen as source-closure `support`, with exact/once-resolved version and recursive support-document closure. A factor-only Flow does not enter the inventory-derived B/C axes, compiled graph, provider discovery, or provider universe. Product, Waste, or Other factor targets are semantic failures; they never cause technosphere expansion.
@@ -143,8 +145,12 @@ traversal and issue aggregation under this document's frozen-release rules.
 Each fresh scan produces deterministic administrative artifacts:
 
 - `closure-bundle-v1.json`: requested bindings, TIDAS validation evidence, scan, and resolution map;
-- `closure-issues-v1.jsonl`: one canonical issue per line;
-- `closure-report-v1.xlsx`: a valid workbook tagged with the current `closureCheckId`.
+- `closure-issues-v1.jsonl`: the V1 compatibility issue projection, one canonical issue per line;
+- `manifest.json`: `lcia.scope-closure-issue-manifest.v2`, binding the closure check, the byte-exact TIDAS logical issue-stream SHA-256/count, exact relation counts, partition limits, sample limits, and sorted partition metadata;
+- `issues/part-NNNNNN.ndjson.zst`, `occurrences/part-NNNNNN.ndjson.zst`, and `affected-roots/part-NNNNNN.ndjson.zst`: the complete normalized issue relations, each partition limited to 25,000 records and 8 MiB uncompressed, with compressed and uncompressed SHA-256/byte sizes in the manifest;
+- `closure-report-v1.xlsx`: a valid workbook tagged with the current `closureCheckId`, containing exact summary counts, a complete-artifact index, at most 5,000 issue rows, 10,000 occurrence rows, and 10,000 affected-root rows.
+
+Partition ordering and zstd level are deterministic for identical inputs. The logical issue hash contract remains the exact TIDAS issue-event NDJSON bytes; repartitioning does not redefine it. Before opening the XLSX ZIP, Worker rejects any worksheet over 1,048,576 rows or 64 MiB estimated uncompressed XML and any workbook over 128 MiB estimated worksheet XML. It also rejects the finished archive above 64 MiB. ZIP64, additional memory, or dropped error details are not substitutes for these limits.
 
 `closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
 

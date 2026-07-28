@@ -20,7 +20,7 @@ checkPaths:
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Reviewed for Issue #165 bounded all-unit result delivery; package-worker import/export semantics remain unchanged."
+lastReviewedNote: "Reviewed for Issues #163 and #165: scope-closure issue partitioning preserves the published TIDAS logical issue-stream hash, and bounded all-unit result delivery does not change package-worker import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
