@@ -24,9 +24,9 @@ checkPaths:
   - docs/tidas-package-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-07-27
-lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
-lastReviewedNote: "Issue #146 clarifies the boundary between administrative closure, numerical inventory axes, and selected LCIA-factor source support."
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
+lastReviewedNote: "Issue #148 defines bounded graph-finalization execution, stable issue ordering, and phase-level capacity evidence."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -73,6 +73,8 @@ Traversal is a union traversal over all exact process and LCIA-method roots. It 
 - non-fail-fast for domain findings;
 - checkpointed through the active Worker lease between batches.
 
+CPU-heavy graph finalization runs through Tokio's blocking pool so sorting, coalescing, and affected-root analysis cannot occupy a lease-heartbeat runtime thread. Canonical ordering materializes each serialized sort key once per collection, and the Worker emits phase durations and collection counts for capacity diagnosis without changing the evidence payload.
+
 Every database fetch is constrained to an identity in the frozen release manifest. The Worker canonicalizes each fetched JSON document and compares it with the release's `canonicalContentHash`. These conditions make the scan incomplete and block certificate issuance:
 
 - an allowlisted identity is unreadable from the live source table;
@@ -101,7 +103,7 @@ Document-validation evidence is cached only under the full immutable key: exact 
 
 ## Issues and affected roots
 
-The Worker coalesces deterministic issue keys while retaining occurrence counts. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status. Graph analysis records every affected root and a deterministic witness path specific to that root. Result projection stores primary issues, occurrences, and affected-root rows through the database's V2 result RPC.
+The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status. Graph analysis records every affected root and a deterministic witness path specific to that root. Result projection stores primary issues, occurrences, and affected-root rows through the database's V2 result RPC.
 
 The scan never short-circuits after the first broken reference or invalid document. This gives the operator one stable issue set for the entire requested union.
 

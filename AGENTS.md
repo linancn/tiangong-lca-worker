@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-27
-lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
-lastReviewedNote: "Reviewed for Issue #144: the Worker now consumes only the version-pinned unified Rust tidas CLI contract with verified bounded spools."
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
+lastReviewedNote: "Reviewed for Issue #148: bounded scope-closure finalization preserves repo ownership, runtime contracts, and local-first validation requirements."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
