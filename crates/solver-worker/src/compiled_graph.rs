@@ -384,6 +384,32 @@ pub struct CompiledReleaseEvidence {
     /// reconstructs it from mutable database state during solve execution.
     #[serde(default)]
     pub source_datasets: Vec<CompiledReleaseSourceDataset>,
+    /// Bounded evidence for non-numerical lineage/model-composition references.
+    /// Older artifacts deserialize without this additive field but are not reusable
+    /// under the v2 source-reference policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_reference_provenance: Option<CompiledSourceReferenceProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledSourceReferenceProvenance {
+    pub policy_version: String,
+    pub reference_count: u64,
+    pub evidence_sha256: String,
+    pub samples: Vec<CompiledSourceReferenceSample>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledSourceReferenceSample {
+    pub source_identity: String,
+    pub json_path: String,
+    pub target_category: String,
+    pub target_uuid: String,
+    pub requested_version: Option<String>,
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

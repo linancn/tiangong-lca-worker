@@ -12,7 +12,7 @@
     clippy::uninlined_format_args
 )]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ use solver_worker::compiled_graph::{
     CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseInventoryExchange,
     CompiledReleaseProcess, CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
     CompiledReleaseSourceDatasetType, CompiledReleaseTechnosphereEdge, CompiledSourceFlowType,
-    CompiledTechnosphereEdge, CompiledUnresolvedBalance,
+    CompiledSourceReferenceProvenance, CompiledTechnosphereEdge, CompiledUnresolvedBalance,
 };
 use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
 use solver_worker::graph_types::{
@@ -80,6 +80,12 @@ use solver_worker::snapshot_builder_protocol::SnapshotBuilderTerminal;
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
 };
+use solver_worker::snapshot_source_closure::{
+    ClassifiedSourceReference, SnapshotSourceClosureError, SourceClosureLimits,
+    classify_source_document, parse_target_uuid, provenance_summary, source_dependency_issue,
+    validate_resource_limits,
+};
+use solver_worker::source_reference_policy::{ArtifactPurpose, SourceReferenceAction};
 use solver_worker::static_lcia_cache::{
     StaticLciaDirection, TrustedStaticCacheSource, VerifiedStaticLciaBundle,
     load_verified_static_lcia_bundle,
@@ -839,6 +845,24 @@ fn scope_closure_boundary_policy(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    match run_snapshot_builder().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(SnapshotSourceClosureError::Blocked { code, issues }) =
+                error.downcast_ref::<SnapshotSourceClosureError>()
+            {
+                println!(
+                    "{}",
+                    SnapshotBuilderTerminal::blocked(code.clone(), issues.clone()).to_line()?
+                );
+                return Ok(());
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn run_snapshot_builder() -> anyhow::Result<()> {
     let total_started = Instant::now();
     let cli = Cli::parse();
     let versioned_scope = validate_versioned_scope_cli(&cli)?;
@@ -946,7 +970,9 @@ async fn main() -> anyhow::Result<()> {
             solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION.to_owned(),
         technosphere_boundary_policy: technosphere_boundary_policy.as_str().to_owned(),
         flow_identity_policy: "exact-flow-version-reference-unit-v2".to_owned(),
-        source_closure_policy: "selected-lcia-factor-flow-support-v1".to_owned(),
+        source_closure_policy: "path-aware-bounded-frontier-v2".to_owned(),
+        source_reference_policy:
+            solver_worker::source_reference_policy::SOURCE_REFERENCE_POLICY_VERSION.to_owned(),
         biosphere_sign_mode: "gross".to_owned(),
         self_loop_cutoff: cli.self_loop_cutoff,
         singular_eps: cli.singular_eps,
@@ -1238,6 +1264,14 @@ async fn main() -> anyhow::Result<()> {
         cli.singular_eps,
         method.has_lcia,
         &impact_factor_sets,
+        if cli.artifact_purpose.as_deref().is_some_and(|purpose| {
+            purpose == REVIEW_SUBMIT_OVERLAY_ARTIFACT_PURPOSE
+                || purpose == REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE
+        }) {
+            ArtifactPurpose::ReviewSubmit
+        } else {
+            ArtifactPurpose::CalculationBundle
+        },
     )
     .await?;
     build_timing.build_sparse_payload_sec = build_started.elapsed().as_secs_f64();
@@ -1992,6 +2026,7 @@ async fn load_or_build_review_submit_baseline(
         cli.singular_eps,
         false,
         &[],
+        ArtifactPurpose::ReviewSubmit,
     )
     .await?;
     let artifact_url = persist_built_snapshot_artifact(
@@ -3402,6 +3437,7 @@ async fn build_sparse_payload(
     singular_eps: f64,
     has_lcia: bool,
     impact_factor_sets: &[ImpactFactorSet],
+    artifact_purpose: ArtifactPurpose,
 ) -> anyhow::Result<BuildOutput> {
     if processes.is_empty() {
         return Err(anyhow::anyhow!("no processes matched filter"));
@@ -3420,6 +3456,7 @@ async fn build_sparse_payload(
         reference_normalization_mode,
         allocation_mode,
         impact_factor_sets,
+        artifact_purpose,
     )
     .await?;
 
@@ -3965,6 +4002,7 @@ async fn compile_scope_graph(
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
     impact_factor_sets: &[ImpactFactorSet],
+    artifact_purpose: ArtifactPurpose,
 ) -> anyhow::Result<CompiledScopeGraph> {
     let process_count_i32 =
         i32::try_from(processes.len()).map_err(|_| anyhow::anyhow!("process overflow"))?;
@@ -4035,12 +4073,13 @@ async fn compile_scope_graph(
     let flow_meta = fetch_flow_meta(pool, &flow_requests, versioned_scope).await?;
     resolve_requested_flow_versions(&mut exchanges, &flow_meta)?;
     let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta.by_identity).await?;
-    let source_datasets = build_frozen_source_datasets(
+    let (source_datasets, source_reference_provenance) = build_frozen_source_datasets(
         pool,
         &processes,
         &flow_meta.by_identity,
         impact_factor_sets,
         versioned_scope,
+        artifact_purpose,
     )
     .await?;
     for exchange in &exchanges {
@@ -4185,6 +4224,7 @@ async fn compile_scope_graph(
         &flow_kind_by_identity,
         release_technosphere_edges,
         source_datasets,
+        source_reference_provenance,
     )?;
 
     Ok(CompiledScopeGraph {
@@ -4247,6 +4287,7 @@ fn build_compiled_release_evidence(
     flow_kind_by_identity: &HashMap<FlowLinkIdentity, CompiledFlowKind>,
     mut technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
     source_datasets: Vec<CompiledReleaseSourceDataset>,
+    source_reference_provenance: Option<CompiledSourceReferenceProvenance>,
 ) -> anyhow::Result<CompiledReleaseEvidence> {
     let mut release_processes = Vec::with_capacity(processes.len());
     for process in processes {
@@ -4350,6 +4391,7 @@ fn build_compiled_release_evidence(
         technosphere_edges,
         biosphere_edges,
         source_datasets,
+        source_reference_provenance,
     })
 }
 
@@ -7014,25 +7056,6 @@ async fn fetch_flow_meta_batched(
     Ok(resolved)
 }
 
-fn source_dataset_type_from_reference(value: &str) -> Option<CompiledReleaseSourceDatasetType> {
-    match value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "contact data set" => Some(CompiledReleaseSourceDatasetType::Contact),
-        "flow data set" => Some(CompiledReleaseSourceDatasetType::Flow),
-        "flow property data set" => Some(CompiledReleaseSourceDatasetType::FlowProperty),
-        "lcia method data set" => Some(CompiledReleaseSourceDatasetType::LciaMethod),
-        "process data set" => Some(CompiledReleaseSourceDatasetType::Process),
-        "source data set" => Some(CompiledReleaseSourceDatasetType::Source),
-        "unit group data set" => Some(CompiledReleaseSourceDatasetType::UnitGroup),
-        _ => None,
-    }
-}
-
 fn valid_source_dataset_version(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 9
@@ -7042,73 +7065,6 @@ fn valid_source_dataset_version(value: &str) -> bool {
             .iter()
             .enumerate()
             .all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit())
-}
-
-fn collect_source_dataset_references(
-    value: &Value,
-    references: &mut BTreeSet<SourceDatasetReference>,
-) -> anyhow::Result<()> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_source_dataset_references(item, references)?;
-            }
-        }
-        Value::Object(map) => {
-            if let Some(dataset_type) = map
-                .get("@type")
-                .and_then(Value::as_str)
-                .and_then(source_dataset_type_from_reference)
-            {
-                let id_value = map
-                    .get("@refObjectId")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "source closure {} reference is missing @refObjectId",
-                            dataset_type.as_str()
-                        )
-                    })?;
-                let id = Uuid::parse_str(id_value).map_err(|_| {
-                    anyhow::anyhow!(
-                        "source closure {} reference has invalid UUID: {id_value}",
-                        dataset_type.as_str()
-                    )
-                })?;
-                let version = match map.get("@version") {
-                    None => None,
-                    Some(Value::String(value)) => {
-                        let value = value.trim();
-                        if !valid_source_dataset_version(value) {
-                            return Err(anyhow::anyhow!(
-                                "source closure {} reference has invalid version: {value}",
-                                dataset_type.as_str()
-                            ));
-                        }
-                        Some(value.to_owned())
-                    }
-                    Some(_) => {
-                        return Err(anyhow::anyhow!(
-                            "source closure {} reference version must be a string",
-                            dataset_type.as_str()
-                        ));
-                    }
-                };
-                references.insert(SourceDatasetReference {
-                    dataset_type,
-                    id,
-                    version,
-                });
-            }
-            for child in map.values() {
-                collect_source_dataset_references(child, references)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn collect_lcia_factor_flow_references(
@@ -7428,7 +7384,11 @@ async fn build_frozen_source_datasets(
     flows: &HashMap<FlowLinkIdentity, FlowRow>,
     impact_factor_sets: &[ImpactFactorSet],
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
-) -> anyhow::Result<Vec<CompiledReleaseSourceDataset>> {
+    artifact_purpose: ArtifactPurpose,
+) -> anyhow::Result<(
+    Vec<CompiledReleaseSourceDataset>,
+    Option<CompiledSourceReferenceProvenance>,
+)> {
     let mut datasets = BTreeMap::<
         (CompiledReleaseSourceDatasetType, Uuid, String),
         CompiledReleaseSourceDataset,
@@ -7522,76 +7482,214 @@ async fn build_frozen_source_datasets(
         )?;
     }
 
-    for _ in 0..16 {
-        let mut references = BTreeSet::new();
-        for dataset in datasets.values() {
-            collect_source_dataset_references(&dataset.document, &mut references)?;
+    let limits = SourceClosureLimits::default();
+    let mut frontier = datasets.keys().cloned().collect::<VecDeque<_>>();
+    let mut processed_identity_hash = BTreeMap::new();
+    let mut classified_references = Vec::<ClassifiedSourceReference>::new();
+    let mut preflight_issues = Vec::<Value>::new();
+    let mut frontier_round_count = 0_u64;
+    let mut support_query_count = 0_u64;
+
+    while !frontier.is_empty() {
+        frontier_round_count += 1;
+        if frontier_round_count > 128 {
+            return Err(SnapshotSourceClosureError::Operator {
+                message: "source_closure_depth_limit_exceeded: limit=128".to_owned(),
+            }
+            .into());
         }
-        let missing = references
-            .into_iter()
-            .filter(|reference| !source_reference_is_satisfied(&datasets, reference))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            let mut result = datasets.into_values().collect::<Vec<_>>();
-            result.sort_by(|left, right| {
-                left.dataset_type
-                    .cmp(&right.dataset_type)
-                    .then_with(|| left.dataset_id.cmp(&right.dataset_id))
-                    .then_with(|| left.dataset_version.cmp(&right.dataset_version))
-            });
-            return Ok(result);
-        }
-        if let Some(reference) = missing.iter().find(|reference| {
-            matches!(
-                reference.dataset_type,
-                CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process
-            )
-        }) {
-            return Err(anyhow::anyhow!(
-                "source closure {} reference is outside the exact snapshot selection: {}@{}",
-                reference.dataset_type.as_str(),
-                reference.id,
-                reference.version.as_deref().unwrap_or("<omitted>")
-            ));
+        let level_len = frontier.len();
+        let mut required_support = Vec::<ClassifiedSourceReference>::new();
+        for _ in 0..level_len {
+            let key = frontier
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("source closure frontier underflow"))?;
+            let dataset = datasets
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("source closure frontier dataset missing"))?;
+            if let Some(existing_hash) =
+                processed_identity_hash.insert(key.clone(), dataset.document_sha256.clone())
+            {
+                if existing_hash != dataset.document_sha256 {
+                    return Err(SnapshotSourceClosureError::Operator {
+                        message: format!(
+                            "source_document_identity_hash_drift: {}:{}@{}",
+                            key.0.as_str(),
+                            key.1,
+                            key.2
+                        ),
+                    }
+                    .into());
+                }
+                continue;
+            }
+            let classification = classify_source_document(dataset, artifact_purpose)?;
+            for issue in classification.extraction_issues {
+                let path = issue
+                    .get("json_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !path.contains("referencetoprecedingdatasetversion")
+                    && !path.contains("referencetoincludedprocess")
+                {
+                    preflight_issues.push(issue);
+                }
+            }
+            for reference in classification.references {
+                match reference.action {
+                    SourceReferenceAction::RecordEvidence => {}
+                    SourceReferenceAction::ValidateExchangeAxis
+                    | SourceReferenceAction::ValidateProviderInvariant => {
+                        let Ok(id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
+                            preflight_issues.push(source_dependency_issue(
+                                &reference,
+                                "Required numerical-axis reference has an invalid target UUID.",
+                            ));
+                            classified_references.push(reference);
+                            continue;
+                        };
+                        let lookup = SourceDatasetReference {
+                            dataset_type: reference.target_type,
+                            id,
+                            version: reference.requested_version.clone(),
+                        };
+                        if !source_reference_is_satisfied(&datasets, &lookup) {
+                            preflight_issues.push(source_dependency_issue(
+                                &reference,
+                                "Required exact numerical-axis dependency is unavailable.",
+                            ));
+                        }
+                    }
+                    SourceReferenceAction::FetchRequiredSupport => {
+                        let Ok(id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
+                            preflight_issues.push(source_dependency_issue(
+                                &reference,
+                                "Required support reference has an invalid target UUID.",
+                            ));
+                            classified_references.push(reference);
+                            continue;
+                        };
+                        let lookup = SourceDatasetReference {
+                            dataset_type: reference.target_type,
+                            id,
+                            version: reference.requested_version.clone(),
+                        };
+                        if !source_reference_is_satisfied(&datasets, &lookup) {
+                            required_support.push(reference.clone());
+                        }
+                    }
+                    SourceReferenceAction::TraverseAdministrative => {
+                        return Err(SnapshotSourceClosureError::Operator {
+                            message: "certificate-grade traversal must remain in scope_closure.rs"
+                                .to_owned(),
+                        }
+                        .into());
+                    }
+                }
+                classified_references.push(reference);
+            }
+            validate_resource_limits(&classified_references, limits)?;
         }
 
         for dataset_type in [
             CompiledReleaseSourceDatasetType::Contact,
+            CompiledReleaseSourceDatasetType::Flow,
             CompiledReleaseSourceDatasetType::FlowProperty,
             CompiledReleaseSourceDatasetType::LciaMethod,
+            CompiledReleaseSourceDatasetType::Process,
             CompiledReleaseSourceDatasetType::Source,
             CompiledReleaseSourceDatasetType::UnitGroup,
         ] {
-            let type_references = missing
+            let type_references = required_support
                 .iter()
-                .filter(|reference| reference.dataset_type == dataset_type)
+                .filter(|reference| reference.target_type == dataset_type)
                 .collect::<Vec<_>>();
             if type_references.is_empty() {
                 continue;
             }
+            if matches!(
+                dataset_type,
+                CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process
+            ) {
+                for reference in type_references {
+                    preflight_issues.push(source_dependency_issue(
+                        reference,
+                        "Required exact Flow/Process dependency is outside the selected artifact axis.",
+                    ));
+                }
+                continue;
+            }
             let ids = type_references
                 .iter()
-                .map(|reference| reference.id)
+                .filter_map(|reference| parse_target_uuid(reference).ok())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
+            if ids.is_empty() {
+                continue;
+            }
+            support_query_count += 1;
             let rows = fetch_source_dataset_rows(pool, dataset_type, &ids).await?;
             for reference in type_references {
-                let row = resolve_source_dataset_row(dataset_type, reference, &rows)?;
-                insert_compiled_source_dataset(
-                    &mut datasets,
+                let Ok(id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
+                    continue;
+                };
+                let lookup = SourceDatasetReference {
                     dataset_type,
-                    CompiledReleaseSourceDatasetRole::Support,
-                    row.id,
-                    row.version.clone(),
-                    &row.json,
-                )?;
+                    id,
+                    version: reference.requested_version.clone(),
+                };
+                match resolve_source_dataset_row(dataset_type, &lookup, &rows) {
+                    Ok(row) => {
+                        let key = (dataset_type, row.id, row.version.clone());
+                        let is_new = !datasets.contains_key(&key);
+                        insert_compiled_source_dataset(
+                            &mut datasets,
+                            dataset_type,
+                            CompiledReleaseSourceDatasetRole::Support,
+                            row.id,
+                            row.version.clone(),
+                            &row.json,
+                        )?;
+                        if is_new {
+                            frontier.push_back(key);
+                        }
+                    }
+                    Err(_) => preflight_issues.push(source_dependency_issue(
+                        reference,
+                        "Required support dependency could not be resolved.",
+                    )),
+                }
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "source closure reference graph exceeded the maximum supported depth"
-    ))
+
+    preflight_issues.sort_by_key(|issue| serde_json::to_string(issue).unwrap_or_default());
+    preflight_issues.dedup();
+    if !preflight_issues.is_empty() {
+        return Err(SnapshotSourceClosureError::Blocked {
+            code: "source_dependency_unavailable".to_owned(),
+            issues: preflight_issues,
+        }
+        .into());
+    }
+    let provenance = provenance_summary(&classified_references, limits)?;
+    let mut result = datasets.into_values().collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        left.dataset_type
+            .cmp(&right.dataset_type)
+            .then_with(|| left.dataset_id.cmp(&right.dataset_id))
+            .then_with(|| left.dataset_version.cmp(&right.dataset_version))
+    });
+    println!(
+        "[source_closure_metrics] source_document_count={} classified_reference_count={} frontier_round_count={} support_query_count={}",
+        result.len(),
+        classified_references.len(),
+        frontier_round_count,
+        support_query_count
+    );
+    Ok((result, provenance))
 }
 
 fn compiled_source_dataset_category(
@@ -9035,6 +9133,7 @@ async fn run_provider_rule_replay(
             reference_normalization_mode,
             allocation_mode,
             &[],
+            ArtifactPurpose::CalculationBundle,
         )
         .await?;
         out.push(build_provider_rule_replay_row(*rule, &compiled_graph.graph));
@@ -9186,20 +9285,19 @@ mod tests {
         assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
         build_compiled_release_evidence, build_lcia_factor_coverage,
         build_review_submit_overlay_graph, candidate_count_bucket_label,
-        collect_lcia_factor_flow_references, collect_source_dataset_references,
-        compute_review_submit_overlay_source_hash, compute_scope_hash,
-        compute_source_fingerprint_from_summary, flow_reference_requests_from_source_references,
-        geo_score, insert_compiled_source_dataset, load_impact_factor_sets,
-        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
-        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
-        parse_provider_rule_list, resolve_allocation_fraction, resolve_database_lcia_method_row,
-        resolve_database_lcia_method_rows, resolve_lcia_method_source_row,
-        resolve_lcia_support_flows, resolve_multi_provider, resolve_process_selection,
-        resolve_reference_normalization, review_submit_root_dependency_fingerprint,
-        reviewed_lcia_artifact_locator, scope_closure_boundary_policy,
-        scope_closure_candidate_process_axis, snapshot_db_statement_timeout,
-        source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
-        time_score, unique_supported_direction_by_flow,
+        collect_lcia_factor_flow_references, compute_review_submit_overlay_source_hash,
+        compute_scope_hash, compute_source_fingerprint_from_summary,
+        flow_reference_requests_from_source_references, geo_score, insert_compiled_source_dataset,
+        load_impact_factor_sets, location_granularity_label, no_balancing_reference_failure_reason,
+        normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
+        parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
+        resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
+        resolve_lcia_method_source_row, resolve_lcia_support_flows, resolve_multi_provider,
+        resolve_process_selection, resolve_reference_normalization,
+        review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
+        scope_closure_boundary_policy, scope_closure_candidate_process_axis,
+        snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
         validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
         validate_process_row_visibility, validate_quantitative_references,
         validate_unique_database_lcia_method_identities,
@@ -9304,6 +9402,7 @@ mod tests {
             technosphere_boundary_policy: "closed".to_owned(),
             flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
             source_closure_policy: "snapshot-exchange-flows-only-v0".to_owned(),
+            source_reference_policy: "source-reference-policy.legacy-unclassified-v1".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -9424,6 +9523,15 @@ mod tests {
             overlay_hash,
             compute_review_submit_overlay_source_hash("baseline", &config)
                 .expect("LCIA factor Flow overlay fingerprint")
+        );
+        config.source_reference_policy = "source-reference-policy.v2".to_owned();
+        let v2_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("v2 source-reference fingerprint");
+        assert_ne!(snapshot_hash, v2_snapshot_hash);
+        assert_eq!(
+            v2_snapshot_hash,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("stable v2 source-reference fingerprint")
         );
     }
 
@@ -10259,6 +10367,7 @@ mod tests {
             technosphere_edges: Vec::new(),
             biosphere_edges: Vec::new(),
             source_datasets: Vec::new(),
+            source_reference_provenance: None,
         });
         let method = MethodSelection {
             has_lcia: false,
@@ -13245,64 +13354,6 @@ mod tests {
     }
 
     #[test]
-    fn source_closure_reference_scan_preserves_exact_and_omitted_versions() {
-        let flow_property_id = Uuid::new_v4();
-        let process_id = Uuid::new_v4();
-        let source_id = Uuid::new_v4();
-        let document = json!({
-            "references": [
-                {
-                    "@type": "flow property data set",
-                    "@refObjectId": flow_property_id,
-                    "@version": "01.02.003"
-                },
-                {
-                    "@type": "source data set",
-                    "@refObjectId": source_id
-                },
-                {
-                    "@type": "process data set",
-                    "@refObjectId": process_id,
-                    "@version": "01.02.003"
-                }
-            ]
-        });
-        let mut references = BTreeSet::new();
-        collect_source_dataset_references(&document, &mut references)
-            .expect("scan source references");
-
-        assert!(references.contains(&SourceDatasetReference {
-            dataset_type: CompiledReleaseSourceDatasetType::FlowProperty,
-            id: flow_property_id,
-            version: Some("01.02.003".to_owned()),
-        }));
-        assert!(references.contains(&SourceDatasetReference {
-            dataset_type: CompiledReleaseSourceDatasetType::Source,
-            id: source_id,
-            version: None,
-        }));
-        assert!(references.contains(&SourceDatasetReference {
-            dataset_type: CompiledReleaseSourceDatasetType::Process,
-            id: process_id,
-            version: Some("01.02.003".to_owned()),
-        }));
-    }
-
-    #[test]
-    fn source_closure_reference_scan_rejects_invalid_recognized_reference() {
-        let document = json!({
-            "reference": {
-                "@type": "contact data set",
-                "@refObjectId": "not-a-uuid",
-                "@version": "01.00.000"
-            }
-        });
-        let error = collect_source_dataset_references(&document, &mut BTreeSet::new())
-            .expect_err("recognized malformed reference must fail closed");
-        assert!(error.to_string().contains("invalid UUID"));
-    }
-
-    #[test]
     fn lcia_factor_flow_collection_preserves_exact_and_omitted_versions() {
         let exact_flow_id = Uuid::new_v4();
         let omitted_flow_id = Uuid::new_v4();
@@ -13856,6 +13907,7 @@ mod tests {
             &flow_kinds,
             technosphere_edges,
             Vec::new(),
+            None,
         )
         .expect("release evidence");
 

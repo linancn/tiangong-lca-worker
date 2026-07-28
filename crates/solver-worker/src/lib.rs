@@ -38,6 +38,8 @@ pub mod snapshot_artifacts;
 pub mod snapshot_builder_protocol;
 pub mod snapshot_index;
 pub mod snapshot_retention;
+pub mod snapshot_source_closure;
+pub mod source_reference_policy;
 pub mod static_lcia_cache;
 pub mod storage;
 pub mod tidas_cli;
