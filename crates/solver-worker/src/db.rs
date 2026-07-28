@@ -4259,7 +4259,9 @@ mod tests {
 
     impl SnapshotBuilderEnvGuard {
         fn set(bin: &Path, timeout_seconds: &str) -> Self {
-            let lock = SNAPSHOT_BUILDER_ENV_LOCK.lock().unwrap();
+            let lock = SNAPSHOT_BUILDER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous_bin = std::env::var("SNAPSHOT_BUILDER_BIN").ok();
             let previous_timeout = std::env::var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS").ok();
             // SAFETY: subprocess tests serialize every mutation through SNAPSHOT_BUILDER_ENV_LOCK.
@@ -4348,7 +4350,7 @@ mod tests {
     }
 
     async fn wait_for_pid(path: &Path) -> String {
-        for _ in 0..100 {
+        for _ in 0..250 {
             if let Ok(pid) = fs::read_to_string(path)
                 && !pid.trim().is_empty()
             {
@@ -4559,13 +4561,22 @@ mod tests {
             )
             .as_str(),
         );
-        let _env = SnapshotBuilderEnvGuard::set(&script, "1");
-        let error = run_test_snapshot_builder().await.unwrap_err();
+        let _env = SnapshotBuilderEnvGuard::set(&script, "10");
+        let mut runner = Box::pin(run_test_snapshot_builder());
+        let pid = tokio::select! {
+            pid = wait_for_pid(&pid_path) => pid,
+            result = &mut runner => match result {
+                Ok(_) => panic!("test subprocess succeeded before publishing its pid"),
+                Err(error) => panic!(
+                    "test subprocess failed before publishing its pid: {error:#}"
+                ),
+            },
+        };
+        let error = runner.await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<SnapshotBuilderProcessFailure>(),
             Some(SnapshotBuilderProcessFailure::Timeout { .. })
         ));
-        let pid = wait_for_pid(&pid_path).await;
         assert_process_reaped(&pid).await;
     }
 
@@ -4591,20 +4602,28 @@ mod tests {
             lease_token: Uuid::new_v4(),
             lease_seconds: 1,
         };
-        let result = run_snapshot_builder_job_with_worker_heartbeat(
+        let mut runner = Box::pin(run_snapshot_builder_job_with_worker_heartbeat(
             &pool,
             &lease,
             json!({"slot": 0}),
             run_test_snapshot_builder(),
-        )
-        .await;
+        ));
+        let pid = tokio::select! {
+            pid = wait_for_pid(&pid_path) => pid,
+            result = &mut runner => match result {
+                Ok(_) => panic!("test subprocess succeeded before publishing its pid"),
+                Err(error) => panic!(
+                    "test subprocess failed before publishing its pid: {error:#}"
+                ),
+            },
+        };
+        let result = runner.await;
         assert!(
             result
                 .unwrap_err()
                 .to_string()
                 .contains("lease heartbeat failed")
         );
-        let pid = wait_for_pid(&pid_path).await;
         assert_process_reaped(&pid).await;
     }
 

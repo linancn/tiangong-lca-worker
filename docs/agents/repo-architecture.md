@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
-lastReviewedNote: "Reviewed for Issue #158: the 2048 MiB RSS guard changes capacity policy without changing the file-backed closure architecture."
+lastReviewedCommit: 98ca40c
+lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; runtime architecture and child-process ownership remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
-lastReviewedNote: "Issue #158 sets the Linux scope-closure fail-closed RSS guard to 2048 MiB after production-shape validation."
+lastReviewedCommit: 98ca40c
+lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; closure traversal, evidence, and certificate semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

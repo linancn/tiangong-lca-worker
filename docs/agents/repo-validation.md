@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 82c1c6e
-lastReviewedNote: "Issue #158 requires production-shape proof against the 2048 MiB scope-closure RSS guard."
+lastReviewedCommit: 98ca40c
+lastReviewedNote: "Issue #160 subprocess tests passed five consecutive default-parallel focused runs after deterministic child-start ordering and mutex-poison recovery."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

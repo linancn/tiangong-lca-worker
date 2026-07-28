@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
-lastReviewedNote: "Reviewed for Issue #158; the 2048 MiB internal RSS guard does not change jobs, payloads, statuses, or result contracts."
+lastReviewedCommit: 98ca40c
+lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; jobs, payloads, statuses, and result contracts remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

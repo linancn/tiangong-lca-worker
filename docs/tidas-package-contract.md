@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
-lastReviewedNote: "Reviewed for Issue #158; the 2048 MiB scope-closure RSS guard does not change package-worker import/export semantics."
+lastReviewedCommit: 98ca40c
+lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; package-worker import/export semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
