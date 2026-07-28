@@ -24,9 +24,9 @@ checkPaths:
   - docs/tidas-package-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Updated for Issues #163 and #165: complete issue relations are deterministic manifest-addressed NDJSON+zstd partitions with bounded RPC/XLSX compatibility views; bounded all-unit result delivery does not change closure traversal, evidence, or certificate semantics."
+lastReviewedAt: 2026-07-29
+lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
+lastReviewedNote: "Updated for Issue #169: final TIDAS issue coalescing and affected-root enrichment are spool-to-spool, externally sorted, and bounded before manifest partitions are produced."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -103,15 +103,15 @@ Document validation uses only the published unified Rust `tidas` CLI selected by
 
 Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
 
-The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Issue events are stream-verified into disk spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 16 MiB external-sort runs. Resolution-map ordering uses the same bounded mechanism. The Worker records document/cache/issue/spool counts and hashes, retains at least 512 MiB of temporary-volume headroom beyond planned sort space, and fails closed when a spool, cache record, or temporary-space limit is exceeded.
+The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Issue events are stream-verified into disk spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 16 MiB external-sort runs. Final issue coalescing writes source/issue/occurrence-keyed bounded sort runs and k-way merges them directly into normalized issue and occurrence spools; it never constructs a resident all-unique `BTreeMap` or complete issue `Vec`. Resolution-map ordering uses the same bounded mechanism. The Worker records document/cache/issue/spool counts and hashes, retains at least 512 MiB of temporary-volume headroom beyond planned sort space, and fails closed when a spool, cache record, or temporary-space limit is exceeded.
 
 On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 
 ## Issues and affected roots
 
-The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Duplicate occurrences are eliminated during merge rather than appended and deduplicated after the complete event stream is resident. Document lookup uses the sorted compact document index rather than rebuilding a full identity map. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status.
+The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Duplicate occurrences are eliminated while adjacent externally sorted records are merged. Only the bounded RPC/XLSX sample is deserialized into `scan.issues`; complete normalized issues and occurrences remain in deterministic spools. Document lookup uses the sorted compact document index rather than rebuilding a full identity map. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status.
 
-Graph analysis records an exact affected-root count plus at most 100 roots and witness paths per issue in the inline compatibility view. The complete issue, occurrence, and affected-root/witness relations are the manifest-addressed partitions described below. The V3 result RPC receives exact counts, at most 5,000 issue summaries, and at most 100 occurrences/affected roots per projected issue; `issueDetailsTruncated` and the per-issue truncation flags make sampling explicit. Consumers that require every issue or relationship must read the manifest rather than infer completeness from inline arrays.
+Graph analysis groups the sorted merge stream by source identity, keeps only one source's reverse-reachability state at a time, and streams every affected-root/witness relation to a sidecar spool. It records an exact affected-root count plus at most 100 roots and witness paths per issue in the inline compatibility view. The complete issue, occurrence, and affected-root/witness relations are externally sorted by issue key before manifest partitioning. The V3 result RPC receives exact counts, at most 5,000 issue summaries, and at most 100 occurrences/affected roots per projected issue; `issueDetailsTruncated` and the per-issue truncation flags make sampling explicit. Consumers that require every issue or relationship must read the manifest rather than infer completeness from inline arrays.
 
 The scan never short-circuits after the first broken reference or invalid document. This gives the operator one stable issue set for the entire requested union.
 

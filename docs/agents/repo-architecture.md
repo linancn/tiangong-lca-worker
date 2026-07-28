@@ -34,9 +34,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Updated for Issue #163: scope_closure owns bounded relation partitions and compatibility report projections without changing solver-core or storage ownership."
+lastReviewedAt: 2026-07-29
+lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
+lastReviewedNote: "Reviewed for Issue #169: external issue coalescing and affected-root relation spools remain inside the existing scope_closure hotspot without changing solver-core or storage ownership."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

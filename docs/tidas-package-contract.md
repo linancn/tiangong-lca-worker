@@ -18,9 +18,9 @@ checkPaths:
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Reviewed for Issues #163 and #165: scope-closure issue partitioning preserves the published TIDAS logical issue-stream hash, and bounded all-unit result delivery does not change package-worker import/export semantics."
+lastReviewedAt: 2026-07-29
+lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
+lastReviewedNote: "Reviewed for Issue #169: Worker-side external coalescing preserves the published raw TIDAS issue-stream hash and does not change package-worker import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

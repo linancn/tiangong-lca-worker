@@ -23,9 +23,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Updated for Issue #163: scope-closure inline result/report details are bounded compatibility samples; manifest-addressed partitions are the complete relation source."
+lastReviewedAt: 2026-07-29
+lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
+lastReviewedNote: "Reviewed for Issue #169: streamed internal coalescing preserves the existing bounded API projections, exact counts, logical issue hash, and manifest-addressed complete relations."
 related:
   - AGENTS.md
   - .docpact/config.yaml
