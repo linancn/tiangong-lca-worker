@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 98ca40c
-lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; runtime architecture and child-process ownership remain unchanged."
+lastReviewedCommit: 5dfc9d93389f09dca30863acb881292dbeed5e20
+lastReviewedNote: "Reviewed for Issue #160 isolated source-closure performance evidence; runtime architecture and child-process ownership remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

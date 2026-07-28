@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 98ca40c
-lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; jobs, payloads, statuses, and result contracts remain unchanged."
+lastReviewedCommit: 5dfc9d93389f09dca30863acb881292dbeed5e20
+lastReviewedNote: "Reviewed for Issue #160 isolated source-closure performance evidence; passed|blocked|error, blockingReasons, calculatorReport, and consumer schema boundaries remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

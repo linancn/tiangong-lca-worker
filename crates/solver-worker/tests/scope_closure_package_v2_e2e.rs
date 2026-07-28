@@ -24,7 +24,7 @@ use solver_worker::{
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     worker_jobs::{WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::{task::JoinHandle, time::sleep};
 use uuid::Uuid;
 
@@ -329,6 +329,10 @@ async fn setup_fixture(pool: &PgPool) -> anyhow::Result<Fixture> {
         flow_property: Uuid::new_v4(),
         unit_group: Uuid::new_v4(),
     };
+    setup_fixture_with(pool, fixture).await
+}
+
+async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<Fixture> {
     let release_run = Uuid::new_v4();
     let approval = Uuid::new_v4();
 
@@ -640,6 +644,23 @@ async fn setup_fixture(pool: &PgPool) -> anyhow::Result<Fixture> {
     Ok(fixture)
 }
 
+fn review_submit_benchmark_fixture() -> anyhow::Result<Fixture> {
+    Ok(Fixture {
+        actor: Uuid::parse_str("16000000-0000-4000-8000-000000000001")?,
+        processes: [
+            Uuid::parse_str("16000000-0000-4000-8000-000000000010")?,
+            Uuid::parse_str("16000000-0000-4000-8000-000000000011")?,
+        ],
+        product_flows: [
+            Uuid::parse_str("16000000-0000-4000-8000-000000000020")?,
+            Uuid::parse_str("16000000-0000-4000-8000-000000000021")?,
+        ],
+        elementary_flow: Uuid::parse_str("16000000-0000-4000-8000-000000000022")?,
+        flow_property: Uuid::parse_str("16000000-0000-4000-8000-000000000030")?,
+        unit_group: Uuid::parse_str("16000000-0000-4000-8000-000000000040")?,
+    })
+}
+
 async fn request_closure(pool: &PgPool, fixture: &Fixture) -> anyhow::Result<(Uuid, Uuid)> {
     let scope = json!({
         "coverageMode": "subset",
@@ -919,6 +940,36 @@ fn object_key(artifact_url: &str, bucket: &str) -> anyhow::Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!("artifact URL does not contain bucket {bucket}: {artifact_url}")
         })
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated local Supabase DB + Storage; run scripts/run_review_submit_source_closure_benchmark.sh"]
+async fn review_submit_source_closure_benchmark_fixture() -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(required_env("DATABASE_URL").as_str())
+        .await?;
+    let fixture = setup_fixture_with(&pool, review_submit_benchmark_fixture()?).await?;
+    println!(
+        "[review_submit_source_closure_benchmark_fixture] {}",
+        serde_json::to_string(&json!({
+            "schemaVersion": "review_submit_source_closure_benchmark_fixture.v1",
+            "actorId": fixture.actor,
+            "rootProcess": {
+                "id": fixture.processes[1],
+                "version": VERSION,
+            },
+            "dependencyProcess": {
+                "id": fixture.processes[0],
+                "version": VERSION,
+            },
+            "productFlowCount": fixture.product_flows.len(),
+            "elementaryFlowId": fixture.elementary_flow,
+            "flowPropertyId": fixture.flow_property,
+            "unitGroupId": fixture.unit_group,
+        }))?
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
