@@ -3483,9 +3483,10 @@ async fn run_snapshot_builder_job(
         let stdout_task = tokio::spawn(read_bounded_stream(stdout, SNAPSHOT_BUILDER_CAPTURE_BYTES));
         let stderr_task = tokio::spawn(read_bounded_stream(stderr, SNAPSHOT_BUILDER_CAPTURE_BYTES));
         let timeout_seconds = snapshot_builder_wall_timeout_seconds();
-        let status = match timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
-            Ok(result) => result?,
-            Err(_) => {
+        let status =
+            if let Ok(result) = timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
+                result?
+            } else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 let _ = stdout_task.await;
@@ -3495,8 +3496,7 @@ async fn run_snapshot_builder_job(
                     timeout_seconds,
                 }
                 .into());
-            }
-        };
+            };
         let stdout_bytes = stdout_task.await.map_err(|error| {
             anyhow::anyhow!("snapshot_builder stdout reader join error: {error}")
         })??;
@@ -3505,6 +3505,8 @@ async fn run_snapshot_builder_job(
         })??;
         let stdout = utf8_safe_tail(&stdout_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
         let stderr = utf8_safe_tail(&stderr_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
+        let redacted_stdout = redact_sensitive_diagnostics(&stdout);
+        let redacted_stderr = redact_sensitive_diagnostics(&stderr);
         let terminal =
             parse_terminal(&stdout).map_err(|error| SnapshotBuilderProcessFailure::Protocol {
                 command: command_diagnostics.clone(),
@@ -3514,15 +3516,15 @@ async fn run_snapshot_builder_job(
             let Some(exit_code) = status.code() else {
                 return Err(SnapshotBuilderProcessFailure::Signal {
                     command: command_diagnostics,
-                    stderr_tail: tail_text(&stderr, 2000),
+                    stderr_tail: tail_text(&redacted_stderr, 2000),
                 }
                 .into());
             };
             return Err(SnapshotBuilderProcessFailure::Exit {
                 command: command_diagnostics,
                 exit_code,
-                stdout_tail: tail_text(&stdout, 4000),
-                stderr_tail: tail_text(&stderr, 2000),
+                stdout_tail: tail_text(&redacted_stdout, 4000),
+                stderr_tail: tail_text(&redacted_stderr, 2000),
             }
             .into());
         }
@@ -3572,8 +3574,8 @@ async fn run_snapshot_builder_job(
                 .map(ToOwned::to_owned)
                 .collect(),
             exit_code: status.code().unwrap_or(0),
-            stdout_tail: tail_text(&stdout, 4000),
-            stderr_tail: tail_text(&stderr, 2000),
+            stdout_tail: tail_text(&redacted_stdout, 4000),
+            stderr_tail: tail_text(&redacted_stderr, 2000),
             scope_closure_discovery: discovery,
         });
     }
@@ -3701,6 +3703,30 @@ fn utf8_safe_tail(input: &[u8], max_bytes: usize) -> String {
         start += 1;
     }
     String::from_utf8_lossy(&input[start..]).into_owned()
+}
+
+fn redact_sensitive_diagnostics(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let normalized = token.to_ascii_lowercase();
+            if normalized.contains("postgres://")
+                || normalized.contains("postgresql://")
+                || normalized.contains("authorization:")
+                || normalized.contains("authorization=")
+                || normalized.contains("bearer")
+                || normalized.contains("token=")
+                || normalized.contains("apikey=")
+                || normalized.contains("api_key=")
+                || normalized.contains("secret=")
+            {
+                "[REDACTED]"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn tail_text(input: &str, max_len: usize) -> String {
@@ -4102,8 +4128,8 @@ mod tests {
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, package_snapshot_execution_mode,
         parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        redacted_builder_command, resolve_solve_all_unit_options, tail_text, utf8_safe_tail,
-        validate_certified_process_axis,
+        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
+        tail_text, utf8_safe_tail, validate_certified_process_axis,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -4165,6 +4191,17 @@ mod tests {
         assert!(byte_tail.len() <= 2_001);
         assert!(byte_tail.ends_with("END"));
         assert!(!byte_tail.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn snapshot_builder_diagnostics_redact_connection_and_token_values() {
+        let redacted = redact_sensitive_diagnostics(
+            "db=postgresql://worker:password@example.test/db token=abc bearer xyz safe=value",
+        );
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("bearer"));
+        assert!(redacted.contains("safe=value"));
     }
 
     #[test]

@@ -244,7 +244,7 @@ async fn process_claimed_review_submit_gate_run(
     let outcome = match execute_claimed_gate_run(state, run, None).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            if let Some(outcome) = snapshot_builder_blocked_outcome(run, &err)? {
+            if let Some(outcome) = snapshot_builder_blocked_outcome(run, &err) {
                 outcome
             } else {
                 warn!(
@@ -316,7 +316,7 @@ async fn process_claimed_review_submit_gate_worker_job(
     let outcome = match execute_claimed_gate_run(state, &run, Some(&progress)).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            if let Some(outcome) = snapshot_builder_blocked_outcome(&run, &err)? {
+            if let Some(outcome) = snapshot_builder_blocked_outcome(&run, &err) {
                 outcome
             } else {
                 warn!(
@@ -420,12 +420,12 @@ async fn execute_claimed_gate_run(
             )
             .await?;
     }
-    let snapshot = db::run_review_submit_gate_snapshot_builder(
+    let snapshot = run_review_submit_snapshot_with_heartbeat(
         state,
-        run.id,
-        run.requested_by,
+        run,
         request_roots.as_slice(),
         &actual_revision_checksum,
+        progress,
     )
     .await
     .context("failed to build review-submit gate snapshot")?;
@@ -506,6 +506,43 @@ async fn execute_claimed_gate_run(
         audit,
         authoritative_revision_checksum: input.actual_revision_checksum,
     })
+}
+
+async fn run_review_submit_snapshot_with_heartbeat(
+    state: &AppState,
+    run: &ReviewSubmitGateRun,
+    request_roots: &[RequestRootProcess],
+    revision_checksum: &str,
+    progress: Option<&WorkerJobProgress<'_>>,
+) -> anyhow::Result<db::SnapshotBuilderExecution> {
+    let build = db::run_review_submit_gate_snapshot_builder(
+        state,
+        run.id,
+        run.requested_by,
+        request_roots,
+        revision_checksum,
+    );
+    let mut build = Box::pin(build);
+    let Some(progress) = progress else {
+        return build.await;
+    };
+    loop {
+        tokio::select! {
+            result = &mut build => return result,
+            () = sleep(Duration::from_secs(5)) => {
+                progress.heartbeat(
+                    "building_snapshot",
+                    0.35,
+                    Some(json!({
+                        "datasetTable": run.dataset_table,
+                        "datasetId": run.dataset_id,
+                        "datasetVersion": run.dataset_version,
+                        "snapshotBuilder": { "running": true }
+                    })),
+                ).await?;
+            }
+        }
+    }
 }
 
 async fn claim_next_review_submit_gate_run(
@@ -804,16 +841,16 @@ fn runtime_error_outcome(
 fn snapshot_builder_blocked_outcome(
     run: &ReviewSubmitGateRun,
     error: &anyhow::Error,
-) -> anyhow::Result<Option<GateExecutionOutcome>> {
+) -> Option<GateExecutionOutcome> {
     let Some(db::SnapshotBuilderProcessFailure::Blocked {
         code,
         blocking_reasons,
     }) = error.downcast_ref::<db::SnapshotBuilderProcessFailure>()
     else {
-        return Ok(None);
+        return None;
     };
     let reasons = Value::Array(blocking_reasons.clone());
-    Ok(Some(GateExecutionOutcome {
+    Some(GateExecutionOutcome {
         status: RecordedGateStatus::Blocked,
         calculator_report: json!({
             "schema_version": REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION,
@@ -833,7 +870,7 @@ fn snapshot_builder_blocked_outcome(
             "blocker_count": blocking_reasons.len(),
         }),
         authoritative_revision_checksum: run.revision_checksum.clone(),
-    }))
+    })
 }
 
 fn synthetic_blocker(code: &str, message: &str, details: Value) -> ReadinessFinding {
@@ -1482,9 +1519,7 @@ mod tests {
             blocking_reasons: vec![reason.clone()],
         })
         .context("failed to build review-submit gate snapshot");
-        let outcome = super::snapshot_builder_blocked_outcome(&run, &error)
-            .unwrap()
-            .expect("typed blocker");
+        let outcome = super::snapshot_builder_blocked_outcome(&run, &error).expect("typed blocker");
 
         assert_eq!(outcome.status, RecordedGateStatus::Blocked);
         assert_eq!(outcome.calculator_report["status"], "blocked");

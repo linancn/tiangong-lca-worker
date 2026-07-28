@@ -143,4 +143,22 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn terminal_rejects_unknown_schema_and_truncated_json() {
+        let unknown_schema = format!(
+            "{SNAPSHOT_BUILDER_TERMINAL_PREFIX}{}",
+            json!({
+                "status": "succeeded",
+                "schema_version": "snapshot_builder_terminal.v2",
+                "resolved_snapshot_id": Uuid::new_v4()
+            })
+        );
+        let unknown_error = parse_terminal(&unknown_schema).unwrap_err().to_string();
+        assert!(unknown_error.contains("snapshot_builder_protocol_schema_unsupported"));
+
+        let truncated = format!("{SNAPSHOT_BUILDER_TERMINAL_PREFIX}{{\"status\":\"succeeded\"");
+        let truncated_error = parse_terminal(&truncated).unwrap_err().to_string();
+        assert!(truncated_error.contains("snapshot_builder_protocol_terminal_invalid"));
+    }
 }

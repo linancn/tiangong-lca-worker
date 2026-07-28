@@ -127,6 +127,19 @@ Administrative and final closure bundles, document/edge/reference evidence, issu
 
 Administrative closure and numerical Flow selection remain distinct. During the persisted snapshot build, every Elementary Flow referenced by a selected LCIA Method factor is additionally frozen as source-closure `support`, with exact/once-resolved version and recursive support-document closure. A factor-only Flow does not enter the inventory-derived B/C axes, compiled graph, provider discovery, or provider universe. Product, Waste, or Other factor targets are semantic failures; they never cause technosphere expansion.
 
+The numerical snapshot source walk is `path-aware-bounded-frontier-v2`. It consumes the same raw
+reference edges produced by `scope_closure.rs`, but applies a separate role × artifact-purpose
+policy. Each exact document identity/hash is processed once; exact and omitted-version indexes make
+satisfaction checks deterministic; support reads use fixed 512-identity batches with a 64 MiB
+returned-byte ceiling, and the build enforces cumulative document/reference/edge/depth limits.
+Identity/hash drift and limit overflow are operator errors. Metrics expose source document count,
+classified reference count, frontier rounds, support query count, and decoded document bytes.
+
+This numerical frontier does not replace certificate-grade administrative traversal. For
+review-submit and ordinary Calculation Bundles, lineage and model-composition edges are evidence
+only and never probe their target. Certificate closure continues its full, non-fail-fast union
+traversal and issue aggregation under this document's frozen-release rules.
+
 Each fresh scan produces deterministic administrative artifacts:
 
 - `closure-bundle-v1.json`: requested bindings, TIDAS validation evidence, scan, and resolution map;

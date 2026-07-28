@@ -19,7 +19,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedCommit: aa439f2
 lastReviewedNote: "Reviewed for Issue #158; the 2048 MiB scope-closure RSS guard does not change package-worker import/export semantics."
 related:
   - AGENTS.md

@@ -848,7 +848,7 @@ fn scope_closure_boundary_policy(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match run_snapshot_builder().await {
+    match Box::pin(run_snapshot_builder()).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Some(SnapshotSourceClosureError::Blocked { code, issues }) =

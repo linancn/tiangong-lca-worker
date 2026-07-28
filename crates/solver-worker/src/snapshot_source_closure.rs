@@ -144,6 +144,7 @@ pub fn validate_resource_limits(
     Ok(())
 }
 
+#[must_use]
 pub fn source_dependency_issue(reference: &ClassifiedSourceReference, message: &str) -> Value {
     json!({
         "code": "source_dependency_unavailable",
