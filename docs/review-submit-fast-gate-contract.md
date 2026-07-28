@@ -147,6 +147,34 @@ DB runner 默认通过 snapshot_builder 的 no-LCIA baseline + draft overlay fas
 
 no-LCIA fast path 的 source fingerprint 不包含 `lciamethods` count / max_modified_at，因此 LCIA method 或 factor 变化不会打断 review-submit submit-readiness snapshot 复用。baseline source hash 只绑定依赖数据与 root dependency surface；draft root 的完整内容通过权威 `json_ordered` checksum 进入 overlay source hash，所以金额等 draft 内容变化会重建 overlay，但不必重建依赖 baseline。
 
+Source reference preflight 使用 `scope_closure.rs` 的公共 raw extractor，再由
+`source-reference-policy.v2` 做 role classification 和 artifact-purpose action。Process 数值轴只来自
+request root 与 provider graph invariant，不从任意 document Process reference 推断。
+`referenceToPrecedingDataSetVersion` 等 lineage reference 与
+`referenceToIncludedProcesses` 等 model-composition reference 在 review-submit / 普通 bundle 中只形成
+count、SHA-256 和 bounded sample evidence；它们不 fetch/probe target、不进入 Process/Flow axis。
+exchange Flow 与 provider Process 的 exact identity 仍 fail closed；未知 Flow/Process path 是 operator
+error。role/provenance 字符串固定为 snake_case（例如 `model_composition`、`required_support`）。
+确定性的必需 source 缺失使用稳定 `source_dependency_unavailable` blocker；必需 numerical/support
+reference 的 malformed UUID/version 使用稳定 `source_reference_invalid`。Lineage/ModelComposition
+的 malformed target 在数值 artifact 中仍只记录 evidence，不触发 target lookup。
+
+Snapshot builder 子进程输出 exactly-one `snapshot_builder_terminal.v1` terminal frame，状态只为
+`succeeded` 或 `blocked`。exit `0` 必须且只能配对 `succeeded`；专用 exit `42` 必须且只能配对
+`blocked`。其他非零 exit 仍是 typed operator `Exit`，signal 仍是 typed `Signal`。runner 对
+terminal 缺失、重复、未知 schema、截断、exit/terminal 不一致、wall timeout、DB/S3 failure
+记 operator error；blocked terminal 只映射到现有
+`blocked`、`blockingReasons` 与 `calculatorReport`。stdout/stderr 以 UTF-8-safe bounded tail
+流式保留，command diagnostics 只保存 program/flag name，不保存 argv value、inline JSON、token 或
+连接串。worker-jobs 模式在子进程运行期间持续 heartbeat；heartbeat/lease loss 会取消当前 future，
+触发 child kill，且旧 lease 不得写回终态。
+blocked terminal 的 reasons 使用确定性的总数、SHA-256 与有界 sample，完整 frame 必须小于
+32 KiB，因此不会被 parent 的 64 KiB capture tail 截断。`truncated=false` 要求总数等于 sample
+长度且 sample 不含 truncated summary；`truncated=true` 必须由总数大于 sample 长度或 sample
+中的 truncated summary 证明。`SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS`
+控制 parent wall timeout，默认 `1800` 秒；unset、`0`、负数或非数字值均回退默认值，不能借此
+关闭 timeout。
+
 ## 输出
 
 输出 schema version 为 `review_submit_gate_report.v1`，核心字段为：

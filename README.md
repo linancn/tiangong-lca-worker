@@ -23,7 +23,7 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedCommit: 82c1c6e
 lastReviewedNote: "Issue #158 sets the Linux scope-closure RSS guard to 2048 MiB while retaining Rust tidas v0.1.1 runtime enforcement."
 related:
   - AGENTS.md

@@ -57,6 +57,7 @@ fn calculation_solver_contract(config: &SnapshotBuildConfig) -> Value {
             "flowIdentity": config.flow_identity_policy,
         },
         "sourceClosurePolicy": config.source_closure_policy,
+        "sourceReferencePolicy": config.source_reference_policy,
         "zeroPolicy": {
             "directionalLci": "retain_finite_nonzero",
             "lcia": "retain_finite_including_zero",
@@ -1529,6 +1530,7 @@ mod tests {
                 document_sha256: source_document_sha256,
                 document: source_document,
             }],
+            source_reference_provenance: None,
         };
         CalculationBundleWriter::new(
             Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap(),

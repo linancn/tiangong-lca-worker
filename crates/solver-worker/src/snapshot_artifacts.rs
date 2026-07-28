@@ -92,6 +92,9 @@ pub struct SnapshotBuildConfig {
     /// Versioned policy for freezing LCIA-factor Flow documents into source closure.
     #[serde(default = "default_source_closure_policy")]
     pub source_closure_policy: String,
+    /// Versioned path-aware role × artifact-purpose policy.
+    #[serde(default = "default_legacy_source_reference_policy")]
+    pub source_reference_policy: String,
     /// Biosphere sign convention (`signed`/`gross`).
     #[serde(default = "default_biosphere_sign_mode")]
     pub biosphere_sign_mode: String,
@@ -348,6 +351,10 @@ fn default_source_closure_policy() -> String {
     "snapshot-exchange-flows-only-v0".to_owned()
 }
 
+fn default_legacy_source_reference_policy() -> String {
+    "source-reference-policy.legacy-unclassified-v1".to_owned()
+}
+
 fn default_biosphere_sign_mode() -> String {
     "signed".to_owned()
 }
@@ -547,6 +554,7 @@ mod tests {
             technosphere_boundary_policy: "closed".to_owned(),
             flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
             source_closure_policy: "snapshot-exchange-flows-only-v0".to_owned(),
+            source_reference_policy: "source-reference-policy.legacy-unclassified-v1".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -759,6 +767,10 @@ mod tests {
         assert_eq!(parsed.biosphere_sign_mode, "signed");
         assert_eq!(parsed.allocation_semantics_version, "legacy-unscoped-v0");
         assert_eq!(parsed.include_user_id, None);
+        assert_eq!(
+            parsed.source_reference_policy,
+            "source-reference-policy.legacy-unclassified-v1"
+        );
         assert_eq!(
             parsed.selection_mode,
             SnapshotSelectionMode::FilteredLibrary

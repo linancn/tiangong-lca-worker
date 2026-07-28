@@ -244,20 +244,24 @@ async fn process_claimed_review_submit_gate_run(
     let outcome = match execute_claimed_gate_run(state, run, None).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            warn!(
-                gate_run_id = %run.id,
-                dataset_table = %run.dataset_table,
-                dataset_id = %run.dataset_id,
-                dataset_version = %run.dataset_version,
-                error = %err,
-                "review-submit gate execution failed; recording error result"
-            );
-            runtime_error_outcome(
-                run,
-                "calculator_gate_error",
-                "calculator review-submit gate runner failed before producing a passed/blocked report",
-                json!({ "error": err.to_string() }),
-            )?
+            if let Some(outcome) = snapshot_builder_blocked_outcome(run, &err) {
+                outcome
+            } else {
+                warn!(
+                    gate_run_id = %run.id,
+                    dataset_table = %run.dataset_table,
+                    dataset_id = %run.dataset_id,
+                    dataset_version = %run.dataset_version,
+                    error = %err,
+                    "review-submit gate execution failed; recording error result"
+                );
+                runtime_error_outcome(
+                    run,
+                    "calculator_gate_error",
+                    "calculator review-submit gate runner failed before producing a passed/blocked report",
+                    json!({ "error": err.to_string() }),
+                )?
+            }
         }
     };
 
@@ -312,20 +316,24 @@ async fn process_claimed_review_submit_gate_worker_job(
     let outcome = match execute_claimed_gate_run(state, &run, Some(&progress)).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            warn!(
-                worker_job_id = %job.id,
-                dataset_table = %run.dataset_table,
-                dataset_id = %run.dataset_id,
-                dataset_version = %run.dataset_version,
-                error = %err,
-                "worker_jobs review-submit gate execution failed; recording failed result"
-            );
-            runtime_error_outcome(
-                &run,
-                "calculator_gate_error",
-                "calculator review-submit gate worker failed before producing a passed/blocked report",
-                json!({ "error": err.to_string(), "worker_job_id": job.id }),
-            )?
+            if let Some(outcome) = snapshot_builder_blocked_outcome(&run, &err) {
+                outcome
+            } else {
+                warn!(
+                    worker_job_id = %job.id,
+                    dataset_table = %run.dataset_table,
+                    dataset_id = %run.dataset_id,
+                    dataset_version = %run.dataset_version,
+                    error = %err,
+                    "worker_jobs review-submit gate execution failed; recording failed result"
+                );
+                runtime_error_outcome(
+                    &run,
+                    "calculator_gate_error",
+                    "calculator review-submit gate worker failed before producing a passed/blocked report",
+                    json!({ "error": err.to_string(), "worker_job_id": job.id }),
+                )?
+            }
         }
     };
 
@@ -412,12 +420,12 @@ async fn execute_claimed_gate_run(
             )
             .await?;
     }
-    let snapshot = db::run_review_submit_gate_snapshot_builder(
+    let snapshot = run_review_submit_snapshot_with_heartbeat(
         state,
-        run.id,
-        run.requested_by,
+        run,
         request_roots.as_slice(),
         &actual_revision_checksum,
+        progress,
     )
     .await
     .context("failed to build review-submit gate snapshot")?;
@@ -498,6 +506,43 @@ async fn execute_claimed_gate_run(
         audit,
         authoritative_revision_checksum: input.actual_revision_checksum,
     })
+}
+
+async fn run_review_submit_snapshot_with_heartbeat(
+    state: &AppState,
+    run: &ReviewSubmitGateRun,
+    request_roots: &[RequestRootProcess],
+    revision_checksum: &str,
+    progress: Option<&WorkerJobProgress<'_>>,
+) -> anyhow::Result<db::SnapshotBuilderExecution> {
+    let build = db::run_review_submit_gate_snapshot_builder(
+        state,
+        run.id,
+        run.requested_by,
+        request_roots,
+        revision_checksum,
+    );
+    let mut build = Box::pin(build);
+    let Some(progress) = progress else {
+        return build.await;
+    };
+    loop {
+        tokio::select! {
+            result = &mut build => return result,
+            () = sleep(Duration::from_secs(5)) => {
+                progress.heartbeat(
+                    "building_snapshot",
+                    0.35,
+                    Some(json!({
+                        "datasetTable": run.dataset_table,
+                        "datasetId": run.dataset_id,
+                        "datasetVersion": run.dataset_version,
+                        "snapshotBuilder": { "running": true }
+                    })),
+                ).await?;
+            }
+        }
+    }
 }
 
 async fn claim_next_review_submit_gate_run(
@@ -790,6 +835,47 @@ fn runtime_error_outcome(
         blocking_reasons,
         audit,
         authoritative_revision_checksum: None,
+    })
+}
+
+fn snapshot_builder_blocked_outcome(
+    run: &ReviewSubmitGateRun,
+    error: &anyhow::Error,
+) -> Option<GateExecutionOutcome> {
+    let Some(db::SnapshotBuilderProcessFailure::Blocked {
+        code,
+        blocking_reasons,
+        blocking_reason_count,
+        blocking_reasons_sha256,
+        blocking_reasons_truncated,
+    }) = error.downcast_ref::<db::SnapshotBuilderProcessFailure>()
+    else {
+        return None;
+    };
+    let reasons = Value::Array(blocking_reasons.clone());
+    Some(GateExecutionOutcome {
+        status: RecordedGateStatus::Blocked,
+        calculator_report: json!({
+            "schema_version": REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION,
+            "generated_at_utc": utc_now_text(),
+            "dataset_revision_id": run.dataset_id,
+            "snapshot_id": null,
+            "status": "blocked",
+            "policy": { "policy_profile": run.policy_profile },
+            "metrics": null,
+            "blockers": reasons.clone(),
+        }),
+        blocking_reasons: reasons,
+        audit: json!({
+            "runner": RUNNER_NAME,
+            "phase": "snapshot_source_preflight",
+            "blocker_code": code,
+            "blocker_count": blocking_reason_count,
+            "blocking_reasons_sha256": blocking_reasons_sha256,
+            "blocking_reasons_truncated": blocking_reasons_truncated,
+            "sample_count": blocking_reasons.len(),
+        }),
+        authoritative_revision_checksum: run.revision_checksum.clone(),
     })
 }
 
@@ -1415,6 +1501,42 @@ mod tests {
         assert_eq!(outcome.status, RecordedGateStatus::Error);
         assert!(outcome.blocking_reasons.is_array());
         assert_eq!(outcome.calculator_report["status"], "error");
+    }
+
+    #[test]
+    fn snapshot_source_blocker_uses_existing_blocked_json_contract() {
+        let run = ReviewSubmitGateRun {
+            id: Uuid::new_v4(),
+            dataset_table: "processes".to_owned(),
+            dataset_id: Uuid::new_v4(),
+            dataset_version: "01.00.000".to_owned(),
+            revision_checksum: Some("a".repeat(64)),
+            policy_profile: super::REVIEW_SUBMIT_GATE_POLICY_PROFILE.to_owned(),
+            report_schema_version: super::REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned(),
+            requested_by: Uuid::new_v4(),
+        };
+        let reason = json!({
+            "code": "source_dependency_unavailable",
+            "sourceIdentity": format!("process:{}@01.00.000", run.dataset_id),
+            "jsonPath": "$.processDataSet.exchanges.exchange[0].referenceToFlowDataSet"
+        });
+        let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Blocked {
+            code: "source_dependency_unavailable".to_owned(),
+            blocking_reasons: vec![reason.clone()],
+            blocking_reason_count: 1,
+            blocking_reasons_sha256: "a".repeat(64),
+            blocking_reasons_truncated: false,
+        })
+        .context("failed to build review-submit gate snapshot");
+        let outcome = super::snapshot_builder_blocked_outcome(&run, &error).expect("typed blocker");
+
+        assert_eq!(outcome.status, RecordedGateStatus::Blocked);
+        assert_eq!(outcome.calculator_report["status"], "blocked");
+        assert_eq!(outcome.blocking_reasons, json!([reason]));
+        assert!(outcome.calculator_report.get("blockingReasons").is_none());
+        assert_eq!(outcome.audit["blocker_count"], 1);
+        assert_eq!(outcome.audit["blocking_reasons_truncated"], false);
+        assert_eq!(outcome.audit["blocking_reasons_sha256"], "a".repeat(64));
     }
 
     #[test]

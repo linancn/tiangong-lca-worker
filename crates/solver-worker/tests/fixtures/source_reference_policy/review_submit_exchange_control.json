@@ -1,0 +1,19 @@
+{
+  "processDataSet": {
+    "processInformation": {
+      "dataSetInformation": {
+        "common:UUID": "55555555-5555-4555-8555-555555555555"
+      }
+    },
+    "exchanges": {
+      "exchange": {
+        "@dataSetInternalID": "1",
+        "referenceToFlowDataSet": {
+          "@type": "flow data set",
+          "@refObjectId": "66666666-6666-4666-8666-666666666666",
+          "@version": "01.01.000"
+        }
+      }
+    }
+  }
+}
