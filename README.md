@@ -353,6 +353,8 @@ Supabase 连接说明：
 
 说明：结果持久化已改为 S3-only。`S3_ENDPOINT/S3_REGION/S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY` 必须同时提供。上传请求使用 SigV4 签名认证。若对象存储平台设置了文件大小上限，生产环境应先在平台侧调高该 max-file-limit；`S3_MAX_UPLOAD_BYTES` 只是在 worker 侧提前阻断明显超限的 artifact，避免 multipart 上传到中途才返回 `EntityTooLarge`。
 
+Worker 内部新增显式 byte-cap 的 file transfer primitives：download 即使没有 `Content-Length` 也按流式累计字节拒绝，完成前校验可选 SHA-256/cancellation，失败不发布 partial destination；upload 在传输前检查 metadata byte size 和 SHA-256，multipart 只保留固定 part buffer，并在失败/取消时 abort。旧的 byte-returning download API 保留用于兼容，后续大型 snapshot/package/graph-cache 路径迁移必须使用 file API 并提供 job-specific cap。
+
 ## 6. 启动与检查
 
 Ubuntu 依赖：
@@ -716,7 +718,7 @@ sudo systemctl restart package-worker.service
 
 ### 6.5 Maintenance Worker Jobs（systemd，推荐）
 
-`worker_jobs` 模式下，GC timer/operator action 不再直接代表任务事实；它们只 enqueue `worker_queue=maintenance` job。常驻 `maintenance_worker` 负责 claim job、调用现有 GC binary、写回 summary 和 operator-only report artifact metadata。
+`worker_jobs` 模式下，GC timer/operator action 不再直接代表任务事实；它们只 enqueue `worker_queue=maintenance` job。常驻 `maintenance_worker` 负责 claim job、调用现有 GC binary、写回 summary 和 operator-only report artifact metadata。子进程 stdout/stderr 不再通过 `Command::output()` 全量驻留；两个 stream 并发 drain 到各自固定 1 MiB tail buffer，并记录 observed byte count 与 truncation flag。
 
 构建：
 
