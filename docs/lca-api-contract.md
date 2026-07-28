@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
-lastReviewedNote: "Reviewed for Issue #148; bounded validation/cache/artifact execution preserves API payload, V1 bundle, result, status, and persistence semantics."
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Reviewed for Issue #152; the exact tidas v0.1.1 runtime handshake does not change jobs, payloads, statuses, or result contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

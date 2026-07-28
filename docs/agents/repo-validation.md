@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
-lastReviewedNote: "Issue #148 adds qualified 112,032-document graph and 1,088,760-event bounded-spool capacity gates."
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Issue #152 requires the published tidas v0.1.1 version/describe handshake before coordinated rollout."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
