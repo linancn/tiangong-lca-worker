@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 31c5c0a12d62fa1176c8fa7ea2a76d8d09f415f1
-lastReviewedNote: "Issue #152 advances the exact Rust validator handshake to tidas v0.1.1 without changing Worker-owned bounded orchestration."
+lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
+lastReviewedNote: "Issue #156 defines the TIDAS issue hash as exact NDJSON bytes and makes document, edge, and resolved-reference retention file-backed behind a compact in-memory graph."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -75,6 +75,8 @@ Traversal is a union traversal over all exact process and LCIA-method roots. It 
 
 CPU-heavy graph finalization runs through Tokio's blocking pool so sorting, coalescing, and affected-root analysis cannot occupy a lease-heartbeat runtime thread. Canonical ordering materializes each serialized sort key once per collection, and the Worker emits phase durations and collection counts for capacity diagnosis without changing the evidence payload.
 
+Fetched document payloads are canonicalized and appended to a temporary random-access spool during traversal, then released after reference extraction. The retained document index contains only exact identity, canonical content hash, file offset, and byte size. Reference-edge and resolved-reference evidence is likewise file-backed; affected-root analysis uses numeric identity IDs and compact adjacency lists rather than repeated full identity objects per graph edge. Cache hits never reload document payloads, while each uncached TIDAS execution reloads at most its fixed 64-document window.
+
 Every database fetch is constrained to an identity in the frozen release manifest. The Worker canonicalizes each fetched JSON document and compares it with the release's `canonicalContentHash`. These conditions make the scan incomplete and block certificate issuance:
 
 - an allowlisted identity is unreadable from the live source table;
@@ -95,13 +97,15 @@ Document validation uses only the published unified Rust `tidas` CLI selected by
 2. `validate --describe --format json --progress never` must advertise `document-validation-batch.v1`, `tidas-document-conformance.v1`, the validation report schema, and an immutable asset fingerprint.
 3. Uncached documents are spooled as canonical JSON plus an exact JSONL input manifest.
 4. The Worker invokes profile `tidas-document-conformance.v1` with bounded memory/queue configuration inherited by the binary.
-5. Validation events are written to a file spool and the bounded operation report is captured as JSON. Worker verifies spool SHA-256/byte size, final-event equality, report completeness, and asset fingerprint before accepting evidence.
+5. Validation events are written to a file spool and the bounded operation report is captured as JSON. For the published v0.1 protocol field `logical_issue_stream_sha256`, both producer and consumer hash the exact issue-event NDJSON bytes, including line framing and excluding the terminal final event; Worker computes that digest before JSON parsing. Worker also verifies spool SHA-256/byte size, issue count, final-event equality, report completeness, and asset fingerprint before accepting evidence.
 6. While traversal/validation is active, the leased Worker executor refreshes its lease every one-third lease interval. Lease loss or cancellation rejects the operation future and no validation evidence may reach certificate projection.
 7. A command timeout, unsupported version/protocol, malformed report/event, spool mismatch, or missing final event is a system failure; document issues remain domain blockers.
 
 Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Issue events are stream-verified into disk spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 16 MiB external-sort runs. Resolution-map ordering uses the same bounded mechanism. The Worker records document/cache/issue/spool counts and hashes, retains at least 512 MiB of temporary-volume headroom beyond planned sort space, and fails closed when a spool, cache record, or temporary-space limit is exceeded.
+
+On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 512 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 
 ## Issues and affected roots
 
@@ -118,7 +122,7 @@ Closure production runs in this fail-closed order:
 3. freeze the discovered exact Process axis and administratively scan the added provider processes;
 4. evaluate the discovered matrix, provider-link, factorization, and LCIA readiness evidence;
 
-Administrative and final closure bundles, issue JSONL, XLSX worksheets, and object-store uploads are file-backed. Canonical V1 arrays are emitted incrementally from stable in-memory scan collections or sorted spools; the Worker does not reconstruct the complete TIDAS issue or resolution-map event collection as `Vec<Value>`. Temporary directories own every intermediate spool/run/artifact and remove them on success, failure, cancellation, or lease loss after the bounded blocking task exits. Lease heartbeats remain active during both administrative and final artifact preparation.
+Administrative and final closure bundles, document/edge/reference evidence, issue JSONL, XLSX worksheets, and object-store uploads are file-backed. Canonical V1 arrays are emitted incrementally from indexed or sorted spools; the Worker does not reconstruct the complete document, reference-edge, TIDAS issue, or resolution-map collection as `Vec<Value>`. Temporary directories own every intermediate spool/run/artifact and remove them on success, failure, cancellation, or lease loss after the bounded blocking task exits. Lease heartbeats remain active during both administrative and final artifact preparation.
 5. only when every scan is complete and no blocker remains, run the frozen snapshot builder in persisted build mode.
 
 Administrative closure and numerical Flow selection remain distinct. During the persisted snapshot build, every Elementary Flow referenced by a selected LCIA Method factor is additionally frozen as source-closure `support`, with exact/once-resolved version and recursive support-document closure. A factor-only Flow does not enter the inventory-derived B/C axes, compiled graph, provider discovery, or provider universe. Product, Waste, or Other factor targets are semantic failures; they never cause technosphere expansion.
@@ -178,6 +182,8 @@ For changes to this contract, run the repo baseline plus focused closure tests. 
 - frozen-release live drift and live-only substitution rejection;
 - omitted-version frozen candidates and winner provenance;
 - bounded batches, deterministic hashes, cancellation, and valid check-scoped XLSX output;
+- byte-exact non-empty TIDAS issue-stream hashing across JSON field orders;
+- file-backed document/reference retention and compact-graph RSS qualification;
 - all-or-none package binding and database certificate mismatch rejection;
 - shared-scan target-specific report/finalizer behavior.
 

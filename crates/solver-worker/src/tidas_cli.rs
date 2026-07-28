@@ -270,27 +270,44 @@ pub fn visit_jsonl(
     path: &Path,
     mut visit: impl FnMut(Value) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    visit_jsonl_raw(path, |value, _raw_line| visit(value))
+}
+
+pub fn visit_jsonl_raw(
+    path: &Path,
+    mut visit: impl FnMut(Value, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let file = File::open(path)
         .with_context(|| format!("tidas_spool_missing: open {}", path.display()))?;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.with_context(|| {
+    let mut reader = BufReader::new(file);
+    let mut raw_line = Vec::new();
+    let mut index = 0_usize;
+    loop {
+        raw_line.clear();
+        if reader.read_until(b'\n', &mut raw_line).with_context(|| {
             format!(
                 "tidas_spool_invalid: read line {} from {}",
                 index + 1,
                 path.display()
             )
-        })?;
-        if line.trim().is_empty() {
+        })? == 0
+        {
+            break;
+        }
+        index += 1;
+        let json_bytes = raw_line.strip_suffix(b"\n").unwrap_or(raw_line.as_slice());
+        let json_bytes = json_bytes.strip_suffix(b"\r").unwrap_or(json_bytes);
+        if json_bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value = serde_json::from_str(&line).with_context(|| {
+        let value = serde_json::from_slice(json_bytes).with_context(|| {
             format!(
                 "tidas_spool_invalid: parse line {} from {}",
-                index + 1,
+                index,
                 path.display()
             )
         })?;
-        visit(value)?;
+        visit(value, &raw_line)?;
     }
     Ok(())
 }
@@ -433,6 +450,22 @@ mod tests {
         })
         .unwrap();
         assert_eq!(indexes, vec![1, 2]);
+    }
+
+    #[test]
+    fn raw_jsonl_visitor_preserves_field_order_and_line_framing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let bytes = b"{\"z\":1,\"a\":2}\n";
+        std::fs::write(&path, bytes).unwrap();
+        let mut observed = Vec::new();
+        visit_jsonl_raw(&path, |value, raw_line| {
+            assert_eq!(value.get("z").and_then(Value::as_u64), Some(1));
+            observed.extend_from_slice(raw_line);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(observed, bytes);
     }
 
     #[test]
