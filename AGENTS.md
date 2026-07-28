@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
-lastReviewedNote: "Reviewed for Issue #148: bounded scope-closure finalization preserves repo ownership, runtime contracts, and local-first validation requirements."
+lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
+lastReviewedNote: "Reviewed for Issue #148: bounded validation spools, cache batches, file-backed artifacts, heartbeat-safe blocking work, and local capacity gates preserve repo ownership and fail-closed runtime contracts."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

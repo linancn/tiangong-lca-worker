@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
-lastReviewedNote: "Reviewed for Issue #148; scope-closure graph-finalization changes do not alter the package-worker import/export or tidas validation contract."
+lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
+lastReviewedNote: "Reviewed for Issue #148; scope-closure now uses the same streaming verified-spool boundary without changing package-worker import/export or tidas protocol semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
