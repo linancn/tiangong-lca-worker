@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 98ca40c
-lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; package-worker import/export semantics remain unchanged."
+lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
+lastReviewedNote: "Reviewed for Issue #163: scope-closure issue partitioning preserves the published TIDAS logical issue-stream hash and does not change package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

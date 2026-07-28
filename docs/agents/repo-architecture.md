@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 5dfc9d93389f09dca30863acb881292dbeed5e20
-lastReviewedNote: "Reviewed for Issue #160 isolated source-closure performance evidence; runtime architecture and child-process ownership remain unchanged."
+lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
+lastReviewedNote: "Updated for Issue #163: scope_closure owns bounded relation partitions and compatibility report projections without changing solver-core or storage ownership."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -73,7 +73,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/suitesparse-ffi/**` | CSC matrix representation and SuiteSparse bindings |
 | `crates/solver-core/**` | matrix build, factorization cache, solve orchestration, provider matching |
 | `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
-| `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, evidence artifacts, scan reuse, and package certificate verification |
+| `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, bounded issue-relation partitions/reports, scan reuse, and package certificate verification |
 | `crates/solver-worker/src/tidas_cli.rs` | single-binary Rust tidas version/protocol handshake, bounded command execution, report validation, and spool hash/count verification |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
