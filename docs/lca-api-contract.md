@@ -23,9 +23,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-27
-lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
-lastReviewedNote: "Issue #146 separates selected LCIA-factor Flow source closure from inventory-derived matrix/provider selection."
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
+lastReviewedNote: "Reviewed for Issue #148; graph-finalization scheduling and diagnostics do not change API payload, result, status, or persistence semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

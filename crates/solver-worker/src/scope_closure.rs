@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{Cursor, Write},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -899,19 +900,54 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         }
     }
 
-    tokio::task::yield_now().await;
-    let scan = finalize_scope_closure_scan(
-        edges,
-        resolved_references,
-        omitted_version_resolutions,
-        raw_issues,
-        &roots,
-        &graph,
-        complete,
-        documents,
-        scheduled,
+    let edge_count = edges.len();
+    let raw_issue_count = raw_issues.len();
+    let root_count = roots.len();
+    let document_count = documents.len();
+    let (scan, metrics) = tokio::task::spawn_blocking(move || {
+        finalize_scope_closure_scan(
+            edges,
+            resolved_references,
+            omitted_version_resolutions,
+            raw_issues,
+            &roots,
+            &graph,
+            complete,
+            documents,
+            scheduled,
+        )
+    })
+    .await?;
+    tracing::info!(
+        phase = "scope_closure_finalize",
+        edge_count,
+        raw_issue_count,
+        issue_count = scan.issues.len(),
+        root_count,
+        document_count,
+        sort_inputs_ms = duration_millis(metrics.sort_inputs),
+        attach_occurrences_ms = duration_millis(metrics.attach_occurrences),
+        coalesce_issues_ms = duration_millis(metrics.coalesce_issues),
+        affected_roots_ms = duration_millis(metrics.affected_roots),
+        sort_issues_ms = duration_millis(metrics.sort_issues),
+        total_ms = duration_millis(metrics.total),
+        "scope closure graph finalization completed"
     );
     Ok(scan)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeClosureFinalizeMetrics {
+    sort_inputs: Duration,
+    attach_occurrences: Duration,
+    coalesce_issues: Duration,
+    affected_roots: Duration,
+    sort_issues: Duration,
+    total: Duration,
+}
+
+const fn duration_millis(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,17 +961,33 @@ fn finalize_scope_closure_scan(
     complete: bool,
     documents: BTreeMap<ExactDatasetIdentity, ClosureDocument>,
     scheduled: BTreeSet<ExactDatasetIdentity>,
-) -> ScopeClosureScan {
-    edges.sort_by_key(canonical_value);
-    resolved_references.sort();
-    omitted_version_resolutions.sort_by_key(canonical_value);
-    let mut raw_issues = raw_issues;
-    attach_reference_occurrences(&mut raw_issues, &resolved_references);
-    let mut issues = coalesce_issues(raw_issues);
-    compute_affected_roots_batch(&mut issues, roots, graph);
-    issues.sort_by_key(canonical_value);
+) -> (ScopeClosureScan, ScopeClosureFinalizeMetrics) {
+    let total_started = Instant::now();
 
-    ScopeClosureScan {
+    let phase_started = Instant::now();
+    sort_by_canonical_value(&mut edges);
+    resolved_references.sort();
+    sort_by_canonical_value(&mut omitted_version_resolutions);
+    let sort_inputs = phase_started.elapsed();
+
+    let mut raw_issues = raw_issues;
+    let phase_started = Instant::now();
+    attach_reference_occurrences(&mut raw_issues, &resolved_references);
+    let attach_occurrences = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    let mut issues = coalesce_issues(raw_issues);
+    let coalesce_issues = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    compute_affected_roots_batch(&mut issues, roots, graph);
+    let affected_roots = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    issues.sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+    let sort_issues = phase_started.elapsed();
+
+    let scan = ScopeClosureScan {
         schema_version: "lcia.scope-closure-scan.v1".to_owned(),
         complete,
         roots: roots.to_vec(),
@@ -946,7 +998,16 @@ fn finalize_scope_closure_scan(
         issues,
         frontier: Vec::new(),
         provider_universe: scheduled.into_iter().collect(),
-    }
+    };
+    let metrics = ScopeClosureFinalizeMetrics {
+        sort_inputs,
+        attach_occurrences,
+        coalesce_issues,
+        affected_roots,
+        sort_issues,
+        total: total_started.elapsed(),
+    };
+    (scan, metrics)
 }
 
 fn attach_reference_occurrences(issues: &mut [ClosureIssue], references: &[ResolvedReference]) {
@@ -1088,7 +1149,8 @@ fn populate_affected_roots(scan: &mut ScopeClosureScan) {
             .insert(reference.target.clone());
     }
     compute_affected_roots_batch(&mut scan.issues, &scan.roots, &graph);
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues
+        .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
 }
 
 #[must_use]
@@ -1694,6 +1756,10 @@ fn canonical_value<T: Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+fn sort_by_canonical_value<T: Serialize>(values: &mut [T]) {
+    values.sort_by_cached_key(canonical_value);
+}
+
 fn canonical_json_bytes<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
     let value = serde_json::to_value(value)?;
     let mut output = Vec::new();
@@ -1836,7 +1902,8 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     let issue_events = validation.issue_events.clone();
     let scan = tokio::task::spawn_blocking(move || {
         merge_tidas_validation_issues(&mut scan, &issue_events);
-        scan.issues.sort_by_key(canonical_value);
+        scan.issues
+            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
         scan
     })
     .await?;
@@ -2323,7 +2390,8 @@ pub async fn execute_scope_closure_job(
             })),
         )
         .await?;
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues
+        .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
 
     let mut effective_scope =
         build_effective_scope_manifest(&input.requested_scope, &scan.documents);
@@ -2394,11 +2462,13 @@ pub async fn execute_scope_closure_job(
         effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
         add_process_axis_drift_issue(&mut scan, frozen_process_axis.as_slice(), &effective_scope)?;
         merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
-        scan.issues.sort_by_key(canonical_value);
+        scan.issues
+            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
     }
 
     normalize_database_issue_severities(&mut scan.issues)?;
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues
+        .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
     let (closure_bundle_bytes, closure_bundle_hash) =
         build_closure_bundle(&input, &validation, &scan)?;
     let source_fingerprint = source_fingerprint(&scan.documents)?;
@@ -3218,7 +3288,7 @@ fn build_resolution_map(edges: &[ReferenceEdge], omitted_resolutions: &[Value]) 
             "provenance": resolution,
         })
     }));
-    resolutions.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut resolutions);
     resolutions
 }
 
@@ -3504,7 +3574,7 @@ async fn run_tidas_batch_validation_cached(
             .collect::<anyhow::Result<Vec<_>>>()?;
         record_document_validation_evidence(pool, worker_job_id, &records).await?;
     }
-    issue_events.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut issue_events);
     let final_event = json!({
         "type": "final",
         "schema_version": "tidas.validation-final-event.v1",
@@ -5129,6 +5199,78 @@ mod tests {
         )
         .expect_err("builder identity drift must fail closed");
         assert!(error.to_string().contains("database-preallocated identity"));
+    }
+
+    #[test]
+    fn cached_canonical_sort_preserves_canonical_order() {
+        let mut values = vec![
+            json!({"z": 1, "a": 2}),
+            json!({"a": 1}),
+            json!([2, 1]),
+            json!(null),
+        ];
+        let mut expected = values.clone();
+        expected.sort_by_key(canonical_value);
+
+        sort_by_canonical_value(&mut values);
+
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn issue_heavy_finalization_is_bounded_and_orders_by_stable_issue_key() {
+        const ISSUE_COUNT: usize = 50_000;
+        let raw_issues = (0..ISSUE_COUNT)
+            .rev()
+            .map(|index| ClosureIssue {
+                issue_key: format!("issue-{index:06}"),
+                severity: "warning".to_owned(),
+                blocking: false,
+                issue_code: "test_issue".to_owned(),
+                source: None,
+                json_path: None,
+                reference_role: None,
+                requested_target_type: None,
+                requested_target_id: None,
+                requested_target_version: None,
+                message: "representative issue-heavy finalization fixture".to_owned(),
+                suggested_action: None,
+                occurrence_count: 0,
+                occurrences: Vec::new(),
+                affected_roots: Vec::new(),
+                affected_root_witness_paths: Vec::new(),
+                witness_path: Vec::new(),
+            })
+            .collect();
+
+        let started = Instant::now();
+        let (scan, metrics) = finalize_scope_closure_scan(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            raw_issues,
+            &[],
+            &BTreeMap::new(),
+            true,
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+
+        assert_eq!(scan.issues.len(), ISSUE_COUNT);
+        assert_eq!(
+            scan.issues.first().map(|issue| issue.issue_key.as_str()),
+            Some("issue-000000")
+        );
+        assert_eq!(
+            scan.issues.last().map(|issue| issue.issue_key.as_str()),
+            Some("issue-049999")
+        );
+        assert!(metrics.total <= started.elapsed());
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "issue-heavy finalization took {:?}, expected under 10s",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -18,9 +18,9 @@ checkPaths:
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
-lastReviewedAt: 2026-07-27
-lastReviewedCommit: e48356e3b24dddbe6cdfebd88be13e48609ef0d1
-lastReviewedNote: "Cut import validation over to the version-pinned unified Rust tidas binary with verified bounded evidence for Issue #144."
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
+lastReviewedNote: "Reviewed for Issue #148; scope-closure graph-finalization changes do not alter the package-worker import/export or tidas validation contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml
