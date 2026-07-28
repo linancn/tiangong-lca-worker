@@ -24,7 +24,7 @@ checkPaths:
   - docs/tidas-package-contract.md
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
-lastReviewedNote: "Issue #152 updates every active Worker entry point to the exact published Rust tidas v0.1.1 contract."
+lastReviewedNote: "Issue #158 sets the Linux scope-closure RSS guard to 2048 MiB while retaining Rust tidas v0.1.1 runtime enforcement."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -307,7 +307,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `TIDAS_EXPECTED_VERSION`（必须与 binary `version` 及 validation describe package version 精确匹配，默认 `0.1.1`）
 - `TIDAS_TIMEOUT_SECONDS`（单次 `tidas` 子进程上限，默认 `1800`）
 - `TIDAS_MEMORY_BUDGET_MIB` / `TIDAS_QUEUE_CAPACITY`（由 `tidas` 消费的有界资源配置；package 与 scope-closure 子进程继承）
-- `SCOPE_CLOSURE_MEMORY_BUDGET_MIB`（Linux Worker scope-closure RSS 上限，默认 `512` MiB；遍历、图收尾、验证与 issue 合并阶段超限时 fail closed）
+- `SCOPE_CLOSURE_MEMORY_BUDGET_MIB`（Linux Worker scope-closure RSS 上限，默认 `2048` MiB；遍历、图收尾、验证与 issue 合并阶段超限时 fail closed）
 
 数据库连接池与 `build_snapshot` 并发：
 

@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
-lastReviewedNote: "Issue #156 defines the TIDAS issue hash as exact NDJSON bytes and makes document, edge, and resolved-reference retention file-backed behind a compact in-memory graph."
+lastReviewedNote: "Issue #158 sets the Linux scope-closure fail-closed RSS guard to 2048 MiB after production-shape validation."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -105,7 +105,7 @@ Document-validation evidence is cached only under the full immutable key: exact 
 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Issue events are stream-verified into disk spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 16 MiB external-sort runs. Resolution-map ordering uses the same bounded mechanism. The Worker records document/cache/issue/spool counts and hashes, retains at least 512 MiB of temporary-volume headroom beyond planned sort space, and fails closed when a spool, cache record, or temporary-space limit is exceeded.
 
-On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 512 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
+On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 
 ## Issues and affected roots
 

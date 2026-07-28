@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
-lastReviewedNote: "Issue #156 keeps full closure payload/reference evidence file-backed, uses a compact numeric graph, and verifies exact TIDAS issue bytes."
+lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedNote: "Reviewed for Issue #158: the 2048 MiB RSS guard changes capacity policy without changing the file-backed closure architecture."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
