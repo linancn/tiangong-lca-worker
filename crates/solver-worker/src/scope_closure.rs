@@ -1,10 +1,12 @@
 //! Exact-version, non-fail-fast source-closure preflight for data-product builds.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
-    io::{Cursor, Write},
-    path::PathBuf,
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -39,6 +41,13 @@ pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
 pub const REFERENCE_ISSUE_SCHEMA_VERSION: &str = "tidas.reference-extraction-issue.v1";
 const FETCH_BATCH_SIZE: usize = 96;
+const VALIDATION_CACHE_LOOKUP_BATCH_SIZE: usize = 256;
+const VALIDATION_EXECUTION_BATCH_SIZE: usize = 64;
+const VALIDATION_CACHE_RECORD_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const VALIDATION_SORT_RUN_BYTES: usize = 16 * 1024 * 1024;
+const VALIDATION_ISSUE_SPOOL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const VALIDATION_ISSUE_SPOOL_MAX_EVENTS: u64 = 5_000_000;
+const SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1864,15 +1873,216 @@ struct ArtifactManifestEntry {
 #[derive(Debug, Clone)]
 struct PreparedArtifact {
     descriptor: ArtifactManifestEntry,
-    bytes: Vec<u8>,
+    path: PathBuf,
+    _temp: Arc<TempDir>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 struct TidasBatchValidation {
     describe: Value,
     final_event: Value,
-    issue_events: Vec<Value>,
+    issue_events: JsonlValueSpool,
+}
+
+#[derive(Debug)]
+struct ClosureBundleFile {
+    temp: Arc<TempDir>,
+    path: PathBuf,
+    byte_size: u64,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct JsonlValueSpool {
+    _temp: TempDir,
+    path: PathBuf,
+    event_count: u64,
+    byte_size: u64,
+    sha256: String,
+}
+
+impl JsonlValueSpool {
+    fn visit(&self, visit: impl FnMut(Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        tidas_cli::visit_jsonl(&self.path, visit)
+    }
+}
+
+struct JsonlValueSpoolWriter {
+    temp: TempDir,
+    path: PathBuf,
+    writer: BufWriter<File>,
+    digest: Sha256,
+    event_count: u64,
+    byte_size: u64,
+}
+
+impl JsonlValueSpoolWriter {
+    fn new(file_name: &str) -> anyhow::Result<Self> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join(file_name);
+        let writer = BufWriter::new(File::create(&path)?);
+        Ok(Self {
+            temp,
+            path,
+            writer,
+            digest: Sha256::new(),
+            event_count: 0,
+            byte_size: 0,
+        })
+    }
+
+    fn append(&mut self, event: &Value) -> anyhow::Result<()> {
+        self.append_canonical_bytes(canonical_json_bytes(event)?)
+    }
+
+    fn append_canonical_bytes(&mut self, mut bytes: Vec<u8>) -> anyhow::Result<()> {
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes)?;
+        self.digest.update(&bytes);
+        self.byte_size = self
+            .byte_size
+            .checked_add(u64::try_from(bytes.len())?)
+            .ok_or_else(|| anyhow::anyhow!("validation issue spool byte count overflow"))?;
+        self.event_count = self
+            .event_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("validation issue spool event count overflow"))?;
+        if self.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES
+            || self.event_count > VALIDATION_ISSUE_SPOOL_MAX_EVENTS
+        {
+            return Err(anyhow::anyhow!(
+                "validation issue spool exceeded bounded capacity: bytes={}/{}, events={}/{}",
+                self.byte_size,
+                VALIDATION_ISSUE_SPOOL_MAX_BYTES,
+                self.event_count,
+                VALIDATION_ISSUE_SPOOL_MAX_EVENTS
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<JsonlValueSpool> {
+        self.writer.flush()?;
+        drop(self.writer);
+        Ok(JsonlValueSpool {
+            _temp: self.temp,
+            path: self.path,
+            event_count: self.event_count,
+            byte_size: self.byte_size,
+            sha256: hex::encode(self.digest.finalize()),
+        })
+    }
+}
+
+fn sort_jsonl_spool(spool: &JsonlValueSpool) -> anyhow::Result<JsonlValueSpool> {
+    sort_jsonl_spool_with_run_bytes(spool, VALIDATION_SORT_RUN_BYTES)
+}
+
+fn sort_jsonl_spool_with_run_bytes(
+    spool: &JsonlValueSpool,
+    run_bytes: usize,
+) -> anyhow::Result<JsonlValueSpool> {
+    if run_bytes == 0 {
+        return Err(anyhow::anyhow!(
+            "validation issue sort run budget must be positive"
+        ));
+    }
+    let runs = TempDir::new()?;
+    ensure_temp_free_space(runs.path(), spool.byte_size.saturating_mul(2))?;
+    let mut run_paths = Vec::new();
+    let mut buffered = Vec::<Vec<u8>>::new();
+    let mut buffered_bytes = 0_usize;
+    spool.visit(|event| {
+        let bytes = canonical_json_bytes(&event)?;
+        buffered_bytes = buffered_bytes.saturating_add(bytes.len());
+        buffered.push(bytes);
+        if buffered_bytes >= run_bytes {
+            run_paths.push(write_sorted_jsonl_run(
+                runs.path(),
+                run_paths.len(),
+                &mut buffered,
+            )?);
+            buffered_bytes = 0;
+        }
+        Ok(())
+    })?;
+    if !buffered.is_empty() {
+        run_paths.push(write_sorted_jsonl_run(
+            runs.path(),
+            run_paths.len(),
+            &mut buffered,
+        )?);
+    }
+
+    let mut output = JsonlValueSpoolWriter::new("validation-issues-sorted.jsonl")?;
+    let mut readers = run_paths
+        .iter()
+        .map(|path| File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<(Vec<u8>, usize)>>::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(line) = read_canonical_jsonl_line(reader)? {
+            heap.push(Reverse((line, index)));
+        }
+    }
+    while let Some(Reverse((line, index))) = heap.pop() {
+        output.append_canonical_bytes(line)?;
+        if let Some(next) = read_canonical_jsonl_line(&mut readers[index])? {
+            heap.push(Reverse((next, index)));
+        }
+    }
+    let output = output.finish()?;
+    if output.event_count != spool.event_count {
+        return Err(anyhow::anyhow!(
+            "validation issue external sort count mismatch: expected {}, got {}",
+            spool.event_count,
+            output.event_count
+        ));
+    }
+    Ok(output)
+}
+
+fn ensure_temp_free_space(path: &Path, planned_bytes: u64) -> anyhow::Result<()> {
+    let available = fs2::available_space(path)?;
+    let required = planned_bytes
+        .checked_add(SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("scope closure temporary-space requirement overflow"))?;
+    if available < required {
+        return Err(anyhow::anyhow!(
+            "scope_closure_temp_space_low: available={available}, required={required}, planned={planned_bytes}, reserve={SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn write_sorted_jsonl_run(
+    directory: &Path,
+    index: usize,
+    buffered: &mut Vec<Vec<u8>>,
+) -> anyhow::Result<PathBuf> {
+    buffered.sort();
+    let path = directory.join(format!("run-{index:06}.jsonl"));
+    let mut writer = BufWriter::new(File::create(&path)?);
+    for line in buffered.drain(..) {
+        writer.write_all(&line)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(path)
+}
+
+fn read_canonical_jsonl_line(reader: &mut BufReader<File>) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    if reader.read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(Some(line))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1899,36 +2109,232 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     let mut scan = collect_scope_closure(provider, requested_scope).await?;
     let validation =
         run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
-    let issue_events = validation.issue_events.clone();
-    let scan = tokio::task::spawn_blocking(move || {
-        merge_tidas_validation_issues(&mut scan, &issue_events);
+    let (scan, validation) = tokio::task::spawn_blocking(move || {
+        merge_tidas_validation_issues(&mut scan, &validation.issue_events)?;
         scan.issues
             .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
-        scan
+        Ok::<_, anyhow::Error>((scan, validation))
     })
-    .await?;
+    .await??;
     Ok((scan, validation))
+}
+
+async fn scan_and_validate_scope_with_heartbeat<P: ScopeClosureProvider>(
+    provider: &P,
+    pool: &PgPool,
+    worker_job_id: Uuid,
+    requested_scope: &RequestedScopeManifest,
+    progress: &WorkerJobProgress<'_>,
+    closure_check_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<(ScopeClosureScan, TidasBatchValidation)> {
+    let operation = scan_and_validate_scope(provider, pool, worker_job_id, requested_scope);
+    tokio::pin!(operation);
+    let mut heartbeat = tokio::time::interval(lease_heartbeat_period(lease_seconds));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = heartbeat.tick() => {
+                progress
+                    .heartbeat(
+                        "discover_and_validate_scope",
+                        0.4,
+                        Some(json!({
+                            "closureCheckId": closure_check_id,
+                            "longRunningOperation": true,
+                            "progressCounters": {
+                                "scanned": 0,
+                                "total": requested_scope.roots().len(),
+                                "unit": "scopeRoots"
+                            },
+                        })),
+                    )
+                    .await?;
+            }
+        }
+    }
 }
 
 fn build_closure_bundle(
     input: &ScopeClosureWorkerInput,
     validation: &TidasBatchValidation,
     scan: &ScopeClosureScan,
-) -> anyhow::Result<(Vec<u8>, String)> {
-    let resolution_map = build_resolution_map(&scan.edges, &scan.omitted_version_resolutions);
-    let closure_bundle = json!({
-        "schemaVersion": "lcia.scope-closure-bundle.v1",
-        "requestedScopeHash": input.requested_scope_hash,
-        "policyFingerprint": input.policy_fingerprint,
-        "dataSnapshotToken": input.data_snapshot_token,
-        "validatorScannerFingerprint": input.expected_validator_scanner_fingerprint,
-        "tidasValidation": validation,
-        "scan": scan,
-        "resolutionMap": resolution_map,
-    });
-    let bytes = canonical_json_bytes(&closure_bundle)?;
-    let hash = sha256_hex(&bytes);
-    Ok((bytes, hash))
+    resolution_map: &JsonlValueSpool,
+) -> anyhow::Result<ClosureBundleFile> {
+    let temp = Arc::new(TempDir::new()?);
+    ensure_temp_free_space(
+        temp.path(),
+        validation.issue_events.byte_size.saturating_mul(2),
+    )?;
+    let path = temp.path().join("closure-bundle-v1.json");
+    let mut writer = BufWriter::new(File::create(&path)?);
+    writer.write_all(b"{")?;
+    write_canonical_field(
+        &mut writer,
+        "dataSnapshotToken",
+        &input.data_snapshot_token,
+        false,
+    )?;
+    write_canonical_field(
+        &mut writer,
+        "policyFingerprint",
+        &input.policy_fingerprint,
+        true,
+    )?;
+    write_canonical_field(
+        &mut writer,
+        "requestedScopeHash",
+        &input.requested_scope_hash,
+        true,
+    )?;
+    writer.write_all(b",\"resolutionMap\":")?;
+    write_spooled_json_array(&mut writer, resolution_map)?;
+    writer.write_all(b",\"scan\":")?;
+    write_scope_closure_scan(&mut writer, scan)?;
+    write_canonical_field(
+        &mut writer,
+        "schemaVersion",
+        &"lcia.scope-closure-bundle.v1",
+        true,
+    )?;
+    writer.write_all(b",\"tidasValidation\":")?;
+    write_tidas_validation(&mut writer, validation)?;
+    write_canonical_field(
+        &mut writer,
+        "validatorScannerFingerprint",
+        &input.expected_validator_scanner_fingerprint,
+        true,
+    )?;
+    writer.write_all(b"}")?;
+    writer.flush()?;
+    drop(writer);
+    let (byte_size, sha256) = file_size_and_sha256(&path)?;
+    Ok(ClosureBundleFile {
+        temp,
+        path,
+        byte_size,
+        sha256,
+    })
+}
+
+fn write_canonical_field<W: Write, T: Serialize>(
+    writer: &mut W,
+    key: &str,
+    value: &T,
+    comma: bool,
+) -> anyhow::Result<()> {
+    if comma {
+        writer.write_all(b",")?;
+    }
+    serde_json::to_writer(&mut *writer, key)?;
+    writer.write_all(b":")?;
+    writer.write_all(&canonical_json_bytes(value)?)?;
+    Ok(())
+}
+
+fn write_canonical_array<'a, W, T>(
+    writer: &mut W,
+    values: impl IntoIterator<Item = &'a T>,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    T: Serialize + 'a,
+{
+    writer.write_all(b"[")?;
+    let mut comma = false;
+    for value in values {
+        if comma {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(&canonical_json_bytes(value)?)?;
+        comma = true;
+    }
+    writer.write_all(b"]")?;
+    Ok(())
+}
+
+fn write_scope_closure_scan<W: Write>(
+    writer: &mut W,
+    scan: &ScopeClosureScan,
+) -> anyhow::Result<()> {
+    writer.write_all(b"{")?;
+    write_canonical_field(writer, "complete", &scan.complete, false)?;
+    writer.write_all(b",\"documents\":")?;
+    write_canonical_array(writer, &scan.documents)?;
+    writer.write_all(b",\"edges\":")?;
+    write_canonical_array(writer, &scan.edges)?;
+    writer.write_all(b",\"frontier\":")?;
+    write_canonical_array(writer, &scan.frontier)?;
+    writer.write_all(b",\"issues\":")?;
+    write_canonical_array(writer, &scan.issues)?;
+    writer.write_all(b",\"omittedVersionResolutions\":")?;
+    write_canonical_array(writer, &scan.omitted_version_resolutions)?;
+    writer.write_all(b",\"providerUniverse\":")?;
+    write_canonical_array(writer, &scan.provider_universe)?;
+    writer.write_all(b",\"resolvedReferences\":")?;
+    write_canonical_array(writer, &scan.resolved_references)?;
+    writer.write_all(b",\"roots\":")?;
+    write_canonical_array(writer, &scan.roots)?;
+    write_canonical_field(writer, "schemaVersion", &scan.schema_version, true)?;
+    writer.write_all(b"}")?;
+    Ok(())
+}
+
+fn write_tidas_validation<W: Write>(
+    writer: &mut W,
+    validation: &TidasBatchValidation,
+) -> anyhow::Result<()> {
+    writer.write_all(b"{")?;
+    write_canonical_field(writer, "describe", &validation.describe, false)?;
+    write_canonical_field(writer, "finalEvent", &validation.final_event, true)?;
+    writer.write_all(b",\"issueEvents\":[")?;
+    let mut comma = false;
+    validation.issue_events.visit(|event| {
+        if comma {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(&canonical_json_bytes(&event)?)?;
+        comma = true;
+        Ok(())
+    })?;
+    writer.write_all(b"]}")?;
+    Ok(())
+}
+
+fn write_spooled_json_array<W: Write>(
+    writer: &mut W,
+    spool: &JsonlValueSpool,
+) -> anyhow::Result<()> {
+    writer.write_all(b"[")?;
+    let mut comma = false;
+    spool.visit(|event| {
+        if comma {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(&canonical_json_bytes(&event)?)?;
+        comma = true;
+        Ok(())
+    })?;
+    writer.write_all(b"]")?;
+    Ok(())
+}
+
+fn spooled_json_array_sha256(spool: &JsonlValueSpool) -> anyhow::Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"[");
+    let mut comma = false;
+    spool.visit(|event| {
+        if comma {
+            digest.update(b",");
+        }
+        digest.update(canonical_json_bytes(&event)?);
+        comma = true;
+        Ok(())
+    })?;
+    digest.update(b"]");
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn closure_scan_allows_numerical_snapshot(scan: &ScopeClosureScan) -> bool {
@@ -2328,38 +2734,16 @@ pub async fn execute_scope_closure_job(
         lease_token,
         lease_seconds,
     );
-    let scan_operation = scan_and_validate_scope(
+    let (mut scan, mut validation) = scan_and_validate_scope_with_heartbeat(
         &provider,
         &state.pool,
         worker_job_id,
         &input.requested_scope,
-    );
-    tokio::pin!(scan_operation);
-    let mut scan_heartbeat = tokio::time::interval(lease_heartbeat_period(lease_seconds));
-    scan_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    scan_heartbeat.tick().await;
-    let (mut scan, mut validation) = loop {
-        tokio::select! {
-            result = &mut scan_operation => break result?,
-            _ = scan_heartbeat.tick() => {
-                progress
-                    .heartbeat(
-                        "discover_and_validate_scope",
-                        0.4,
-                        Some(json!({
-                            "closureCheckId": closure_check_id,
-                            "longRunningOperation": true,
-                            "progressCounters": {
-                                "scanned": 0,
-                                "total": input.requested_scope.roots().len(),
-                                "unit": "scopeRoots"
-                            },
-                        })),
-                    )
-                    .await?;
-            }
-        }
-    };
+        &progress,
+        closure_check_id,
+        lease_seconds,
+    )
+    .await?;
 
     progress
         .heartbeat(
@@ -2398,7 +2782,43 @@ pub async fn execute_scope_closure_job(
     let mut frozen_process_axis = scope_process_axis(&effective_scope);
 
     if closure_scan_allows_numerical_snapshot(&scan) {
-        let (_, administrative_bundle_hash) = build_closure_bundle(&input, &validation, &scan)?;
+        let input_for_administrative_bundle = input.clone();
+        let prepare_administrative_bundle = tokio::task::spawn_blocking(move || {
+            let resolution_map =
+                build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
+            let bundle = build_closure_bundle(
+                &input_for_administrative_bundle,
+                &validation,
+                &scan,
+                &resolution_map,
+            )?;
+            Ok::<_, anyhow::Error>(bundle.sha256)
+        });
+        tokio::pin!(prepare_administrative_bundle);
+        let mut administrative_bundle_heartbeat =
+            tokio::time::interval(lease_heartbeat_period(lease_seconds));
+        administrative_bundle_heartbeat
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        administrative_bundle_heartbeat.tick().await;
+        let administrative_bundle_hash = loop {
+            tokio::select! {
+                result = &mut prepare_administrative_bundle => {
+                    break result??;
+                },
+                _ = administrative_bundle_heartbeat.tick() => {
+                    progress
+                        .heartbeat(
+                            "prepare_administrative_closure_bundle",
+                            0.68,
+                            Some(json!({
+                                "closureCheckId": closure_check_id,
+                                "longRunningOperation": true,
+                            })),
+                        )
+                        .await?;
+                }
+            }
+        };
         let discovery_binding = scope_closure_snapshot_binding(
             &state.pool,
             &effective_scope,
@@ -2452,11 +2872,14 @@ pub async fn execute_scope_closure_job(
                 })),
             )
             .await?;
-        (scan, validation) = scan_and_validate_scope(
+        (scan, validation) = scan_and_validate_scope_with_heartbeat(
             &provider,
             &state.pool,
             worker_job_id,
             &final_requested_scope,
+            &progress,
+            closure_check_id,
+            lease_seconds,
         )
         .await?;
         effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
@@ -2466,29 +2889,67 @@ pub async fn execute_scope_closure_job(
             .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
     }
 
-    normalize_database_issue_severities(&mut scan.issues)?;
-    scan.issues
-        .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
-    let (closure_bundle_bytes, closure_bundle_hash) =
-        build_closure_bundle(&input, &validation, &scan)?;
-    let source_fingerprint = source_fingerprint(&scan.documents)?;
-    let resolution_map = build_resolution_map(&scan.edges, &scan.omitted_version_resolutions);
-    let resolution_map_hash = canonical_json_sha256(&resolution_map)?;
-    let issue_jsonl = build_issue_jsonl(&scan.issues)?;
-    let xlsx_report = build_xlsx_report(closure_check_id, &scan.issues)?;
-
-    let mut artifacts =
-        prepare_closure_content_artifacts(closure_bundle_bytes, issue_jsonl, xlsx_report);
-    artifacts.sort_by(|left, right| {
-        left.descriptor
-            .artifact_type
-            .cmp(&right.descriptor.artifact_type)
+    let input_for_artifacts = input.clone();
+    let prepare_artifacts = tokio::task::spawn_blocking(move || {
+        normalize_database_issue_severities(&mut scan.issues)?;
+        scan.issues
+            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+        let resolution_map =
+            build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
+        let resolution_map_hash = spooled_json_array_sha256(&resolution_map)?;
+        let closure_bundle =
+            build_closure_bundle(&input_for_artifacts, &validation, &scan, &resolution_map)?;
+        let closure_bundle_hash = closure_bundle.sha256.clone();
+        let source_fingerprint = source_fingerprint(&scan.documents)?;
+        let mut artifacts =
+            prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan.issues)?;
+        artifacts.sort_by(|left, right| {
+            left.descriptor
+                .artifact_type
+                .cmp(&right.descriptor.artifact_type)
+        });
+        let artifact_manifest = artifacts
+            .iter()
+            .map(|artifact| artifact.descriptor.clone())
+            .collect::<Vec<_>>();
+        let content_artifact_manifest_hash = canonical_json_sha256(&artifact_manifest)?;
+        Ok::<_, anyhow::Error>((
+            scan,
+            artifacts,
+            closure_bundle_hash,
+            source_fingerprint,
+            resolution_map_hash,
+            content_artifact_manifest_hash,
+        ))
     });
-    let artifact_manifest = artifacts
-        .iter()
-        .map(|artifact| artifact.descriptor.clone())
-        .collect::<Vec<_>>();
-    let content_artifact_manifest_hash = canonical_json_sha256(&artifact_manifest)?;
+    tokio::pin!(prepare_artifacts);
+    let mut artifact_heartbeat = tokio::time::interval(lease_heartbeat_period(lease_seconds));
+    artifact_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    artifact_heartbeat.tick().await;
+    let (
+        scan,
+        artifacts,
+        closure_bundle_hash,
+        source_fingerprint,
+        resolution_map_hash,
+        content_artifact_manifest_hash,
+    ) = loop {
+        tokio::select! {
+            result = &mut prepare_artifacts => break result??,
+            _ = artifact_heartbeat.tick() => {
+                progress
+                    .heartbeat(
+                        "prepare_closure_artifacts",
+                        0.82,
+                        Some(json!({
+                            "closureCheckId": closure_check_id,
+                            "longRunningOperation": true,
+                        })),
+                    )
+                    .await?;
+            }
+        }
+    };
 
     progress
         .heartbeat(
@@ -2739,13 +3200,16 @@ async fn reuse_completed_scan_execution(
         return Err(anyhow::anyhow!("completed scan is not reusable"));
     }
     let issues = load_reused_issues(&state.pool, completed_check_id).await?;
-    let xlsx = build_xlsx_report(closure_check_id, &issues)?;
-    let artifact = prepare_artifact(
+    let temp = Arc::new(TempDir::new()?);
+    let xlsx_path = temp.path().join("closure-report-v1.xlsx");
+    build_xlsx_report_file(&xlsx_path, closure_check_id, &issues)?;
+    let artifact = prepare_file_artifact(
+        temp,
         "closure_report_xlsx",
         "closure-report-v1.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        xlsx,
-    );
+        xlsx_path,
+    )?;
     let content_manifest_hash = canonical_json_sha256(&vec![artifact.descriptor.clone()])?;
     let persisted = persist_closure_artifacts(
         state,
@@ -3266,75 +3730,115 @@ fn source_fingerprint(documents: &[ClosureDocument]) -> anyhow::Result<String> {
     canonical_json_sha256(&source)
 }
 
-fn build_resolution_map(edges: &[ReferenceEdge], omitted_resolutions: &[Value]) -> Vec<Value> {
-    let mut resolutions = edges
-        .iter()
-        .map(|edge| {
-            json!({
-                "kind": "reference-request",
-                "source": edge.document_key,
-                "jsonPath": edge.json_path,
-                "role": edge.reference_role,
-                "targetCategory": edge.target_category,
-                "targetId": edge.target_uuid,
-                "requestedVersionState": edge.requested_version_state,
-                "requestedVersion": edge.requested_version,
-            })
-        })
-        .collect::<Vec<_>>();
-    resolutions.extend(omitted_resolutions.iter().map(|resolution| {
-        json!({
+fn build_resolution_map_spool(
+    edges: &[ReferenceEdge],
+    omitted_resolutions: &[Value],
+) -> anyhow::Result<JsonlValueSpool> {
+    let mut writer = JsonlValueSpoolWriter::new("resolution-map-unsorted.jsonl")?;
+    for edge in edges {
+        writer.append(&json!({
+            "kind": "reference-request",
+            "source": edge.document_key,
+            "jsonPath": edge.json_path,
+            "role": edge.reference_role,
+            "targetCategory": edge.target_category,
+            "targetId": edge.target_uuid,
+            "requestedVersionState": edge.requested_version_state,
+            "requestedVersion": edge.requested_version,
+        }))?;
+    }
+    for resolution in omitted_resolutions {
+        writer.append(&json!({
             "kind": "omitted-version-resolution",
             "provenance": resolution,
-        })
-    }));
-    sort_by_canonical_value(&mut resolutions);
-    resolutions
+        }))?;
+    }
+    let unsorted = writer.finish()?;
+    sort_jsonl_spool(&unsorted)
 }
 
-fn prepare_artifact(
+fn prepare_closure_content_artifacts(
+    closure_bundle: ClosureBundleFile,
+    closure_check_id: Uuid,
+    issues: &[ClosureIssue],
+) -> anyhow::Result<Vec<PreparedArtifact>> {
+    let ClosureBundleFile {
+        temp,
+        path: bundle_path,
+        byte_size: bundle_byte_size,
+        sha256: bundle_sha256,
+    } = closure_bundle;
+    let issues_path = temp.path().join("closure-issues-v1.jsonl");
+    write_issue_jsonl_file(&issues_path, issues)?;
+    let xlsx_path = temp.path().join("closure-report-v1.xlsx");
+    build_xlsx_report_file(&xlsx_path, closure_check_id, issues)?;
+
+    Ok(vec![
+        PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_bundle".to_owned(),
+                file_name: "closure-bundle-v1.json".to_owned(),
+                content_type: "application/json".to_owned(),
+                byte_size: usize::try_from(bundle_byte_size)?,
+                checksum_sha256: bundle_sha256,
+            },
+            path: bundle_path,
+            _temp: Arc::clone(&temp),
+        },
+        prepare_file_artifact(
+            Arc::clone(&temp),
+            "closure_issues_jsonl",
+            "closure-issues-v1.jsonl",
+            "application/x-ndjson",
+            issues_path,
+        )?,
+        prepare_file_artifact(
+            temp,
+            "closure_report_xlsx",
+            "closure-report-v1.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            xlsx_path,
+        )?,
+    ])
+}
+
+fn prepare_file_artifact(
+    temp: Arc<TempDir>,
     artifact_type: &str,
     file_name: &str,
     content_type: &str,
-    bytes: Vec<u8>,
-) -> PreparedArtifact {
-    PreparedArtifact {
+    path: PathBuf,
+) -> anyhow::Result<PreparedArtifact> {
+    let (byte_size, checksum_sha256) = file_size_and_sha256(&path)?;
+    Ok(PreparedArtifact {
         descriptor: ArtifactManifestEntry {
             artifact_type: artifact_type.to_owned(),
             file_name: file_name.to_owned(),
             content_type: content_type.to_owned(),
-            byte_size: bytes.len(),
-            checksum_sha256: sha256_hex(&bytes),
+            byte_size: usize::try_from(byte_size)?,
+            checksum_sha256,
         },
-        bytes,
-    }
+        path,
+        _temp: temp,
+    })
 }
 
-fn prepare_closure_content_artifacts(
-    closure_bundle_bytes: Vec<u8>,
-    issue_jsonl: Vec<u8>,
-    xlsx_report: Vec<u8>,
-) -> Vec<PreparedArtifact> {
-    vec![
-        prepare_artifact(
-            "closure_bundle",
-            "closure-bundle-v1.json",
-            "application/json",
-            closure_bundle_bytes,
-        ),
-        prepare_artifact(
-            "closure_issues_jsonl",
-            "closure-issues-v1.jsonl",
-            "application/x-ndjson",
-            issue_jsonl,
-        ),
-        prepare_artifact(
-            "closure_report_xlsx",
-            "closure-report-v1.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            xlsx_report,
-        ),
-    ]
+fn file_size_and_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        byte_size = byte_size
+            .checked_add(u64::try_from(read)?)
+            .ok_or_else(|| anyhow::anyhow!("artifact byte size overflow"))?;
+    }
+    Ok((byte_size, hex::encode(digest.finalize())))
 }
 
 async fn persist_closure_artifacts(
@@ -3355,10 +3859,11 @@ async fn persist_closure_artifacts(
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
         if let Err(error) = state
             .object_store
-            .upload_object_key(
+            .upload_object_key_file(
                 object_key.as_str(),
                 artifact.descriptor.content_type.as_str(),
-                artifact.bytes.clone(),
+                &artifact.path,
+                u64::try_from(artifact.descriptor.byte_size)?,
             )
             .await
         {
@@ -3462,13 +3967,14 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
     Ok(row.try_get("manifest_hash")?)
 }
 
-fn build_issue_jsonl(issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
-    let mut output = Vec::new();
+fn write_issue_jsonl_file(path: &Path, issues: &[ClosureIssue]) -> anyhow::Result<()> {
+    let mut output = BufWriter::new(File::create(path)?);
     for issue in issues {
-        output.extend(canonical_json_bytes(issue)?);
-        output.push(b'\n');
+        output.write_all(&canonical_json_bytes(issue)?)?;
+        output.write_all(b"\n")?;
     }
-    Ok(output)
+    output.flush()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3479,113 +3985,137 @@ async fn run_tidas_batch_validation_cached(
 ) -> anyhow::Result<TidasBatchValidation> {
     let handshake = tokio::task::spawn_blocking(tidas_cli::handshake).await??;
     let describe = handshake.validation_describe;
-    let documents_for_keys = documents.to_vec();
-    let describe_for_keys = describe.clone();
-    let cache_keys = tokio::task::spawn_blocking(move || {
-        documents_for_keys
-            .iter()
-            .map(|document| document_validation_cache_key(document, &describe_for_keys))
-            .collect::<anyhow::Result<Vec<_>>>()
-    })
-    .await??;
-    let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
-    let cached_by_key = cached
-        .into_iter()
-        .map(|item| (document_evidence_key(&item), item))
-        .collect::<BTreeMap<_, _>>();
-    let mut issue_events = Vec::new();
-    let mut missing = Vec::new();
-    for (document, key) in documents.iter().zip(&cache_keys) {
-        if let Some(hit) = cached_by_key.get(&document_evidence_key(key)) {
-            let issue_artifact_ref = hit
-                .get("issueArtifactRef")
-                .ok_or_else(|| anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactRef"))?;
-            let expected_artifact_hash = hit
-                .get("issueArtifactHash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
+    let mut aggregate = JsonlValueSpoolWriter::new("validation-issues-unsorted.jsonl")?;
+    let mut cache_hit_count = 0_usize;
+    let mut validated_count = 0_usize;
+
+    for document_chunk in documents.chunks(VALIDATION_CACHE_LOOKUP_BATCH_SIZE) {
+        let documents_for_keys = document_chunk.to_vec();
+        let describe_for_keys = describe.clone();
+        let cache_keys = tokio::task::spawn_blocking(move || {
+            documents_for_keys
+                .iter()
+                .map(|document| document_validation_cache_key(document, &describe_for_keys))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .await??;
+        let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
+        let cached_by_key = cached
+            .into_iter()
+            .map(|item| (document_evidence_key(&item), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut missing = Vec::new();
+
+        for (document, key) in document_chunk.iter().zip(&cache_keys) {
+            if let Some(hit) = cached_by_key.get(&document_evidence_key(key)) {
+                let issue_artifact_ref = hit.get("issueArtifactRef").ok_or_else(|| {
+                    anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactRef")
+                })?;
+                let expected_artifact_hash = hit
+                    .get("issueArtifactHash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
                     anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactHash")
                 })?;
-            if canonical_json_sha256(issue_artifact_ref)? != expected_artifact_hash {
-                return Err(anyhow::anyhow!(
-                    "cached TIDAS evidence issue artifact hash mismatch"
-                ));
-            }
-            issue_events.extend(
-                issue_artifact_ref
+                if canonical_json_sha256(issue_artifact_ref)? != expected_artifact_hash {
+                    return Err(anyhow::anyhow!(
+                        "cached TIDAS evidence issue artifact hash mismatch"
+                    ));
+                }
+                for event in issue_artifact_ref
                     .get("issues")
                     .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        } else {
-            missing.push(document.clone());
+                    .into_iter()
+                    .flatten()
+                {
+                    aggregate.append(event)?;
+                }
+                cache_hit_count += 1;
+            } else {
+                missing.push(document.clone());
+            }
+        }
+
+        for validation_batch in missing.chunks(VALIDATION_EXECUTION_BATCH_SIZE) {
+            let owned_batch = validation_batch.to_vec();
+            let describe_for_validation = describe.clone();
+            let uncached = tokio::task::spawn_blocking(move || {
+                run_tidas_batch_validation(&owned_batch, describe_for_validation)
+            })
+            .await??;
+            validated_count += validation_batch.len();
+
+            let mut issues_by_document = BTreeMap::<String, Vec<Value>>::new();
+            uncached.issue_events.visit(|event| {
+                let document_key = event
+                    .get("document_key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("TIDAS issue event omitted document_key"))?
+                    .to_owned();
+                aggregate.append(&event)?;
+                issues_by_document
+                    .entry(document_key)
+                    .or_default()
+                    .push(event);
+                Ok(())
+            })?;
+
+            let mut records = Vec::new();
+            let mut record_bytes = 0_usize;
+            for document in validation_batch {
+                let issues = issues_by_document
+                    .remove(&document.identity.document_key())
+                    .unwrap_or_default();
+                let record =
+                    build_document_validation_evidence(document, &describe, issues.as_slice())?;
+                let encoded_bytes = canonical_json_bytes(&record)?.len();
+                if !records.is_empty()
+                    && record_bytes.saturating_add(encoded_bytes)
+                        > VALIDATION_CACHE_RECORD_BATCH_BYTES
+                {
+                    record_document_validation_evidence(pool, worker_job_id, records.as_slice())
+                        .await?;
+                    records.clear();
+                    record_bytes = 0;
+                }
+                if encoded_bytes > VALIDATION_CACHE_RECORD_BATCH_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "validation cache record exceeds the {VALIDATION_CACHE_RECORD_BATCH_BYTES} byte memory budget"
+                    ));
+                }
+                record_bytes = record_bytes.saturating_add(encoded_bytes);
+                records.push(record);
+            }
+            if !records.is_empty() {
+                record_document_validation_evidence(pool, worker_job_id, &records).await?;
+            }
         }
     }
 
-    let missing_for_validation = missing.clone();
-    let describe_for_validation = describe.clone();
-    let uncached = tokio::task::spawn_blocking(move || {
-        run_tidas_batch_validation(&missing_for_validation, describe_for_validation)
-    })
-    .await??;
-    issue_events.extend(uncached.issue_events.clone());
-    if !missing.is_empty() {
-        let records = missing
-            .iter()
-            .map(|document| {
-                let issues = uncached
-                    .issue_events
-                    .iter()
-                    .filter(|event| {
-                        event.get("document_key").and_then(Value::as_str)
-                            == Some(document.identity.document_key().as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut record = document_validation_cache_key(document, &describe)?;
-                let Value::Object(record) = &mut record else {
-                    unreachable!("cache key is an object")
-                };
-                record.insert(
-                    "status".to_owned(),
-                    Value::String(
-                        if issues.is_empty() {
-                            "passed"
-                        } else {
-                            "failed"
-                        }
-                        .to_owned(),
-                    ),
-                );
-                record.insert(
-                    "summary".to_owned(),
-                    json!({"issueCount": issues.len(), "completed": true}),
-                );
-                record.insert("issueArtifactRef".to_owned(), json!({"issues": issues}));
-                record.insert(
-                    "issueArtifactHash".to_owned(),
-                    Value::String(canonical_json_sha256(
-                        record.get("issueArtifactRef").unwrap(),
-                    )?),
-                );
-                Ok(Value::Object(record.clone()))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        record_document_validation_evidence(pool, worker_job_id, &records).await?;
-    }
-    sort_by_canonical_value(&mut issue_events);
+    let unsorted_issue_events = aggregate.finish()?;
+    let issue_events = sort_jsonl_spool(&unsorted_issue_events)?;
+    tracing::info!(
+        phase = "scope_closure_tidas_validation",
+        document_count = documents.len(),
+        cache_hit_count,
+        validated_count,
+        issue_event_count = issue_events.event_count,
+        issue_spool_bytes = issue_events.byte_size,
+        issue_spool_sha256 = issue_events.sha256,
+        "scope closure TIDAS validation completed"
+    );
     let final_event = json!({
         "type": "final",
         "schema_version": "tidas.validation-final-event.v1",
         "protocol": TIDAS_BATCH_PROTOCOL,
         "profile": TIDAS_BATCH_PROFILE,
         "completed": true,
+        "logical_issue_stream_sha256": issue_events.sha256.as_str(),
         "summary": {
             "document_count": documents.len(),
-            "issue_count": issue_events.len(),
-            "cache_hit_count": documents.len() - missing.len(),
-            "validated_count": missing.len(),
+            "issue_count": issue_events.event_count,
+            "cache_hit_count": cache_hit_count,
+            "validated_count": validated_count,
         },
         "fingerprints": describe,
     });
@@ -3601,6 +4131,7 @@ fn run_tidas_batch_validation(
     describe: Value,
 ) -> anyhow::Result<TidasBatchValidation> {
     if documents.is_empty() {
+        let issue_events = JsonlValueSpoolWriter::new("validation-issues.jsonl")?.finish()?;
         return Ok(TidasBatchValidation {
             describe,
             final_event: json!({
@@ -3608,7 +4139,7 @@ fn run_tidas_batch_validation(
                 "completed": true,
                 "summary": {"document_count": 0, "issue_count": 0},
             }),
-            issue_events: Vec::new(),
+            issue_events,
         });
     }
     let (temp, input_dir, manifest_path) = spool_tidas_batch_documents(documents)?;
@@ -3651,23 +4182,34 @@ fn run_tidas_batch_validation(
             anyhow::anyhow!("tidas_report_invalid: document batch omitted event spool artifact")
         })?;
     tidas_cli::verify_artifact(&events_path, artifact)?;
-    let events = tidas_cli::read_jsonl(&events_path)?;
-    if output.report.pointer("/summary/validation_batch_final") != events.last() {
-        return Err(anyhow::anyhow!(
-            "tidas_spool_final_mismatch: operation report final event differs from event spool"
-        ));
-    }
-    let final_positions = events
-        .iter()
-        .enumerate()
-        .filter(|(_, event)| event.get("type").and_then(Value::as_str) == Some("final"))
-        .collect::<Vec<_>>();
-    if final_positions.len() != 1 || final_positions[0].0 + 1 != events.len() {
+    let mut issue_events = JsonlValueSpoolWriter::new("validation-issues.jsonl")?;
+    let mut final_event = None;
+    let mut final_count = 0_u64;
+    let mut observed_after_final = false;
+    tidas_cli::visit_jsonl(&events_path, |event| {
+        if final_event.is_some() {
+            observed_after_final = true;
+        }
+        if event.get("type").and_then(Value::as_str) == Some("final") {
+            final_count += 1;
+            final_event = Some(event);
+        } else if event.get("type").and_then(Value::as_str) == Some("issue") {
+            issue_events.append(&event)?;
+        }
+        Ok(())
+    })?;
+    if final_count != 1 || observed_after_final {
         return Err(anyhow::anyhow!(
             "TIDAS batch validator must emit exactly one terminal final event"
         ));
     }
-    let final_event = final_positions[0].1.clone();
+    let final_event = final_event
+        .ok_or_else(|| anyhow::anyhow!("TIDAS batch validator omitted terminal final event"))?;
+    if output.report.pointer("/summary/validation_batch_final") != Some(&final_event) {
+        return Err(anyhow::anyhow!(
+            "tidas_spool_final_mismatch: operation report final event differs from event spool"
+        ));
+    }
     if final_event.get("completed").and_then(Value::as_bool) != Some(true)
         || final_event.get("protocol").and_then(Value::as_str) != Some(TIDAS_BATCH_PROTOCOL)
         || final_event.get("profile").and_then(Value::as_str) != Some(TIDAS_BATCH_PROFILE)
@@ -3676,11 +4218,13 @@ fn run_tidas_batch_validation(
             "TIDAS batch validator final event does not match the requested protocol/profile"
         ));
     }
-    let issue_events = events
-        .into_iter()
-        .filter(|event| event.get("type").and_then(Value::as_str) == Some("issue"))
-        .collect::<Vec<_>>();
-    validate_tidas_final_event(&final_event, &issue_events, documents.len())?;
+    let issue_events = issue_events.finish()?;
+    validate_tidas_final_event(
+        &final_event,
+        issue_events.event_count,
+        issue_events.sha256.as_str(),
+        documents.len(),
+    )?;
     Ok(TidasBatchValidation {
         describe,
         final_event,
@@ -3719,7 +4263,8 @@ fn spool_tidas_batch_documents(
 
 fn validate_tidas_final_event(
     final_event: &Value,
-    issue_events: &[Value],
+    issue_event_count: u64,
+    logical_issue_stream_sha256: &str,
     document_count: usize,
 ) -> anyhow::Result<()> {
     let reported_documents = final_event
@@ -3728,22 +4273,16 @@ fn validate_tidas_final_event(
         .and_then(|count| usize::try_from(count).ok());
     let reported_issues = final_event
         .pointer("/summary/issue_count")
-        .and_then(Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok());
-    if reported_documents != Some(document_count) || reported_issues != Some(issue_events.len()) {
+        .and_then(Value::as_u64);
+    if reported_documents != Some(document_count) || reported_issues != Some(issue_event_count) {
         return Err(anyhow::anyhow!(
             "TIDAS batch validator final summary does not match the observed stream"
         ));
     }
-    let mut logical_stream = Vec::new();
-    for issue in issue_events {
-        logical_stream.extend(canonical_json_bytes(issue)?);
-        logical_stream.push(b'\n');
-    }
     if final_event
         .get("logical_issue_stream_sha256")
         .and_then(Value::as_str)
-        != Some(sha256_hex(&logical_stream).as_str())
+        != Some(logical_issue_stream_sha256)
     {
         return Err(anyhow::anyhow!(
             "TIDAS batch validator logical issue stream hash mismatch"
@@ -3801,6 +4340,42 @@ fn document_validation_cache_key(
         // indexes, methodologies, rulesets, XSD, and XSLT assets.
         "tidasSchemaLockSha256": asset_fingerprint,
     }))
+}
+
+fn build_document_validation_evidence(
+    document: &ClosureDocument,
+    describe: &Value,
+    issues: &[Value],
+) -> anyhow::Result<Value> {
+    let mut record = document_validation_cache_key(document, describe)?;
+    let Value::Object(record) = &mut record else {
+        unreachable!("cache key is an object")
+    };
+    record.insert(
+        "status".to_owned(),
+        Value::String(
+            if issues.is_empty() {
+                "passed"
+            } else {
+                "failed"
+            }
+            .to_owned(),
+        ),
+    );
+    record.insert(
+        "summary".to_owned(),
+        json!({"issueCount": issues.len(), "completed": true}),
+    );
+    record.insert("issueArtifactRef".to_owned(), json!({"issues": issues}));
+    record.insert(
+        "issueArtifactHash".to_owned(),
+        Value::String(canonical_json_sha256(
+            record
+                .get("issueArtifactRef")
+                .expect("issueArtifactRef was inserted"),
+        )?),
+    );
+    Ok(Value::Object(record.clone()))
 }
 
 fn document_evidence_key(value: &Value) -> String {
@@ -3871,13 +4446,16 @@ async fn record_document_validation_evidence(
     ensure_rpc_ok(&result, "svc_lcia_document_validation_evidence_record")
 }
 
-fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) {
+fn merge_tidas_validation_issues(
+    scan: &mut ScopeClosureScan,
+    events: &JsonlValueSpool,
+) -> anyhow::Result<()> {
     let documents = scan
         .documents
         .iter()
         .map(|document| (document.identity.document_key(), document.identity.clone()))
         .collect::<BTreeMap<_, _>>();
-    for event in events {
+    events.visit(|event| {
         let document_key = event
             .get("document_key")
             .and_then(Value::as_str)
@@ -3932,15 +4510,36 @@ fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) 
             affected_root_witness_paths: Vec::new(),
             witness_path: Vec::new(),
         });
-    }
+        Ok(())
+    })?;
     scan.issues = coalesce_issues(std::mem::take(&mut scan.issues));
     populate_affected_roots(scan);
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
-    let cursor = Cursor::new(Vec::new());
-    let mut zip = ZipWriter::new(cursor);
+    let cursor = std::io::Cursor::new(Vec::new());
+    Ok(write_xlsx_report(cursor, closure_check_id, issues)?.into_inner())
+}
+
+fn build_xlsx_report_file(
+    path: &Path,
+    closure_check_id: Uuid,
+    issues: &[ClosureIssue],
+) -> anyhow::Result<()> {
+    write_xlsx_report(File::create(path)?, closure_check_id, issues)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_xlsx_report<W: Write + Seek>(
+    writer: W,
+    closure_check_id: Uuid,
+    issues: &[ClosureIssue],
+) -> anyhow::Result<W> {
+    let mut zip = ZipWriter::new(writer);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("[Content_Types].xml", options)?;
     zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
@@ -3997,35 +4596,35 @@ fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow:
         "Affected roots",
         "Suggested action",
     ];
-    let mut issue_rows = vec![headers.iter().map(|value| (*value).to_owned()).collect()];
-    for issue in issues {
-        let source = issue.source.as_ref();
-        issue_rows.push(vec![
-            issue.issue_key.clone(),
-            issue.issue_code.clone(),
-            issue.severity.clone(),
-            issue.message.clone(),
-            source
-                .map(|item| item.category.table_name().to_owned())
-                .unwrap_or_default(),
-            source.map(|item| item.id.to_string()).unwrap_or_default(),
-            source.map(|item| item.version.clone()).unwrap_or_default(),
-            issue.json_path.clone().unwrap_or_default(),
-            issue.reference_role.clone().unwrap_or_default(),
-            issue.requested_target_type.clone().unwrap_or_default(),
-            issue
-                .requested_target_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
-            issue.requested_target_version.clone().unwrap_or_default(),
-            issue.occurrence_count.to_string(),
-            issue.affected_roots.len().to_string(),
-            issue.suggested_action.clone().unwrap_or_default(),
-        ]);
-    }
+    let issue_rows = std::iter::once(headers.iter().map(|value| (*value).to_owned()).collect())
+        .chain(issues.iter().map(|issue| {
+            let source = issue.source.as_ref();
+            vec![
+                issue.issue_key.clone(),
+                issue.issue_code.clone(),
+                issue.severity.clone(),
+                issue.message.clone(),
+                source
+                    .map(|item| item.category.table_name().to_owned())
+                    .unwrap_or_default(),
+                source.map(|item| item.id.to_string()).unwrap_or_default(),
+                source.map(|item| item.version.clone()).unwrap_or_default(),
+                issue.json_path.clone().unwrap_or_default(),
+                issue.reference_role.clone().unwrap_or_default(),
+                issue.requested_target_type.clone().unwrap_or_default(),
+                issue
+                    .requested_target_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                issue.requested_target_version.clone().unwrap_or_default(),
+                issue.occurrence_count.to_string(),
+                issue.affected_roots.len().to_string(),
+                issue.suggested_action.clone().unwrap_or_default(),
+            ]
+        }));
     write_xlsx_worksheet(&mut zip, options, 2, issue_rows)?;
 
-    let mut occurrence_rows = vec![vec![
+    let occurrence_header = vec![
         "Issue key".to_owned(),
         "Occurrence key".to_owned(),
         "Source type".to_owned(),
@@ -4034,89 +4633,94 @@ fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow:
         "JSON path".to_owned(),
         "Reference role".to_owned(),
         "Details".to_owned(),
-    ]];
-    for issue in issues {
-        for occurrence in &issue.occurrences {
-            let source = occurrence.source.as_ref();
-            occurrence_rows.push(vec![
-                issue.issue_key.clone(),
-                occurrence.occurrence_key.clone(),
-                source
-                    .map(|item| item.category.table_name().to_owned())
-                    .unwrap_or_default(),
-                source.map(|item| item.id.to_string()).unwrap_or_default(),
-                source.map(|item| item.version.clone()).unwrap_or_default(),
-                occurrence.json_path.clone().unwrap_or_default(),
-                occurrence.reference_role.clone().unwrap_or_default(),
-                canonical_value(&occurrence.details),
-            ]);
-        }
-    }
+    ];
+    let occurrence_rows =
+        std::iter::once(occurrence_header).chain(issues.iter().flat_map(|issue| {
+            issue.occurrences.iter().map(move |occurrence| {
+                let source = occurrence.source.as_ref();
+                vec![
+                    issue.issue_key.clone(),
+                    occurrence.occurrence_key.clone(),
+                    source
+                        .map(|item| item.category.table_name().to_owned())
+                        .unwrap_or_default(),
+                    source.map(|item| item.id.to_string()).unwrap_or_default(),
+                    source.map(|item| item.version.clone()).unwrap_or_default(),
+                    occurrence.json_path.clone().unwrap_or_default(),
+                    occurrence.reference_role.clone().unwrap_or_default(),
+                    canonical_value(&occurrence.details),
+                ]
+            })
+        }));
     write_xlsx_worksheet(&mut zip, options, 3, occurrence_rows)?;
 
-    let mut affected_rows = vec![vec![
+    let affected_header = vec![
         "Issue key".to_owned(),
         "Dataset type".to_owned(),
         "Dataset id".to_owned(),
         "Dataset version".to_owned(),
         "Witness path".to_owned(),
-    ]];
-    for issue in issues {
-        for (index, root) in issue.affected_roots.iter().enumerate() {
-            let witness = issue
-                .affected_root_witness_paths
-                .get(index)
-                .unwrap_or(&issue.witness_path);
-            affected_rows.push(vec![
-                issue.issue_key.clone(),
-                root.category.table_name().to_owned(),
-                root.id.to_string(),
-                root.version.clone(),
-                canonical_value(witness),
-            ]);
-        }
-    }
+    ];
+    let affected_rows = std::iter::once(affected_header).chain(issues.iter().flat_map(|issue| {
+        issue
+            .affected_roots
+            .iter()
+            .enumerate()
+            .map(move |(index, root)| {
+                let witness = issue
+                    .affected_root_witness_paths
+                    .get(index)
+                    .unwrap_or(&issue.witness_path);
+                vec![
+                    issue.issue_key.clone(),
+                    root.category.table_name().to_owned(),
+                    root.id.to_string(),
+                    root.version.clone(),
+                    canonical_value(witness),
+                ]
+            })
+    }));
     write_xlsx_worksheet(&mut zip, options, 4, affected_rows)?;
-    Ok(zip.finish()?.into_inner())
+    Ok(zip.finish()?)
 }
 
-fn write_xlsx_worksheet<I>(
-    zip: &mut ZipWriter<Cursor<Vec<u8>>>,
+fn write_xlsx_worksheet<W, I>(
+    zip: &mut ZipWriter<W>,
     options: SimpleFileOptions,
     sheet_number: usize,
     rows: I,
 ) -> anyhow::Result<()>
 where
+    W: Write + Seek,
     I: IntoIterator<Item = Vec<String>>,
 {
     zip.start_file(format!("xl/worksheets/sheet{sheet_number}.xml"), options)?;
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
-    );
+    zip.write_all(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+    )?;
     for (index, row) in rows.into_iter().enumerate() {
-        append_xlsx_row(&mut xml, index + 1, row);
+        write_xlsx_row(zip, index + 1, row)?;
     }
-    xml.push_str("</sheetData></worksheet>");
-    zip.write_all(xml.as_bytes())?;
+    zip.write_all(b"</sheetData></worksheet>")?;
     Ok(())
 }
 
-fn append_xlsx_row<I>(xml: &mut String, row: usize, values: I)
+fn write_xlsx_row<W, I>(writer: &mut W, row: usize, values: I) -> anyhow::Result<()>
 where
+    W: Write,
     I: IntoIterator<Item = String>,
 {
-    xml.push_str(format!("<row r=\"{row}\">").as_str());
+    write!(writer, "<row r=\"{row}\">")?;
     for (column, value) in values.into_iter().enumerate() {
         let reference = format!("{}{}", xlsx_column_name(column), row);
-        xml.push_str(
-            format!(
-                "<c r=\"{reference}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
-                xml_escape(value.as_str())
-            )
-            .as_str(),
-        );
+        write!(
+            writer,
+            "<c r=\"{reference}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+            xml_escape(value.as_str())
+        )?;
     }
-    xml.push_str("</row>");
+    writer.write_all(b"</row>")?;
+    Ok(())
 }
 
 fn xlsx_column_name(mut index: usize) -> String {
@@ -4274,6 +4878,7 @@ pub struct PackageClosureBinding<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -4691,7 +5296,7 @@ mod tests {
 
     #[test]
     fn tidas_final_event_must_close_the_exact_observed_issue_stream() {
-        let issues = vec![json!({
+        let issues = [json!({
             "type": "issue",
             "document_key": "sources:1:01.00.000",
             "issue": {"code": "invalid"},
@@ -4706,11 +5311,172 @@ mod tests {
             "summary": {"document_count": 1, "issue_count": 1},
             "logical_issue_stream_sha256": sha256_hex(&logical_stream),
         });
-        validate_tidas_final_event(&final_event, &issues, 1).unwrap();
+        validate_tidas_final_event(
+            &final_event,
+            u64::try_from(issues.len()).unwrap(),
+            sha256_hex(&logical_stream).as_str(),
+            1,
+        )
+        .unwrap();
 
         let mut drifted = final_event;
         drifted["logical_issue_stream_sha256"] = json!("0".repeat(64));
-        assert!(validate_tidas_final_event(&drifted, &issues, 1).is_err());
+        assert!(
+            validate_tidas_final_event(
+                &drifted,
+                u64::try_from(issues.len()).unwrap(),
+                sha256_hex(&logical_stream).as_str(),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_issue_sort_is_deterministic_across_bounded_runs() {
+        let mut writer = JsonlValueSpoolWriter::new("unsorted.jsonl").unwrap();
+        let mut expected = Vec::new();
+        for index in (0..500_u64).rev() {
+            let event = json!({
+                "type": "issue",
+                "document_key": format!("sources:{index}:01.00.000"),
+                "issue": {"code": "invalid", "message": "x".repeat(usize::try_from(index).unwrap() % 17)},
+            });
+            expected.push(event.clone());
+            writer.append(&event).unwrap();
+        }
+        sort_by_canonical_value(&mut expected);
+
+        let unsorted = writer.finish().unwrap();
+        let sorted = sort_jsonl_spool_with_run_bytes(&unsorted, 512).unwrap();
+        let mut actual = Vec::new();
+        sorted
+            .visit(|event| {
+                actual.push(event);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(sorted.event_count, 500);
+        let mut logical_stream = Vec::new();
+        for event in &actual {
+            logical_stream.extend(canonical_json_bytes(event).unwrap());
+            logical_stream.push(b'\n');
+        }
+        assert_eq!(sorted.sha256, sha256_hex(&logical_stream));
+    }
+
+    #[test]
+    #[ignore = "local capacity gate: writes and external-sorts the qualified 1,088,760-event spool"]
+    fn qualified_million_event_spool_stays_within_fixed_runs() {
+        let event_count = std::env::var("SCOPE_CLOSURE_CAPACITY_EVENTS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_088_760);
+        let message = "x".repeat(440);
+        let started = Instant::now();
+        let mut writer = JsonlValueSpoolWriter::new("qualified-unsorted.jsonl").unwrap();
+        for index in (0..event_count).rev() {
+            writer
+                .append(&json!({
+                    "type": "issue",
+                    "document_key": format!("sources:{index:07}:01.00.000"),
+                    "issue": {
+                        "code": "qualified_capacity_issue",
+                        "location": "$.fixture",
+                        "message": message,
+                    },
+                }))
+                .unwrap();
+        }
+        let unsorted = writer.finish().unwrap();
+        assert_eq!(unsorted.event_count, event_count);
+        assert!(
+            unsorted.byte_size >= 512 * 1024 * 1024,
+            "qualified spool was unexpectedly small: {} bytes",
+            unsorted.byte_size
+        );
+
+        let sorted = sort_jsonl_spool(&unsorted).unwrap();
+        let mut observed = 0_u64;
+        let mut previous = None::<Vec<u8>>;
+        sorted
+            .visit(|event| {
+                let current = canonical_json_bytes(&event)?;
+                if let Some(previous) = previous.as_ref() {
+                    assert!(previous <= &current);
+                }
+                previous = Some(current);
+                observed += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, event_count);
+        assert_eq!(sorted.event_count, event_count);
+        assert!(
+            started.elapsed().as_secs() <= 180,
+            "qualified issue spool exceeded 3 minutes: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn file_backed_closure_bundle_preserves_v1_canonical_bytes() {
+        let input: ScopeClosureWorkerInput =
+            serde_json::from_value(scope_closure_worker_input_json()).unwrap();
+        let event = json!({
+            "type": "issue",
+            "document_key": "sources:1:01.00.000",
+            "issue": {"code": "invalid"},
+        });
+        let mut spool = JsonlValueSpoolWriter::new("issues.jsonl").unwrap();
+        spool.append(&event).unwrap();
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "fixture"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: spool.finish().unwrap(),
+        };
+        let scan = ScopeClosureScan {
+            schema_version: "lcia.scope-closure-scan.v1".to_owned(),
+            complete: true,
+            roots: Vec::new(),
+            documents: Vec::new(),
+            edges: Vec::new(),
+            resolved_references: Vec::new(),
+            omitted_version_resolutions: Vec::new(),
+            issues: Vec::new(),
+            frontier: Vec::new(),
+            provider_universe: Vec::new(),
+        };
+        let expected = json!({
+            "schemaVersion": "lcia.scope-closure-bundle.v1",
+            "requestedScopeHash": input.requested_scope_hash,
+            "policyFingerprint": input.policy_fingerprint,
+            "dataSnapshotToken": input.data_snapshot_token,
+            "validatorScannerFingerprint": input.expected_validator_scanner_fingerprint,
+            "tidasValidation": {
+                "describe": validation.describe,
+                "finalEvent": validation.final_event,
+                "issueEvents": [event],
+            },
+            "scan": scan,
+            "resolutionMap": [],
+        });
+
+        let resolution_map =
+            build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions).unwrap();
+        let bundle = build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
+
+        assert_eq!(
+            fs::read(&bundle.path).unwrap(),
+            canonical_json_bytes(&expected).unwrap()
+        );
+        assert_eq!(
+            bundle.sha256,
+            sha256_hex(&canonical_json_bytes(&expected).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -4967,11 +5733,21 @@ mod tests {
         assert_eq!(evidence.snapshot_build_contract_hash, None);
         assert_eq!(evidence.evidence_hash, None);
 
+        let temp = Arc::new(TempDir::new().unwrap());
+        let path = temp.path().join("closure-bundle-v1.json");
+        let bytes = br#"{"schemaVersion":"lcia.scope-closure-bundle.v1"}"#;
+        fs::write(&path, bytes).unwrap();
         let artifacts = prepare_closure_content_artifacts(
-            br#"{"schemaVersion":"lcia.scope-closure-bundle.v1"}"#.to_vec(),
-            Vec::new(),
-            Vec::new(),
-        );
+            ClosureBundleFile {
+                temp,
+                path,
+                byte_size: u64::try_from(bytes.len()).unwrap(),
+                sha256: sha256_hex(bytes),
+            },
+            id("91919191-9191-4191-8191-919191919191"),
+            &[],
+        )
+        .unwrap();
         let names = artifacts
             .iter()
             .map(|artifact| artifact.descriptor.file_name.as_str())
@@ -5380,5 +6156,77 @@ mod tests {
         for issue in &issues {
             assert!(!issue.affected_roots.is_empty());
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "local capacity gate: constructs the qualified 112,032-document reference graph"]
+    async fn qualified_reference_graph_completes_within_five_minutes() {
+        const ROOT_COUNT: usize = 5_605;
+        const DOCUMENT_COUNT: usize = 112_032;
+        let support_count = DOCUMENT_COUNT - ROOT_COUNT;
+        let roots = (0..ROOT_COUNT)
+            .map(|index| ExactDatasetIdentity {
+                category: DatasetCategory::Processes,
+                id: Uuid::from_u128(u128::try_from(index).unwrap() + 1),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let support = (0..support_count)
+            .map(|index| ExactDatasetIdentity {
+                category: DatasetCategory::Sources,
+                id: Uuid::from_u128(u128::try_from(ROOT_COUNT + index).unwrap() + 1),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut documents = BTreeMap::new();
+        for (index, root) in roots.iter().enumerate() {
+            let target = &support[index];
+            documents.insert(
+                root.clone(),
+                ClosureDocument {
+                    identity: root.clone(),
+                    payload: json!({
+                        "referenceToSource": reference("source", target.id, Some("01.00.000"))
+                    }),
+                },
+            );
+        }
+        for (index, identity) in support.iter().enumerate() {
+            let next = index + ROOT_COUNT;
+            let payload = if next < support.len() {
+                json!({
+                    "referenceToSource": reference(
+                        "source",
+                        support[next].id,
+                        Some("01.00.000")
+                    )
+                })
+            } else {
+                json!({})
+            };
+            documents.insert(
+                identity.clone(),
+                ClosureDocument {
+                    identity: identity.clone(),
+                    payload,
+                },
+            );
+        }
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+
+        let started = Instant::now();
+        let scan = collect_scope_closure(&provider, &manifest(roots))
+            .await
+            .unwrap();
+
+        assert_eq!(scan.documents.len(), DOCUMENT_COUNT);
+        assert!(
+            started.elapsed().as_secs() <= 300,
+            "qualified reference graph exceeded five minutes: {:?}",
+            started.elapsed()
+        );
     }
 }

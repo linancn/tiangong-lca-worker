@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
-lastReviewedNote: "Issue #148 defines bounded graph-finalization execution, stable issue ordering, and phase-level capacity evidence."
+lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
+lastReviewedNote: "Issue #148 completes bounded validation consumption, cache batching, external ordering, file-backed artifact production, and local capacity evidence."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -101,6 +101,8 @@ Document validation uses only the published unified Rust `tidas` CLI selected by
 
 Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
 
+The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Issue events are stream-verified into disk spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 16 MiB external-sort runs. Resolution-map ordering uses the same bounded mechanism. The Worker records document/cache/issue/spool counts and hashes, retains at least 512 MiB of temporary-volume headroom beyond planned sort space, and fails closed when a spool, cache record, or temporary-space limit is exceeded.
+
 ## Issues and affected roots
 
 The Worker coalesces deterministic issue keys while retaining occurrence counts and orders the final set by stable `issue_key`. Each issue records the primary source identity, JSON path, reference role, requested target identity, message, action, and blocker status. Graph analysis records every affected root and a deterministic witness path specific to that root. Result projection stores primary issues, occurrences, and affected-root rows through the database's V2 result RPC.
@@ -115,6 +117,8 @@ Closure production runs in this fail-closed order:
 2. run signed-flow provider discovery against that same manifest without persisting a snapshot;
 3. freeze the discovered exact Process axis and administratively scan the added provider processes;
 4. evaluate the discovered matrix, provider-link, factorization, and LCIA readiness evidence;
+
+Administrative and final closure bundles, issue JSONL, XLSX worksheets, and object-store uploads are file-backed. Canonical V1 arrays are emitted incrementally from stable in-memory scan collections or sorted spools; the Worker does not reconstruct the complete TIDAS issue or resolution-map event collection as `Vec<Value>`. Temporary directories own every intermediate spool/run/artifact and remove them on success, failure, cancellation, or lease loss after the bounded blocking task exits. Lease heartbeats remain active during both administrative and final artifact preparation.
 5. only when every scan is complete and no blocker remains, run the frozen snapshot builder in persisted build mode.
 
 Administrative closure and numerical Flow selection remain distinct. During the persisted snapshot build, every Elementary Flow referenced by a selected LCIA Method factor is additionally frozen as source-closure `support`, with exact/once-resolved version and recursive support-document closure. A factor-only Flow does not enter the inventory-derived B/C axes, compiled graph, provider discovery, or provider universe. Product, Waste, or Other factor targets are semantic failures; they never cause technosphere expansion.

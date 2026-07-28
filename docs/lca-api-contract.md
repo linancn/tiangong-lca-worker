@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1be56e6f1af9a1bc352a7bbb863454ab8772e392
-lastReviewedNote: "Reviewed for Issue #148; graph-finalization scheduling and diagnostics do not change API payload, result, status, or persistence semantics."
+lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
+lastReviewedNote: "Reviewed for Issue #148; bounded validation/cache/artifact execution preserves API payload, V1 bundle, result, status, and persistence semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

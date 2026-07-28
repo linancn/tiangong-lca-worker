@@ -258,32 +258,41 @@ fn diagnostic_summary(report: &Value, stderr: &str) -> String {
 }
 
 pub fn read_jsonl(path: &Path) -> anyhow::Result<Vec<Value>> {
+    let mut values = Vec::new();
+    visit_jsonl(path, |value| {
+        values.push(value);
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+pub fn visit_jsonl(
+    path: &Path,
+    mut visit: impl FnMut(Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let file = File::open(path)
         .with_context(|| format!("tidas_spool_missing: open {}", path.display()))?;
-    BufReader::new(file)
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| match line {
-            Ok(line) if line.trim().is_empty() => None,
-            other => Some((index, other)),
-        })
-        .map(|(index, line)| {
-            let line = line.with_context(|| {
-                format!(
-                    "tidas_spool_invalid: read line {} from {}",
-                    index + 1,
-                    path.display()
-                )
-            })?;
-            serde_json::from_str(&line).with_context(|| {
-                format!(
-                    "tidas_spool_invalid: parse line {} from {}",
-                    index + 1,
-                    path.display()
-                )
-            })
-        })
-        .collect()
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "tidas_spool_invalid: read line {} from {}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "tidas_spool_invalid: parse line {} from {}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        visit(value)?;
+    }
+    Ok(())
 }
 
 pub fn read_verified_jsonl(path: &Path, expected: &Value) -> anyhow::Result<Vec<Value>> {
@@ -411,6 +420,20 @@ pub fn verify_artifact(path: &Path, expected: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonl_visitor_streams_non_empty_values_in_order() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(&path, b"{\"index\":1}\n\n{\"index\":2}\n").unwrap();
+        let mut indexes = Vec::new();
+        visit_jsonl(&path, |value| {
+            indexes.push(value.get("index").and_then(Value::as_u64).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(indexes, vec![1, 2]);
+    }
 
     #[test]
     fn operation_report_requires_stable_schema_and_fields() {
