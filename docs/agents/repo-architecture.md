@@ -35,7 +35,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 82c1c6e
+lastReviewedCommit: 833808c
 lastReviewedNote: "Reviewed for Issue #158: the 2048 MiB RSS guard changes capacity policy without changing the file-backed closure architecture."
 related:
   - ../../AGENTS.md

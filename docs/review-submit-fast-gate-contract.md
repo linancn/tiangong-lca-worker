@@ -160,14 +160,18 @@ reference 的 malformed UUID/version 使用稳定 `source_reference_invalid`。L
 的 malformed target 在数值 artifact 中仍只记录 evidence，不触发 target lookup。
 
 Snapshot builder 子进程输出 exactly-one `snapshot_builder_terminal.v1` terminal frame，状态只为
-`succeeded` 或 `blocked`。runner 对 terminal 缺失、重复、未知 schema、截断、非零 exit/terminal
-不一致、signal、wall timeout、DB/S3 failure 记 operator error；blocked terminal 只映射到现有
+`succeeded` 或 `blocked`。exit `0` 必须且只能配对 `succeeded`；专用 exit `42` 必须且只能配对
+`blocked`。其他非零 exit 仍是 typed operator `Exit`，signal 仍是 typed `Signal`。runner 对
+terminal 缺失、重复、未知 schema、截断、exit/terminal 不一致、wall timeout、DB/S3 failure
+记 operator error；blocked terminal 只映射到现有
 `blocked`、`blockingReasons` 与 `calculatorReport`。stdout/stderr 以 UTF-8-safe bounded tail
 流式保留，command diagnostics 只保存 program/flag name，不保存 argv value、inline JSON、token 或
 连接串。worker-jobs 模式在子进程运行期间持续 heartbeat；heartbeat/lease loss 会取消当前 future，
 触发 child kill，且旧 lease 不得写回终态。
 blocked terminal 的 reasons 使用确定性的总数、SHA-256 与有界 sample，完整 frame 必须小于
-32 KiB，因此不会被 parent 的 64 KiB capture tail 截断。`SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS`
+32 KiB，因此不会被 parent 的 64 KiB capture tail 截断。`truncated=false` 要求总数等于 sample
+长度且 sample 不含 truncated summary；`truncated=true` 必须由总数大于 sample 长度或 sample
+中的 truncated summary 证明。`SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS`
 控制 parent wall timeout，默认 `1800` 秒；unset、`0`、负数或非数字值均回退默认值，不能借此
 关闭 timeout。
 

@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -76,7 +77,9 @@ use solver_worker::snapshot_artifacts::{
     SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
     encode_snapshot_artifact_with_graph,
 };
-use solver_worker::snapshot_builder_protocol::SnapshotBuilderTerminal;
+use solver_worker::snapshot_builder_protocol::{
+    SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal,
+};
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
 };
@@ -847,9 +850,9 @@ fn scope_closure_boundary_policy(
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     match Box::pin(run_snapshot_builder()).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) => {
             if let Some(SnapshotSourceClosureError::Blocked { code, issues }) =
                 error.downcast_ref::<SnapshotSourceClosureError>()
@@ -858,7 +861,10 @@ async fn main() -> anyhow::Result<()> {
                     "{}",
                     SnapshotBuilderTerminal::blocked(code.clone(), issues.clone()).to_line()?
                 );
-                return Ok(());
+                return Ok(ExitCode::from(
+                    u8::try_from(SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE)
+                        .expect("blocked exit code fits in u8"),
+                ));
             }
             Err(error)
         }

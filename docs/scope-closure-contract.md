@@ -25,7 +25,7 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 82c1c6e
+lastReviewedCommit: 833808c
 lastReviewedNote: "Issue #158 sets the Linux scope-closure fail-closed RSS guard to 2048 MiB after production-shape validation."
 related:
   - AGENTS.md

@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub const SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION: &str = "snapshot_builder_terminal.v1";
 pub const SNAPSHOT_BUILDER_TERMINAL_PREFIX: &str = "[snapshot_builder_terminal] ";
 pub const SNAPSHOT_BUILDER_TERMINAL_MAX_BYTES: usize = 32 * 1024;
+pub const SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE: i32 = 42;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_COUNT: usize = 16;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_BYTES: usize = 1024;
 const SNAPSHOT_BUILDER_BLOCKING_SAMPLE_MAX_BYTES: usize = 16 * 1024;
@@ -158,6 +159,7 @@ pub fn parse_terminal(stdout: &str) -> anyhow::Result<SnapshotBuilderTerminal> {
             blocking_reasons,
             blocking_reason_count,
             blocking_reasons_sha256,
+            blocking_reasons_truncated,
             ..
         } if code.trim().is_empty()
             || blocking_reasons.is_empty()
@@ -166,13 +168,34 @@ pub fn parse_terminal(stdout: &str) -> anyhow::Result<SnapshotBuilderTerminal> {
             || blocking_reasons_sha256.len() != 64
             || !blocking_reasons_sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()) =>
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !blocked_metadata_is_consistent(
+                blocking_reasons,
+                *blocking_reason_count,
+                *blocking_reasons_truncated,
+            ) =>
         {
             Err(anyhow::anyhow!(
                 "snapshot_builder_protocol_blocked_payload_invalid"
             ))
         }
         _ => Ok(terminal),
+    }
+}
+
+fn blocked_metadata_is_consistent(
+    blocking_reasons: &[Value],
+    blocking_reason_count: u64,
+    truncated: bool,
+) -> bool {
+    let sample_count = u64::try_from(blocking_reasons.len()).unwrap_or(u64::MAX);
+    let has_truncated_summary = blocking_reasons
+        .iter()
+        .any(|reason| reason.get("truncated").and_then(Value::as_bool) == Some(true));
+    if truncated {
+        blocking_reason_count > sample_count || has_truncated_summary
+    } else {
+        blocking_reason_count == sample_count && !has_truncated_summary
     }
 }
 
@@ -291,5 +314,45 @@ mod tests {
             terminal,
             SnapshotBuilderTerminal::blocked("source_reference_invalid", reasons)
         );
+    }
+
+    #[test]
+    fn blocked_terminal_rejects_inconsistent_truncation_metadata() {
+        let reason = json!({"code": "source_reference_invalid"});
+        let hash = "a".repeat(64);
+        for terminal in [
+            SnapshotBuilderTerminal::Blocked {
+                schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
+                code: "source_reference_invalid".to_owned(),
+                blocking_reasons: vec![reason.clone()],
+                blocking_reason_count: 2,
+                blocking_reasons_sha256: hash.clone(),
+                blocking_reasons_truncated: false,
+            },
+            SnapshotBuilderTerminal::Blocked {
+                schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
+                code: "source_reference_invalid".to_owned(),
+                blocking_reasons: vec![json!({
+                    "code": "source_reference_invalid",
+                    "truncated": true
+                })],
+                blocking_reason_count: 1,
+                blocking_reasons_sha256: hash.clone(),
+                blocking_reasons_truncated: false,
+            },
+            SnapshotBuilderTerminal::Blocked {
+                schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
+                code: "source_reference_invalid".to_owned(),
+                blocking_reasons: vec![reason],
+                blocking_reason_count: 1,
+                blocking_reasons_sha256: hash,
+                blocking_reasons_truncated: true,
+            },
+        ] {
+            let error = parse_terminal(&terminal.to_line().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("snapshot_builder_protocol_blocked_payload_invalid"));
+        }
     }
 }

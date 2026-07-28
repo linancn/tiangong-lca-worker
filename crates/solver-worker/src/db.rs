@@ -41,7 +41,9 @@ use crate::{
     snapshot_artifacts::{
         DecodedSnapshotArtifact, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
     },
-    snapshot_builder_protocol::{SnapshotBuilderTerminal, parse_terminal},
+    snapshot_builder_protocol::{
+        SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
+    },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::ObjectStoreClient,
     types::{JobPayload, SolveOptionsPayload},
@@ -3510,14 +3512,14 @@ async fn run_snapshot_builder_job(
         let stderr = utf8_safe_tail(&stderr_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
         let redacted_stdout = redact_sensitive_diagnostics(&stdout);
         let redacted_stderr = redact_sensitive_diagnostics(&stderr);
-        if !status.success() {
-            let Some(exit_code) = status.code() else {
-                return Err(SnapshotBuilderProcessFailure::Signal {
-                    command: command_diagnostics,
-                    stderr_tail: tail_text(&redacted_stderr, 2000),
-                }
-                .into());
-            };
+        let Some(exit_code) = status.code() else {
+            return Err(SnapshotBuilderProcessFailure::Signal {
+                command: command_diagnostics,
+                stderr_tail: tail_text(&redacted_stderr, 2000),
+            }
+            .into());
+        };
+        if exit_code != 0 && exit_code != SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE {
             return Err(SnapshotBuilderProcessFailure::Exit {
                 command: command_diagnostics,
                 exit_code,
@@ -3532,25 +3534,31 @@ async fn run_snapshot_builder_job(
                 message: error.to_string(),
             })?;
 
-        let (resolved_snapshot_id, terminal_timing, discovery) = match terminal {
-            SnapshotBuilderTerminal::Succeeded {
-                resolved_snapshot_id,
-                build_timing_sec,
-                scope_closure_discovery,
-                ..
-            } => (
+        let (resolved_snapshot_id, terminal_timing, discovery) = match (exit_code, terminal) {
+            (
+                0,
+                SnapshotBuilderTerminal::Succeeded {
+                    resolved_snapshot_id,
+                    build_timing_sec,
+                    scope_closure_discovery,
+                    ..
+                },
+            ) => (
                 resolved_snapshot_id,
                 build_timing_sec,
                 scope_closure_discovery,
             ),
-            SnapshotBuilderTerminal::Blocked {
-                code,
-                blocking_reasons,
-                blocking_reason_count,
-                blocking_reasons_sha256,
-                blocking_reasons_truncated,
-                ..
-            } => {
+            (
+                SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
+                SnapshotBuilderTerminal::Blocked {
+                    code,
+                    blocking_reasons,
+                    blocking_reason_count,
+                    blocking_reasons_sha256,
+                    blocking_reasons_truncated,
+                    ..
+                },
+            ) => {
                 return Err(SnapshotBuilderProcessFailure::Blocked {
                     code,
                     blocking_reasons,
@@ -3560,6 +3568,25 @@ async fn run_snapshot_builder_job(
                 }
                 .into());
             }
+            (0, SnapshotBuilderTerminal::Blocked { .. }) => {
+                return Err(SnapshotBuilderProcessFailure::Protocol {
+                    command: command_diagnostics,
+                    message:
+                        "snapshot_builder_protocol_exit_terminal_mismatch: exit=0 terminal=blocked expected=succeeded"
+                            .to_owned(),
+                }
+                .into());
+            }
+            (SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal::Succeeded { .. }) => {
+                return Err(SnapshotBuilderProcessFailure::Protocol {
+                    command: command_diagnostics,
+                    message: format!(
+                        "snapshot_builder_protocol_exit_terminal_mismatch: exit={SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE} terminal=succeeded expected=blocked"
+                    ),
+                }
+                .into());
+            }
+            _ => unreachable!("ordinary nonzero exits returned before terminal parsing"),
         };
         if let Some(legacy_id) = parse_snapshot_builder_resolved_snapshot_id(&stdout)
             && legacy_id != resolved_snapshot_id
@@ -3582,7 +3609,7 @@ async fn run_snapshot_builder_job(
                 .split_whitespace()
                 .map(ToOwned::to_owned)
                 .collect(),
-            exit_code: status.code().unwrap_or(0),
+            exit_code,
             stdout_tail: tail_text(&redacted_stdout, 4000),
             stderr_tail: tail_text(&redacted_stderr, 2000),
             scope_closure_discovery: discovery,
@@ -4194,7 +4221,8 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 mod tests {
     use super::{
         BuildSnapshotWorkerLease, BuilderCommandCandidate, JobLifecycleBackend,
-        PackageSnapshotExecutionMode, SnapshotBuilderProcessFailure, SolveOptionsPayload,
+        PackageSnapshotExecutionMode, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
+        SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
         acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
         build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
@@ -4272,6 +4300,19 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    fn terminal_script(
+        directory: &TempDir,
+        terminal: &SnapshotBuilderTerminal,
+        exit_code: i32,
+    ) -> PathBuf {
+        let line = terminal.to_line().unwrap();
+        assert!(!line.contains('\''));
+        executable_script(
+            directory,
+            format!("printf '%s\\n' '{line}'\nexit {exit_code}").as_str(),
+        )
     }
 
     async fn run_test_snapshot_builder() -> anyhow::Result<super::SnapshotBuilderExecution> {
@@ -4430,6 +4471,66 @@ mod tests {
         assert!(matches!(
             error.downcast_ref::<SnapshotBuilderProcessFailure>(),
             Some(SnapshotBuilderProcessFailure::Exit { exit_code: 17, .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_exit_zero_with_blocked_terminal_is_protocol_mismatch() {
+        let directory = TempDir::new().unwrap();
+        let terminal = SnapshotBuilderTerminal::blocked(
+            "source_reference_invalid",
+            vec![json!({"code": "source_reference_invalid"})],
+        );
+        let script = terminal_script(&directory, &terminal, 0);
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Protocol { message, .. })
+                if message.contains("exit=0 terminal=blocked expected=succeeded")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_exit_zero_with_succeeded_terminal_is_accepted() {
+        let directory = TempDir::new().unwrap();
+        let resolved_snapshot_id = Uuid::new_v4();
+        let terminal = SnapshotBuilderTerminal::succeeded(resolved_snapshot_id, None, None);
+        let script = terminal_script(&directory, &terminal, 0);
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let execution = run_test_snapshot_builder().await.unwrap();
+        assert_eq!(execution.resolved_snapshot_id, resolved_snapshot_id);
+        assert_eq!(execution.exit_code, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_blocked_exit_with_succeeded_terminal_is_protocol_mismatch() {
+        let directory = TempDir::new().unwrap();
+        let terminal = SnapshotBuilderTerminal::succeeded(Uuid::new_v4(), None, None);
+        let script = terminal_script(&directory, &terminal, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE);
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Protocol { message, .. })
+                if message.contains("terminal=succeeded expected=blocked")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_blocked_exit_with_blocked_terminal_is_typed_blocked() {
+        let directory = TempDir::new().unwrap();
+        let terminal = SnapshotBuilderTerminal::blocked(
+            "source_reference_invalid",
+            vec![json!({"code": "source_reference_invalid"})],
+        );
+        let script = terminal_script(&directory, &terminal, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE);
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Blocked { code, .. })
+                if code == "source_reference_invalid"
         ));
     }
 
