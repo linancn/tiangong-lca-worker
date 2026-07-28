@@ -22,8 +22,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-06-02
-lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Issue #152 updates every active Worker entry point to the exact published Rust tidas v0.1.1 contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -303,7 +304,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `WORKER_POLL_MS`（默认 `1000`）
 - `WORKER_VT_SECONDS`（默认 `30`；生产 `build_snapshot` 队列建议按最长任务耗时设置，例如 `1800`）
 - `TIDAS_BIN`（统一 Rust `tidas` binary；默认通过 `PATH` 查找 `tidas`，生产建议使用原子切换的绝对路径）
-- `TIDAS_EXPECTED_VERSION`（必须与 binary `version` 及 validation describe package version 精确匹配，默认 `0.1.0`）
+- `TIDAS_EXPECTED_VERSION`（必须与 binary `version` 及 validation describe package version 精确匹配，默认 `0.1.1`）
 - `TIDAS_TIMEOUT_SECONDS`（单次 `tidas` 子进程上限，默认 `1800`）
 - `TIDAS_MEMORY_BUDGET_MIB` / `TIDAS_QUEUE_CAPACITY`（由 `tidas` 消费的有界资源配置；package 与 scope-closure 子进程继承）
 
@@ -473,7 +474,7 @@ cargo run -p solver-worker --bin solver-worker --release -- --mode worker
 ```bash
 set -a && source .env && set +a
 tidas_bin="${TIDAS_BIN:-tidas}"
-test "$("$tidas_bin" version --format json --progress never | jq -r '.summary.binary_version')" = "${TIDAS_EXPECTED_VERSION:-0.1.0}"
+test "$("$tidas_bin" version --format json --progress never | jq -r '.summary.binary_version')" = "${TIDAS_EXPECTED_VERSION:-0.1.1}"
 "$tidas_bin" validate --describe --format json --progress never | jq -e '.summary.validation_describe.protocols | index("document-validation-batch.v1")'
 cargo run -p solver-worker --bin package_worker --release
 ```
@@ -680,7 +681,7 @@ WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
 Environment=RUST_LOG=info
 Environment=TIDAS_BIN=/home/ubuntu/.runtime/tidas/current/bin/tidas
-Environment=TIDAS_EXPECTED_VERSION=0.1.0
+Environment=TIDAS_EXPECTED_VERSION=0.1.1
 ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/package_worker
 Restart=always
 RestartSec=2

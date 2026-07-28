@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub const TIDAS_OPERATION_REPORT_SCHEMA: &str = "tidas.operation-report.v1";
 pub const TIDAS_BATCH_PROTOCOL: &str = "document-validation-batch.v1";
 pub const TIDAS_BATCH_PROFILE: &str = "tidas-document-conformance.v1";
-pub const DEFAULT_TIDAS_VERSION: &str = "0.1.0";
+pub const DEFAULT_TIDAS_VERSION: &str = "0.1.1";
 const DEFAULT_TIDAS_TIMEOUT_SECONDS: u64 = 1_800;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 

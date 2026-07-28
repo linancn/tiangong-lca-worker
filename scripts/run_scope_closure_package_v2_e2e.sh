@@ -25,7 +25,7 @@ export S3_SECRET_ACCESS_KEY="$S3_PROTOCOL_ACCESS_KEY_SECRET"
 export SNAPSHOT_BUILDER_BIN="$worker_root/target/debug/snapshot_builder"
 export SNAPSHOT_REPORT_MODE="disabled"
 export TIDAS_BIN="${TIDAS_BIN:-tidas}"
-export TIDAS_EXPECTED_VERSION="${TIDAS_EXPECTED_VERSION:-0.1.0}"
+export TIDAS_EXPECTED_VERSION="${TIDAS_EXPECTED_VERSION:-0.1.1}"
 
 "$TIDAS_BIN" version --format json --progress never >/dev/null
 "$TIDAS_BIN" validate --describe --format json --progress never >/dev/null

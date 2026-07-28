@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
-lastReviewedNote: "Issue #148 completes the bounded scope-closure consumer with chunked cache work, external JSONL sorting, file-backed artifacts, and heartbeat-safe blocking phases."
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Issue #152 advances the single exact Rust tidas runtime contract to v0.1.1 without changing Worker ownership boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

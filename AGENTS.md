@@ -42,7 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Reviewed for Issue #152: all active Worker validation paths require the exact published Rust tidas v0.1.1 binary and preserve fail-closed version/protocol enforcement."
 lastReviewedNote: "Reviewed for Issue #148: bounded validation spools, cache batches, file-backed artifacts, heartbeat-safe blocking work, and local capacity gates preserve repo ownership and fail-closed runtime contracts."
 related:
   - .docpact/config.yaml

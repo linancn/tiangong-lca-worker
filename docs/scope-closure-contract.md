@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 1844d095f7d4e4da6c2a588cd234ca9697b2f1fe
-lastReviewedNote: "Issue #148 completes bounded validation consumption, cache batching, external ordering, file-backed artifact production, and local capacity evidence."
+lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedNote: "Issue #152 advances the exact Rust validator handshake to tidas v0.1.1 without changing Worker-owned bounded orchestration."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -91,7 +91,7 @@ Reference extraction in `scope_closure.rs` mirrors the public `tidas.reference-e
 
 Document validation uses only the published unified Rust `tidas` CLI selected by `TIDAS_BIN` (default `tidas`). No Python entrypoint, legacy binary name, or ordered command-candidate fallback is permitted:
 
-1. `version --format json --progress never` must equal `TIDAS_EXPECTED_VERSION` (default `0.1.0`).
+1. `version --format json --progress never` must equal `TIDAS_EXPECTED_VERSION` (default `0.1.1`).
 2. `validate --describe --format json --progress never` must advertise `document-validation-batch.v1`, `tidas-document-conformance.v1`, the validation report schema, and an immutable asset fingerprint.
 3. Uncached documents are spooled as canonical JSON plus an exact JSONL input manifest.
 4. The Worker invokes profile `tidas-document-conformance.v1` with bounded memory/queue configuration inherited by the binary.
