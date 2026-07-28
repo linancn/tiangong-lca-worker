@@ -473,9 +473,9 @@ pub async fn archive_queue_message(
     Ok(())
 }
 
-/// Updates `lca_jobs` status and diagnostics.
+/// Updates `lca_jobs` status and diagnostics for the explicit legacy backend.
 #[instrument(skip(pool, diagnostics))]
-pub async fn update_job_status(
+pub async fn update_legacy_lca_job_status(
     pool: &PgPool,
     job_id: Uuid,
     status: &str,
@@ -988,7 +988,13 @@ fn is_undefined_table(err: &sqlx::Error) -> bool {
 /// Executes one queue payload end-to-end.
 #[instrument(skip(state))]
 pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow::Result<()> {
-    Box::pin(handle_job_payload_with_worker_lease(state, payload, None)).await
+    Box::pin(handle_job_payload_with_worker_lease(
+        state,
+        payload,
+        None,
+        JobLifecycleBackend::LegacyLcaJobs,
+    ))
+    .await
 }
 
 pub(crate) async fn handle_worker_jobs_job_payload(
@@ -1006,8 +1012,34 @@ pub(crate) async fn handle_worker_jobs_job_payload(
             lease_token,
             lease_seconds,
         }),
+        JobLifecycleBackend::WorkerJobs,
     ))
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobLifecycleBackend {
+    LegacyLcaJobs,
+    WorkerJobs,
+}
+
+impl JobLifecycleBackend {
+    fn writes_legacy_lca_jobs(self) -> bool {
+        matches!(self, Self::LegacyLcaJobs)
+    }
+}
+
+async fn update_job_status_for_backend(
+    pool: &PgPool,
+    backend: JobLifecycleBackend,
+    job_id: Uuid,
+    status: &str,
+    diagnostics: Value,
+) -> anyhow::Result<f64> {
+    if !backend.writes_legacy_lca_jobs() {
+        return Ok(0.0);
+    }
+    update_legacy_lca_job_status(pool, job_id, status, diagnostics).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1015,6 +1047,7 @@ async fn handle_job_payload_with_worker_lease(
     state: &AppState,
     payload: JobPayload,
     build_snapshot_worker_lease: Option<BuildSnapshotWorkerLease>,
+    lifecycle_backend: JobLifecycleBackend,
 ) -> anyhow::Result<()> {
     match payload {
         JobPayload::PrepareFactorization {
@@ -1022,8 +1055,9 @@ async fn handle_job_payload_with_worker_lease(
             snapshot_id,
             print_level,
         } => {
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({"phase": "prepare"}),
@@ -1043,7 +1077,14 @@ async fn handle_job_payload_with_worker_lease(
                 "running",
                 running_db_write_sec,
             );
-            let _ = update_job_status(&state.pool, job_id, "ready", ready_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "ready",
+                ready_diag,
+            )
+            .await?;
         }
         JobPayload::SolveOne {
             job_id,
@@ -1053,8 +1094,9 @@ async fn handle_job_payload_with_worker_lease(
             print_level,
             calculation_evidence_binding,
         } => {
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({"phase": "solve_one"}),
@@ -1103,7 +1145,14 @@ async fn handle_job_payload_with_worker_lease(
                 "running",
                 running_db_write_sec,
             );
-            let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "completed",
+                completed_diag,
+            )
+            .await?;
 
             if let Some(result_id) = latest_result_id_for_job(&state.pool, job_id).await?
                 && let Err(err) = mark_result_cache_ready(&state.pool, job_id, result_id).await
@@ -1124,8 +1173,9 @@ async fn handle_job_payload_with_worker_lease(
             print_level,
             calculation_evidence_binding,
         } => {
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({"phase": "solve_batch"}),
@@ -1174,7 +1224,14 @@ async fn handle_job_payload_with_worker_lease(
                 "running",
                 running_db_write_sec,
             );
-            let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "completed",
+                completed_diag,
+            )
+            .await?;
 
             if let Some(result_id) = latest_result_id_for_job(&state.pool, job_id).await?
                 && let Err(err) = mark_result_cache_ready(&state.pool, job_id, result_id).await
@@ -1195,8 +1252,9 @@ async fn handle_job_payload_with_worker_lease(
             print_level,
             calculation_evidence_binding,
         } => {
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({"phase": "solve_all_unit"}),
@@ -1275,7 +1333,14 @@ async fn handle_job_payload_with_worker_lease(
                 "running",
                 running_db_write_sec,
             );
-            let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "completed",
+                completed_diag,
+            )
+            .await?;
 
             if let Some(result_id) = latest_result_id_for_job(&state.pool, job_id).await? {
                 if let Err(err) = mark_result_cache_ready(&state.pool, job_id, result_id).await {
@@ -1319,8 +1384,9 @@ async fn handle_job_payload_with_worker_lease(
             print_level,
             calculation_evidence_binding,
         } => {
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({"phase": "analyze_contribution_path"}),
@@ -1418,7 +1484,14 @@ async fn handle_job_payload_with_worker_lease(
                 "running",
                 running_db_write_sec,
             );
-            let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "completed",
+                completed_diag,
+            )
+            .await?;
 
             if let Some(result_id) = latest_result_id_for_job(&state.pool, job_id).await?
                 && let Err(err) = mark_result_cache_ready(&state.pool, job_id, result_id).await
@@ -1436,8 +1509,9 @@ async fn handle_job_payload_with_worker_lease(
             snapshot_id,
         } => {
             let invalidated = state.solver.invalidate(snapshot_id);
-            let _ = update_job_status(
+            let _ = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "completed",
                 serde_json::json!({"invalidated": invalidated}),
@@ -1457,8 +1531,9 @@ async fn handle_job_payload_with_worker_lease(
                     print_level: print_level.unwrap_or(0.0),
                 },
             )?;
-            let _ = update_job_status(
+            let _ = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "ready",
                 serde_json::to_value(prepared)?,
@@ -1501,8 +1576,9 @@ async fn handle_job_payload_with_worker_lease(
             } else {
                 "postgres_transaction_advisory_lock"
             };
-            let running_db_write_sec = update_job_status(
+            let running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({
@@ -1541,8 +1617,9 @@ async fn handle_job_payload_with_worker_lease(
             if let Some(lock_payload) = build_snapshot_lock.as_object_mut() {
                 lock_payload.insert("waiting".to_owned(), Value::Bool(false));
             }
-            let _lock_running_db_write_sec = update_job_status(
+            let _lock_running_db_write_sec = update_job_status_for_backend(
                 &state.pool,
+                lifecycle_backend,
                 job_id,
                 "running",
                 serde_json::json!({
@@ -1687,7 +1764,13 @@ async fn handle_job_payload_with_worker_lease(
                 })?;
             }
             if resolved_snapshot_id != snapshot_id {
-                set_job_snapshot_id(&state.pool, job_id, resolved_snapshot_id).await?;
+                set_legacy_lca_job_snapshot_id_for_backend(
+                    &state.pool,
+                    lifecycle_backend,
+                    job_id,
+                    resolved_snapshot_id,
+                )
+                .await?;
             }
 
             let source_hash = fetch_snapshot_source_hash(&state.pool, resolved_snapshot_id).await?;
@@ -1719,7 +1802,14 @@ async fn handle_job_payload_with_worker_lease(
             }
             let completed_diag =
                 merge_job_status_update_timing(completed_payload, "running", running_db_write_sec);
-            let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
+            let _ = update_job_status_for_backend(
+                &state.pool,
+                lifecycle_backend,
+                job_id,
+                "completed",
+                completed_diag,
+            )
+            .await?;
         }
         JobPayload::LciaResultPackageBuild { .. } => {
             return Err(anyhow::anyhow!(
@@ -3490,7 +3580,11 @@ async fn fetch_snapshot_source_hash(
     }
 }
 
-async fn set_job_snapshot_id(pool: &PgPool, job_id: Uuid, snapshot_id: Uuid) -> anyhow::Result<()> {
+async fn set_legacy_lca_job_snapshot_id(
+    pool: &PgPool,
+    job_id: Uuid,
+    snapshot_id: Uuid,
+) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
         UPDATE lca_jobs
@@ -3508,6 +3602,18 @@ async fn set_job_snapshot_id(pool: &PgPool, job_id: Uuid, snapshot_id: Uuid) -> 
         Err(err) if is_undefined_table(&err) => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+async fn set_legacy_lca_job_snapshot_id_for_backend(
+    pool: &PgPool,
+    backend: JobLifecycleBackend,
+    job_id: Uuid,
+    snapshot_id: Uuid,
+) -> anyhow::Result<()> {
+    if !backend.writes_legacy_lca_jobs() {
+        return Ok(());
+    }
+    set_legacy_lca_job_snapshot_id(pool, job_id, snapshot_id).await
 }
 
 async fn upsert_active_snapshot(
@@ -3826,7 +3932,7 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageSnapshotExecutionMode, SolveOptionsPayload,
+        JobLifecycleBackend, PackageSnapshotExecutionMode, SolveOptionsPayload,
         acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
         build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
@@ -3839,6 +3945,12 @@ mod tests {
     use uuid::Uuid;
 
     use crate::graph_types::RequestRootProcess;
+
+    #[test]
+    fn worker_jobs_backend_never_writes_legacy_lca_jobs() {
+        assert!(!JobLifecycleBackend::WorkerJobs.writes_legacy_lca_jobs());
+        assert!(JobLifecycleBackend::LegacyLcaJobs.writes_legacy_lca_jobs());
+    }
 
     #[test]
     fn build_snapshot_worker_jobs_slot_sql_uses_short_transaction_and_lease_fencing() {

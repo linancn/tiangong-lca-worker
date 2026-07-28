@@ -25,7 +25,7 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
+lastReviewedCommit: 31c5c0a12d62fa1176c8fa7ea2a76d8d09f415f1
 lastReviewedNote: "Issue #152 advances the exact Rust validator handshake to tidas v0.1.1 without changing Worker-owned bounded orchestration."
 related:
   - AGENTS.md
