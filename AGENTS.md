@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Reviewed for Issue #160 isolated source-closure performance evidence; repo ownership and runtime contracts remain unchanged."
+lastReviewedCommit: 4d84c4fb371d03c46a20272e4fe7613ce5147974
+lastReviewedNote: "Reviewed while merging Issues #163 and #164: bounded scope-closure reports and shared resource/object-I/O primitives remain Worker-owned without changing integration boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
