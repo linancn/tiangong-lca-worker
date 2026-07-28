@@ -1477,12 +1477,10 @@ mod tests {
             "sourceIdentity": format!("process:{}@01.00.000", run.dataset_id),
             "jsonPath": "$.processDataSet.exchanges.exchange[0].referenceToFlowDataSet"
         });
-        let error = anyhow::Error::new(
-            crate::db::SnapshotBuilderProcessFailure::Blocked {
-                code: "source_dependency_unavailable".to_owned(),
-                blocking_reasons: vec![reason.clone()],
-            },
-        )
+        let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Blocked {
+            code: "source_dependency_unavailable".to_owned(),
+            blocking_reasons: vec![reason.clone()],
+        })
         .context("failed to build review-submit gate snapshot");
         let outcome = super::snapshot_builder_blocked_outcome(&run, &error)
             .unwrap()

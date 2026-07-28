@@ -277,4 +277,39 @@ mod tests {
         assert_eq!(first.reference_count, 1);
         assert_eq!(first.samples.len(), 1);
     }
+
+    #[test]
+    fn cumulative_reference_count_and_edge_bytes_are_bounded() {
+        let reference = ClassifiedSourceReference {
+            source_identity: "process:source@01.00.000".to_owned(),
+            target_type: CompiledReleaseSourceDatasetType::Flow,
+            target_uuid: Uuid::new_v4().to_string(),
+            requested_version: Some("01.00.000".to_owned()),
+            json_path: "$.exchange.referenceToFlowDataSet".to_owned(),
+            role: SourceReferenceRole::ExchangeFlow,
+            action: SourceReferenceAction::ValidateExchangeAxis,
+        };
+        assert!(
+            validate_resource_limits(
+                &[reference.clone(), reference.clone()],
+                SourceClosureLimits {
+                    max_references: 1,
+                    max_edge_bytes: usize::MAX,
+                    max_evidence_samples: 1,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resource_limits(
+                &[reference],
+                SourceClosureLimits {
+                    max_references: 1,
+                    max_edge_bytes: 1,
+                    max_evidence_samples: 1,
+                }
+            )
+            .is_err()
+        );
+    }
 }

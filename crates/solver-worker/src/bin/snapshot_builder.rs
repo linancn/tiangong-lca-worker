@@ -99,6 +99,9 @@ const REVIEW_SUBMIT_BASELINE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS: u64 = 900;
 const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
 const SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE: usize = 1_024;
+const SOURCE_CLOSURE_SUPPORT_QUERY_BATCH_SIZE: usize = 512;
+const SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
 const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -7181,21 +7184,17 @@ fn resolve_lcia_support_flows<'a>(
         .collect())
 }
 
-fn source_reference_is_satisfied(
-    datasets: &BTreeMap<
-        (CompiledReleaseSourceDatasetType, Uuid, String),
-        CompiledReleaseSourceDataset,
-    >,
+fn source_reference_is_satisfied_index(
+    exact_dataset_index: &BTreeSet<(CompiledReleaseSourceDatasetType, Uuid, String)>,
+    omitted_version_index: &BTreeSet<(CompiledReleaseSourceDatasetType, Uuid)>,
     reference: &SourceDatasetReference,
 ) -> bool {
-    datasets.keys().any(|(dataset_type, id, version)| {
-        *dataset_type == reference.dataset_type
-            && *id == reference.id
-            && reference
-                .version
-                .as_ref()
-                .is_none_or(|expected| version == expected)
-    })
+    reference.version.as_ref().map_or_else(
+        || omitted_version_index.contains(&(reference.dataset_type, reference.id)),
+        |version| {
+            exact_dataset_index.contains(&(reference.dataset_type, reference.id, version.clone()))
+        },
+    )
 }
 
 fn insert_compiled_source_dataset(
@@ -7483,6 +7482,24 @@ async fn build_frozen_source_datasets(
     }
 
     let limits = SourceClosureLimits::default();
+    let mut exact_dataset_index = datasets.keys().cloned().collect::<BTreeSet<_>>();
+    let mut omitted_version_index = datasets
+        .keys()
+        .map(|(dataset_type, id, _)| (*dataset_type, *id))
+        .collect::<BTreeSet<_>>();
+    let mut total_document_bytes = datasets.values().try_fold(0_usize, |total, dataset| {
+        total
+            .checked_add(serde_json::to_vec(&dataset.document)?.len())
+            .ok_or_else(|| anyhow::anyhow!("source closure document bytes overflow"))
+    })?;
+    if total_document_bytes > SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES {
+        return Err(SnapshotSourceClosureError::Operator {
+            message: format!(
+                "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES}"
+            ),
+        }
+        .into());
+    }
     let mut frontier = datasets.keys().cloned().collect::<VecDeque<_>>();
     let mut processed_identity_hash = BTreeMap::new();
     let mut classified_references = Vec::<ClassifiedSourceReference>::new();
@@ -7554,7 +7571,11 @@ async fn build_frozen_source_datasets(
                             id,
                             version: reference.requested_version.clone(),
                         };
-                        if !source_reference_is_satisfied(&datasets, &lookup) {
+                        if !source_reference_is_satisfied_index(
+                            &exact_dataset_index,
+                            &omitted_version_index,
+                            &lookup,
+                        ) {
                             preflight_issues.push(source_dependency_issue(
                                 &reference,
                                 "Required exact numerical-axis dependency is unavailable.",
@@ -7575,7 +7596,11 @@ async fn build_frozen_source_datasets(
                             id,
                             version: reference.requested_version.clone(),
                         };
-                        if !source_reference_is_satisfied(&datasets, &lookup) {
+                        if !source_reference_is_satisfied_index(
+                            &exact_dataset_index,
+                            &omitted_version_index,
+                            &lookup,
+                        ) {
                             required_support.push(reference.clone());
                         }
                     }
@@ -7629,8 +7654,25 @@ async fn build_frozen_source_datasets(
             if ids.is_empty() {
                 continue;
             }
-            support_query_count += 1;
-            let rows = fetch_source_dataset_rows(pool, dataset_type, &ids).await?;
+            let mut rows = Vec::new();
+            for chunk in ids.chunks(SOURCE_CLOSURE_SUPPORT_QUERY_BATCH_SIZE) {
+                support_query_count += 1;
+                let batch_rows = fetch_source_dataset_rows(pool, dataset_type, chunk).await?;
+                let batch_bytes = batch_rows.iter().try_fold(0_usize, |total, row| {
+                    total
+                        .checked_add(serde_json::to_vec(&row.json)?.len())
+                        .ok_or_else(|| anyhow::anyhow!("source support batch bytes overflow"))
+                })?;
+                if batch_bytes > SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES {
+                    return Err(SnapshotSourceClosureError::Operator {
+                        message: format!(
+                            "source_support_batch_bytes_exceeded: actual={batch_bytes} limit={SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES}"
+                        ),
+                    }
+                    .into());
+                }
+                rows.extend(batch_rows);
+            }
             for reference in type_references {
                 let Ok(id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
                     continue;
@@ -7653,6 +7695,22 @@ async fn build_frozen_source_datasets(
                             &row.json,
                         )?;
                         if is_new {
+                            let document_bytes = serde_json::to_vec(&row.json)?.len();
+                            total_document_bytes = total_document_bytes
+                                .checked_add(document_bytes)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("source closure document bytes overflow")
+                                })?;
+                            if total_document_bytes > SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES {
+                                return Err(SnapshotSourceClosureError::Operator {
+                                    message: format!(
+                                        "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES}"
+                                    ),
+                                }
+                                .into());
+                            }
+                            exact_dataset_index.insert(key.clone());
+                            omitted_version_index.insert((dataset_type, row.id));
                             frontier.push_back(key);
                         }
                     }
@@ -7683,11 +7741,12 @@ async fn build_frozen_source_datasets(
             .then_with(|| left.dataset_version.cmp(&right.dataset_version))
     });
     println!(
-        "[source_closure_metrics] source_document_count={} classified_reference_count={} frontier_round_count={} support_query_count={}",
+        "[source_closure_metrics] source_document_count={} classified_reference_count={} frontier_round_count={} support_query_count={} decoded_document_bytes={}",
         result.len(),
         classified_references.len(),
         frontier_round_count,
-        support_query_count
+        support_query_count,
+        total_document_bytes
     );
     Ok((result, provenance))
 }
@@ -9296,11 +9355,11 @@ mod tests {
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
         scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        snapshot_db_statement_timeout, source_dataset_document_id, source_reference_is_satisfied,
-        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_quantitative_references,
-        validate_unique_database_lcia_method_identities,
+        snapshot_db_statement_timeout, source_dataset_document_id,
+        source_reference_is_satisfied_index, summarize_matching_diagnostics, time_score,
+        unique_supported_direction_by_flow, validate_compiled_sources_against_frozen_manifest,
+        validate_flow_row_visibility, validate_process_row_visibility,
+        validate_quantitative_references, validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -13647,16 +13706,23 @@ mod tests {
         )
         .expect("insert source dataset");
 
-        assert!(source_reference_is_satisfied(
-            &datasets,
+        let exact = datasets.keys().cloned().collect::<BTreeSet<_>>();
+        let omitted = datasets
+            .keys()
+            .map(|(dataset_type, id, _)| (*dataset_type, *id))
+            .collect::<BTreeSet<_>>();
+        assert!(source_reference_is_satisfied_index(
+            &exact,
+            &omitted,
             &SourceDatasetReference {
                 dataset_type: CompiledReleaseSourceDatasetType::Source,
                 id: source_id,
                 version: None,
             }
         ));
-        assert!(!source_reference_is_satisfied(
-            &datasets,
+        assert!(!source_reference_is_satisfied_index(
+            &exact,
+            &omitted,
             &SourceDatasetReference {
                 dataset_type: CompiledReleaseSourceDatasetType::Source,
                 id: source_id,
