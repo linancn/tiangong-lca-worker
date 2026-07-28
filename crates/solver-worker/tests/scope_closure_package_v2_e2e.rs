@@ -1109,9 +1109,11 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
         .await?;
     let before_query: Value = serde_json::from_slice(&before_query)?;
     let after_query: Value = serde_json::from_slice(&after_query)?;
-    let expected_h = expected_h_matrix_for_axis(expected_axis, fixture.processes)?;
-    anyhow::ensure!(before_query["h_matrix"] == expected_h);
-    anyhow::ensure!(before_query["h_matrix"] == after_query["h_matrix"]);
+    anyhow::ensure!(before_query["format"] == "all-unit-query:v2");
+    anyhow::ensure!(before_query["processCount"] == expected_axis.len());
+    anyhow::ensure!(before_query["impactCount"] == json!(RELEASE_METHOD_IDENTITIES.len()));
+    anyhow::ensure!(before_query.get("hMatrix").is_none());
+    anyhow::ensure!(before_query["lciaChunks"] == after_query["lciaChunks"]);
     anyhow::ensure!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.lca_network_snapshots")
             .fetch_one(&state.pool)

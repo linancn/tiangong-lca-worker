@@ -13,6 +13,12 @@ const UMFPACK_OK: i32 = 0;
 const UMFPACK_WARNING_SINGULAR: i32 = 1;
 const UMFPACK_A: i32 = 0;
 const UMFPACK_PRL: usize = 0;
+const UMFPACK_SIZE_OF_UNIT: usize = 3;
+const UMFPACK_SYMBOLIC_SIZE: usize = 14;
+const UMFPACK_NUMERIC_SIZE_ESTIMATE: usize = 20;
+const UMFPACK_PEAK_MEMORY_ESTIMATE: usize = 21;
+const UMFPACK_NUMERIC_SIZE: usize = 40;
+const UMFPACK_PEAK_MEMORY: usize = 41;
 
 #[link(name = "umfpack")]
 unsafe extern "C" {
@@ -114,6 +120,49 @@ unsafe impl Send for UmfpackFactorization {}
 unsafe impl Sync for UmfpackFactorization {}
 
 impl UmfpackFactorization {
+    fn info_units_to_bytes(info: &[f64; UMFPACK_INFO_LEN], index: usize) -> Option<usize> {
+        let units = info[index];
+        let bytes_per_unit = info[UMFPACK_SIZE_OF_UNIT];
+        if !units.is_finite() || units < 0.0 || !bytes_per_unit.is_finite() || bytes_per_unit <= 0.0
+        {
+            return None;
+        }
+        let bytes = (units.ceil() * bytes_per_unit.ceil()).ceil();
+        format!("{bytes:.0}").parse::<usize>().ok()
+    }
+
+    /// Actual retained bytes reported by UMFPACK plus the owned factorized CSC matrix.
+    ///
+    /// UMFPACK reports the symbolic and numeric object sizes in implementation
+    /// units together with the unit size. The returned estimate is therefore
+    /// workload-derived and includes factorization fill-in observed for this
+    /// matrix, rather than assuming a constant multiplier.
+    #[must_use]
+    pub fn estimated_owned_bytes(&self) -> usize {
+        let symbolic = Self::info_units_to_bytes(&self.stats.symbolic_info, UMFPACK_SYMBOLIC_SIZE)
+            .unwrap_or_default();
+        let numeric = Self::info_units_to_bytes(&self.stats.numeric_info, UMFPACK_NUMERIC_SIZE)
+            .unwrap_or_default();
+        self.matrix
+            .estimated_owned_bytes()
+            .saturating_add(symbolic)
+            .saturating_add(numeric)
+    }
+
+    /// Peak factorization bytes reported by UMFPACK for telemetry.
+    #[must_use]
+    pub fn reported_peak_bytes(&self) -> Option<usize> {
+        Self::info_units_to_bytes(&self.stats.numeric_info, UMFPACK_PEAK_MEMORY).or_else(|| {
+            Self::info_units_to_bytes(&self.stats.symbolic_info, UMFPACK_PEAK_MEMORY_ESTIMATE)
+        })
+    }
+
+    /// Symbolic-stage numeric-object estimate reported before numeric factorization.
+    #[must_use]
+    pub fn reported_numeric_estimate_bytes(&self) -> Option<usize> {
+        Self::info_units_to_bytes(&self.stats.symbolic_info, UMFPACK_NUMERIC_SIZE_ESTIMATE)
+    }
+
     /// Performs symbolic and numeric factorization.
     pub fn factorize(
         matrix: CscMatrix,

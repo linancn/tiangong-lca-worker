@@ -126,6 +126,23 @@ pub struct AppConfig {
     /// Optional local preflight upload limit matching the storage max-file-limit.
     #[arg(long, env = "S3_MAX_UPLOAD_BYTES")]
     pub s3_max_upload_bytes: Option<u64>,
+    /// Hard retained-byte capacity for prepared sparse factorizations.
+    #[arg(
+        long,
+        env = "FACTORIZATION_CACHE_MAX_BYTES",
+        default_value_t = 1_073_741_824_usize
+    )]
+    pub factorization_cache_max_bytes: usize,
+    /// Workload admission multiplier applied to factorized M storage before UMFPACK runs.
+    ///
+    /// This is a deployment/workload policy for fill-in headroom, not a
+    /// matrix-size-independent memory guarantee.
+    #[arg(
+        long,
+        env = "FACTORIZATION_ADMISSION_FILL_IN_MULTIPLIER",
+        default_value_t = 8.0_f64
+    )]
+    pub factorization_admission_fill_in_multiplier: f64,
 }
 
 impl AppConfig {
@@ -256,6 +273,22 @@ impl AppConfig {
         self.s3_max_upload_bytes
     }
 
+    /// Hard factorization-cache capacity.
+    #[must_use]
+    pub fn factorization_cache_max_bytes(&self) -> usize {
+        self.factorization_cache_max_bytes.max(1)
+    }
+
+    /// Sanitized workload-derived fill-in admission multiplier.
+    #[must_use]
+    pub fn factorization_admission_fill_in_multiplier(&self) -> f64 {
+        if self.factorization_admission_fill_in_multiplier.is_finite() {
+            self.factorization_admission_fill_in_multiplier.max(1.0)
+        } else {
+            8.0
+        }
+    }
+
     /// Parsed http socket addr.
     pub fn http_socket_addr(&self) -> anyhow::Result<SocketAddr> {
         SocketAddr::from_str(&self.http_addr)
@@ -298,6 +331,8 @@ mod tests {
             config.build_snapshot_lock_poll_interval(),
             Duration::from_secs(5)
         );
+        assert_eq!(config.factorization_cache_max_bytes(), 1_073_741_824);
+        assert!((config.factorization_admission_fill_in_multiplier() - 8.0).abs() < f64::EPSILON);
     }
 
     #[test]

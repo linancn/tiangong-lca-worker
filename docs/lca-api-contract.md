@@ -255,6 +255,11 @@ legacy pgmq/debug 路径语义：
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 
+`solve_one` / `solve_batch` 继续把数值 payload 写入 `hdf5:v1`。`solve_all_unit`
+例外：完整结果只存在于 Calculation Bundle manifest/partitions；`lca_results` 的
+`hdf5:v1` 是一个 bounded compatibility descriptor，只包含 canonical bundle 与
+query-index references，不包含 `SolveBatchResult.items` 或完整 `h_matrix`。
+
 ### 5.1 Calculation Bundle v2
 
 `solve_all_unit` 的 canonical release evidence 是 manifest + deterministic gzip NDJSON sidecars：
@@ -273,6 +278,7 @@ evidence/coverage.json
 
 - 每个 canonical chunk 固定覆盖最多 256 个连续 process index；NDJSON record 使用 canonical JSON 和单个换行，gzip 固定 level 6、mtime 0、无文件名/comment。
 - manifest 的 `artifacts[]` 按 path 排序，记录 compressed/uncompressed SHA-256、byte size、record count 与 process-index boundary；`bundleContentHash` 不包含生成时间、对象存储 URL 或自身 hash。
+- `all-unit-query:v2` 是确定性 metadata/index view：记录 Calculation Bundle manifest identity，并按 `firstProcessIndex` 排序列出 LCIA chunk path/schema/compression/hash/bytes/record count/range。调用方按所需 range 读取 partitions；该 artifact 不包含 `h_matrix`。
 - `source/source-closure.ndjson.gz` 使用 `tiangong.source-closure.bundle.v1`，每条 `tiangong.source-closure.dataset.v1` record 固化 dataset type、role、TIDAS UUID/version、目标包内 path、canonical document SHA-256 与完整 TIDAS JSON。Process role 固定为 `unit_process`，其余为 `support`；它是 Calculation Bundle 的原始输入证据，不是由结果反推的派生视图。
 - process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit、raw direction/amount/coefficient 与 signed normalized pivot；inventory axis逐 exchange 保存 raw/signed/normalized coefficient、allocation target 与 selected fraction。Snapshot flow axis 使用 `(Flow UUID, resolved version)`；同一 UUID 的多个实际引用 revision 可共存并获得独立连续 `flow_idx`，未被最终 process closure exchange 引用的 revision 不进入矩阵。Selected LCIA-factor-only Elementary Flow 不获得 `flow_idx`，但会作为 source-closure `support` 文档进入 bundle。
 - 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 及 `source_datasets` 写入 snapshot artifact。source closure 从本次 snapshot 精确选择的 Process/inventory Flow revision 和已审 LCIA Method identity 出发；另外一次扫描 selected Method 的全部 factor Flow reference（包括 zero factor），按 UUID/version 去重后 bounded-batch 解析为 Elementary Flow support root，再递归解析 Contact、Flow Property、Source、Unit Group 与 LCIA Method reference。显式版本只允许 exact match，省略的 support version 只确定一次并冻结，缺失、歧义、无效 UUID/version、非 Elementary factor target 或同 identity/version 内容漂移均 fail closed。这个 source-evidence 扩展不改变 B/C axis、compiled graph 或 provider lookup；support documents 不在 solve 时重新查询。
@@ -290,7 +296,14 @@ evidence/coverage.json
 - technosphere evidence 使用中性字段固化 `dependent_process_idx`、`residual_exchange_internal_id`、`balancing_process_idx`、`balancing_reference_exchange_internal_id`、residual/reference coefficient、routing weight、activity requirement、Flow UUID/version 和 location；每个最终 balancing reference port 一条 edge。
 - directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
-- `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
+- bounded `hdf5:v1` descriptor 与 `all-unit-query:v2` index 是兼容/查询视图；它们不是 canonical release evidence，也不得回退为完整矩阵驻留。旧 `all-unit-query:v1` artifacts remain readable only as historical artifacts; new solves never produce them。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
+
+Factorization cache uses a configured hard retained-byte capacity. Entry estimates include CSC
+vector capacities and UMFPACK-reported symbolic/numeric object sizes after workload-dependent
+fill-in; prepare diagnostics expose admitted entry bytes, UMFPACK peak bytes, resident/capacity
+bytes, hits/misses, evictions, invalidations, and admission rejections. Pre-factorization
+admission applies deployment-tuned fill-in headroom to the concrete M/B/C workload. This is an
+admission policy, not a promise of constant memory independent of sparse fill-in.
 
 Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只对应一个 process index / 矩阵列，其 `quantitativeReference.referenceToReferenceFlow` 选择 signed normalization pivot。Reference 可以是 Input/Output、正/负 amount、任一 source flow type；有效性不由 Product/Waste 或方向决定。Non-reference exchange 不生成派生 Process；需要独立 activity pivot 时，上游必须提供另一个完整 Process revision。
 

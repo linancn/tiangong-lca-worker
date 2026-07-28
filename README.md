@@ -94,9 +94,11 @@ related:
 - 已切换为结果 S3-only：
   - 所有 `solve` 结果统一上传对象存储（HDF5）
   - `lca_results` 仅存 artifact 元数据 + diagnostics（不存 inline payload）
-- `solve_all_unit` 同时生成 canonical `tiangong.calculation-bundle.v1`：
+- `solve_all_unit` 生成 canonical `tiangong.calculation-bundle.v2`：
   - 固定 256-process deterministic gzip NDJSON chunks，保存 exact quantitative reference、direct provider edge、directional LCI 和 reviewed 25-method LCIA
-  - 只在单个 artifact chunk 内临时保留 `x`，不跨 chunk 聚合完整 G/LCI；sidecars 先上传，content-addressed manifest 最后上传
+  - 只在单个 artifact chunk 内临时保留 `x/h`，不跨 chunk 聚合完整 G/LCI/H；sidecars 先上传，content-addressed manifest 最后上传
+  - `all-unit-query:v2` 只保存 manifest identity 与确定性的 LCIA chunk range/hash index；legacy `lca_results` HDF5 仅为指向 bundle/query index 的小型 descriptor，不再包含完整 `h_matrix`
+- factorization cache 使用 `FACTORIZATION_CACHE_MAX_BYTES` hard capacity 和 deterministic LRU eviction；admission 结合 `FACTORIZATION_ADMISSION_FILL_IN_MULTIPLIER` 与 UMFPACK 实际 symbolic/numeric size telemetry，fill-in 仍按 workload 评估
 - 已支持 snapshot artifact-first：
   - builder 直接生成 `M/B/C` 并上传 `HDF5`
   - worker 优先从 `lca_snapshot_artifacts` 下载 artifact，失败才回退到旧 `lca_*_entries` 读取
@@ -572,6 +574,11 @@ USER_API_KEY=<base64-email-password> \
 ```bash
 ./scripts/export_latest_matrices.sh
 ```
+
+新 `solve_all_unit` 的 query artifact 是 `all-unit-query:v2` chunk index，不再内嵌完整
+`h_matrix`。导出/查询工具应先读取该 index，再按所需 process range 扫描 canonical
+Calculation Bundle `results/lcia-*.ndjson.gz` partitions；不得为了兼容重新聚合完整矩阵到
+Worker 内存。
 
 默认行为：
 

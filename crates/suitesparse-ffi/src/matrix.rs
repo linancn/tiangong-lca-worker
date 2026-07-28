@@ -52,6 +52,27 @@ pub enum MatrixError {
 }
 
 impl CscMatrix {
+    /// Estimated bytes owned by the CSC vectors at their current capacities.
+    ///
+    /// This excludes the small inline `Vec` headers and the matrix struct itself;
+    /// callers can use it as a deterministic lower-level accounting primitive.
+    #[must_use]
+    pub fn estimated_owned_bytes(&self) -> usize {
+        self.col_ptr
+            .capacity()
+            .saturating_mul(std::mem::size_of::<i32>())
+            .saturating_add(
+                self.row_idx
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<i32>()),
+            )
+            .saturating_add(
+                self.values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<f64>()),
+            )
+    }
+
     /// Creates a validated CSC matrix.
     pub fn new(
         nrows: i32,
@@ -76,6 +97,19 @@ impl CscMatrix {
         nrows: i32,
         ncols: i32,
         triplets: &[MatrixTriplet],
+        zero_epsilon: f64,
+    ) -> Result<Self, MatrixError> {
+        Self::from_triplet_iter(nrows, ncols, triplets.iter().copied(), zero_epsilon)
+    }
+
+    /// Builds a validated CSC matrix from an owned triplet iterator.
+    ///
+    /// This permits callers to transform source entries directly into the
+    /// aggregation pass without retaining an intermediate triplet vector.
+    pub fn from_triplet_iter(
+        nrows: i32,
+        ncols: i32,
+        triplets: impl IntoIterator<Item = MatrixTriplet>,
         zero_epsilon: f64,
     ) -> Result<Self, MatrixError> {
         if nrows <= 0 || ncols <= 0 {

@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Updated for Issue #163: complete issue relations are deterministic manifest-addressed NDJSON+zstd partitions; RPC and XLSX details are bounded compatibility views."
+lastReviewedNote: "Updated for Issues #163 and #165: complete issue relations are deterministic manifest-addressed NDJSON+zstd partitions with bounded RPC/XLSX compatibility views; bounded all-unit result delivery does not change closure traversal, evidence, or certificate semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

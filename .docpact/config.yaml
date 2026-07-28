@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedAt: "2026-07-28"
 lastReviewedCommit: "3850855f6a3a3cc505e3a62499c0a85d6ce17df6"
-lastReviewedNote: "Reviewed for Issue #163: existing ownership and routing cover bounded scope-closure report artifacts."
+lastReviewedNote: "Reviewed for Issues #163 and #165: existing ownership and routing cover bounded scope-closure report artifacts, all-unit result delivery, and factorization cache controls."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

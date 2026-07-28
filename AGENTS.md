@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
 lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
-lastReviewedNote: "Reviewed for Issue #163: bounded scope-closure report artifacts remain Worker-owned and do not change repository or integration boundaries."
+lastReviewedNote: "Reviewed for Issues #163 and #165: bounded scope-closure report artifacts, all-unit results, and factorization cache controls remain Worker-owned and do not change repository or integration boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
