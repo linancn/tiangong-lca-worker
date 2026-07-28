@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
-lastReviewedNote: "Reviewed for Issue #156: byte-exact TIDAS issue hashing, file-backed closure inputs/reference evidence, and compact graph retention preserve repo ownership and fail-closed runtime contracts."
+lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedNote: "Reviewed for Issue #158: the 2048 MiB scope-closure RSS guard preserves repo ownership and fail-closed runtime contracts."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

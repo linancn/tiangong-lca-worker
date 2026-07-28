@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
-lastReviewedNote: "Reviewed for Issue #156; byte-exact validation hashing and bounded internal closure retention do not change jobs, payloads, statuses, or result contracts."
+lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedNote: "Reviewed for Issue #158; the 2048 MiB internal RSS guard does not change jobs, payloads, statuses, or result contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
