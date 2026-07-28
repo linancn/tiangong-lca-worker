@@ -40,7 +40,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedCommit: 82c1c6e
 lastReviewedNote: "Issue #158 requires production-shape proof against the 2048 MiB scope-closure RSS guard."
 related:
   - ../../AGENTS.md

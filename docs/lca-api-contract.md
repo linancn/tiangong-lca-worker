@@ -24,7 +24,7 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: a12ff17c347d831c1b74b819fb100f344a0c9c88
+lastReviewedCommit: 82c1c6e
 lastReviewedNote: "Reviewed for Issue #158; the 2048 MiB internal RSS guard does not change jobs, payloads, statuses, or result contracts."
 related:
   - AGENTS.md

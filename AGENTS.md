@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: aa439f2
+lastReviewedCommit: 82c1c6e
 lastReviewedNote: "Reviewed for Issue #158: the 2048 MiB scope-closure RSS guard preserves repo ownership and fail-closed runtime contracts."
 related:
   - .docpact/config.yaml

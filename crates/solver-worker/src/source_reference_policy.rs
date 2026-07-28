@@ -22,6 +22,19 @@ pub enum SourceReferenceRole {
     ModelComposition,
 }
 
+impl SourceReferenceRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExchangeFlow => "exchange_flow",
+            Self::ProviderProcess => "provider_process",
+            Self::RequiredSupport => "required_support",
+            Self::Lineage => "lineage",
+            Self::ModelComposition => "model_composition",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceReferenceAction {
@@ -76,9 +89,45 @@ pub fn classify_reference(
 }
 
 fn classify_role(edge: &ReferenceEdge) -> Result<SourceReferenceRole, SourceReferencePolicyError> {
-    let path = edge.json_path.to_ascii_lowercase();
-    let source = edge.source_category.as_str();
-    let target = edge.target_category.as_str();
+    classify_role_parts(
+        edge.source_category.as_str(),
+        edge.target_category.as_str(),
+        edge.json_path.as_str(),
+    )
+}
+
+#[must_use]
+pub fn classify_malformed_reference_role(
+    source_category: &str,
+    json_path: &str,
+) -> Option<SourceReferenceRole> {
+    let path = json_path.to_ascii_lowercase();
+    if is_lineage_path(&path) {
+        return Some(SourceReferenceRole::Lineage);
+    }
+    if is_model_composition_path(source_category, &path) {
+        return Some(SourceReferenceRole::ModelComposition);
+    }
+    if source_category == "processes"
+        && path.contains("exchange")
+        && path.ends_with("referencetoflowdataset")
+    {
+        return Some(SourceReferenceRole::ExchangeFlow);
+    }
+    if source_category == "processes"
+        && (path.contains("provider") || path.contains("referenceprocess"))
+    {
+        return Some(SourceReferenceRole::ProviderProcess);
+    }
+    None
+}
+
+fn classify_role_parts(
+    source: &str,
+    target: &str,
+    json_path: &str,
+) -> Result<SourceReferenceRole, SourceReferencePolicyError> {
+    let path = json_path.to_ascii_lowercase();
 
     if source == "processes"
         && target == "flows"
@@ -93,14 +142,10 @@ fn classify_role(edge: &ReferenceEdge) -> Result<SourceReferenceRole, SourceRefe
     {
         return Ok(SourceReferenceRole::RequiredSupport);
     }
-    if path.contains("referencetoprecedingdatasetversion")
-        || path.contains("referencetoreplaceddataset")
-        || path.contains("referencetooriginaldataset")
-    {
+    if is_lineage_path(&path) {
         return Ok(SourceReferenceRole::Lineage);
     }
-    if path.contains("referencetoincludedprocesses")
-        || path.contains("referencetoincludedprocess")
+    if is_model_composition_path(source, &path)
         || (source == "lifecyclemodels" && target == "processes")
     {
         return Ok(SourceReferenceRole::ModelComposition);
@@ -119,12 +164,24 @@ fn classify_role(edge: &ReferenceEdge) -> Result<SourceReferenceRole, SourceRefe
     }
     if matches!(target, "flows" | "processes") {
         return Err(SourceReferencePolicyError::UnknownFlowOrProcessPath {
-            source_category: edge.source_category.clone(),
-            target_category: edge.target_category.clone(),
-            json_path: edge.json_path.clone(),
+            source_category: source.to_owned(),
+            target_category: target.to_owned(),
+            json_path: json_path.to_owned(),
         });
     }
     Ok(SourceReferenceRole::RequiredSupport)
+}
+
+fn is_lineage_path(path: &str) -> bool {
+    path.contains("referencetoprecedingdatasetversion")
+        || path.contains("referencetoreplaceddataset")
+        || path.contains("referencetooriginaldataset")
+}
+
+fn is_model_composition_path(source: &str, path: &str) -> bool {
+    path.contains("referencetoincludedprocesses")
+        || path.contains("referencetoincludedprocess")
+        || (source == "lifecyclemodels" && path.contains("referenceto"))
 }
 
 #[cfg(test)]
@@ -197,5 +254,21 @@ mod tests {
             classify_reference(&unknown, ArtifactPurpose::ReviewSubmit),
             Err(SourceReferencePolicyError::UnknownFlowOrProcessPath { .. })
         ));
+    }
+
+    #[test]
+    fn role_names_are_stable_snake_case() {
+        assert_eq!(
+            SourceReferenceRole::ModelComposition.as_str(),
+            "model_composition"
+        );
+        assert_eq!(
+            SourceReferenceRole::RequiredSupport.as_str(),
+            "required_support"
+        );
+        assert_eq!(
+            serde_json::to_value(SourceReferenceRole::ModelComposition).unwrap(),
+            "model_composition"
+        );
     }
 }

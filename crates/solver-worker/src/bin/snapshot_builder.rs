@@ -7541,18 +7541,7 @@ async fn build_frozen_source_datasets(
                 continue;
             }
             let classification = classify_source_document(dataset, artifact_purpose)?;
-            for issue in classification.extraction_issues {
-                let path = issue
-                    .get("json_path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if !path.contains("referencetoprecedingdatasetversion")
-                    && !path.contains("referencetoincludedprocess")
-                {
-                    preflight_issues.push(issue);
-                }
-            }
+            preflight_issues.extend(classification.extraction_issues);
             for reference in classification.references {
                 match reference.action {
                     SourceReferenceAction::RecordEvidence => {}
@@ -7726,8 +7715,15 @@ async fn build_frozen_source_datasets(
     preflight_issues.sort_by_key(|issue| serde_json::to_string(issue).unwrap_or_default());
     preflight_issues.dedup();
     if !preflight_issues.is_empty() {
+        let code = if preflight_issues.iter().any(|issue| {
+            issue.get("code").and_then(Value::as_str) == Some("source_reference_invalid")
+        }) {
+            "source_reference_invalid"
+        } else {
+            "source_dependency_unavailable"
+        };
         return Err(SnapshotSourceClosureError::Blocked {
-            code: "source_dependency_unavailable".to_owned(),
+            code: code.to_owned(),
             issues: preflight_issues,
         }
         .into());

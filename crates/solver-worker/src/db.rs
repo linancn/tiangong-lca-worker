@@ -2185,6 +2185,9 @@ pub(crate) enum SnapshotBuilderProcessFailure {
     Blocked {
         code: String,
         blocking_reasons: Vec<Value>,
+        blocking_reason_count: u64,
+        blocking_reasons_sha256: String,
+        blocking_reasons_truncated: bool,
     },
 }
 
@@ -3507,11 +3510,6 @@ async fn run_snapshot_builder_job(
         let stderr = utf8_safe_tail(&stderr_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
         let redacted_stdout = redact_sensitive_diagnostics(&stdout);
         let redacted_stderr = redact_sensitive_diagnostics(&stderr);
-        let terminal =
-            parse_terminal(&stdout).map_err(|error| SnapshotBuilderProcessFailure::Protocol {
-                command: command_diagnostics.clone(),
-                message: error.to_string(),
-            })?;
         if !status.success() {
             let Some(exit_code) = status.code() else {
                 return Err(SnapshotBuilderProcessFailure::Signal {
@@ -3528,6 +3526,11 @@ async fn run_snapshot_builder_job(
             }
             .into());
         }
+        let terminal =
+            parse_terminal(&stdout).map_err(|error| SnapshotBuilderProcessFailure::Protocol {
+                command: command_diagnostics.clone(),
+                message: error.to_string(),
+            })?;
 
         let (resolved_snapshot_id, terminal_timing, discovery) = match terminal {
             SnapshotBuilderTerminal::Succeeded {
@@ -3543,11 +3546,17 @@ async fn run_snapshot_builder_job(
             SnapshotBuilderTerminal::Blocked {
                 code,
                 blocking_reasons,
+                blocking_reason_count,
+                blocking_reasons_sha256,
+                blocking_reasons_truncated,
                 ..
             } => {
                 return Err(SnapshotBuilderProcessFailure::Blocked {
                     code,
                     blocking_reasons,
+                    blocking_reason_count,
+                    blocking_reasons_sha256,
+                    blocking_reasons_truncated,
                 }
                 .into());
             }
@@ -3645,8 +3654,15 @@ fn snapshot_builder_candidates(builder_args: Vec<String>) -> Vec<BuilderCommandC
 }
 
 fn snapshot_builder_wall_timeout_seconds() -> u64 {
-    std::env::var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS")
-        .ok()
+    snapshot_builder_wall_timeout_seconds_from(
+        std::env::var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn snapshot_builder_wall_timeout_seconds_from(value: Option<&str>) -> u64 {
+    value
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS)
@@ -3706,20 +3722,37 @@ fn utf8_safe_tail(input: &[u8], max_bytes: usize) -> String {
 }
 
 fn redact_sensitive_diagnostics(input: &str) -> String {
+    let mut redact_following = 0_u8;
     input
         .split_whitespace()
         .map(|token| {
+            if redact_following > 0 {
+                redact_following -= 1;
+                return "[REDACTED]";
+            }
             let normalized = token.to_ascii_lowercase();
-            if normalized.contains("postgres://")
-                || normalized.contains("postgresql://")
-                || normalized.contains("authorization:")
-                || normalized.contains("authorization=")
-                || normalized.contains("bearer")
-                || normalized.contains("token=")
-                || normalized.contains("apikey=")
-                || normalized.contains("api_key=")
-                || normalized.contains("secret=")
-            {
+            if normalized.contains("authorization:") || normalized.contains("authorization=") {
+                redact_following = 2;
+                return "[REDACTED]";
+            }
+            if normalized == "bearer" || normalized.ends_with(":bearer") {
+                redact_following = 1;
+                return "[REDACTED]";
+            }
+            if is_sensitive_key_token(&normalized) {
+                redact_following = 2;
+                return "[REDACTED]";
+            }
+            let contains_url_credentials = normalized.contains("://")
+                && (normalized.split_once("://").is_some_and(|(_, rest)| {
+                    rest.split('/')
+                        .next()
+                        .is_some_and(|host| host.contains('@'))
+                }) || contains_sensitive_assignment(&normalized));
+            if contains_url_credentials || contains_sensitive_assignment(&normalized) {
+                if normalized.ends_with(':') || normalized.ends_with('=') {
+                    redact_following = 1;
+                }
                 "[REDACTED]"
             } else {
                 token
@@ -3727,6 +3760,44 @@ fn redact_sensitive_diagnostics(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn contains_sensitive_assignment(normalized: &str) -> bool {
+    const KEYS: [&str; 8] = [
+        "token",
+        "access_token",
+        "session_token",
+        "apikey",
+        "api_key",
+        "secret",
+        "password",
+        "passwd",
+    ];
+    KEYS.iter().any(|key| {
+        normalized.contains(&format!("{key}="))
+            || normalized.contains(&format!("{key}:"))
+            || normalized.contains(&format!("\"{key}\"="))
+            || normalized.contains(&format!("\"{key}\":"))
+    })
+}
+
+fn is_sensitive_key_token(normalized: &str) -> bool {
+    let key = normalized
+        .trim_matches(|character: char| {
+            matches!(character, '{' | '}' | '[' | ']' | ',' | '"' | '\'')
+        })
+        .trim();
+    matches!(
+        key,
+        "token"
+            | "access_token"
+            | "session_token"
+            | "apikey"
+            | "api_key"
+            | "secret"
+            | "password"
+            | "passwd"
+    )
 }
 
 fn tail_text(input: &str, max_len: usize) -> String {
@@ -4122,20 +4193,140 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        BuilderCommandCandidate, JobLifecycleBackend, PackageSnapshotExecutionMode,
-        SolveOptionsPayload, acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
+        BuildSnapshotWorkerLease, BuilderCommandCandidate, JobLifecycleBackend,
+        PackageSnapshotExecutionMode, SnapshotBuilderProcessFailure, SolveOptionsPayload,
+        acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
         build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, package_snapshot_execution_mode,
         parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
         redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
-        tail_text, utf8_safe_tail, validate_certified_process_axis,
+        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
+        snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
+        validate_certified_process_axis,
     };
     use serde_json::json;
-    use std::time::Duration;
+    use sqlx::postgres::PgPoolOptions;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::Command as StdCommand,
+        sync::{Mutex, MutexGuard},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tokio::time::sleep;
     use uuid::Uuid;
 
     use crate::graph_types::RequestRootProcess;
+
+    static SNAPSHOT_BUILDER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SnapshotBuilderEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous_bin: Option<String>,
+        previous_timeout: Option<String>,
+    }
+
+    impl SnapshotBuilderEnvGuard {
+        fn set(bin: &Path, timeout_seconds: &str) -> Self {
+            let lock = SNAPSHOT_BUILDER_ENV_LOCK.lock().unwrap();
+            let previous_bin = std::env::var("SNAPSHOT_BUILDER_BIN").ok();
+            let previous_timeout = std::env::var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS").ok();
+            // SAFETY: subprocess tests serialize every mutation through SNAPSHOT_BUILDER_ENV_LOCK.
+            unsafe {
+                std::env::set_var("SNAPSHOT_BUILDER_BIN", bin);
+                std::env::set_var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS", timeout_seconds);
+            }
+            Self {
+                _lock: lock,
+                previous_bin,
+                previous_timeout,
+            }
+        }
+    }
+
+    impl Drop for SnapshotBuilderEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard still owns SNAPSHOT_BUILDER_ENV_LOCK.
+            unsafe {
+                match &self.previous_bin {
+                    Some(value) => std::env::set_var("SNAPSHOT_BUILDER_BIN", value),
+                    None => std::env::remove_var("SNAPSHOT_BUILDER_BIN"),
+                }
+                match &self.previous_timeout {
+                    Some(value) => {
+                        std::env::set_var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS", value);
+                    }
+                    None => std::env::remove_var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS"),
+                }
+            }
+        }
+    }
+
+    fn executable_script(directory: &TempDir, body: &str) -> PathBuf {
+        let path = directory.path().join("snapshot-builder-test.sh");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    async fn run_test_snapshot_builder() -> anyhow::Result<super::SnapshotBuilderExecution> {
+        run_snapshot_builder_job(
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    fn process_is_running(pid: &str) -> bool {
+        StdCommand::new("ps")
+            .args(["-p", pid, "-o", "pid="])
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+    }
+
+    async fn wait_for_pid(path: &Path) -> String {
+        for _ in 0..100 {
+            if let Ok(pid) = fs::read_to_string(path)
+                && !pid.trim().is_empty()
+            {
+                return pid.trim().to_owned();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("test subprocess did not publish its pid");
+    }
+
+    async fn assert_process_reaped(pid: &str) {
+        for _ in 0..100 {
+            if !process_is_running(pid) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("subprocess {pid} remained alive");
+    }
 
     #[test]
     fn worker_jobs_backend_never_writes_legacy_lca_jobs() {
@@ -4196,12 +4387,124 @@ mod tests {
     #[test]
     fn snapshot_builder_diagnostics_redact_connection_and_token_values() {
         let redacted = redact_sensitive_diagnostics(
-            "db=postgresql://worker:password@example.test/db token=abc bearer xyz safe=value",
+            "Authorization: Bearer supersecret \
+             db=postgresql://worker:password@example.test/db?token=querysecret \
+             token=abc bearer xyz {\"token\":\"jsonsecret\"} \
+             {\"api_key\": \"spacedsecret\"} {\"secret\" : \"loosecolonsecret\"} safe=value",
         );
         assert!(!redacted.contains("password"));
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("bearer"));
+        assert!(!redacted.contains("supersecret"));
+        assert!(!redacted.contains("querysecret"));
+        assert!(!redacted.contains("xyz"));
+        assert!(!redacted.contains("jsonsecret"));
+        assert!(!redacted.contains("spacedsecret"));
+        assert!(!redacted.contains("loosecolonsecret"));
         assert!(redacted.contains("safe=value"));
+    }
+
+    #[test]
+    fn snapshot_builder_timeout_config_defaults_for_zero_and_invalid_values() {
+        assert_eq!(
+            snapshot_builder_wall_timeout_seconds_from(None),
+            super::DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            snapshot_builder_wall_timeout_seconds_from(Some("0")),
+            super::DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            snapshot_builder_wall_timeout_seconds_from(Some("invalid")),
+            super::DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS
+        );
+        assert_eq!(snapshot_builder_wall_timeout_seconds_from(Some("45")), 45);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_nonzero_without_terminal_is_typed_exit() {
+        let directory = TempDir::new().unwrap();
+        let script = executable_script(&directory, "printf 'operator failure' >&2\nexit 17");
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Exit { exit_code: 17, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_signal_without_terminal_is_typed_signal() {
+        let directory = TempDir::new().unwrap();
+        let script = executable_script(&directory, "kill -TERM $$");
+        let _env = SnapshotBuilderEnvGuard::set(&script, "5");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Signal { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_builder_timeout_kills_and_reaps_child() {
+        let directory = TempDir::new().unwrap();
+        let pid_path = directory.path().join("timeout.pid");
+        let script = executable_script(
+            &directory,
+            format!(
+                "printf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done",
+                pid_path.display()
+            )
+            .as_str(),
+        );
+        let _env = SnapshotBuilderEnvGuard::set(&script, "1");
+        let error = run_test_snapshot_builder().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotBuilderProcessFailure>(),
+            Some(SnapshotBuilderProcessFailure::Timeout { .. })
+        ));
+        let pid = wait_for_pid(&pid_path).await;
+        assert_process_reaped(&pid).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn heartbeat_failure_cancels_and_reaps_snapshot_builder() {
+        let directory = TempDir::new().unwrap();
+        let pid_path = directory.path().join("lease-loss.pid");
+        let script = executable_script(
+            &directory,
+            format!(
+                "printf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done",
+                pid_path.display()
+            )
+            .as_str(),
+        );
+        let _env = SnapshotBuilderEnvGuard::set(&script, "10");
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgresql://worker:password@127.0.0.1:1/test")
+            .unwrap();
+        let lease = BuildSnapshotWorkerLease {
+            worker_job_id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
+            lease_seconds: 1,
+        };
+        let result = run_snapshot_builder_job_with_worker_heartbeat(
+            &pool,
+            &lease,
+            json!({"slot": 0}),
+            run_test_snapshot_builder(),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("lease heartbeat failed")
+        );
+        let pid = wait_for_pid(&pid_path).await;
+        assert_process_reaped(&pid).await;
     }
 
     #[test]

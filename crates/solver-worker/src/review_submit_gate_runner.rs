@@ -845,6 +845,9 @@ fn snapshot_builder_blocked_outcome(
     let Some(db::SnapshotBuilderProcessFailure::Blocked {
         code,
         blocking_reasons,
+        blocking_reason_count,
+        blocking_reasons_sha256,
+        blocking_reasons_truncated,
     }) = error.downcast_ref::<db::SnapshotBuilderProcessFailure>()
     else {
         return None;
@@ -867,7 +870,10 @@ fn snapshot_builder_blocked_outcome(
             "runner": RUNNER_NAME,
             "phase": "snapshot_source_preflight",
             "blocker_code": code,
-            "blocker_count": blocking_reasons.len(),
+            "blocker_count": blocking_reason_count,
+            "blocking_reasons_sha256": blocking_reasons_sha256,
+            "blocking_reasons_truncated": blocking_reasons_truncated,
+            "sample_count": blocking_reasons.len(),
         }),
         authoritative_revision_checksum: run.revision_checksum.clone(),
     })
@@ -1517,6 +1523,9 @@ mod tests {
         let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Blocked {
             code: "source_dependency_unavailable".to_owned(),
             blocking_reasons: vec![reason.clone()],
+            blocking_reason_count: 1,
+            blocking_reasons_sha256: "a".repeat(64),
+            blocking_reasons_truncated: false,
         })
         .context("failed to build review-submit gate snapshot");
         let outcome = super::snapshot_builder_blocked_outcome(&run, &error).expect("typed blocker");
@@ -1525,6 +1534,9 @@ mod tests {
         assert_eq!(outcome.calculator_report["status"], "blocked");
         assert_eq!(outcome.blocking_reasons, json!([reason]));
         assert!(outcome.calculator_report.get("blockingReasons").is_none());
+        assert_eq!(outcome.audit["blocker_count"], 1);
+        assert_eq!(outcome.audit["blocking_reasons_truncated"], false);
+        assert_eq!(outcome.audit["blocking_reasons_sha256"], "a".repeat(64));
     }
 
     #[test]

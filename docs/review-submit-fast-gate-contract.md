@@ -154,7 +154,10 @@ request root 与 provider graph invariant，不从任意 document Process refere
 `referenceToIncludedProcesses` 等 model-composition reference 在 review-submit / 普通 bundle 中只形成
 count、SHA-256 和 bounded sample evidence；它们不 fetch/probe target、不进入 Process/Flow axis。
 exchange Flow 与 provider Process 的 exact identity 仍 fail closed；未知 Flow/Process path 是 operator
-error。确定性的必需 source 缺失使用稳定 `source_dependency_unavailable` blocker。
+error。role/provenance 字符串固定为 snake_case（例如 `model_composition`、`required_support`）。
+确定性的必需 source 缺失使用稳定 `source_dependency_unavailable` blocker；必需 numerical/support
+reference 的 malformed UUID/version 使用稳定 `source_reference_invalid`。Lineage/ModelComposition
+的 malformed target 在数值 artifact 中仍只记录 evidence，不触发 target lookup。
 
 Snapshot builder 子进程输出 exactly-one `snapshot_builder_terminal.v1` terminal frame，状态只为
 `succeeded` 或 `blocked`。runner 对 terminal 缺失、重复、未知 schema、截断、非零 exit/terminal
@@ -163,6 +166,10 @@ Snapshot builder 子进程输出 exactly-one `snapshot_builder_terminal.v1` term
 流式保留，command diagnostics 只保存 program/flag name，不保存 argv value、inline JSON、token 或
 连接串。worker-jobs 模式在子进程运行期间持续 heartbeat；heartbeat/lease loss 会取消当前 future，
 触发 child kill，且旧 lease 不得写回终态。
+blocked terminal 的 reasons 使用确定性的总数、SHA-256 与有界 sample，完整 frame 必须小于
+32 KiB，因此不会被 parent 的 64 KiB capture tail 截断。`SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS`
+控制 parent wall timeout，默认 `1800` 秒；unset、`0`、负数或非数字值均回退默认值，不能借此
+关闭 timeout。
 
 ## 输出
 

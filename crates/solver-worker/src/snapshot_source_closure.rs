@@ -12,7 +12,7 @@ use crate::{
     scope_closure::{DatasetCategory, extract_references},
     source_reference_policy::{
         ArtifactPurpose, SOURCE_REFERENCE_POLICY_VERSION, SourceReferenceAction,
-        SourceReferenceRole, classify_reference,
+        SourceReferenceRole, classify_malformed_reference_role, classify_reference,
     },
 };
 
@@ -99,12 +99,58 @@ pub fn classify_source_document(
             action: classified.action,
         });
     }
-    references.sort();
     let extraction_issues = extraction
         .issues
         .into_iter()
-        .map(|issue| serde_json::to_value(issue).expect("reference issue serializes"))
+        .filter_map(|issue| {
+            let role = classify_malformed_reference_role(
+                issue.source_category.as_str(),
+                issue.json_path.as_str(),
+            );
+            let evidence_only = matches!(
+                role,
+                Some(SourceReferenceRole::Lineage | SourceReferenceRole::ModelComposition)
+            ) && purpose != ArtifactPurpose::CertificateClosure;
+            if evidence_only {
+                if !references
+                    .iter()
+                    .any(|reference| reference.json_path == issue.json_path)
+                {
+                    let role = role.expect("evidence-only role is present");
+                    references.push(ClassifiedSourceReference {
+                        source_identity: source_identity.clone(),
+                        target_type: match role {
+                            SourceReferenceRole::ModelComposition => {
+                                CompiledReleaseSourceDatasetType::Process
+                            }
+                            _ => source.dataset_type,
+                        },
+                        target_uuid: issue
+                            .details
+                            .get("raw_ref_object_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>")
+                            .to_owned(),
+                        requested_version: None,
+                        json_path: issue.json_path,
+                        role,
+                        action: SourceReferenceAction::RecordEvidence,
+                    });
+                }
+                return None;
+            }
+            Some(json!({
+                "code": "source_reference_invalid",
+                "sourceIdentity": issue.document_key,
+                "jsonPath": issue.json_path,
+                "referenceRole": role.map_or("required_support", SourceReferenceRole::as_str),
+                "extractionIssueCode": issue.issue_code,
+                "message": issue.message,
+                "details": issue.details,
+            }))
+        })
         .collect();
+    references.sort();
     Ok(SourceClosureClassification {
         references,
         extraction_issues,
@@ -153,7 +199,7 @@ pub fn source_dependency_issue(reference: &ClassifiedSourceReference, message: &
         "targetId": reference.target_uuid,
         "targetVersion": reference.requested_version,
         "jsonPath": reference.json_path,
-        "referenceRole": format!("{:?}", reference.role).to_ascii_lowercase(),
+        "referenceRole": reference.role.as_str(),
         "message": message,
     })
 }
@@ -171,7 +217,7 @@ pub fn provenance_summary(
             target_category: reference.target_type.as_str().to_owned(),
             target_uuid: reference.target_uuid.clone(),
             requested_version: reference.requested_version.clone(),
-            role: format!("{:?}", reference.role).to_ascii_lowercase(),
+            role: reference.role.as_str().to_owned(),
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -277,6 +323,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.reference_count, 1);
         assert_eq!(first.samples.len(), 1);
+        assert_eq!(first.samples[0].role, "lineage");
     }
 
     #[test]
@@ -311,6 +358,74 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_lineage_is_evidence_only_but_required_reference_is_blocking() {
+        let lineage_cases = [
+            json!({
+                "referenceToReplacedDataSet": {
+                    "@type": "flow data set",
+                    "@version": "01.00.000"
+                }
+            }),
+            json!({
+                "referenceToOriginalDataSet": {
+                    "@type": "flow data set",
+                    "@refObjectId": "not-a-uuid",
+                    "@version": "01.00.000"
+                }
+            }),
+            json!({
+                "referenceToPrecedingDataSetVersion": {
+                    "@type": "flow data set",
+                    "@refObjectId": Uuid::new_v4(),
+                    "@version": "1.0"
+                }
+            }),
+        ];
+        for document in lineage_cases {
+            let classified = classify_source_document(
+                &source(CompiledReleaseSourceDatasetType::Flow, document),
+                ArtifactPurpose::ReviewSubmit,
+            )
+            .unwrap();
+            assert!(
+                classified.extraction_issues.is_empty(),
+                "lineage validation must remain evidence-only"
+            );
+            assert!(classified.references.iter().all(|reference| {
+                reference.role == SourceReferenceRole::Lineage
+                    && reference.action == SourceReferenceAction::RecordEvidence
+            }));
+        }
+
+        let required = classify_source_document(
+            &source(
+                CompiledReleaseSourceDatasetType::Process,
+                json!({
+                    "exchanges": {
+                        "exchange": [{
+                            "referenceToFlowDataSet": {
+                                "@type": "flow data set",
+                                "@version": "01.00.000"
+                            }
+                        }]
+                    }
+                }),
+            ),
+            ArtifactPurpose::ReviewSubmit,
+        )
+        .unwrap();
+        assert_eq!(required.extraction_issues.len(), 1);
+        assert_eq!(
+            required.extraction_issues[0]["code"],
+            "source_reference_invalid"
+        );
+        assert_eq!(
+            required.extraction_issues[0]["referenceRole"],
+            "exchange_flow"
         );
     }
 }
