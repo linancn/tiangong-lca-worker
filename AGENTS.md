@@ -42,9 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 31c5c0a12d62fa1176c8fa7ea2a76d8d09f415f1
-lastReviewedNote: "Reviewed for Issue #152: all active Worker validation paths require the exact published Rust tidas v0.1.1 binary and preserve fail-closed version/protocol enforcement."
-lastReviewedNote: "Reviewed for Issue #148: bounded validation spools, cache batches, file-backed artifacts, heartbeat-safe blocking work, and local capacity gates preserve repo ownership and fail-closed runtime contracts."
+lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
+lastReviewedNote: "Reviewed for Issue #156: byte-exact TIDAS issue hashing, file-backed closure inputs/reference evidence, and compact graph retention preserve repo ownership and fail-closed runtime contracts."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -173,7 +172,7 @@ Route those tasks to:
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
-- package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION`, verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; Python validators and command-candidate fallback are not runtime paths
+- package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION`, verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 
 ## Documentation Update Rules

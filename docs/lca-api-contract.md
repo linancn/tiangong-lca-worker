@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 615162082a7e3e1e7cfa4c603585c86c73c0b920
-lastReviewedNote: "Reviewed for Issue #152; the exact tidas v0.1.1 runtime handshake does not change jobs, payloads, statuses, or result contracts."
+lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
+lastReviewedNote: "Reviewed for Issue #156; byte-exact validation hashing and bounded internal closure retention do not change jobs, payloads, statuses, or result contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

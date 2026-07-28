@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 31c5c0a12d62fa1176c8fa7ea2a76d8d09f415f1
-lastReviewedNote: "Issue #152 advances package-worker's exact Rust validator handshake to tidas v0.1.1."
+lastReviewedCommit: 0c1c3c4e8bec3d19a0806dba61980a9d722304ee
+lastReviewedNote: "Reviewed for Issue #156; scope-closure raw-byte hashing and file-backed graph retention do not change package-worker import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
