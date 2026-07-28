@@ -30,7 +30,10 @@ fn raw_extractor_preserves_lineage_identity_and_stable_path() {
     assert_eq!(edge.target_category, "flows");
     assert_eq!(edge.target_uuid, "22222222-2222-4222-8222-222222222222");
     assert_eq!(edge.requested_version.as_deref(), Some("01.01.001"));
-    assert!(edge.json_path.ends_with("common:referenceToPrecedingDataSetVersion"));
+    assert!(
+        edge.json_path
+            .ends_with("common:referenceToPrecedingDataSetVersion")
+    );
 }
 
 #[test]

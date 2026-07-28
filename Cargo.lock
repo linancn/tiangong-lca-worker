@@ -2159,6 +2159,7 @@ dependencies = [
  "solver-core",
  "sqlx",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

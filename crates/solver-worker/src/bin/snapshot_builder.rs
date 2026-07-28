@@ -76,6 +76,7 @@ use solver_worker::snapshot_artifacts::{
     SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
     encode_snapshot_artifact_with_graph,
 };
+use solver_worker::snapshot_builder_protocol::SnapshotBuilderTerminal;
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
 };
@@ -94,6 +95,24 @@ const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
 const SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE: usize = 1_024;
 const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
 const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn emit_snapshot_builder_succeeded(
+    resolved_snapshot_id: Uuid,
+    build_timing: Option<&BuildTimingSec>,
+    scope_closure_discovery: Option<Value>,
+) -> anyhow::Result<()> {
+    let build_timing_sec = build_timing.map(serde_json::to_value).transpose()?;
+    println!(
+        "{}",
+        SnapshotBuilderTerminal::succeeded(
+            resolved_snapshot_id,
+            build_timing_sec,
+            scope_closure_discovery,
+        )
+        .to_line()?
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "snapshot-builder")]
@@ -1187,6 +1206,7 @@ async fn main() -> anyhow::Result<()> {
                     reused.coverage.matching.any_provider_match_pct,
                     reused.coverage.singular_risk.risk_level
                 );
+                emit_snapshot_builder_succeeded(resolved_snapshot_id, Some(&build_timing), None)?;
                 return Ok(());
             }
             Err(error) => {
@@ -1252,14 +1272,16 @@ async fn main() -> anyhow::Result<()> {
                 })
             })
             .collect::<Vec<_>>();
+        let discovery = serde_json::json!({
+            "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
+            "processAxis": process_axis,
+            "readiness": built.readiness,
+        });
         println!(
             "[scope_closure_discovery] {}",
-            serde_json::to_string(&serde_json::json!({
-                "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
-                "processAxis": process_axis,
-                "readiness": built.readiness,
-            }))?
+            serde_json::to_string(&discovery)?
         );
+        emit_snapshot_builder_succeeded(snapshot_id, Some(&build_timing), Some(discovery))?;
         return Ok(());
     }
 
@@ -1352,6 +1374,7 @@ async fn main() -> anyhow::Result<()> {
     println!("[done] snapshot ready: {snapshot_id}");
     println!("[artifact] {artifact_url}");
     println!("[snapshot_index] {snapshot_index_url}");
+    emit_snapshot_builder_succeeded(snapshot_id, Some(&build_timing), None)?;
     println!(
         "[matrix] process_count={} flow_count={} a_nnz={} b_nnz={} c_nnz={}",
         built.data.process_count,
@@ -1763,6 +1786,7 @@ async fn run_review_submit_overlay_build(
                 reused_overlay.b_nnz,
                 reused_overlay.c_nnz
             );
+            emit_snapshot_builder_succeeded(reused_overlay.snapshot_id, Some(&build_timing), None)?;
             return Ok(());
         }
     }
@@ -1864,6 +1888,7 @@ async fn run_review_submit_overlay_build(
     println!("[done] snapshot ready: {requested_snapshot_id}");
     println!("[artifact] {artifact_url}");
     println!("[snapshot_index] {snapshot_index_url}");
+    emit_snapshot_builder_succeeded(requested_snapshot_id, Some(&build_timing), None)?;
     println!(
         "[matrix] process_count={} flow_count={} a_nnz={} b_nnz={} c_nnz={}",
         built.data.process_count,

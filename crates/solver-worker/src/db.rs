@@ -2,7 +2,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     path::PathBuf,
-    process::Command,
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,11 @@ use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
     SolveOptions, SolveResult, SolverService, SparseTriplet,
 };
-use tokio::time::sleep;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::{sleep, timeout},
+};
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
@@ -37,6 +41,7 @@ use crate::{
     snapshot_artifacts::{
         DecodedSnapshotArtifact, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
     },
+    snapshot_builder_protocol::{SnapshotBuilderTerminal, parse_terminal},
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::ObjectStoreClient,
     types::{JobPayload, SolveOptionsPayload},
@@ -71,6 +76,8 @@ pub struct AppState {
 const DEFAULT_ALL_UNIT_BATCH_SIZE: usize = 128;
 const MAX_ALL_UNIT_BATCH_SIZE: usize = 2_048;
 const BUILD_SNAPSHOT_ADVISORY_LOCK_BASE: i64 = 0x5447_4c43_4253_4e50;
+const SNAPSHOT_BUILDER_CAPTURE_BYTES: usize = 64 * 1024;
+const DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS: u64 = 30 * 60;
 const ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL: &str = r"
 WITH _service_role AS (
     SELECT set_config('request.jwt.claim.role', 'service_role', true)
@@ -2145,6 +2152,42 @@ pub(crate) struct SnapshotBuilderExecution {
     pub(crate) scope_closure_discovery: Option<Value>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SnapshotBuilderProcessFailure {
+    #[error("snapshot_builder launch failed for {command}: {source}")]
+    Launch {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("snapshot_builder wall timeout after {timeout_seconds}s for {command}")]
+    Timeout {
+        command: String,
+        timeout_seconds: u64,
+    },
+    #[error("snapshot_builder terminated by signal for {command}; stderr_tail={stderr_tail}")]
+    Signal {
+        command: String,
+        stderr_tail: String,
+    },
+    #[error(
+        "snapshot_builder exited with code {exit_code} for {command}; stdout_tail={stdout_tail}; stderr_tail={stderr_tail}"
+    )]
+    Exit {
+        command: String,
+        exit_code: i32,
+        stdout_tail: String,
+        stderr_tail: String,
+    },
+    #[error("snapshot_builder protocol failure for {command}: {message}")]
+    Protocol { command: String, message: String },
+    #[error("snapshot_builder blocked with {code}")]
+    Blocked {
+        code: String,
+        blocking_reasons: Vec<Value>,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct BuilderCommandCandidate {
     program: String,
@@ -3405,61 +3448,130 @@ async fn run_snapshot_builder_job(
     let candidates = snapshot_builder_candidates(builder_args);
     let mut last_not_found = false;
     for candidate in candidates {
-        let cmd_vec = std::iter::once(candidate.program.clone())
-            .chain(candidate.args.iter().cloned())
-            .collect::<Vec<_>>();
-        let program = candidate.program.clone();
-        let args = candidate.args.clone();
-        let current_dir = candidate.current_dir.clone();
-        let output = match tokio::task::spawn_blocking(move || {
-            let mut command = Command::new(&program);
-            command.args(&args);
-            if let Some(dir) = current_dir {
-                command.current_dir(dir);
-            }
-            command.output()
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("snapshot_builder join error: {err}"))?
-        {
-            Ok(output) => output,
+        let command_diagnostics = redacted_builder_command(&candidate);
+        let mut command = Command::new(&candidate.program);
+        command
+            .args(&candidate.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(dir) = &candidate.current_dir {
+            command.current_dir(dir);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 last_not_found = true;
                 continue;
             }
-            Err(err) => return Err(err.into()),
+            Err(source) => {
+                return Err(SnapshotBuilderProcessFailure::Launch {
+                    command: command_diagnostics,
+                    source,
+                }
+                .into());
+            }
         };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if !output.status.success() {
-            let code = output.status.code().unwrap_or(-1);
-            return Err(anyhow::anyhow!(
-                "snapshot_builder failed: code={} cmd={} stdout_tail={} stderr_tail={}",
-                code,
-                cmd_vec.join(" "),
-                tail_text(&stdout, 2000),
-                tail_text(&stderr, 2000),
-            ));
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("snapshot_builder stdout pipe unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("snapshot_builder stderr pipe unavailable"))?;
+        let stdout_task = tokio::spawn(read_bounded_stream(stdout, SNAPSHOT_BUILDER_CAPTURE_BYTES));
+        let stderr_task = tokio::spawn(read_bounded_stream(stderr, SNAPSHOT_BUILDER_CAPTURE_BYTES));
+        let timeout_seconds = snapshot_builder_wall_timeout_seconds();
+        let status = match timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(SnapshotBuilderProcessFailure::Timeout {
+                    command: command_diagnostics,
+                    timeout_seconds,
+                }
+                .into());
+            }
+        };
+        let stdout_bytes = stdout_task.await.map_err(|error| {
+            anyhow::anyhow!("snapshot_builder stdout reader join error: {error}")
+        })??;
+        let stderr_bytes = stderr_task.await.map_err(|error| {
+            anyhow::anyhow!("snapshot_builder stderr reader join error: {error}")
+        })??;
+        let stdout = utf8_safe_tail(&stdout_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
+        let stderr = utf8_safe_tail(&stderr_bytes, SNAPSHOT_BUILDER_CAPTURE_BYTES);
+        let terminal =
+            parse_terminal(&stdout).map_err(|error| SnapshotBuilderProcessFailure::Protocol {
+                command: command_diagnostics.clone(),
+                message: error.to_string(),
+            })?;
+        if !status.success() {
+            let Some(exit_code) = status.code() else {
+                return Err(SnapshotBuilderProcessFailure::Signal {
+                    command: command_diagnostics,
+                    stderr_tail: tail_text(&stderr, 2000),
+                }
+                .into());
+            };
+            return Err(SnapshotBuilderProcessFailure::Exit {
+                command: command_diagnostics,
+                exit_code,
+                stdout_tail: tail_text(&stdout, 4000),
+                stderr_tail: tail_text(&stderr, 2000),
+            }
+            .into());
         }
 
-        let discovery = parse_scope_closure_discovery(&stdout)?;
-        let resolved_snapshot_id = if discovery.is_some() {
-            snapshot_id
-        } else {
-            parse_snapshot_builder_resolved_snapshot_id(&stdout).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "snapshot_builder succeeded but did not report resolved snapshot id"
-                )
-            })?
+        let (resolved_snapshot_id, terminal_timing, discovery) = match terminal {
+            SnapshotBuilderTerminal::Succeeded {
+                resolved_snapshot_id,
+                build_timing_sec,
+                scope_closure_discovery,
+                ..
+            } => (
+                resolved_snapshot_id,
+                build_timing_sec,
+                scope_closure_discovery,
+            ),
+            SnapshotBuilderTerminal::Blocked {
+                code,
+                blocking_reasons,
+                ..
+            } => {
+                return Err(SnapshotBuilderProcessFailure::Blocked {
+                    code,
+                    blocking_reasons,
+                }
+                .into());
+            }
         };
+        if let Some(legacy_id) = parse_snapshot_builder_resolved_snapshot_id(&stdout)
+            && legacy_id != resolved_snapshot_id
+        {
+            return Err(SnapshotBuilderProcessFailure::Protocol {
+                command: command_diagnostics,
+                message: format!(
+                    "snapshot_builder_protocol_exit_mismatch: terminal={resolved_snapshot_id} legacy={legacy_id}"
+                ),
+            }
+            .into());
+        }
 
         return Ok(SnapshotBuilderExecution {
             requested_snapshot_id: snapshot_id,
             resolved_snapshot_id,
-            build_timing_sec: parse_snapshot_builder_build_timing(&stdout),
-            command: cmd_vec,
-            exit_code: output.status.code().unwrap_or(0),
+            build_timing_sec: terminal_timing
+                .or_else(|| parse_snapshot_builder_build_timing(&stdout)),
+            command: command_diagnostics
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect(),
+            exit_code: status.code().unwrap_or(0),
             stdout_tail: tail_text(&stdout, 4000),
             stderr_tail: tail_text(&stderr, 2000),
             scope_closure_discovery: discovery,
@@ -3530,11 +3642,76 @@ fn snapshot_builder_candidates(builder_args: Vec<String>) -> Vec<BuilderCommandC
     out
 }
 
+fn snapshot_builder_wall_timeout_seconds() -> u64 {
+    std::env::var("SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS)
+}
+
+fn redacted_builder_command(candidate: &BuilderCommandCandidate) -> String {
+    let program = PathBuf::from(&candidate.program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("snapshot_builder")
+        .to_owned();
+    let flags = candidate
+        .args
+        .iter()
+        .filter(|argument| argument.starts_with('-'))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    std::iter::once(program.as_str())
+        .chain(flags)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn read_bounded_stream<R>(mut reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::with_capacity(max_bytes);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(retained);
+        }
+        if count >= max_bytes {
+            retained.clear();
+            retained.extend_from_slice(&chunk[count - max_bytes..count]);
+            continue;
+        }
+        let overflow = retained
+            .len()
+            .saturating_add(count)
+            .saturating_sub(max_bytes);
+        if overflow > 0 {
+            retained.drain(..overflow);
+        }
+        retained.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn utf8_safe_tail(input: &[u8], max_bytes: usize) -> String {
+    let mut start = input.len().saturating_sub(max_bytes);
+    while start < input.len() && std::str::from_utf8(&input[start..]).is_err() {
+        start += 1;
+    }
+    String::from_utf8_lossy(&input[start..]).into_owned()
+}
+
 fn tail_text(input: &str, max_len: usize) -> String {
     if input.len() <= max_len {
         return input.to_owned();
     }
-    input[input.len() - max_len..].to_owned()
+    let mut start = input.len() - max_len;
+    while !input.is_char_boundary(start) {
+        start += 1;
+    }
+    input[start..].to_owned()
 }
 
 fn parse_snapshot_builder_resolved_snapshot_id(stdout: &str) -> Option<Uuid> {
@@ -3543,19 +3720,6 @@ fn parse_snapshot_builder_resolved_snapshot_id(stdout: &str) -> Option<Uuid> {
         .rev()
         .find_map(|line| line.strip_prefix("[resolved_snapshot_id] "))
         .and_then(|value| Uuid::parse_str(value.trim()).ok())
-}
-
-fn parse_scope_closure_discovery(stdout: &str) -> anyhow::Result<Option<Value>> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("[scope_closure_discovery] "))
-        .map(|value| {
-            serde_json::from_str(value.trim()).map_err(|error| {
-                anyhow::anyhow!("snapshot_builder emitted invalid scope closure discovery: {error}")
-            })
-        })
-        .transpose()
 }
 
 fn parse_snapshot_builder_build_timing(stdout: &str) -> Option<Value> {
@@ -3932,13 +4096,14 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        JobLifecycleBackend, PackageSnapshotExecutionMode, SolveOptionsPayload,
-        acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
+        BuilderCommandCandidate, JobLifecycleBackend, PackageSnapshotExecutionMode,
+        SolveOptionsPayload, acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
         build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, package_snapshot_execution_mode,
         parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        resolve_solve_all_unit_options, validate_certified_process_axis,
+        redacted_builder_command, resolve_solve_all_unit_options, tail_text, utf8_safe_tail,
+        validate_certified_process_axis,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -3964,6 +4129,42 @@ mod tests {
         assert!(sql.contains("lease_token is not distinct from $2"));
         assert!(sql.contains("lease_expires_at >= NOW()"));
         assert!(sql.contains("phase = 'build_snapshot'"));
+    }
+
+    #[test]
+    fn snapshot_builder_command_diagnostics_never_include_argument_values() {
+        let candidate = BuilderCommandCandidate {
+            program: "/private/bin/snapshot_builder".to_owned(),
+            args: vec![
+                "--scope-manifest-json".to_owned(),
+                r#"{"token":"secret"}"#.to_owned(),
+                "--include-user-id".to_owned(),
+                Uuid::nil().to_string(),
+                "--no-lcia".to_owned(),
+            ],
+            current_dir: None,
+        };
+        let diagnostic = redacted_builder_command(&candidate);
+        assert_eq!(
+            diagnostic,
+            "snapshot_builder --scope-manifest-json --include-user-id --no-lcia"
+        );
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains(Uuid::nil().to_string().as_str()));
+    }
+
+    #[test]
+    fn snapshot_builder_tails_are_utf8_safe_and_byte_bounded() {
+        let text = format!("{}END", "柴油🙂".repeat(2_000));
+        let tail = tail_text(&text, 2_000);
+        assert!(tail.len() <= 2_000);
+        assert!(tail.ends_with("END"));
+
+        let bytes = text.as_bytes();
+        let byte_tail = utf8_safe_tail(bytes, 2_001);
+        assert!(byte_tail.len() <= 2_001);
+        assert!(byte_tail.ends_with("END"));
+        assert!(!byte_tail.contains('\u{fffd}'));
     }
 
     #[test]
