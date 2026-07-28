@@ -65,6 +65,8 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 - Do not introduce explicit matrix inversion for solve paths. Reuse factorization or sparse-solve flows instead.
 - Heavy recomputation belongs in async worker jobs, not inline request handlers or API-edge adapters.
 - If a change affects factorization reuse, provider matching, or snapshot payload shape, review worker and persistence paths together.
+- `solve_all_unit` treats Calculation Bundle partitions plus manifest as the complete result. Its query artifact is a bounded deterministic chunk index, while the retained HDF5 result row is only a compatibility descriptor; neither path may reconstruct a process-by-impact `h_matrix`.
+- The factorization cache accounts retained CSC capacities plus UMFPACK's workload-reported symbolic/numeric object sizes, enforces a hard byte capacity with deterministic LRU eviction, and releases invalidated entries immediately. Pre-factorization admission uses deployment-tuned fill-in headroom and must not be described as input-independent constant memory.
 
 ## Stable Path Map
 

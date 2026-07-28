@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 98ca40c
-lastReviewedNote: "Reviewed for Issue #160 subprocess-test harness stabilization; closure traversal, evidence, and certificate semantics remain unchanged."
+lastReviewedCommit: 3850855f6a3a3cc505e3a62499c0a85d6ce17df6
+lastReviewedNote: "Reviewed for Issue #165 bounded all-unit result delivery; closure traversal, evidence, and certificate semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

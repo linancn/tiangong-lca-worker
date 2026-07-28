@@ -5,7 +5,10 @@ mod data_builder;
 mod service;
 mod validator;
 
-pub use cache::{FactorizationCache, FactorizationKey, FactorizationState, SolverBackend};
+pub use cache::{
+    FactorizationCache, FactorizationCacheAdmissionError, FactorizationCacheTelemetry,
+    FactorizationKey, FactorizationState, SolverBackend,
+};
 pub use data_builder::{DataBuilder, ModelSparseData, SparseTriplet};
 pub use service::{
     FactorizationDiagnostics, NumericOptions, PrepareResult, SolveBatchResult,

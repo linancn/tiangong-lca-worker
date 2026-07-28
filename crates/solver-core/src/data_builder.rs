@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use suitesparse_ffi::{CscMatrix, MatrixError, MatrixTriplet};
 use thiserror::Error;
@@ -96,42 +94,39 @@ impl DataBuilder {
             });
         }
 
-        let a_map = self.aggregate(
-            &data.technosphere_entries,
+        let m = CscMatrix::from_triplet_iter(
             data.process_count,
             data.process_count,
-        )?;
-        let m_triplets = self.build_m_triplets(data.process_count, &a_map);
-
-        let b_triplets = data
-            .biosphere_entries
-            .iter()
-            .copied()
-            .map(Self::to_matrix_triplet)
-            .collect::<Vec<_>>();
-        let c_triplets = data
-            .characterization_factors
-            .iter()
-            .copied()
-            .map(Self::to_matrix_triplet)
-            .collect::<Vec<_>>();
-
-        let m = CscMatrix::from_triplets(
-            data.process_count,
-            data.process_count,
-            &m_triplets,
+            data.technosphere_entries
+                .iter()
+                .map(|entry| MatrixTriplet {
+                    row: entry.row,
+                    col: entry.col,
+                    value: -entry.value,
+                })
+                .chain((0..data.process_count).map(|index| MatrixTriplet {
+                    row: index,
+                    col: index,
+                    value: 1.0,
+                })),
             self.zero_epsilon,
         )?;
-        let b = CscMatrix::from_triplets(
+        let b = CscMatrix::from_triplet_iter(
             data.flow_count,
             data.process_count,
-            &b_triplets,
+            data.biosphere_entries
+                .iter()
+                .copied()
+                .map(Self::to_matrix_triplet),
             self.zero_epsilon,
         )?;
-        let c = CscMatrix::from_triplets(
+        let c = CscMatrix::from_triplet_iter(
             data.impact_count,
             data.flow_count,
-            &c_triplets,
+            data.characterization_factors
+                .iter()
+                .copied()
+                .map(Self::to_matrix_triplet),
             self.zero_epsilon,
         )?;
 
@@ -143,56 +138,6 @@ impl DataBuilder {
             b,
             c,
         })
-    }
-
-    fn aggregate(
-        &self,
-        input: &[SparseTriplet],
-        nrows: i32,
-        ncols: i32,
-    ) -> Result<HashMap<(i32, i32), f64>, DataBuilderError> {
-        let mut acc: HashMap<(i32, i32), f64> = HashMap::new();
-        for t in input {
-            let triplet = Self::to_matrix_triplet(*t);
-            if !(0..nrows).contains(&triplet.row) || !(0..ncols).contains(&triplet.col) {
-                return Err(DataBuilderError::Matrix(MatrixError::ColOutOfRange {
-                    col: triplet.col,
-                    ncols,
-                }));
-            }
-            if triplet.value.abs() <= self.zero_epsilon {
-                continue;
-            }
-            *acc.entry((triplet.row, triplet.col)).or_insert(0.0) += triplet.value;
-        }
-
-        acc.retain(|_, value| value.abs() > self.zero_epsilon);
-        Ok(acc)
-    }
-
-    fn build_m_triplets(
-        &self,
-        process_count: i32,
-        a_map: &HashMap<(i32, i32), f64>,
-    ) -> Vec<MatrixTriplet> {
-        let mut m_map: HashMap<(i32, i32), f64> = HashMap::with_capacity(
-            a_map.len() + usize::try_from(process_count).unwrap_or_default(),
-        );
-
-        for (&(row, col), &value) in a_map {
-            *m_map.entry((row, col)).or_insert(0.0) -= value;
-        }
-
-        for i in 0..process_count {
-            *m_map.entry((i, i)).or_insert(0.0) += 1.0;
-        }
-
-        m_map
-            .into_iter()
-            .filter_map(|((row, col), value)| {
-                (value.abs() > self.zero_epsilon).then_some(MatrixTriplet { row, col, value })
-            })
-            .collect()
     }
 
     fn to_matrix_triplet(t: SparseTriplet) -> MatrixTriplet {
