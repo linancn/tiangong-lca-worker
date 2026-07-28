@@ -213,13 +213,13 @@ On success, the worker records a terminal `worker_jobs` result with:
 - `result_json.snapshotId`
 - `result_json.resultId` when a `lca_results` row was produced
 - `result_ref = {"domainSource":"worker_jobs","workerJobId":"<uuid>","lcaJobId":"<uuid>","result":{"table":"lca_results","id":"<uuid>"}}` for solve/result-producing jobs
-- `diagnostics.lcaJob` as an optional legacy `lca_jobs` projection; if the table is absent, the projection reports `legacyTableMissing=true`
+- `diagnostics.lcaJob = {"id":"<uuid>","projectionSkipped":true}` and `result_json.lcaJobStatus = null` are non-querying compatibility placeholders; canonical result diagnostics come from `worker_jobs` and domain result tables, and the `worker_jobs` runtime does not query optional `lca_jobs`
 
 `build_snapshot` is projected independently from `worker_jobs.diagnostics.build_snapshot_result`: it always returns the resolved snapshot ID (including reuse) and scoped calculation evidence without reading optional `lca_jobs`. Its `result_ref.snapshot` points at the resolved `lca_network_snapshots` row.
 
 Singular/factorization failure diagnostics load the exact `(process_id, process_version)` pairs from `snapshot-index.process_map`. Duplicate-exchange and service-loop scans join only those pairs; they do not reconstruct scope from broad owner/state filters.
 
-On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. If optional `lca_jobs` exists, the worker also backfills `lca_jobs.worker_job_id`; if it does not exist, the compatibility write is skipped. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists; retained `lca_jobs.status/diagnostics` are best-effort compatibility only.
+On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. The canonical path never probes or backfills optional `lca_jobs`. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists. Retained `lca_jobs.status/diagnostics` writes are limited to the explicitly enabled legacy pgmq/debug backend.
 
 For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `public.cmd_lcia_result_package_mark_ready(...)`. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `lca_result_cache` or optional legacy `lca_jobs`.
 
@@ -325,7 +325,7 @@ Provider-link 的运行时决策顺序、默认 provider rule、candidate eligib
 - `requested_location_granularity_counts`：目标供应区域粒度总计，例如 `subnational`、`country`、`region`、`global`、`unspecified`。
 - `requested_location_granularity_counts_by_strategy`：按 resolved strategy 拆分的目标供应区域粒度。
 
-`build_snapshot` job 运行和完成时，worker 会在 `worker_jobs.diagnostics/result_json` 中记录全局构建并发锁与构建耗时信息；如果 optional `lca_jobs` 存在，也会 best-effort 写入 `lca_jobs.diagnostics.build_snapshot_lock` 与 `build_timing_sec`。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
+`build_snapshot` job 运行和完成时，worker 会在 `worker_jobs.diagnostics/result_json` 中记录全局构建并发锁与构建耗时信息。Canonical `worker_jobs` execution never mirrors these diagnostics into optional `lca_jobs`; only the explicitly enabled legacy pgmq/debug backend writes legacy diagnostics. 这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
 ### 5.1 Matrix-readiness verification report
 
@@ -442,6 +442,6 @@ legacy pgmq 路径：
 1. 先创建或复用 `lca_result_cache` domain row，并生成 `lcaJobId` compatibility UUID；不要求创建 `lca_jobs` row。
 2. 调 `public.worker_enqueue_job(...)` 创建 `job_kind=lca.*`、`worker_queue=solver` 的 job，payload 带 `lcaJobId` 和标准化求解参数。
 3. 返回 `workerJobId` 与 `lcaJobId` 给 Edge / Next projection。
-4. worker 使用 `worker_claim_jobs('solver', ...)` claim、heartbeat，并通过 `worker_record_job_result(...)` 写 canonical 终态；同时维护 `lca_results`、`lca_result_cache` domain/cache metadata，并回填 `worker_job_id`。optional `lca_jobs` 只做 best-effort compatibility update。
+4. worker 使用 `worker_claim_jobs('solver', ...)` claim、heartbeat，并通过 `worker_record_job_result(...)` 写 canonical 终态；同时维护 `lca_results`、`lca_result_cache` domain/cache metadata，并回填 `worker_job_id`。Canonical path does not query or update optional `lca_jobs`; legacy table access is restricted to the explicitly enabled pgmq/debug backend。
 
 不建议前端直接调用 `pgmq.send`、直接写 `lca_jobs` 或直接写 `worker_jobs`。

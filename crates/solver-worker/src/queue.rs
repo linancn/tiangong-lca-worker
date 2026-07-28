@@ -16,7 +16,7 @@ use crate::{
         AppState, archive_queue_message, fetch_snapshot_index_document, handle_job_payload,
         handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
         latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
-        update_job_status,
+        update_legacy_lca_job_status,
     },
     scope_closure::{
         SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION, execute_scope_closure_job,
@@ -726,7 +726,6 @@ async fn record_solver_worker_job_failure(
     }
 
     let diagnostics = build_failure_diagnostics(state, payload, err_message).await;
-    let _ = update_job_status(&state.pool, lca_job_id, "failed", diagnostics.clone()).await;
     let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
         .await;
     if let Err(err) = link_lca_worker_job_domain_refs(&state.pool, job.id, lca_job_id).await {
@@ -927,21 +926,16 @@ async fn build_solver_worker_job_result(
 
     let lca_job_id = extract_job_id(payload);
     link_lca_worker_job_domain_refs(&state.pool, worker_job_id, lca_job_id).await?;
-    let job_projection = fetch_lca_job_projection(&state.pool, lca_job_id).await?;
     let result_id = latest_result_id_for_job(&state.pool, lca_job_id).await?;
     let result_ref = solver_worker_result_ref(worker_job_id, lca_job_id, result_id);
-    let snapshot_id = job_projection
-        .get("snapshotId")
-        .cloned()
-        .filter(|value| !value.is_null())
-        .or_else(|| extract_snapshot_id(payload).map(|id| json!(id)))
-        .unwrap_or(Value::Null);
+    let snapshot_id = extract_snapshot_id(payload).map_or(Value::Null, |id| json!(id));
+    let legacy_job_projection = skipped_legacy_lca_job_projection(lca_job_id);
     let result_json = json!({
         "workerJobId": worker_job_id,
         "lcaJobId": lca_job_id,
         "payloadType": payload_type_name(payload),
         "snapshotId": snapshot_id,
-        "lcaJobStatus": job_projection.get("status").cloned().unwrap_or(Value::Null),
+        "lcaJobStatus": Value::Null,
         "resultId": result_id,
         "calculationEvidence": calculation_evidence_binding_for_payload(payload),
     });
@@ -952,7 +946,7 @@ async fn build_solver_worker_job_result(
         result_schema_version: Some(result_schema_version_for_payload(payload).to_owned()),
         result_ref: Some(result_ref),
         diagnostics: Some(json!({
-            "lcaJob": job_projection,
+            "lcaJob": legacy_job_projection,
             "calculationEvidence": calculation_evidence_binding_for_payload(payload),
         })),
         error_code: None,
@@ -1070,66 +1064,37 @@ fn lcia_result_package_worker_result_ref(
     })
 }
 
+const CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES: [&str; 4] = [
+    r"
+        UPDATE public.lca_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+    r"
+        UPDATE public.lca_result_cache
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+    r"
+        UPDATE public.lca_latest_all_unit_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+    r"
+        UPDATE public.lca_factorization_registry
+           SET prepared_worker_job_id = $1
+         WHERE prepared_job_id = $2
+        ",
+];
+
 async fn link_lca_worker_job_domain_refs(
     pool: &sqlx::PgPool,
     worker_job_id: Uuid,
     lca_job_id: Uuid,
 ) -> anyhow::Result<()> {
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_jobs
-           SET worker_job_id = $1
-         WHERE id = $2
-        ",
-        worker_job_id,
-        lca_job_id,
-    )
-    .await?;
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_results
-           SET worker_job_id = $1
-         WHERE job_id = $2
-        ",
-        worker_job_id,
-        lca_job_id,
-    )
-    .await?;
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_result_cache
-           SET worker_job_id = $1
-         WHERE job_id = $2
-        ",
-        worker_job_id,
-        lca_job_id,
-    )
-    .await?;
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_latest_all_unit_results
-           SET worker_job_id = $1
-         WHERE job_id = $2
-        ",
-        worker_job_id,
-        lca_job_id,
-    )
-    .await?;
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_factorization_registry
-           SET prepared_worker_job_id = $1
-         WHERE prepared_job_id = $2
-        ",
-        worker_job_id,
-        lca_job_id,
-    )
-    .await?;
+    for statement in CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES {
+        execute_optional_worker_job_ref_update(pool, statement, worker_job_id, lca_job_id).await?;
+    }
 
     Ok(())
 }
@@ -1168,42 +1133,11 @@ fn solver_worker_result_ref(
     })
 }
 
-async fn fetch_lca_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let result = sqlx::query(
-        r"
-        SELECT status, job_type, snapshot_id, diagnostics
-        FROM public.lca_jobs
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await;
-
-    let row = match result {
-        Ok(row) => row,
-        Err(err) if is_undefined_table(&err) => {
-            return Ok(json!({
-                "id": job_id,
-                "missing": true,
-                "legacyTableMissing": true,
-            }));
-        }
-        Err(err) => return Err(err.into()),
-    };
-
-    Ok(row.map_or_else(
-        || json!({"id": job_id, "missing": true}),
-        |row| {
-            json!({
-                "id": job_id,
-                "status": row.try_get::<String, _>("status").ok(),
-                "jobType": row.try_get::<String, _>("job_type").ok(),
-                "snapshotId": row.try_get::<Uuid, _>("snapshot_id").ok(),
-                "diagnostics": row.try_get::<Value, _>("diagnostics").ok(),
-            })
-        },
-    ))
+fn skipped_legacy_lca_job_projection(job_id: Uuid) -> Value {
+    json!({
+        "id": job_id,
+        "projectionSkipped": true,
+    })
 }
 
 fn is_undefined_table(err: &sqlx::Error) -> bool {
@@ -1767,8 +1701,13 @@ pub async fn run_worker_loop(
                             let err_message = err.to_string();
                             let diagnostics =
                                 build_failure_diagnostics(&state, &payload, &err_message).await;
-                            let _ =
-                                update_job_status(&state.pool, job_id, "failed", diagnostics).await;
+                            let _ = update_legacy_lca_job_status(
+                                &state.pool,
+                                job_id,
+                                "failed",
+                                diagnostics,
+                            )
+                            .await;
                             let _ = mark_result_cache_failed(
                                 &state.pool,
                                 job_id,
@@ -1784,7 +1723,7 @@ pub async fn run_worker_loop(
                         warn!(error = %err, "invalid job payload");
                         if let Some(job_id) = extract_job_id_from_raw_payload(&message.payload) {
                             let err_message = format!("invalid job payload: {err}");
-                            let _ = update_job_status(
+                            let _ = update_legacy_lca_job_status(
                                 &state.pool,
                                 job_id,
                                 "failed",
@@ -1863,15 +1802,38 @@ mod tests {
             method_factor_source_contract_fixture,
         },
         queue::{
-            AuthoritativePackageClosureBinding, lcia_result_package_worker_result_ref,
-            parse_build_snapshot_worker_projection, payload_type_name,
-            result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
+            AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
+            lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
+            payload_type_name, result_schema_version_for_payload,
+            skipped_legacy_lca_job_projection, snapshot_diagnostic_scope_pairs,
             solver_worker_job_payload, solver_worker_result_ref,
             validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
         worker_jobs::WorkerJob,
     };
+
+    #[test]
+    fn canonical_worker_job_domain_links_never_reference_legacy_lca_jobs() {
+        assert!(
+            CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES
+                .iter()
+                .all(|statement| !statement.contains("lca_jobs")),
+            "canonical worker_jobs domain linking must not query the retired lca_jobs table"
+        );
+    }
+
+    #[test]
+    fn canonical_legacy_job_projection_is_a_non_querying_compatibility_placeholder() {
+        let lca_job_id = Uuid::new_v4();
+        assert_eq!(
+            skipped_legacy_lca_job_projection(lca_job_id),
+            json!({
+                "id": lca_job_id,
+                "projectionSkipped": true,
+            })
+        );
+    }
 
     fn worker_job(
         job_kind: &str,
