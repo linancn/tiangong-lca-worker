@@ -24,7 +24,8 @@ use uuid::Uuid;
 use crate::{
     artifacts::{
         EncodedArtifact, encode_contribution_path_artifact, encode_solve_all_unit_query_artifact,
-        encode_solve_batch_artifact, encode_solve_one_artifact,
+        encode_solve_all_unit_result_descriptor, encode_solve_batch_artifact,
+        encode_solve_one_artifact,
     },
     calculation_bundle::{
         CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT, CalculationBundleArtifactRef,
@@ -297,7 +298,10 @@ impl AppState {
         Ok(Self {
             pool,
             queue_pool,
-            solver: SolverService::new(),
+            solver: SolverService::with_cache_policy(
+                config.factorization_cache_max_bytes(),
+                config.factorization_admission_fill_in_multiplier(),
+            ),
             object_store,
             build_snapshot_max_concurrency: config.build_snapshot_max_concurrency(),
             build_snapshot_lock_poll_interval: config.build_snapshot_lock_poll_interval(),
@@ -1296,7 +1300,7 @@ async fn handle_job_payload_with_worker_lease(
             }
             let batch_size = normalize_all_unit_batch_size(unit_batch_size, n);
             let _ = resolve_solve_all_unit_options(solve)?;
-            let (solved, calculation_bundle) = solve_all_unit_with_calculation_bundle(
+            let all_unit_artifacts = solve_all_unit_with_calculation_bundle(
                 state,
                 job_id,
                 snapshot_id,
@@ -1305,27 +1309,12 @@ async fn handle_job_payload_with_worker_lease(
                 level,
             )
             .await?;
-            let query_artifact_meta =
-                persist_solve_all_unit_query_artifact(state, job_id, snapshot_id, &solved)
-                    .await
-                    .map_err(|err| {
-                        warn!(
-                            error = %err,
-                            job_id = %job_id,
-                            snapshot_id = %snapshot_id,
-                            "failed to persist solve_all_unit query sidecar artifact"
-                        );
-                        err
-                    })
-                    .ok();
-            let result_diag = persist_solve_batch_result(
+            let result_diag = persist_solve_all_unit_result(
                 state,
                 job_id,
                 snapshot_id,
-                &solved,
-                "solve_all_unit",
+                &all_unit_artifacts,
                 calculation_evidence.clone(),
-                Some(calculation_bundle.clone()),
             )
             .await?;
             let completed_diag = merge_job_status_update_timing(
@@ -1336,7 +1325,13 @@ async fn handle_job_payload_with_worker_lease(
                         "process_count": n,
                         "unit_batch_size": batch_size,
                     },
-                    "calculation_bundle": calculation_bundle,
+                    "calculation_bundle": all_unit_artifacts.calculation_bundle.clone(),
+                    "query_artifact": {
+                        "artifact_url": all_unit_artifacts.query_artifact_meta.url.clone(),
+                        "artifact_sha256": all_unit_artifacts.query_artifact_meta.sha256.clone(),
+                        "artifact_byte_size": all_unit_artifacts.query_artifact_meta.byte_size,
+                        "artifact_format": all_unit_artifacts.query_artifact_meta.format.clone(),
+                    },
                     "calculation_evidence": calculation_evidence,
                 }),
                 "running",
@@ -1361,15 +1356,14 @@ async fn handle_job_payload_with_worker_lease(
                     );
                 }
 
-                if let Some(meta) = query_artifact_meta
-                    && let Err(err) = upsert_latest_all_unit_result(
-                        &state.pool,
-                        snapshot_id,
-                        job_id,
-                        result_id,
-                        &meta,
-                    )
-                    .await
+                if let Err(err) = upsert_latest_all_unit_result(
+                    &state.pool,
+                    snapshot_id,
+                    job_id,
+                    result_id,
+                    &all_unit_artifacts.query_artifact_meta,
+                )
+                .await
                 {
                     warn!(
                         error = %err,
@@ -1919,7 +1913,7 @@ async fn solve_all_unit_with_calculation_bundle(
     process_count: usize,
     solve_batch_size: usize,
     print_level: f64,
-) -> anyhow::Result<(SolveBatchResult, CalculationBundleArtifactRef)> {
+) -> anyhow::Result<SolvedAllUnitArtifacts> {
     let snapshot_meta = fetch_snapshot_artifact_meta(&state.pool, snapshot_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} has no ready artifact"))?;
@@ -1951,7 +1945,6 @@ async fn solve_all_unit_with_calculation_bundle(
         &release_evidence,
     )?;
 
-    let mut legacy_items = Vec::with_capacity(process_count);
     let internal_options = SolveOptions {
         return_x: true,
         return_g: false,
@@ -1973,30 +1966,31 @@ async fn solve_all_unit_with_calculation_bundle(
             artifact_items.extend(partial.items);
         }
         bundle_writer.write_result_chunk(artifact_start, artifact_items.as_slice())?;
-        legacy_items.extend(artifact_items.into_iter().map(|item| SolveResult {
-            x: None,
-            g: None,
-            h: item.h,
-            factorization_state: item.factorization_state,
-        }));
     }
     let built = bundle_writer.finish()?;
     let bundle_ref = upload_built_calculation_bundle(&state.object_store, &built).await?;
-    Ok((
-        SolveBatchResult {
-            items: legacy_items,
-        },
-        bundle_ref,
-    ))
+    let query_artifact_meta = persist_solve_all_unit_query_artifact(
+        state,
+        job_id,
+        snapshot_id,
+        &built.manifest,
+        &bundle_ref,
+    )
+    .await?;
+    Ok(SolvedAllUnitArtifacts {
+        calculation_bundle: bundle_ref,
+        query_artifact_meta,
+    })
 }
 
 async fn persist_solve_all_unit_query_artifact(
     state: &AppState,
     job_id: Uuid,
     snapshot_id: Uuid,
-    solved: &SolveBatchResult,
+    manifest: &crate::calculation_bundle::CalculationBundleManifest,
+    bundle_ref: &CalculationBundleArtifactRef,
 ) -> anyhow::Result<QueryArtifactMeta> {
-    let encoded = encode_solve_all_unit_query_artifact(snapshot_id, job_id, solved)?;
+    let encoded = encode_solve_all_unit_query_artifact(snapshot_id, job_id, manifest, bundle_ref)?;
     let artifact_len = i64::try_from(encoded.bytes.len())
         .map_err(|_| anyhow::anyhow!("query artifact size overflow"))?;
     let artifact_url = state
@@ -2017,6 +2011,43 @@ async fn persist_solve_all_unit_query_artifact(
         byte_size: artifact_len,
         format: encoded.format.to_owned(),
     })
+}
+
+async fn persist_solve_all_unit_result(
+    state: &AppState,
+    job_id: Uuid,
+    snapshot_id: Uuid,
+    artifacts: &SolvedAllUnitArtifacts,
+    calculation_evidence: Option<LcaCalculationEvidence>,
+) -> anyhow::Result<Value> {
+    let query_index = serde_json::json!({
+        "artifactUrl": artifacts.query_artifact_meta.url.clone(),
+        "artifactSha256": artifacts.query_artifact_meta.sha256.clone(),
+        "artifactByteSize": artifacts.query_artifact_meta.byte_size,
+        "artifactFormat": artifacts.query_artifact_meta.format.clone(),
+    });
+    let encode_started = Instant::now();
+    let encoded = encode_solve_all_unit_result_descriptor(
+        snapshot_id,
+        job_id,
+        &artifacts.calculation_bundle,
+        query_index,
+    )?;
+    let encode_artifact_sec = encode_started.elapsed().as_secs_f64();
+    persist_result_artifact(
+        state,
+        job_id,
+        snapshot_id,
+        PersistArtifactInput {
+            suffix: "solve_all_unit",
+            encoded,
+            compute_timing: None,
+            encode_artifact_sec,
+            calculation_evidence,
+            calculation_bundle: Some(artifacts.calculation_bundle.clone()),
+        },
+    )
+    .await
 }
 
 async fn persist_contribution_path_result(
@@ -2113,6 +2144,11 @@ struct QueryArtifactMeta {
     sha256: String,
     byte_size: i64,
     format: String,
+}
+
+struct SolvedAllUnitArtifacts {
+    calculation_bundle: CalculationBundleArtifactRef,
+    query_artifact_meta: QueryArtifactMeta,
 }
 
 #[derive(Debug, Clone)]
@@ -3070,7 +3106,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
     }
 
     let batch_size = normalize_all_unit_batch_size(None, n);
-    let (solved, calculation_bundle) = solve_all_unit_with_calculation_bundle(
+    let all_unit_artifacts = solve_all_unit_with_calculation_bundle(
         state,
         result_job_id,
         snapshot_id,
@@ -3079,18 +3115,9 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         0.0,
     )
     .await?;
-    let query_artifact_meta =
-        persist_solve_all_unit_query_artifact(state, result_job_id, snapshot_id, &solved).await?;
-    let result_diag = persist_solve_batch_result(
-        state,
-        result_job_id,
-        snapshot_id,
-        &solved,
-        "solve_all_unit",
-        None,
-        Some(calculation_bundle.clone()),
-    )
-    .await?;
+    let result_diag =
+        persist_solve_all_unit_result(state, result_job_id, snapshot_id, &all_unit_artifacts, None)
+            .await?;
     let result_id = latest_result_id_for_job(&state.pool, result_job_id)
         .await?
         .ok_or_else(|| {
@@ -3101,7 +3128,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         snapshot_id,
         result_job_id,
         result_id,
-        &query_artifact_meta,
+        &all_unit_artifacts.query_artifact_meta,
     )
     .await?;
 
@@ -3109,8 +3136,8 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         result_id,
         latest_all_unit_result_id,
         result_diag,
-        query_artifact_meta,
-        calculation_bundle,
+        query_artifact_meta: all_unit_artifacts.query_artifact_meta,
+        calculation_bundle: all_unit_artifacts.calculation_bundle,
     })
 }
 

@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-28
-lastReviewedCommit: 4d84c4fb371d03c46a20272e4fe7613ce5147974
-lastReviewedNote: "Reviewed while merging Issues #163 and #164: bounded scope-closure reports and shared resource/object-I/O primitives remain Worker-owned without changing integration boundaries."
+lastReviewedCommit: 2b0a3b215bf6c2a36cdf46cfe9c7d174471c0f5e
+lastReviewedNote: "Reviewed while merging Issues #163, #164, and #165: bounded scope-closure reports, shared resource/object-I/O primitives, all-unit results, and factorization cache controls remain Worker-owned without changing integration boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

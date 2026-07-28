@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::{
     cache::{
-        FactorizationCache, FactorizationKey, FactorizationState, PreparedModel, SolverBackend,
+        FactorizationCache, FactorizationCacheAdmissionError, FactorizationCacheTelemetry,
+        FactorizationKey, FactorizationState, PreparedModel, SolverBackend,
     },
     data_builder::{BuiltMatrices, DataBuilder, DataBuilderError, ModelSparseData},
     validator::{ValidationReport, ValidationStatus, validate_factorization_matrix},
@@ -62,6 +63,12 @@ pub struct FactorizationDiagnostics {
     pub b_nnz: usize,
     /// Matrix nnz stats.
     pub c_nnz: usize,
+    /// Workload-derived retained-byte estimate admitted to the cache.
+    pub cache_entry_estimated_bytes: usize,
+    /// Peak bytes reported by UMFPACK for symbolic/numeric factorization.
+    pub factorization_reported_peak_bytes: Option<usize>,
+    /// Cache capacity and activity after admission.
+    pub cache: FactorizationCacheTelemetry,
 }
 
 /// Result of prepare stage.
@@ -133,6 +140,16 @@ pub enum SolverError {
         rhs_len: usize,
         process_count: usize,
     },
+    #[error(
+        "factorization workload admission rejected: estimated_bytes={estimated_bytes} capacity_bytes={capacity_bytes} fill_in_multiplier={fill_in_multiplier}"
+    )]
+    WorkloadAdmissionRejected {
+        estimated_bytes: usize,
+        capacity_bytes: usize,
+        fill_in_multiplier: f64,
+    },
+    #[error(transparent)]
+    CacheAdmission(#[from] FactorizationCacheAdmissionError),
 }
 
 /// Orchestrates prepare/solve/invalidate with in-memory factorization cache.
@@ -140,6 +157,7 @@ pub enum SolverError {
 pub struct SolverService {
     cache: FactorizationCache,
     builder: DataBuilder,
+    admission_fill_in_multiplier: f64,
 }
 
 impl SolverService {
@@ -149,6 +167,21 @@ impl SolverService {
         Self {
             cache: FactorizationCache::new(),
             builder: DataBuilder::default(),
+            admission_fill_in_multiplier: 8.0,
+        }
+    }
+
+    /// Creates service with explicit retained-cache capacity and workload admission multiplier.
+    ///
+    /// The multiplier is a configurable workload policy, not a universal memory
+    /// bound. Actual UMFPACK fill-in is measured after factorization and the
+    /// hard cache capacity is enforced again using that observed estimate.
+    #[must_use]
+    pub fn with_cache_policy(capacity_bytes: usize, admission_fill_in_multiplier: f64) -> Self {
+        Self {
+            cache: FactorizationCache::with_capacity(capacity_bytes),
+            builder: DataBuilder::default(),
+            admission_fill_in_multiplier: admission_fill_in_multiplier.max(1.0),
         }
     }
 
@@ -179,12 +212,54 @@ impl SolverService {
             return Err(SolverError::ValidationFailed(validation));
         }
 
-        let factorization = Arc::new(UmfpackFactorization::factorize(
-            matrices.m.clone(),
+        let m_nnz = matrices.m_nnz;
+        let b_nnz = matrices.b_nnz;
+        let c_nnz = matrices.c_nnz;
+        let matrix_bytes = matrices
+            .m
+            .estimated_owned_bytes()
+            .saturating_add(matrices.b.estimated_owned_bytes())
+            .saturating_add(matrices.c.estimated_owned_bytes());
+        let m_owned_bytes = matrices.m.estimated_owned_bytes();
+        let m_owned_bytes_f64 = m_owned_bytes
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(f64::INFINITY);
+        let scaled_factorization_bytes =
+            (m_owned_bytes_f64 * self.admission_fill_in_multiplier).ceil();
+        let factorization_working_estimate = format!("{scaled_factorization_bytes:.0}")
+            .parse::<usize>()
+            .unwrap_or(usize::MAX);
+        let workload_estimated_bytes = matrix_bytes.saturating_add(factorization_working_estimate);
+        let capacity_bytes = self.cache.telemetry().capacity_bytes;
+        if workload_estimated_bytes > capacity_bytes {
+            self.cache.set_failed(
+                key.clone(),
+                format!(
+                    "workload admission rejected: estimated_bytes={workload_estimated_bytes} capacity_bytes={capacity_bytes}"
+                ),
+            );
+            return Err(SolverError::WorkloadAdmissionRejected {
+                estimated_bytes: workload_estimated_bytes,
+                capacity_bytes,
+                fill_in_multiplier: self.admission_fill_in_multiplier,
+            });
+        }
+
+        let factorization = match UmfpackFactorization::factorize(
+            matrices.m,
             UmfpackNumericOptions {
                 print_level: options.print_level,
             },
-        )?);
+        ) {
+            Ok(factorization) => Arc::new(factorization),
+            Err(error) => {
+                self.cache
+                    .set_failed(key.clone(), format!("factorization failed: {error}"));
+                return Err(SolverError::Factorization(error));
+            }
+        };
+        let factorization_reported_peak_bytes = factorization.reported_peak_bytes();
 
         let prepared = Arc::new(PreparedModel {
             factorization,
@@ -193,7 +268,8 @@ impl SolverService {
             validation: validation.clone(),
         });
 
-        self.cache.set_ready(key.clone(), prepared);
+        let cache_entry_estimated_bytes = self.cache.set_ready(key.clone(), prepared)?;
+        let cache = self.cache.telemetry();
 
         Ok(PrepareResult {
             factorization_id: key.factorization_id(),
@@ -201,9 +277,12 @@ impl SolverService {
             diagnostics: FactorizationDiagnostics {
                 validation,
                 backend: SolverBackend::Umfpack,
-                m_nnz: matrices.m_nnz,
-                b_nnz: matrices.b_nnz,
-                c_nnz: matrices.c_nnz,
+                m_nnz,
+                b_nnz,
+                c_nnz,
+                cache_entry_estimated_bytes,
+                factorization_reported_peak_bytes,
+                cache,
             },
         })
     }
