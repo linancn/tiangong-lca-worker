@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "worker.artifact-lifecycle.database-fixture.v1",
+  "sourceIssue": "tiangong-lca/database-engine#308",
+  "status": "reconciled-with-database-engine-pr-309-recovery-contract",
+  "sourcePullRequest": "tiangong-lca/database-engine#309",
+  "sourceCommit": "cc059eef795b0f8a9942f9830945f100a1895638",
+  "publication": {
+    "table": "public.worker_job_artifacts",
+    "trustedClock": "transaction_timestamp",
+    "defaultRetentionSeconds": 604800,
+    "requiredFields": [
+      "job_id",
+      "artifact_type",
+      "artifact_role",
+      "lifecycle_state",
+      "storage_bucket",
+      "storage_path",
+      "content_type",
+      "byte_size",
+      "checksum_sha256",
+      "expires_at"
+    ],
+    "roles": [
+      "closure_report",
+      "complete_machine_result",
+      "closure_bundle"
+    ]
+  },
+  "downloadProjection": {
+    "rpc": "public.get_lcia_scope_closure_report_download(uuid,text)",
+    "selectors": [
+      "closure_report_xlsx",
+      "closure_issue_manifest"
+    ],
+    "descriptorFields": [
+      "artifactId",
+      "artifactRole",
+      "artifactState",
+      "filename",
+      "format",
+      "mediaType",
+      "size",
+      "checksumSha256",
+      "artifactExpiresAt",
+      "bucket",
+      "objectPath"
+    ]
+  },
+  "garbageCollection": {
+    "jobKind": "worker.artifact_gc",
+    "requestSchemaVersion": "worker.artifact_gc.request.v1",
+    "rpcFixture": {
+      "claim": "public.svc_lcia_scope_closure_artifact_gc_claim(integer,integer)",
+      "complete": "public.svc_lcia_scope_closure_artifact_gc_complete(uuid,uuid,boolean,integer)",
+      "fail": "public.svc_lcia_scope_closure_artifact_gc_fail(uuid,uuid,text)"
+    },
+    "claimFields": [
+      "claimToken",
+      "leaseExpiresAt",
+      "items"
+    ],
+    "candidateFields": [
+      "artifactId",
+      "artifactRole",
+      "lifecycleState",
+      "gcPhase",
+      "objectDeleteRequired",
+      "bucket",
+      "objectPath",
+      "checksumSha256",
+      "artifactExpiresAt"
+    ],
+    "ordering": [
+      "claim_bounded_candidates",
+      "delete_object",
+      "complete_tombstone",
+      "repeat_bounded_detail_cleanup_until_detailsRemaining_is_zero"
+    ],
+    "missingObjectOutcome": "success",
+    "deleteFailureOutcome": "retryable_failure",
+    "completionFailureRecovery": "same_claim_token_retry_within_active_worker_process",
+    "crossProcessOrphanRecovery": {
+      "phase": "detail_cleanup",
+      "objectDeleteRequired": false,
+      "locator": null,
+      "claimToken": "fresh-fenced-token"
+    }
+  }
+}

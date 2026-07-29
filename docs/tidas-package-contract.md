@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
-lastReviewedNote: "Reviewed for Issue #174: measured-topology derived-relation admission remains separate from the published raw TIDAS issue-stream hash and package-worker import/export semantics."
+lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
+lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 commit cc059eef: measured-topology admission, role-tagged temporary scope-closure artifacts, strict download projection, and phase-aware lifecycle GC remain separate from the raw TIDAS issue-stream hash and package-specific retention."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -243,6 +243,8 @@ cargo run -p solver-worker --bin package_gc -- --execute
 `lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。
 
 这项绑定不会改变 TIDAS import/export ZIP、report、retention 或 `worker_queue=package` 状态机。完整契约见 `docs/scope-closure-contract.md` 与 `docs/lca-api-contract.md`。
+
+`worker.artifact_gc` 当前消费 Database Engine 管理的通用临时 artifact lifecycle contract，首先覆盖七天 scope-closure evidence。它不替代 `tidas.package_artifact_gc`、不改变本文件的 14/30 天 package retention、pin/cache/job protection 或 package-specific metadata cleanup。未来若 Database contract 将 package artifacts 纳入同一通用 claim surface，必须先在 database-engine 与本文件中显式协调迁移。
 
 ## 8. 状态机
 

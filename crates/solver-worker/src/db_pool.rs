@@ -10,6 +10,7 @@ pub const APP_PACKAGE_WORKER_QUEUE: &str = "package-worker-queue";
 pub const APP_REVIEW_SUBMIT_GATE_RUNNER: &str = "review-submit-gate-runner";
 pub const APP_REVIEW_SUBMIT_GATE_RUNNER_QUEUE: &str = "review-submit-gate-runner-queue";
 pub const APP_PACKAGE_GC: &str = "package-gc";
+pub const APP_ARTIFACT_GC: &str = "artifact-gc";
 pub const APP_SNAPSHOT_GC: &str = "snapshot-gc";
 pub const APP_RESULT_GC: &str = "result-gc";
 pub const APP_MAINTENANCE_WORKER: &str = "maintenance-worker";

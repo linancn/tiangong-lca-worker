@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
-lastReviewedNote: "Updated for Issue #174: initial admission uses observed raw-stage costs while topology-dependent relation output uses measured incremental run/merge watermarks with reserve."
+lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
+lastReviewedNote: "Updated for Issue #172 on the merged #174 baseline: observed-raw admission and measured topology watermarks feed direct deterministic compressed partitions plus manifest, with role-tagged publication, trusted seven-day expiry, and generic retry-safe GC."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -147,12 +147,17 @@ traversal and issue aggregation under this document's frozen-release rules.
 Each fresh scan produces deterministic administrative artifacts:
 
 - `closure-bundle-v1.json`: requested bindings, TIDAS validation evidence, scan, and resolution map;
-- `closure-issues-v1.jsonl`: the V1 compatibility issue projection, one canonical issue per line;
 - `manifest.json`: `lcia.scope-closure-issue-manifest.v2`, binding the closure check, the byte-exact TIDAS logical issue-stream SHA-256/count, exact relation counts, partition limits, sample limits, and sorted partition metadata;
 - `issues/part-NNNNNN.ndjson.zst`, `occurrences/part-NNNNNN.ndjson.zst`, and `affected-roots/part-NNNNNN.ndjson.zst`: the complete normalized issue relations, each streamed through one active zstd writer and sealed at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON, with record count, first/last canonical issue key, and compressed/uncompressed SHA-256 and byte sizes in the manifest;
 - `closure-report-v1.xlsx`: a valid workbook tagged with the current `closureCheckId`, containing exact summary counts, a complete-artifact index, at most 5,000 issue rows, 10,000 occurrence rows, and 10,000 affected-root rows.
 
 Partition ordering and zstd level are deterministic for identical inputs. The logical issue hash contract remains the exact TIDAS issue-event NDJSON bytes; repartitioning does not redefine it. Before opening the XLSX ZIP, Worker rejects any worksheet over 1,048,576 rows or 64 MiB estimated uncompressed XML and any workbook over 128 MiB estimated worksheet XML. It also rejects the finished archive above 64 MiB. ZIP64, additional memory, or dropped error details are not substitutes for these limits.
+
+The manifest plus its listed compressed partitions is the only complete machine-result representation; Worker does not publish a second monolithic issue JSONL copy. Every report artifact is published with one Database Engine #309 role: `closure_bundle`, `complete_machine_result`, or `closure_report`. Its database row records `ready` lifecycle state, the actual configured storage bucket and object path, SHA-256, byte size, content type, and `expires_at` calculated from trusted database time at publication plus seven days. The bundle metadata binds the preallocated manifest-row ID as `completeMachineResultArtifactId`, allowing the Database certificate guard to derive the evidence deadline.
+
+Expired report artifacts are reclaimed through the generic `worker.artifact_gc` maintenance job and Database Engine #309's exact `svc_lcia_scope_closure_artifact_gc_*` contract. The claim RPC returns at most 500 items under one token. An `object_delete` item has `lifecycleState=expired`, `objectDeleteRequired=true`, and an exact bucket/path; Worker validates that identity, deletes once, treats an already-missing object as idempotent success, and begins at most 50,000-row completion batches. If details remain after tombstoning, Database persists `gc_cleanup_state=pending`; a fresh process reclaims the row with a new fenced token as `gcPhase=detail_cleanup`, `objectDeleteRequired=false`, and null bucket/path, then completes bounded batches without a second object deletion. Object deletion failure records `gc_failure_count` and releases the claim without premature tombstoning.
+
+The actor-bound download projection is `get_lcia_scope_closure_report_download(uuid,text)`. It accepts only `closure_report_xlsx` and `closure_issue_manifest` and returns the exact 11-field public descriptor: artifact ID/role/state, semantic filename, format, media type, size, checksum, expiry, bucket, and object path. Database maps these public selectors to the linked coarse-role rows; Worker does not expose or synthesize a separate download API.
 
 `closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
 
@@ -203,6 +208,8 @@ For changes to this contract, run the repo baseline plus focused closure tests. 
 - frozen-release live drift and live-only substitution rejection;
 - omitted-version frozen candidates and winner provenance;
 - bounded batches, deterministic hashes, cancellation, and valid check-scoped XLSX output;
+- role-tagged publication metadata, trusted seven-day expiry, bounded compressed partitions, and no duplicate monolithic machine result;
+- object-delete-before-complete GC, missing-object idempotency, invalid bucket/path rejection, and retry without premature tombstoning;
 - byte-exact non-empty TIDAS issue-stream hashing across JSON field orders;
 - file-backed document/reference retention and compact-graph RSS qualification;
 - all-or-none package binding and database certificate mismatch rejection;

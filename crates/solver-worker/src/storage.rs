@@ -137,6 +137,12 @@ impl std::fmt::Display for ObjectStoreUploadError {
 impl std::error::Error for ObjectStoreUploadError {}
 
 impl ObjectStoreClient {
+    /// Returns the configured bucket name used for object persistence.
+    #[must_use]
+    pub fn bucket_name(&self) -> &str {
+        self.bucket.as_str()
+    }
+
     /// Creates storage client from config.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

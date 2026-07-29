@@ -8,6 +8,9 @@ use std::{
 use clap::Parser;
 use serde_json::{Map, Value, json};
 use solver_worker::{
+    artifact_gc::{
+        ARTIFACT_GC_JOB_KIND, ARTIFACT_GC_REQUEST_SCHEMA_VERSION, ARTIFACT_GC_RESULT_SCHEMA_VERSION,
+    },
     db_pool::{APP_MAINTENANCE_WORKER, WorkerDbPoolOptions},
     pgbouncer_sqlx::{self as sqlx, Row},
     worker_jobs::{
@@ -568,6 +571,12 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
 
     let (binary_name, payload_schema_version, result_schema_version, args) =
         match job.job_kind.as_str() {
+            ARTIFACT_GC_JOB_KIND => (
+                "artifact_gc",
+                ARTIFACT_GC_REQUEST_SCHEMA_VERSION,
+                ARTIFACT_GC_RESULT_SCHEMA_VERSION,
+                artifact_gc_args(job, payload, execute),
+            ),
             SNAPSHOT_GC_JOB_KIND => (
                 "snapshot_gc",
                 SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION,
@@ -617,6 +626,31 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
         payload_schema_version,
         result_schema_version,
     })
+}
+
+fn artifact_gc_args(job: &WorkerJob, payload: &Map<String, Value>, execute: bool) -> Vec<String> {
+    let mut args = vec![
+        "--worker-job-id".to_owned(),
+        job.id.to_string(),
+        "--worker-lease-token".to_owned(),
+        job.lease_token.to_string(),
+    ];
+    push_i64_arg(
+        &mut args,
+        "--batch-size",
+        payload,
+        &["batchSize", "batch_size"],
+    );
+    push_i64_arg(
+        &mut args,
+        "--max-batches",
+        payload,
+        &["maxBatches", "max_batches"],
+    );
+    if execute {
+        args.push("--execute".to_owned());
+    }
+    args
 }
 
 fn snapshot_gc_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
@@ -882,11 +916,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BoundedLogCapture, PACKAGE_ARTIFACT_GC_JOB_KIND,
-        PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION, PROCESS_FLOW_GRAPH_CACHE_JOB_KIND,
-        PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION, RESULT_GC_JOB_KIND,
-        RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND, SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION,
-        maintenance_command_for_job, parse_summary_line,
+        ARTIFACT_GC_JOB_KIND, ARTIFACT_GC_REQUEST_SCHEMA_VERSION, BoundedLogCapture,
+        PACKAGE_ARTIFACT_GC_JOB_KIND, PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION,
+        PROCESS_FLOW_GRAPH_CACHE_JOB_KIND, PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
+        RESULT_GC_JOB_KIND, RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND,
+        SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION, maintenance_command_for_job, parse_summary_line,
     };
     use solver_worker::worker_jobs::WorkerJob;
     use uuid::Uuid;
@@ -1006,6 +1040,37 @@ mod tests {
                 "--request-cache-retention-days",
                 "7",
                 "--execute"
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_generic_artifact_gc_with_worker_lease_fencing() {
+        let job = worker_job(
+            ARTIFACT_GC_JOB_KIND,
+            ARTIFACT_GC_REQUEST_SCHEMA_VERSION,
+            json!({
+                "execute": true,
+                "batchSize": 50,
+                "maxBatches": 2
+            }),
+        );
+
+        let command = maintenance_command_for_job(&job).expect("command");
+        assert_eq!(command.binary_name, "artifact_gc");
+        assert!(command.execute);
+        assert_eq!(
+            command.args,
+            vec![
+                "--worker-job-id".to_owned(),
+                job.id.to_string(),
+                "--worker-lease-token".to_owned(),
+                job.lease_token.to_string(),
+                "--batch-size".to_owned(),
+                "50".to_owned(),
+                "--max-batches".to_owned(),
+                "2".to_owned(),
+                "--execute".to_owned()
             ]
         );
     }

@@ -31,6 +31,7 @@ use crate::{
     readiness::{MatrixReadinessReport, ReadinessStatus},
     resource::{ResourceCounters, ResourceMeasurement, directory_bytes},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
+    storage::ObjectTransferOptions,
     tidas_cli,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
@@ -64,6 +65,20 @@ const XLSX_MAX_WORKSHEET_ROWS: usize = 1_048_576;
 const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+const SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const INSERT_SCOPE_CLOSURE_ARTIFACT_SQL: &str = r"
+    INSERT INTO public.worker_job_artifacts (
+        id, job_id, artifact_type, artifact_role, lifecycle_state,
+        storage_bucket, storage_path, content_type, byte_size,
+        checksum_sha256, metadata, visibility, expires_at
+    ) VALUES (
+        $1, $2, $3, $4, 'ready',
+        $5, $6, $7, $8, $9, $10::jsonb, 'operator',
+        transaction_timestamp() + make_interval(secs => $11::integer)
+    )
+    RETURNING id
+    ";
 
 fn scope_closure_memory_budget_bytes() -> u64 {
     std::env::var("SCOPE_CLOSURE_MEMORY_BUDGET_MIB")
@@ -2251,10 +2266,29 @@ enum ScanExecutionClaim {
 #[serde(rename_all = "camelCase")]
 struct ArtifactManifestEntry {
     artifact_type: String,
+    artifact_role: ScopeClosureArtifactRole,
     file_name: String,
     content_type: String,
     byte_size: usize,
     checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopeClosureArtifactRole {
+    ClosureReport,
+    CompleteMachineResult,
+    ClosureBundle,
+}
+
+impl ScopeClosureArtifactRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClosureReport => "closure_report",
+            Self::CompleteMachineResult => "complete_machine_result",
+            Self::ClosureBundle => "closure_bundle",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4017,6 +4051,7 @@ async fn reuse_completed_scan_execution(
     let artifact = prepare_file_artifact(
         temp,
         "closure_report_xlsx",
+        ScopeClosureArtifactRole::ClosureReport,
         "closure-report-v1.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         xlsx_path,
@@ -4691,7 +4726,6 @@ impl IssuePartitionAccumulator {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
-        let index = self.entries.len();
         let mut output = active.encoder.finish()?;
         output.flush()?;
         release_file_cache(output.get_ref());
@@ -4712,10 +4746,8 @@ impl IssuePartitionAccumulator {
         };
         self.artifacts.push(PreparedArtifact {
             descriptor: ArtifactManifestEntry {
-                artifact_type: format!(
-                    "closure_{}_partition_{index:06}",
-                    self.relation.replace('-', "_")
-                ),
+                artifact_type: "closure_complete_machine_result".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
                 file_name: active.relative_path,
                 content_type: "application/x-ndjson+zstd".to_owned(),
                 byte_size: usize::try_from(compressed_byte_size)?,
@@ -4887,7 +4919,8 @@ fn prepare_issue_partition_artifacts(
     fs::write(&manifest_path, canonical_json_bytes(&manifest)?)?;
     artifacts.push(prepare_file_artifact(
         temp,
-        "closure_issue_manifest",
+        "closure_complete_machine_result",
+        ScopeClosureArtifactRole::CompleteMachineResult,
         "manifest.json",
         "application/vnd.tiangong.scope-closure-manifest+json",
         manifest_path,
@@ -4907,8 +4940,6 @@ fn prepare_closure_content_artifacts(
         byte_size: bundle_byte_size,
         sha256: bundle_sha256,
     } = closure_bundle;
-    let issues_path = temp.path().join("closure-issues-v1.jsonl");
-    write_issue_jsonl_file(&issues_path, scan)?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
     build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
 
@@ -4916,6 +4947,7 @@ fn prepare_closure_content_artifacts(
         PreparedArtifact {
             descriptor: ArtifactManifestEntry {
                 artifact_type: "closure_bundle".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::ClosureBundle,
                 file_name: "closure-bundle-v1.json".to_owned(),
                 content_type: "application/json".to_owned(),
                 byte_size: usize::try_from(bundle_byte_size)?,
@@ -4926,14 +4958,8 @@ fn prepare_closure_content_artifacts(
         },
         prepare_file_artifact(
             Arc::clone(&temp),
-            "closure_issues_jsonl",
-            "closure-issues-v1.jsonl",
-            "application/x-ndjson",
-            issues_path,
-        )?,
-        prepare_file_artifact(
-            Arc::clone(&temp),
             "closure_report_xlsx",
+            ScopeClosureArtifactRole::ClosureReport,
             "closure-report-v1.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_path,
@@ -4951,6 +4977,7 @@ fn prepare_closure_content_artifacts(
 fn prepare_file_artifact(
     temp: Arc<TempDir>,
     artifact_type: &str,
+    artifact_role: ScopeClosureArtifactRole,
     file_name: &str,
     content_type: &str,
     path: PathBuf,
@@ -4959,6 +4986,7 @@ fn prepare_file_artifact(
     Ok(PreparedArtifact {
         descriptor: ArtifactManifestEntry {
             artifact_type: artifact_type.to_owned(),
+            artifact_role,
             file_name: file_name.to_owned(),
             content_type: content_type.to_owned(),
             byte_size: usize::try_from(byte_size)?,
@@ -4987,6 +5015,47 @@ fn file_size_and_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
     Ok((byte_size, hex::encode(digest.finalize())))
 }
 
+fn closure_artifact_metadata(
+    artifact: &PreparedArtifact,
+    closure_check_id: Uuid,
+    write_set_id: Uuid,
+    content_artifact_manifest_hash: &str,
+    complete_machine_result_artifact_id: Option<Uuid>,
+) -> anyhow::Result<Value> {
+    let mut metadata = json!({
+        "schemaVersion": "lcia.scope-closure-artifact.v2",
+        "closureCheckId": closure_check_id,
+        "writeSetId": write_set_id,
+        "fileName": artifact.descriptor.file_name,
+        "artifactRole": artifact.descriptor.artifact_role,
+        "lifecycleState": "ready",
+        "retentionSeconds": SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS,
+        "contentArtifactManifestHash": content_artifact_manifest_hash,
+    });
+    if artifact.descriptor.artifact_role == ScopeClosureArtifactRole::ClosureBundle {
+        metadata["completeMachineResultArtifactId"] = json!(
+            complete_machine_result_artifact_id
+                .ok_or_else(|| anyhow::anyhow!("closure bundle omitted machine-result manifest"))?
+        );
+    }
+    Ok(metadata)
+}
+
+fn preallocated_artifact_id(
+    artifact_ids: &BTreeMap<String, Uuid>,
+    artifact: &PreparedArtifact,
+) -> anyhow::Result<Uuid> {
+    artifact_ids
+        .get(&artifact.descriptor.file_name)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("closure artifact ID was not preallocated"))
+}
+
+fn is_semantic_closure_artifact(artifact: &PreparedArtifact) -> bool {
+    artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+        || artifact.descriptor.file_name == "manifest.json"
+}
+
 async fn persist_closure_artifacts(
     state: &AppState,
     worker_job_id: Uuid,
@@ -5013,11 +5082,12 @@ async fn persist_closure_artifacts(
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
         if let Err(error) = state
             .object_store
-            .upload_object_key_file(
+            .upload_object_key_file_bounded(
                 object_key.as_str(),
                 artifact.descriptor.content_type.as_str(),
                 &artifact.path,
-                u64::try_from(artifact.descriptor.byte_size)?,
+                ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES)
+                    .with_expected_sha256(artifact.descriptor.checksum_sha256.clone()),
             )
             .await
         {
@@ -5028,6 +5098,11 @@ async fn persist_closure_artifacts(
         staged.push((artifact, object_key));
     }
 
+    let artifact_ids = staged
+        .iter()
+        .map(|(artifact, _)| (artifact.descriptor.file_name.clone(), Uuid::new_v4()))
+        .collect::<BTreeMap<_, _>>();
+    let complete_machine_result_artifact_id = artifact_ids.get("manifest.json").copied();
     let mut transaction = match state.pool.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -5040,30 +5115,28 @@ async fn persist_closure_artifacts(
     let mut persisted = BTreeMap::new();
     for (artifact, object_key) in &staged {
         let byte_size = i64::try_from(artifact.descriptor.byte_size)?;
-        let row = match sqlx::query(
-            r"
-            INSERT INTO public.worker_job_artifacts (
-                job_id, artifact_type, storage_path, content_type, byte_size,
-                checksum_sha256, metadata, visibility
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'operator')
-            RETURNING id
-            ",
-        )
-        .bind(worker_job_id)
-        .bind(artifact.descriptor.artifact_type.as_str())
-        .bind(object_key)
-        .bind(artifact.descriptor.content_type.as_str())
-        .bind(byte_size)
-        .bind(artifact.descriptor.checksum_sha256.as_str())
-        .bind(json!({
-            "schemaVersion": "lcia.scope-closure-artifact.v1",
-            "closureCheckId": closure_check_id,
-            "writeSetId": write_set_id,
-            "fileName": artifact.descriptor.file_name,
-            "contentArtifactManifestHash": content_artifact_manifest_hash,
-        }))
-        .fetch_one(&mut *transaction)
-        .await
+        let artifact_id = preallocated_artifact_id(&artifact_ids, artifact)?;
+        let metadata = closure_artifact_metadata(
+            artifact,
+            closure_check_id,
+            write_set_id,
+            content_artifact_manifest_hash,
+            complete_machine_result_artifact_id,
+        )?;
+        let row = match sqlx::query(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL)
+            .bind(artifact_id)
+            .bind(worker_job_id)
+            .bind(artifact.descriptor.artifact_type.as_str())
+            .bind(artifact.descriptor.artifact_role.as_str())
+            .bind(state.object_store.bucket_name())
+            .bind(object_key)
+            .bind(artifact.descriptor.content_type.as_str())
+            .bind(byte_size)
+            .bind(artifact.descriptor.checksum_sha256.as_str())
+            .bind(metadata)
+            .bind(i32::try_from(SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS)?)
+            .fetch_one(&mut *transaction)
+            .await
         {
             Ok(row) => row,
             Err(error) => {
@@ -5074,10 +5147,10 @@ async fn persist_closure_artifacts(
                 ));
             }
         };
-        persisted.insert(
-            artifact.descriptor.artifact_type.clone(),
-            row.try_get::<Uuid, _>("id")?,
-        );
+        let persisted_id = row.try_get::<Uuid, _>("id")?;
+        if is_semantic_closure_artifact(artifact) {
+            persisted.insert(artifact.descriptor.artifact_type.clone(), persisted_id);
+        }
     }
     if let Err(error) = transaction.commit().await {
         cleanup_uploaded_artifacts(state, &uploaded).await;
@@ -5145,28 +5218,6 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
     .fetch_one(pool)
     .await?;
     Ok(row.try_get("manifest_hash")?)
-}
-
-fn write_issue_jsonl_file(path: &Path, scan: &ScopeClosureScan) -> anyhow::Result<()> {
-    let mut output = BufWriter::new(File::create(path)?);
-    if let Some(relations) = &scan.issue_relations {
-        relations.issues.visit(|record| {
-            let issue = record
-                .as_array()
-                .and_then(|fields| fields.get(1))
-                .ok_or_else(|| anyhow::anyhow!("issue relation omitted payload"))?;
-            output.write_all(&canonical_json_bytes(issue)?)?;
-            output.write_all(b"\n")?;
-            Ok(())
-        })?;
-    } else {
-        for issue in &scan.issues {
-            output.write_all(&canonical_json_bytes(issue)?)?;
-            output.write_all(b"\n")?;
-        }
-    }
-    output.flush()?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7742,7 +7793,6 @@ mod tests {
         let mut partition_uncompressed_bytes = 0_u64;
         let mut closure_bundle_bytes = 0_u64;
         let mut closure_bundle_sha256 = String::new();
-        let mut closure_issues_sha256 = String::new();
         let mut xlsx_bytes = 0_u64;
         let mut xlsx_sha256 = String::new();
         for artifact in &artifacts {
@@ -7757,11 +7807,6 @@ mod tests {
                     .descriptor
                     .checksum_sha256
                     .clone_into(&mut closure_bundle_sha256);
-            } else if artifact.descriptor.file_name == "closure-issues-v1.jsonl" {
-                artifact
-                    .descriptor
-                    .checksum_sha256
-                    .clone_into(&mut closure_issues_sha256);
             } else if artifact.descriptor.file_name == "closure-report-v1.xlsx" {
                 xlsx_bytes = artifact_bytes;
                 artifact
@@ -7890,7 +7935,6 @@ mod tests {
             "partitionUncompressedBytes": partition_uncompressed_bytes,
             "closureBundleBytes": closure_bundle_bytes,
             "closureBundleSha256": closure_bundle_sha256,
-            "closureIssuesSha256": closure_issues_sha256,
             "xlsxBytes": xlsx_bytes,
             "xlsxSha256": xlsx_sha256,
             "resourceMeasurements": {
@@ -8401,7 +8445,6 @@ mod tests {
             names,
             BTreeSet::from([
                 "closure-bundle-v1.json",
-                "closure-issues-v1.jsonl",
                 "closure-report-v1.xlsx",
                 "issues/part-000000.ndjson.zst",
                 "manifest.json",
@@ -8409,6 +8452,74 @@ mod tests {
             ])
         );
         assert!(!names.contains("closure-snapshot-v1.json"));
+        let roles = artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.descriptor.file_name.as_str(),
+                    artifact.descriptor.artifact_role,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            roles["closure-bundle-v1.json"],
+            ScopeClosureArtifactRole::ClosureBundle
+        );
+        assert_eq!(
+            roles["closure-report-v1.xlsx"],
+            ScopeClosureArtifactRole::ClosureReport
+        );
+        assert_eq!(
+            roles["manifest.json"],
+            ScopeClosureArtifactRole::CompleteMachineResult
+        );
+        assert_eq!(
+            roles["issues/part-000000.ndjson.zst"],
+            ScopeClosureArtifactRole::CompleteMachineResult
+        );
+        assert!(artifacts.iter().all(|artifact| {
+            artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+                || artifact.descriptor.artifact_type == "closure_complete_machine_result"
+        }));
+    }
+
+    #[test]
+    fn scope_closure_publication_uses_complete_storage_identity_and_trusted_expiry() {
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("storage_bucket"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("storage_path"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("artifact_role"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("lifecycle_state"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("checksum_sha256"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("content_type"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("byte_size"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("expires_at"));
+        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("transaction_timestamp()"));
+        assert_eq!(SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS, 604_800);
+
+        let temp = Arc::new(TempDir::new().unwrap());
+        let report = PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_report_xlsx".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::ClosureReport,
+                file_name: "closure-report-v1.xlsx".to_owned(),
+                content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                byte_size: 0,
+                checksum_sha256: "a".repeat(64),
+            },
+            path: temp.path().join("closure-report-v1.xlsx"),
+            _temp: temp,
+        };
+        assert!(
+            closure_artifact_metadata(&report, Uuid::nil(), Uuid::nil(), "manifest", None).is_ok(),
+            "reused scans publish a current report without a new machine-result manifest"
+        );
+        let mut bundle = report.clone();
+        bundle.descriptor.artifact_role = ScopeClosureArtifactRole::ClosureBundle;
+        assert!(
+            closure_artifact_metadata(&bundle, Uuid::nil(), Uuid::nil(), "manifest", None).is_err(),
+            "fresh closure bundles must bind their machine-result manifest row"
+        );
     }
 
     #[test]
