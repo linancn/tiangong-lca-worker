@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: cd77d8dcd544fd7f23070115b1c2289dfa4f5cb3
-lastReviewedNote: "Reviewed for Issue #171: role-specific external relation runs and direct partitions preserve bounded API projections, exact counts, logical issue hash, and manifest-addressed complete relations."
+lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
+lastReviewedNote: "Reviewed for Issue #174: measured-topology disk admission changes no API projection, exact count, logical issue hash, or manifest-addressed complete-relation semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

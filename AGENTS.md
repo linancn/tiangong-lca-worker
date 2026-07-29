@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
-lastReviewedNote: "Reviewed for Issue #171: derived relation external sorting, deterministic partition streaming, temp admission, and cache telemetry remain Worker-owned and do not change workspace boundaries."
+lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
+lastReviewedNote: "Reviewed for Issue #174: topology-measured relation temp admission and staged free-space watermarks remain Worker-owned and do not change workspace boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

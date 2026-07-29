@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: cd77d8dcd544fd7f23070115b1c2289dfa4f5cb3
-lastReviewedNote: "Updated for Issue #171: derived issue relations use role-specific external runs, workload-derived disk admission, and direct deterministic partition streaming without a total-result cap."
+lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
+lastReviewedNote: "Updated for Issue #174: initial admission uses observed raw-stage costs while topology-dependent relation output uses measured incremental run/merge watermarks with reserve."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -105,7 +105,7 @@ Document-validation evidence is cached only under the full immutable key: exact 
 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Raw validator issue events are stream-verified into role-specific input spools capped at 2 GiB and 5,000,000 events, then deterministically ordered through 32 MiB external-sort runs. That raw-input cap does not constrain complete derived results. Final issue coalescing writes separate source/issue/occurrence-keyed 32 MiB sort runs for issues, occurrences, and affected-root/witness relations; bounded-fan-in k-way merges feed the partition writers directly, without a complete coalesced sidecar, resident all-unique `BTreeMap`, or complete issue `Vec`. Resolution-map ordering uses the same bounded mechanism.
 
-Before relation expansion begins, temporary-disk admission projects raw spool, merge runs, role outputs, active partitions, and merge overlap from the observed raw-event width and root fan-out, then adds a 25% safety margin plus the fixed 512 MiB reserve. Insufficient space returns the stable `scope_closure_relation_temp_space_low` error before expansion; complete results are never truncated at an arbitrary total-byte constant. Run creation, merge consumption, and partition completion use best-effort sequential-access/cache-release hints, while Linux phase telemetry records process RSS and cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`. Hints are not correctness requirements: cancellation, lease loss, or failures still clean every temp directory.
+Before relation expansion begins, temporary-disk admission projects only the stages derivable from the observed raw-event count and byte width: raw input, merge overlap, issue/occurrence role output, and bounded active windows. It adds a 25% safety margin plus the fixed 512 MiB reserve. The global requested-root count is not a per-event fan-out estimate. Topology-dependent affected-root output is admitted from actual bytes at every bounded sort-run and merge boundary; the filesystem's remaining space already reflects prior runs, so each watermark protects the next write while allowing complete results of arbitrary admitted total size. Initial or incremental shortage returns the stable `scope_closure_relation_temp_space_low` error with its stage, available, planned, required, and reserve bytes. Run creation, merge consumption, and partition completion use best-effort sequential-access/cache-release hints, while Linux phase telemetry records process RSS and cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`. Complete results are never truncated at an arbitrary total-byte constant, and cancellation, lease loss, or any admission failure still cleans every temp directory.
 
 On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 

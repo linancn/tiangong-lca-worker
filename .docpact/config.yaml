@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-07-29"
-lastReviewedCommit: "0eeae80ff84ad76b8009142f3a417b7739a9d9eb"
-lastReviewedNote: "Reviewed for Issue #171: existing scope-closure ownership and routing cover role-specific external runs, direct partitions, disk admission, cache telemetry, and offline production-shape proof."
+lastReviewedCommit: "5b8a6cdc75c91530eac9364b82b20c22e1ab7029"
+lastReviewedNote: "Reviewed for Issue #174: existing scope-closure ownership and routing cover measured-topology temp admission, staged free-space watermarks, and offline production-shape proof."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
