@@ -1,9 +1,9 @@
 {
   "schemaVersion": "worker.artifact-lifecycle.database-fixture.v1",
   "sourceIssue": "tiangong-lca/database-engine#308",
-  "status": "reconciled-with-database-engine-pr-309-recovery-contract",
+  "status": "reconciled-with-database-engine-pr-309-final-contract",
   "sourcePullRequest": "tiangong-lca/database-engine#309",
-  "sourceCommit": "cc059eef795b0f8a9942f9830945f100a1895638",
+  "sourceCommit": "837948a789339376daa2c71c1b7fa3f0143ef211",
   "publication": {
     "table": "public.worker_job_artifacts",
     "trustedClock": "transaction_timestamp",
@@ -26,6 +26,38 @@
       "closure_bundle"
     ]
   },
+  "ownerCheckReadProjection": {
+    "rpc": "public.get_lcia_scope_closure_check(uuid)",
+    "artifactOrder": [
+      "closure_report_xlsx",
+      "closure_issue_manifest"
+    ],
+    "artifactStates": [
+      "pending",
+      "ready",
+      "expired",
+      "deleted",
+      "failed"
+    ],
+    "descriptorFields": [
+      "artifactRole",
+      "artifactState",
+      "filename",
+      "format",
+      "mediaType",
+      "size",
+      "checksumSha256",
+      "artifactExpiresAt"
+    ],
+    "forbiddenFields": [
+      "artifactId",
+      "bucket",
+      "objectPath",
+      "storageBucket",
+      "storagePath",
+      "service"
+    ]
+  },
   "downloadProjection": {
     "rpc": "public.get_lcia_scope_closure_report_download(uuid,text)",
     "selectors": [
@@ -44,7 +76,12 @@
       "artifactExpiresAt",
       "bucket",
       "objectPath"
-    ]
+    ],
+    "legacyOverload": {
+      "rpc": "public.get_lcia_scope_closure_report_download(uuid)",
+      "forwardsSelector": "closure_report_xlsx",
+      "removal": "separate cleanup Issue after all Edge consumers migrate"
+    }
   },
   "garbageCollection": {
     "jobKind": "worker.artifact_gc",

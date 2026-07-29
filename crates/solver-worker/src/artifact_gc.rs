@@ -542,13 +542,61 @@ mod tests {
         assert_eq!(fixture["sourceIssue"], "tiangong-lca/database-engine#308");
         assert_eq!(
             fixture["status"],
-            "reconciled-with-database-engine-pr-309-recovery-contract"
+            "reconciled-with-database-engine-pr-309-final-contract"
         );
         assert_eq!(
             fixture["sourceCommit"],
-            "cc059eef795b0f8a9942f9830945f100a1895638"
+            "837948a789339376daa2c71c1b7fa3f0143ef211"
         );
         assert_eq!(fixture["publication"]["defaultRetentionSeconds"], 604_800);
+        assert_eq!(
+            fixture["ownerCheckReadProjection"]["artifactOrder"],
+            serde_json::json!(["closure_report_xlsx", "closure_issue_manifest"])
+        );
+        assert_eq!(
+            fixture["ownerCheckReadProjection"]["descriptorFields"],
+            serde_json::json!([
+                "artifactRole",
+                "artifactState",
+                "filename",
+                "format",
+                "mediaType",
+                "size",
+                "checksumSha256",
+                "artifactExpiresAt"
+            ])
+        );
+        assert_eq!(
+            fixture["ownerCheckReadProjection"]["forbiddenFields"],
+            serde_json::json!([
+                "artifactId",
+                "bucket",
+                "objectPath",
+                "storageBucket",
+                "storagePath",
+                "service"
+            ])
+        );
+        assert_eq!(
+            fixture["downloadProjection"]["descriptorFields"],
+            serde_json::json!([
+                "artifactId",
+                "artifactRole",
+                "artifactState",
+                "filename",
+                "format",
+                "mediaType",
+                "size",
+                "checksumSha256",
+                "artifactExpiresAt",
+                "bucket",
+                "objectPath"
+            ])
+        );
+        assert_eq!(
+            fixture["downloadProjection"]["legacyOverload"]["forwardsSelector"],
+            "closure_report_xlsx"
+        );
         assert_eq!(
             fixture["garbageCollection"]["missingObjectOutcome"],
             "success"
@@ -560,6 +608,20 @@ mod tests {
                 "delete_object",
                 "complete_tombstone",
                 "repeat_bounded_detail_cleanup_until_detailsRemaining_is_zero"
+            ])
+        );
+        assert_eq!(
+            fixture["garbageCollection"]["candidateFields"],
+            serde_json::json!([
+                "artifactId",
+                "artifactRole",
+                "lifecycleState",
+                "gcPhase",
+                "objectDeleteRequired",
+                "bucket",
+                "objectPath",
+                "checksumSha256",
+                "artifactExpiresAt"
             ])
         );
         assert_eq!(

@@ -2298,7 +2298,7 @@ struct PreparedArtifact {
     _temp: Arc<TempDir>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssuePartitionManifestEntry {
     relation: String,
@@ -2313,7 +2313,15 @@ struct IssuePartitionManifestEntry {
     last_issue_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueRelationStreamHashes {
+    issues: String,
+    occurrences: String,
+    affected_roots: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssuePartitionManifest {
     schema_version: String,
@@ -2325,6 +2333,7 @@ struct IssuePartitionManifest {
     issue_count: u64,
     occurrence_count: u64,
     affected_root_count: u64,
+    relation_stream_sha256: IssueRelationStreamHashes,
     rpc_issue_sample_limit: usize,
     rpc_occurrence_sample_limit_per_issue: usize,
     rpc_affected_root_sample_limit_per_issue: usize,
@@ -2342,6 +2351,7 @@ struct IssuePartitionAccumulator {
     active: Option<ActiveIssuePartition>,
     entries: Vec<IssuePartitionManifestEntry>,
     artifacts: Vec<PreparedArtifact>,
+    relation_uncompressed_digest: Sha256,
 }
 
 struct ActiveIssuePartition {
@@ -4634,6 +4644,7 @@ impl IssuePartitionAccumulator {
             active: None,
             entries: Vec::new(),
             artifacts: Vec::new(),
+            relation_uncompressed_digest: Sha256::new(),
         }
     }
 
@@ -4654,6 +4665,7 @@ impl IssuePartitionAccumulator {
             active: None,
             entries: Vec::new(),
             artifacts: Vec::new(),
+            relation_uncompressed_digest: Sha256::new(),
         }
     }
 
@@ -4686,6 +4698,7 @@ impl IssuePartitionAccumulator {
         let active = self.active.as_mut().expect("active partition opened");
         active.encoder.write_all(&bytes)?;
         active.uncompressed_digest.update(&bytes);
+        self.relation_uncompressed_digest.update(&bytes);
         active.record_count = active
             .record_count
             .checked_add(1)
@@ -4762,9 +4775,17 @@ impl IssuePartitionAccumulator {
 
     fn finish(
         mut self,
-    ) -> anyhow::Result<(Vec<IssuePartitionManifestEntry>, Vec<PreparedArtifact>)> {
+    ) -> anyhow::Result<(
+        Vec<IssuePartitionManifestEntry>,
+        Vec<PreparedArtifact>,
+        String,
+    )> {
         self.flush()?;
-        Ok((self.entries, self.artifacts))
+        Ok((
+            self.entries,
+            self.artifacts,
+            hex::encode(self.relation_uncompressed_digest.finalize()),
+        ))
     }
 }
 
@@ -4879,11 +4900,13 @@ fn prepare_issue_partition_artifacts(
         affected_root_writer.push(issue_key, payload)
     })?;
 
-    let (mut entries, mut artifacts) = issue_writer.finish()?;
-    let (occurrence_entries, occurrence_artifacts) = occurrence_writer.finish()?;
+    let (mut entries, mut artifacts, issue_relation_sha256) = issue_writer.finish()?;
+    let (occurrence_entries, occurrence_artifacts, occurrence_relation_sha256) =
+        occurrence_writer.finish()?;
     entries.extend(occurrence_entries);
     artifacts.extend(occurrence_artifacts);
-    let (affected_root_entries, affected_root_artifacts) = affected_root_writer.finish()?;
+    let (affected_root_entries, affected_root_artifacts, affected_root_relation_sha256) =
+        affected_root_writer.finish()?;
     entries.extend(affected_root_entries);
     artifacts.extend(affected_root_artifacts);
     let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
@@ -4907,6 +4930,11 @@ fn prepare_issue_partition_artifacts(
         issue_count: relations.stats.issue_count,
         occurrence_count: relations.stats.occurrence_count,
         affected_root_count: relations.stats.affected_root_count,
+        relation_stream_sha256: IssueRelationStreamHashes {
+            issues: issue_relation_sha256,
+            occurrences: occurrence_relation_sha256,
+            affected_roots: affected_root_relation_sha256,
+        },
         rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
         rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
         rpc_affected_root_sample_limit_per_issue: ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT,
@@ -7248,6 +7276,274 @@ mod tests {
         assert_eq!(issue.occurrences.len(), 1);
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ReconstructedMachineResult {
+        partition_count: usize,
+        issue_count: u64,
+        occurrence_count: u64,
+        affected_root_count: u64,
+        uncompressed_byte_size: u64,
+        relation_stream_sha256: IssueRelationStreamHashes,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_complete_machine_result(
+        artifacts: &[PreparedArtifact],
+    ) -> anyhow::Result<ReconstructedMachineResult> {
+        let manifest_artifacts = artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .collect::<Vec<_>>();
+        if manifest_artifacts.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "complete machine result must contain exactly one manifest"
+            ));
+        }
+        let manifest_artifact = manifest_artifacts[0];
+        let (manifest_size, manifest_sha256) = file_size_and_sha256(&manifest_artifact.path)?;
+        if manifest_size != u64::try_from(manifest_artifact.descriptor.byte_size)?
+            || manifest_sha256 != manifest_artifact.descriptor.checksum_sha256
+        {
+            return Err(anyhow::anyhow!("manifest descriptor identity mismatch"));
+        }
+        let manifest: IssuePartitionManifest =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+        let mut sorted_paths = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        let original_paths = sorted_paths.clone();
+        sorted_paths.sort_unstable();
+        if original_paths != sorted_paths {
+            return Err(anyhow::anyhow!(
+                "manifest partition membership is not deterministically ordered"
+            ));
+        }
+
+        let mut partition_artifacts = BTreeMap::new();
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+        {
+            if partition_artifacts
+                .insert(artifact.descriptor.file_name.as_str(), artifact)
+                .is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "duplicate partition artifact identity: {}",
+                    artifact.descriptor.file_name
+                ));
+            }
+        }
+        let manifest_paths = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<BTreeSet<_>>();
+        if manifest_paths.len() != manifest.partitions.len()
+            || manifest_paths != partition_artifacts.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(anyhow::anyhow!(
+                "manifest membership differs from local partition artifacts"
+            ));
+        }
+
+        let mut relation_partition_indexes = BTreeMap::<String, usize>::new();
+        let mut relation_counts = BTreeMap::<String, u64>::new();
+        let mut relation_digests = BTreeMap::<String, Sha256>::new();
+        let mut previous_sort_keys = BTreeMap::<String, String>::new();
+        let mut total_uncompressed_bytes = 0_u64;
+
+        for entry in &manifest.partitions {
+            if !matches!(
+                entry.relation.as_str(),
+                "issues" | "occurrences" | "affected-roots"
+            ) {
+                return Err(anyhow::anyhow!(
+                    "manifest contains unsupported relation: {}",
+                    entry.relation
+                ));
+            }
+            if Path::new(&entry.path).is_absolute()
+                || entry.path.contains('\\')
+                || entry
+                    .path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            {
+                return Err(anyhow::anyhow!(
+                    "manifest contains invalid relative partition identity: {}",
+                    entry.path
+                ));
+            }
+            let partition_index = relation_partition_indexes
+                .entry(entry.relation.clone())
+                .or_default();
+            let expected_path = format!("{}/part-{partition_index:06}.ndjson.zst", entry.relation);
+            if entry.path != expected_path {
+                return Err(anyhow::anyhow!(
+                    "partition identity is not contiguous: expected={expected_path} actual={}",
+                    entry.path
+                ));
+            }
+            *partition_index += 1;
+            if entry.media_type != "application/x-ndjson+zstd" {
+                return Err(anyhow::anyhow!(
+                    "partition media type mismatch: {}",
+                    entry.path
+                ));
+            }
+
+            let artifact = partition_artifacts
+                .get(entry.path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("partition artifact is missing"))?;
+            let (compressed_size, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
+            if compressed_size != entry.compressed_byte_size
+                || compressed_size != u64::try_from(artifact.descriptor.byte_size)?
+                || compressed_sha256 != entry.compressed_sha256
+                || compressed_sha256 != artifact.descriptor.checksum_sha256
+                || artifact.descriptor.content_type != entry.media_type
+            {
+                return Err(anyhow::anyhow!(
+                    "compressed partition descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+
+            let decoder = zstd::stream::read::Decoder::new(File::open(&artifact.path)?)?;
+            let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+            let mut line = Vec::new();
+            let mut partition_digest = Sha256::new();
+            let relation_digest = relation_digests.entry(entry.relation.clone()).or_default();
+            let mut partition_count = 0_u64;
+            let mut partition_bytes = 0_u64;
+            let mut first_issue_key = None::<String>;
+            let mut last_issue_key = None::<String>;
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
+                }
+                if line.last() != Some(&b'\n')
+                    || u64::try_from(line.len())? > manifest.partition_max_uncompressed_bytes
+                {
+                    return Err(anyhow::anyhow!(
+                        "partition record is unterminated or exceeds the bounded reader window: {}",
+                        entry.path
+                    ));
+                }
+                partition_digest.update(&line);
+                relation_digest.update(&line);
+                partition_bytes = partition_bytes
+                    .checked_add(u64::try_from(line.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("partition uncompressed byte count overflow"))?;
+                line.pop();
+                let record: Value = serde_json::from_slice(&line)?;
+                let issue_key = record
+                    .get("issueKey")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("partition record omitted issueKey"))?;
+                let sort_key = match entry.relation.as_str() {
+                    "issues" => issue_key.to_owned(),
+                    "occurrences" => format!(
+                        "{issue_key}\0{}",
+                        record
+                            .get("occurrenceKey")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "occurrence partition record omitted occurrenceKey"
+                            ))?
+                    ),
+                    "affected-roots" => format!(
+                        "{issue_key}\0{}",
+                        canonical_json_sha256(record.get("root").ok_or_else(
+                            || anyhow::anyhow!("affected-root partition record omitted root")
+                        )?)?
+                    ),
+                    _ => unreachable!(),
+                };
+                if previous_sort_keys
+                    .get(&entry.relation)
+                    .is_some_and(|previous| previous >= &sort_key)
+                {
+                    return Err(anyhow::anyhow!(
+                        "partition relation order is not strictly deterministic: {}",
+                        entry.path
+                    ));
+                }
+                previous_sort_keys.insert(entry.relation.clone(), sort_key);
+                first_issue_key.get_or_insert_with(|| issue_key.to_owned());
+                last_issue_key = Some(issue_key.to_owned());
+                partition_count = partition_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("partition record count overflow"))?;
+            }
+            if partition_count != entry.record_count
+                || partition_bytes != entry.uncompressed_byte_size
+                || hex::encode(partition_digest.finalize()) != entry.uncompressed_sha256
+                || first_issue_key.as_deref() != Some(entry.first_issue_key.as_str())
+                || last_issue_key.as_deref() != Some(entry.last_issue_key.as_str())
+            {
+                return Err(anyhow::anyhow!(
+                    "uncompressed partition descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+            *relation_counts.entry(entry.relation.clone()).or_default() += partition_count;
+            total_uncompressed_bytes = total_uncompressed_bytes
+                .checked_add(partition_bytes)
+                .ok_or_else(|| anyhow::anyhow!("machine result byte count overflow"))?;
+        }
+
+        let reconstructed_hashes = IssueRelationStreamHashes {
+            issues: hex::encode(
+                relation_digests
+                    .remove("issues")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+            occurrences: hex::encode(
+                relation_digests
+                    .remove("occurrences")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+            affected_roots: hex::encode(
+                relation_digests
+                    .remove("affected-roots")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+        };
+        let reconstructed = ReconstructedMachineResult {
+            partition_count: manifest.partitions.len(),
+            issue_count: relation_counts.get("issues").copied().unwrap_or_default(),
+            occurrence_count: relation_counts
+                .get("occurrences")
+                .copied()
+                .unwrap_or_default(),
+            affected_root_count: relation_counts
+                .get("affected-roots")
+                .copied()
+                .unwrap_or_default(),
+            uncompressed_byte_size: total_uncompressed_bytes,
+            relation_stream_sha256: reconstructed_hashes,
+        };
+        if reconstructed.issue_count != manifest.issue_count
+            || reconstructed.occurrence_count != manifest.occurrence_count
+            || reconstructed.affected_root_count != manifest.affected_root_count
+            || reconstructed.relation_stream_sha256 != manifest.relation_stream_sha256
+        {
+            return Err(anyhow::anyhow!(
+                "reconstructed complete machine result differs from manifest global counts/hashes"
+            ));
+        }
+        Ok(reconstructed)
+    }
+
     #[test]
     fn generated_partitions_are_deterministic_and_bounded_at_1x_2x_5x_10x() {
         fn build(record_count: usize) -> (Vec<IssuePartitionManifestEntry>, Vec<Vec<u8>>) {
@@ -7266,7 +7562,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            let (entries, artifacts) = writer.finish().unwrap();
+            let (entries, artifacts, _) = writer.finish().unwrap();
             let compressed = artifacts
                 .iter()
                 .map(|artifact| fs::read(&artifact.path).unwrap())
@@ -7783,14 +8079,11 @@ mod tests {
         let artifacts =
             prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan, &validation)
                 .unwrap();
+        let reconstructed = reconstruct_complete_machine_result(&artifacts).unwrap();
         let relations = scan.issue_relations.as_ref().unwrap();
         let mut partition_bytes = 0_u64;
         let mut total_artifact_bytes = 0_u64;
         let mut artifact_manifest = Vec::new();
-        let mut recovered_issue_count = 0_u64;
-        let mut recovered_occurrence_count = 0_u64;
-        let mut recovered_affected_root_count = 0_u64;
-        let mut partition_uncompressed_bytes = 0_u64;
         let mut closure_bundle_bytes = 0_u64;
         let mut closure_bundle_sha256 = String::new();
         let mut xlsx_bytes = 0_u64;
@@ -7819,41 +8112,15 @@ mod tests {
             {
                 partition_bytes = partition_bytes.saturating_add(artifact_bytes);
             }
-            if artifact.descriptor.file_name == "manifest.json" {
-                let manifest: Value =
-                    serde_json::from_slice(&fs::read(&artifact.path).unwrap()).unwrap();
-                partition_uncompressed_bytes = manifest["partitions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|entry| entry["uncompressedByteSize"].as_u64())
-                    .sum();
-            }
-            if artifact.descriptor.file_name.ends_with(".ndjson.zst") {
-                let decoded =
-                    zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap();
-                let records = u64::try_from(
-                    decoded
-                        .split(|byte| *byte == b'\n')
-                        .count()
-                        .saturating_sub(1),
-                )
-                .unwrap();
-                if artifact.descriptor.file_name.starts_with("issues/") {
-                    recovered_issue_count = recovered_issue_count.saturating_add(records);
-                } else if artifact.descriptor.file_name.starts_with("occurrences/") {
-                    recovered_occurrence_count = recovered_occurrence_count.saturating_add(records);
-                } else if artifact.descriptor.file_name.starts_with("affected-roots/") {
-                    recovered_affected_root_count =
-                        recovered_affected_root_count.saturating_add(records);
-                }
-            }
             artifact_manifest.push(artifact.descriptor.clone());
         }
-        assert_eq!(recovered_issue_count, relations.stats.issue_count);
-        assert_eq!(recovered_occurrence_count, relations.stats.occurrence_count);
+        assert_eq!(reconstructed.issue_count, relations.stats.issue_count);
         assert_eq!(
-            recovered_affected_root_count,
+            reconstructed.occurrence_count,
+            relations.stats.occurrence_count
+        );
+        assert_eq!(
+            reconstructed.affected_root_count,
             relations.stats.affected_root_count
         );
         if let Ok(target) = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS") {
@@ -7898,10 +8165,11 @@ mod tests {
             "occurrenceCount": relations.stats.occurrence_count,
             "affectedRootCount": relations.stats.affected_root_count,
             "recoveredRelationCounts": {
-                "issues": recovered_issue_count,
-                "occurrences": recovered_occurrence_count,
-                "affectedRoots": recovered_affected_root_count,
+                "issues": reconstructed.issue_count,
+                "occurrences": reconstructed.occurrence_count,
+                "affectedRoots": reconstructed.affected_root_count,
             },
+            "machineResultReconstruction": &reconstructed,
             "relationSpoolBytes": {
                 "issues": relations.issues.byte_size,
                 "occurrences": relations.occurrences.byte_size,
@@ -7932,7 +8200,7 @@ mod tests {
             },
             "totalArtifactBytes": total_artifact_bytes,
             "partitionAndManifestBytes": partition_bytes,
-            "partitionUncompressedBytes": partition_uncompressed_bytes,
+            "partitionUncompressedBytes": reconstructed.uncompressed_byte_size,
             "closureBundleBytes": closure_bundle_bytes,
             "closureBundleSha256": closure_bundle_sha256,
             "xlsxBytes": xlsx_bytes,
@@ -8042,7 +8310,7 @@ mod tests {
                 enforce_scope_closure_memory_budget("qualified_relation_partition_scale").unwrap();
             }
         }
-        let (entries, artifacts) = writer.finish().unwrap();
+        let (entries, artifacts, _) = writer.finish().unwrap();
         let recovered_records = entries.iter().map(|entry| entry.record_count).sum::<u64>();
         let uncompressed_bytes = entries
             .iter()
@@ -8810,7 +9078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn affected_root_partitions_preserve_complete_relations_beyond_inline_sample() {
+    async fn manifest_streaming_reconstructs_complete_relations_beyond_inline_sample() {
         let support = identity(
             DatasetCategory::Sources,
             "abababab-abab-4bab-8bab-abababababab",
@@ -8860,8 +9128,14 @@ mod tests {
             requested_target_version: None,
             message: "generated support issue".to_owned(),
             suggested_action: None,
-            occurrence_count: 0,
-            occurrences: Vec::new(),
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: "shared-support-occurrence".to_owned(),
+                source: None,
+                json_path: Some("$.fixture".to_owned()),
+                reference_role: None,
+                details: json!({"source": "reconstruction-proof"}),
+            }],
             affected_root_count: 0,
             affected_roots: Vec::new(),
             affected_root_witness_paths: Vec::new(),
@@ -8887,6 +9161,10 @@ mod tests {
             Arc::new(TempDir::new().unwrap()),
         )
         .unwrap();
+        let reconstructed = reconstruct_complete_machine_result(&artifacts).unwrap();
+        assert_eq!(reconstructed.issue_count, 1);
+        assert_eq!(reconstructed.occurrence_count, 1);
+        assert_eq!(reconstructed.affected_root_count, 101);
         let root_records = artifacts
             .iter()
             .filter(|artifact| artifact.descriptor.file_name.starts_with("affected-roots/"))

@@ -36,7 +36,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-29
 lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline: measured-topology admission, staged run/merge watermarks, direct partition streaming, disk/cache telemetry, role-tagged publication, and generic application-level artifact GC fit the existing Worker, storage, and maintenance boundaries."
+lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: measured-topology admission, bounded complete-result reconstruction, role-tagged publication, and generic application-level artifact GC fit the existing Worker, storage, and maintenance boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-29
 lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline: topology-measured admission, staged free-space watermarks, direct deterministic partition streaming, cache telemetry, role-tagged publication, and retry-safe application-level artifact GC remain Worker-owned while durable lifecycle schema and RPC governance remain database-engine-owned."
+lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: topology-measured admission, bounded complete-result reconstruction, role-tagged publication, and retry-safe application-level artifact GC remain Worker-owned while durable lifecycle schema and RPC governance remain database-engine-owned."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -174,7 +174,7 @@ Route those tasks to:
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
 - package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION`, verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
-- scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, not a duplicate monolithic JSONL artifact
+- scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, with manifest-driven streaming reconstruction of exact membership/counts/hashes, not a duplicate monolithic JSONL artifact; this delivery directly downloads only XLSX and the manifest, and direct partition retrieval remains a separately tracked cross-repository contract
 - generic artifact GC is a lease-fenced `worker.artifact_gc` maintenance job: Database Engine #309 claims bounded rows under a shared token, `object_delete` candidates require one exact object deletion before bounded completion, and fresh-process `detail_cleanup` recovery candidates carry a new fenced token, `objectDeleteRequired=false`, and no locator; a missing object is idempotent success and object-delete failures release the claim without premature tombstoning
 
 ## Documentation Update Rules
