@@ -4,12 +4,14 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fs::{self, File},
+    future::Future,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use serde::ser::{Error as SerdeError, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -29,7 +31,7 @@ use crate::{
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
     readiness::{MatrixReadinessReport, ReadinessStatus},
-    resource::{ResourceCounters, ResourceMeasurement, directory_bytes},
+    resource::{CancellationToken, ResourceCounters, ResourceMeasurement, directory_bytes},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
     tidas_cli,
@@ -67,18 +69,7 @@ const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const INSERT_SCOPE_CLOSURE_ARTIFACT_SQL: &str = r"
-    INSERT INTO public.worker_job_artifacts (
-        id, job_id, artifact_type, artifact_role, lifecycle_state,
-        storage_bucket, storage_path, content_type, byte_size,
-        checksum_sha256, metadata, visibility, expires_at
-    ) VALUES (
-        $1, $2, $3, $4, 'ready',
-        $5, $6, $7, $8, $9, $10::jsonb, 'operator',
-        transaction_timestamp() + make_interval(secs => $11::integer)
-    )
-    RETURNING id
-    ";
+const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
 
 fn scope_closure_memory_budget_bytes() -> u64 {
     std::env::var("SCOPE_CLOSURE_MEMORY_BUDGET_MIB")
@@ -2273,7 +2264,7 @@ struct ArtifactManifestEntry {
     checksum_sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ScopeClosureArtifactRole {
     ClosureReport,
@@ -2281,21 +2272,38 @@ enum ScopeClosureArtifactRole {
     ClosureBundle,
 }
 
-impl ScopeClosureArtifactRole {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::ClosureReport => "closure_report",
-            Self::CompleteMachineResult => "complete_machine_result",
-            Self::ClosureBundle => "closure_bundle",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PreparedArtifact {
     descriptor: ArtifactManifestEntry,
     path: PathBuf,
     _temp: Arc<TempDir>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureArtifactWriteSet {
+    write_set_id: Uuid,
+    status: String,
+    write_token: Uuid,
+    items: Vec<ScopeClosureArtifactWriteSetItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureArtifactWriteSetItem {
+    artifact_id: Uuid,
+    client_key: String,
+    artifact_type: String,
+    artifact_role: ScopeClosureArtifactRole,
+    #[serde(rename = "bucket")]
+    storage_bucket: String,
+    #[serde(rename = "objectPath")]
+    storage_path: String,
+    #[serde(rename = "mediaType")]
+    content_type: String,
+    #[serde(rename = "size")]
+    byte_size: u64,
+    checksum_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3538,6 +3546,7 @@ pub async fn execute_scope_closure_job(
                     worker_job_id,
                     lease_token,
                     completed_check_id,
+                    &progress,
                 )
                 .await;
             }
@@ -3823,6 +3832,7 @@ pub async fn execute_scope_closure_job(
         closure_check_id,
         &artifacts,
         content_artifact_manifest_hash.as_str(),
+        None,
         Some(&progress),
     )
     .await?;
@@ -4029,6 +4039,7 @@ async fn reuse_completed_scan_execution(
     worker_job_id: Uuid,
     lease_token: Uuid,
     completed_check_id: Uuid,
+    progress: &WorkerJobProgress<'_>,
 ) -> anyhow::Result<ScopeClosureExecutionResult> {
     let row = sqlx::query(
         r"
@@ -4073,7 +4084,8 @@ async fn reuse_completed_scan_execution(
         closure_check_id,
         std::slice::from_ref(&artifact),
         content_manifest_hash.as_str(),
-        None,
+        Some(completed_check_id),
+        Some(progress),
     )
     .await?;
     let report_artifact_id = persisted
@@ -5046,37 +5058,20 @@ fn file_size_and_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
 fn closure_artifact_metadata(
     artifact: &PreparedArtifact,
     closure_check_id: Uuid,
-    write_set_id: Uuid,
     content_artifact_manifest_hash: &str,
-    complete_machine_result_artifact_id: Option<Uuid>,
-) -> anyhow::Result<Value> {
+) -> Value {
     let mut metadata = json!({
         "schemaVersion": "lcia.scope-closure-artifact.v2",
         "closureCheckId": closure_check_id,
-        "writeSetId": write_set_id,
         "fileName": artifact.descriptor.file_name,
         "artifactRole": artifact.descriptor.artifact_role,
-        "lifecycleState": "ready",
         "retentionSeconds": SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS,
         "contentArtifactManifestHash": content_artifact_manifest_hash,
     });
     if artifact.descriptor.artifact_role == ScopeClosureArtifactRole::ClosureBundle {
-        metadata["completeMachineResultArtifactId"] = json!(
-            complete_machine_result_artifact_id
-                .ok_or_else(|| anyhow::anyhow!("closure bundle omitted machine-result manifest"))?
-        );
+        metadata["completeMachineResultClientKey"] = json!("manifest.json");
     }
-    Ok(metadata)
-}
-
-fn preallocated_artifact_id(
-    artifact_ids: &BTreeMap<String, Uuid>,
-    artifact: &PreparedArtifact,
-) -> anyhow::Result<Uuid> {
-    artifact_ids
-        .get(&artifact.descriptor.file_name)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("closure artifact ID was not preallocated"))
+    metadata
 }
 
 fn is_semantic_closure_artifact(artifact: &PreparedArtifact) -> bool {
@@ -5084,109 +5079,330 @@ fn is_semantic_closure_artifact(artifact: &PreparedArtifact) -> bool {
         || artifact.descriptor.file_name == "manifest.json"
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_closure_artifacts(
     state: &AppState,
-    worker_job_id: Uuid,
+    _worker_job_id: Uuid,
     closure_check_id: Uuid,
     artifacts: &[PreparedArtifact],
     content_artifact_manifest_hash: &str,
+    reused_from_check_id: Option<Uuid>,
     progress: Option<&WorkerJobProgress<'_>>,
 ) -> anyhow::Result<BTreeMap<String, Uuid>> {
-    let write_set_id = Uuid::new_v4();
+    let publication_id = Uuid::new_v4();
     let mut uploaded = Vec::<String>::new();
     let mut staged = Vec::<(&PreparedArtifact, String)>::new();
-    for (index, artifact) in artifacts.iter().enumerate() {
-        if let Err(error) =
-            heartbeat_closure_artifact_upload(progress, closure_check_id, index, artifacts.len())
-                .await
-        {
-            cleanup_uploaded_artifacts(state, &uploaded).await;
-            return Err(error);
-        }
+    for artifact in artifacts {
         let relative_key = format!(
-            "scope-closure/{closure_check_id}/{write_set_id}/{}",
+            "scope-closure/{closure_check_id}/{publication_id}/{}",
             artifact.descriptor.file_name
         );
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
-        if let Err(error) = state
-            .object_store
-            .upload_object_key_file_bounded(
-                object_key.as_str(),
-                artifact.descriptor.content_type.as_str(),
+        staged.push((artifact, object_key));
+    }
+    let request_items = staged
+        .iter()
+        .map(|(artifact, object_key)| {
+            json!({
+                "clientKey": artifact.descriptor.file_name,
+                "artifactType": artifact.descriptor.artifact_type,
+                "artifactRole": artifact.descriptor.artifact_role,
+                "bucket": state.object_store.bucket_name(),
+                "objectPath": object_key,
+                "mediaType": artifact.descriptor.content_type,
+                "size": artifact.descriptor.byte_size,
+                "checksumSha256": artifact.descriptor.checksum_sha256,
+                "metadata": closure_artifact_metadata(
+                    artifact,
+                    closure_check_id,
+                    content_artifact_manifest_hash,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let write_set = create_closure_artifact_write_set(
+        &state.pool,
+        closure_check_id,
+        publication_id.to_string().as_str(),
+        &request_items,
+        reused_from_check_id,
+    )
+    .await?;
+    validate_closure_artifact_write_set(
+        &write_set,
+        artifacts,
+        &request_items,
+        state.object_store.bucket_name(),
+        "staging",
+    )?;
+
+    for (index, item) in write_set.items.iter().enumerate() {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("write-set response returned an unknown client key"))?;
+        let cancellation = CancellationToken::default();
+        let heartbeat_period = progress.map_or(Duration::from_secs(3_600), |progress| {
+            lease_heartbeat_period(progress.lease_seconds())
+        });
+        let upload = Box::pin(
+            state.object_store.upload_object_key_file_bounded(
+                item.storage_path.as_str(),
+                item.content_type.as_str(),
                 &artifact.path,
                 ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES)
-                    .with_expected_sha256(artifact.descriptor.checksum_sha256.clone()),
-            )
+                    .with_expected_sha256(item.checksum_sha256.clone())
+                    .with_cancellation(cancellation.clone()),
+            ),
+        );
+        if let Err(error) =
+            supervise_cancellable_operation(upload, cancellation, heartbeat_period, || {
+                heartbeat_closure_artifact_upload(
+                    progress,
+                    closure_check_id,
+                    index,
+                    write_set.items.len(),
+                )
+            })
             .await
         {
+            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
             cleanup_uploaded_artifacts(state, &uploaded).await;
             return Err(error.context("failed to upload closure artifact write set"));
         }
-        uploaded.push(object_key.clone());
-        staged.push((artifact, object_key));
+        uploaded.push(item.storage_path.clone());
     }
 
-    let artifact_ids = staged
-        .iter()
-        .map(|(artifact, _)| (artifact.descriptor.file_name.clone(), Uuid::new_v4()))
-        .collect::<BTreeMap<_, _>>();
-    let complete_machine_result_artifact_id = artifact_ids.get("manifest.json").copied();
-    let mut transaction = match state.pool.begin().await {
-        Ok(transaction) => transaction,
+    let finalized = match fence_closure_artifact_finalize(
+        || {
+            heartbeat_closure_artifact_upload(
+                progress,
+                closure_check_id,
+                write_set.items.len(),
+                write_set.items.len(),
+            )
+        },
+        || finalize_closure_artifact_write_set(&state.pool, &write_set),
+    )
+    .await
+    {
+        Ok(finalized) => finalized,
         Err(error) => {
+            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
             cleanup_uploaded_artifacts(state, &uploaded).await;
-            return Err(anyhow::anyhow!(
-                "failed to begin closure artifact metadata transaction: {error}"
-            ));
+            return Err(error
+                .context("closure artifact pre-commit fence or atomic write-set finalize failed"));
         }
     };
+    validate_closure_artifact_write_set(
+        &finalized,
+        artifacts,
+        &request_items,
+        state.object_store.bucket_name(),
+        "ready",
+    )?;
     let mut persisted = BTreeMap::new();
-    for (artifact, object_key) in &staged {
-        let byte_size = i64::try_from(artifact.descriptor.byte_size)?;
-        let artifact_id = preallocated_artifact_id(&artifact_ids, artifact)?;
-        let metadata = closure_artifact_metadata(
-            artifact,
-            closure_check_id,
-            write_set_id,
-            content_artifact_manifest_hash,
-            complete_machine_result_artifact_id,
-        )?;
-        let row = match sqlx::query(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL)
-            .bind(artifact_id)
-            .bind(worker_job_id)
-            .bind(artifact.descriptor.artifact_type.as_str())
-            .bind(artifact.descriptor.artifact_role.as_str())
-            .bind(state.object_store.bucket_name())
-            .bind(object_key)
-            .bind(artifact.descriptor.content_type.as_str())
-            .bind(byte_size)
-            .bind(artifact.descriptor.checksum_sha256.as_str())
-            .bind(metadata)
-            .bind(i32::try_from(SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS)?)
-            .fetch_one(&mut *transaction)
-            .await
-        {
-            Ok(row) => row,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                cleanup_uploaded_artifacts(state, &uploaded).await;
-                return Err(anyhow::anyhow!(
-                    "failed to persist closure artifact metadata write set: {error}"
-                ));
-            }
-        };
-        let persisted_id = row.try_get::<Uuid, _>("id")?;
+    for item in finalized.items {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("finalized write set returned unknown client key"))?;
         if is_semantic_closure_artifact(artifact) {
-            persisted.insert(artifact.descriptor.artifact_type.clone(), persisted_id);
+            persisted.insert(artifact.descriptor.artifact_type.clone(), item.artifact_id);
         }
     }
-    if let Err(error) = transaction.commit().await {
-        cleanup_uploaded_artifacts(state, &uploaded).await;
+    Ok(persisted)
+}
+
+async fn create_closure_artifact_write_set(
+    pool: &PgPool,
+    closure_check_id: Uuid,
+    idempotency_key: &str,
+    items: &[Value],
+    reused_from_check_id: Option<Uuid>,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_create(
+          $1, $2, $3::jsonb, $4, $5
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(closure_check_id)
+    .bind(idempotency_key)
+    .bind(Value::Array(items.to_vec()))
+    .bind(SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS)
+    .bind(reused_from_check_id)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_closure_artifact_write_set(&result, "svc_lcia_scope_closure_artifact_write_set_create")
+}
+
+async fn finalize_closure_artifact_write_set(
+    pool: &PgPool,
+    write_set: &ScopeClosureArtifactWriteSet,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_finalize($1, $2) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(write_set.write_set_id)
+    .bind(write_set.write_token)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_closure_artifact_write_set(
+        &result,
+        "svc_lcia_scope_closure_artifact_write_set_finalize",
+    )
+}
+
+async fn fail_closure_artifact_write_set(
+    pool: &PgPool,
+    write_set: &ScopeClosureArtifactWriteSet,
+    error: &anyhow::Error,
+) {
+    let message = format!("{error:#}").chars().take(1_000).collect::<String>();
+    let result = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_fail($1, $2, $3) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(write_set.write_set_id)
+    .bind(write_set.write_token)
+    .bind(message)
+    .fetch_one(pool)
+    .await;
+    match result {
+        Ok(row) => match row.try_get::<Value, _>("result").and_then(|value| {
+            ensure_rpc_ok(&value, "svc_lcia_scope_closure_artifact_write_set_fail")
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+        }) {
+            Ok(()) => {}
+            Err(failure_error) => {
+                tracing::warn!(
+                    write_set_id = %write_set.write_set_id,
+                    error = %failure_error,
+                    "Database rejected closure artifact write-set reconciliation mark"
+                );
+            }
+        },
+        Err(failure_error) => {
+            tracing::warn!(
+                write_set_id = %write_set.write_set_id,
+                error = %failure_error,
+                "failed to mark closure artifact write set for reconciliation"
+            );
+        }
+    }
+}
+
+fn parse_closure_artifact_write_set(
+    result: &Value,
+    rpc_name: &str,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    ensure_rpc_ok(result, rpc_name)?;
+    let data = result
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{rpc_name} omitted data"))?;
+    Ok(serde_json::from_value(data)?)
+}
+
+fn validate_closure_artifact_write_set(
+    write_set: &ScopeClosureArtifactWriteSet,
+    artifacts: &[PreparedArtifact],
+    request_items: &[Value],
+    expected_bucket: &str,
+    expected_status: &str,
+) -> anyhow::Result<()> {
+    if write_set.status != expected_status
+        || write_set.write_token.is_nil()
+        || write_set.items.len() != artifacts.len()
+        || request_items.len() != artifacts.len()
+    {
         return Err(anyhow::anyhow!(
-            "failed to commit closure artifact metadata write set: {error}"
+            "Database returned an inconsistent closure artifact write set"
         ));
     }
-    Ok(persisted)
+    let mut observed_client_keys = BTreeSet::new();
+    let mut observed_artifact_ids = BTreeSet::new();
+    for item in &write_set.items {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("write set returned unknown clientKey"))?;
+        let requested = request_items
+            .iter()
+            .find(|request| {
+                request.get("clientKey").and_then(Value::as_str) == Some(item.client_key.as_str())
+            })
+            .ok_or_else(|| anyhow::anyhow!("write set omitted requested clientKey"))?;
+        if !observed_client_keys.insert(item.client_key.as_str())
+            || !observed_artifact_ids.insert(item.artifact_id)
+            || item.storage_bucket != expected_bucket
+            || requested.get("bucket").and_then(Value::as_str) != Some(item.storage_bucket.as_str())
+            || requested.get("objectPath").and_then(Value::as_str)
+                != Some(item.storage_path.as_str())
+            || item.artifact_type != artifact.descriptor.artifact_type
+            || item.artifact_role != artifact.descriptor.artifact_role
+            || item.content_type != artifact.descriptor.content_type
+            || item.byte_size != u64::try_from(artifact.descriptor.byte_size)?
+            || item.checksum_sha256 != artifact.descriptor.checksum_sha256
+        {
+            return Err(anyhow::anyhow!(
+                "Database changed closure artifact write-set identity for {}",
+                item.client_key
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn supervise_cancellable_operation<T, Operation, Heartbeat, HeartbeatFuture>(
+    operation: Operation,
+    cancellation: CancellationToken,
+    heartbeat_period: Duration,
+    mut heartbeat: Heartbeat,
+) -> anyhow::Result<T>
+where
+    Operation: Future<Output = anyhow::Result<T>>,
+    Heartbeat: FnMut() -> HeartbeatFuture,
+    HeartbeatFuture: Future<Output = anyhow::Result<()>>,
+{
+    heartbeat().await?;
+    tokio::pin!(operation);
+    let mut interval = tokio::time::interval(heartbeat_period.max(Duration::from_millis(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = interval.tick() => {
+                if let Err(error) = heartbeat().await {
+                    cancellation.cancel();
+                    let _ = (&mut operation).await;
+                    return Err(error.context(
+                        "operation cancelled after lease heartbeat failure",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn heartbeat_closure_artifact_upload(
@@ -5213,6 +5429,30 @@ async fn heartbeat_closure_artifact_upload(
         )
         .await
         .map_err(|error| error.context("closure artifact upload lease heartbeat failed"))
+}
+
+async fn fence_closure_artifact_finalize<
+    Heartbeat,
+    HeartbeatFuture,
+    Finalize,
+    FinalizeFuture,
+    Finalized,
+>(
+    heartbeat: Heartbeat,
+    finalize: Finalize,
+) -> anyhow::Result<Finalized>
+where
+    Heartbeat: FnOnce() -> HeartbeatFuture,
+    HeartbeatFuture: Future<Output = anyhow::Result<()>>,
+    Finalize: FnOnce() -> FinalizeFuture,
+    FinalizeFuture: Future<Output = anyhow::Result<Finalized>>,
+{
+    heartbeat()
+        .await
+        .context("closure artifact pre-commit lease fence failed")?;
+    finalize()
+        .await
+        .context("failed to atomically finalize closure artifact write set")
 }
 
 async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
@@ -7290,6 +7530,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn reconstruct_complete_machine_result(
         artifacts: &[PreparedArtifact],
+        expected_closure_check_id: Uuid,
     ) -> anyhow::Result<ReconstructedMachineResult> {
         let manifest_artifacts = artifacts
             .iter()
@@ -7301,6 +7542,13 @@ mod tests {
             ));
         }
         let manifest_artifact = manifest_artifacts[0];
+        if manifest_artifact.descriptor.artifact_role
+            != ScopeClosureArtifactRole::CompleteMachineResult
+        {
+            return Err(anyhow::anyhow!(
+                "manifest artifact role is not complete_machine_result"
+            ));
+        }
         let (manifest_size, manifest_sha256) = file_size_and_sha256(&manifest_artifact.path)?;
         if manifest_size != u64::try_from(manifest_artifact.descriptor.byte_size)?
             || manifest_sha256 != manifest_artifact.descriptor.checksum_sha256
@@ -7309,6 +7557,13 @@ mod tests {
         }
         let manifest: IssuePartitionManifest =
             serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+        if manifest.schema_version != "lcia.scope-closure-issue-manifest.v2"
+            || manifest.closure_check_id != expected_closure_check_id
+        {
+            return Err(anyhow::anyhow!(
+                "manifest schemaVersion or closureCheckId mismatch"
+            ));
+        }
         let mut sorted_paths = manifest
             .partitions
             .iter()
@@ -7399,6 +7654,13 @@ mod tests {
             let artifact = partition_artifacts
                 .get(entry.path.as_str())
                 .ok_or_else(|| anyhow::anyhow!("partition artifact is missing"))?;
+            if artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+            {
+                return Err(anyhow::anyhow!(
+                    "partition artifact role is not complete_machine_result: {}",
+                    entry.path
+                ));
+            }
             let (compressed_size, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
             if compressed_size != entry.compressed_byte_size
                 || compressed_size != u64::try_from(artifact.descriptor.byte_size)?
@@ -8079,7 +8341,8 @@ mod tests {
         let artifacts =
             prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan, &validation)
                 .unwrap();
-        let reconstructed = reconstruct_complete_machine_result(&artifacts).unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
         let relations = scan.issue_relations.as_ref().unwrap();
         let mut partition_bytes = 0_u64;
         let mut total_artifact_bytes = 0_u64;
@@ -8752,17 +9015,9 @@ mod tests {
     }
 
     #[test]
-    fn scope_closure_publication_uses_complete_storage_identity_and_trusted_expiry() {
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("storage_bucket"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("storage_path"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("artifact_role"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("lifecycle_state"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("checksum_sha256"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("content_type"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("byte_size"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("expires_at"));
-        assert!(INSERT_SCOPE_CLOSURE_ARTIFACT_SQL.contains("transaction_timestamp()"));
+    fn scope_closure_publication_metadata_uses_db_first_manifest_binding() {
         assert_eq!(SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS, 604_800);
+        assert_eq!(SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS, 3_600);
 
         let temp = Arc::new(TempDir::new().unwrap());
         let report = PreparedArtifact {
@@ -8778,15 +9033,111 @@ mod tests {
             path: temp.path().join("closure-report-v1.xlsx"),
             _temp: temp,
         };
+        let report_metadata = closure_artifact_metadata(&report, Uuid::nil(), "manifest");
         assert!(
-            closure_artifact_metadata(&report, Uuid::nil(), Uuid::nil(), "manifest", None).is_ok(),
-            "reused scans publish a current report without a new machine-result manifest"
+            report_metadata
+                .get("completeMachineResultClientKey")
+                .is_none()
         );
+        assert!(report_metadata.get("writeSetId").is_none());
+        assert!(report_metadata.get("lifecycleState").is_none());
         let mut bundle = report.clone();
         bundle.descriptor.artifact_role = ScopeClosureArtifactRole::ClosureBundle;
+        let bundle_metadata = closure_artifact_metadata(&bundle, Uuid::nil(), "manifest");
+        assert_eq!(
+            bundle_metadata["completeMachineResultClientKey"], "manifest.json",
+            "Database finalize resolves the preallocated manifest UUID atomically"
+        );
         assert!(
-            closure_artifact_metadata(&bundle, Uuid::nil(), Uuid::nil(), "manifest", None).is_err(),
-            "fresh closure bundles must bind their machine-result manifest row"
+            bundle_metadata
+                .get("completeMachineResultArtifactId")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_artifact_operation_renews_lease_across_multiple_periods() {
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&heartbeats);
+        let result = supervise_cancellable_operation(
+            async {
+                tokio::time::sleep(Duration::from_millis(110)).await;
+                Ok::<_, anyhow::Error>("uploaded")
+            },
+            CancellationToken::default(),
+            Duration::from_millis(25),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "uploaded");
+        assert!(
+            heartbeats.load(Ordering::SeqCst) >= 5,
+            "initial heartbeat plus at least four periodic heartbeats are required"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_operation_is_really_cancelled_when_lease_is_lost_mid_request() {
+        let cancellation = CancellationToken::default();
+        let operation_cancellation = cancellation.clone();
+        let cleanup_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_cleanup = Arc::clone(&cleanup_observed);
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&heartbeats);
+
+        let error = supervise_cancellable_operation(
+            async move {
+                while !operation_cancellation.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                operation_cleanup.store(true, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("multipart aborted"))
+            },
+            cancellation.clone(),
+            Duration::from_millis(20),
+            move || {
+                let call = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call >= 2 {
+                        Err(anyhow::anyhow!("lease lost"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("lease lost"));
+        assert!(cancellation.is_cancelled());
+        assert!(cleanup_observed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn final_artifact_lease_loss_blocks_ready_finalize() {
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&finalize_calls);
+        let error = fence_closure_artifact_finalize(
+            || async { Err(anyhow::anyhow!("lease lost after final artifact")) },
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>("ready") }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("lease lost after final artifact"));
+        assert_eq!(
+            finalize_calls.load(Ordering::SeqCst),
+            0,
+            "a failed final heartbeat must never invoke the only ready-row transition"
         );
     }
 
@@ -9154,14 +9505,16 @@ mod tests {
             issue_events: JsonlValueSpool::empty("empty-root-partition-issues.jsonl").unwrap(),
         };
         build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd");
         let artifacts = prepare_issue_partition_artifacts(
-            id("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"),
+            closure_check_id,
             &scan,
             &validation,
             Arc::new(TempDir::new().unwrap()),
         )
         .unwrap();
-        let reconstructed = reconstruct_complete_machine_result(&artifacts).unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
         assert_eq!(reconstructed.issue_count, 1);
         assert_eq!(reconstructed.occurrence_count, 1);
         assert_eq!(reconstructed.affected_root_count, 101);
@@ -9175,6 +9528,215 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(root_records, roots.len());
+    }
+
+    fn clone_prepared_artifacts(artifacts: &[PreparedArtifact]) -> Vec<PreparedArtifact> {
+        let temp = Arc::new(TempDir::new().unwrap());
+        artifacts
+            .iter()
+            .map(|artifact| {
+                let path = temp.path().join(&artifact.descriptor.file_name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::copy(&artifact.path, &path).unwrap();
+                PreparedArtifact {
+                    descriptor: artifact.descriptor.clone(),
+                    path,
+                    _temp: Arc::clone(&temp),
+                }
+            })
+            .collect()
+    }
+
+    fn mutate_manifest(artifacts: &mut [PreparedArtifact], mutate: impl FnOnce(&mut Value)) {
+        let manifest = artifacts
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .unwrap();
+        let mut value: Value =
+            serde_json::from_reader(BufReader::new(File::open(&manifest.path).unwrap())).unwrap();
+        mutate(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&manifest.path, &bytes).unwrap();
+        manifest.descriptor.byte_size = bytes.len();
+        manifest.descriptor.checksum_sha256 = sha256_hex(&bytes);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn complete_machine_result_rejects_manifest_and_partition_tampering_matrix() {
+        let support = identity(
+            DatasetCategory::Sources,
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        );
+        let root = ExactDatasetIdentity {
+            category: DatasetCategory::Processes,
+            id: id("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            version: "01.00.000".to_owned(),
+        };
+        let provider = FakeProvider {
+            documents: BTreeMap::from([
+                (
+                    support.clone(),
+                    ClosureDocument {
+                        identity: support.clone(),
+                        payload: json!({}),
+                    },
+                ),
+                (
+                    root.clone(),
+                    ClosureDocument {
+                        identity: root.clone(),
+                        payload: json!({
+                            "referenceToSource": reference(
+                                "source",
+                                support.id,
+                                Some("01.00.000"),
+                            )
+                        }),
+                    },
+                ),
+            ]),
+            ..FakeProvider::default()
+        };
+        let mut scan = collect_scope_closure(&provider, &manifest(vec![root]))
+            .await
+            .unwrap();
+        scan.issues = vec![ClosureIssue {
+            issue_key: "tamper-matrix-issue".to_owned(),
+            severity: "warning".to_owned(),
+            blocking: false,
+            issue_code: "tamper_matrix".to_owned(),
+            source: Some(support),
+            json_path: None,
+            reference_role: None,
+            requested_target_type: None,
+            requested_target_id: None,
+            requested_target_version: None,
+            message: "tamper matrix".to_owned(),
+            suggested_action: None,
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: "tamper-matrix-occurrence".to_owned(),
+                source: None,
+                json_path: Some("$.fixture".to_owned()),
+                reference_role: None,
+                details: json!({}),
+            }],
+            affected_root_count: 0,
+            affected_roots: Vec::new(),
+            affected_root_witness_paths: Vec::new(),
+            witness_path: Vec::new(),
+        }];
+        populate_affected_roots(&mut scan);
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "fixture"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: JsonlValueSpool::empty("empty-tamper-matrix-issues.jsonl").unwrap(),
+        };
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        let artifacts = prepare_issue_partition_artifacts(
+            closure_check_id,
+            &scan,
+            &validation,
+            Arc::new(TempDir::new().unwrap()),
+        )
+        .unwrap();
+        reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
+
+        let assert_rejected = |case: &str, tampered: &[PreparedArtifact]| {
+            assert!(
+                reconstruct_complete_machine_result(tampered, closure_check_id).is_err(),
+                "{case} tampering must be rejected"
+            );
+        };
+
+        let mut missing = clone_prepared_artifacts(&artifacts);
+        let missing_index = missing
+            .iter()
+            .position(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap();
+        missing.remove(missing_index);
+        assert_rejected("missing partition", &missing);
+
+        let mut extra = clone_prepared_artifacts(&artifacts);
+        let mut extra_partition = extra
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .clone();
+        extra_partition.descriptor.file_name = "extra/part-000000.ndjson.zst".to_owned();
+        extra.push(extra_partition);
+        assert_rejected("extra partition", &extra);
+
+        let mut duplicate = clone_prepared_artifacts(&artifacts);
+        duplicate.push(
+            duplicate
+                .iter()
+                .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+                .unwrap()
+                .clone(),
+        );
+        assert_rejected("duplicate partition", &duplicate);
+
+        let mut renamed = clone_prepared_artifacts(&artifacts);
+        renamed
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .descriptor
+            .file_name = "issues/part-999999.ndjson.zst".to_owned();
+        assert_rejected("renamed partition", &renamed);
+
+        let corrupted = clone_prepared_artifacts(&artifacts);
+        let partition = corrupted
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap();
+        let mut bytes = fs::read(&partition.path).unwrap();
+        let midpoint = bytes.len() / 2;
+        bytes[midpoint] ^= 0x01;
+        fs::write(&partition.path, bytes).unwrap();
+        assert_rejected("partition bit corruption", &corrupted);
+
+        let mut wrong_count = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_count, |manifest| {
+            manifest["partitions"][0]["recordCount"] = json!(999);
+        });
+        assert_rejected("partition count", &wrong_count);
+
+        let mut wrong_hash = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_hash, |manifest| {
+            manifest["relationStreamSha256"]["issues"] = json!("0".repeat(64));
+        });
+        assert_rejected("global hash", &wrong_hash);
+
+        let mut wrong_order = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_order, |manifest| {
+            manifest["partitions"].as_array_mut().unwrap().swap(0, 1);
+        });
+        assert_rejected("manifest order", &wrong_order);
+
+        let mut wrong_schema = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_schema, |manifest| {
+            manifest["schemaVersion"] = json!("lcia.scope-closure-issue-manifest.v999");
+        });
+        assert_rejected("schemaVersion", &wrong_schema);
+
+        let mut wrong_check = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_check, |manifest| {
+            manifest["closureCheckId"] = json!(Uuid::nil());
+        });
+        assert_rejected("closureCheckId", &wrong_check);
+
+        let mut wrong_role = clone_prepared_artifacts(&artifacts);
+        wrong_role
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .descriptor
+            .artifact_role = ScopeClosureArtifactRole::ClosureReport;
+        assert_rejected("artifact role", &wrong_role);
     }
 
     #[tokio::test]

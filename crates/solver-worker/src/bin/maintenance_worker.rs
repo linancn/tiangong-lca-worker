@@ -1,9 +1,4 @@
-use std::{
-    io::Read,
-    path::PathBuf,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{future::Future, path::PathBuf, process::Stdio, time::Duration};
 
 use clap::Parser;
 use serde_json::{Map, Value, json};
@@ -18,7 +13,11 @@ use solver_worker::{
         record_worker_job_result,
     },
 };
-use tokio::time::sleep;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::sleep,
+};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
@@ -130,6 +129,12 @@ struct MaintenanceCommandOutput {
     stderr_bytes: u64,
     stdout_truncated: bool,
     stderr_truncated: bool,
+}
+
+#[derive(Debug)]
+enum MaintenanceRunOutcome {
+    Completed(MaintenanceCommandOutput),
+    LeaseLost(anyhow::Error),
 }
 
 #[derive(Debug)]
@@ -270,12 +275,40 @@ async fn process_maintenance_worker_job(pool: &sqlx::PgPool, job: WorkerJob, lea
         return;
     }
 
-    match run_maintenance_command(command.clone()).await {
-        Ok(output) if output.success => {
+    let job_id = job.id;
+    let lease_token = job.lease_token;
+    let supervised = run_maintenance_command_supervised(command.clone(), lease_seconds, || {
+        heartbeat_worker_job(
+            pool,
+            job_id,
+            lease_token,
+            command.binary_name,
+            0.5,
+            Some(json!({
+                "jobKind": command.job_kind,
+                "binary": command.binary_name,
+                "args": command.args,
+                "execute": command.execute,
+                "childRunning": true,
+            })),
+            lease_seconds,
+        )
+    })
+    .await;
+
+    match supervised {
+        Ok(MaintenanceRunOutcome::Completed(output)) if output.success => {
             record_maintenance_success(pool, &job, &command, output).await;
         }
-        Ok(output) => {
+        Ok(MaintenanceRunOutcome::Completed(output)) => {
             record_maintenance_failure(pool, &job, &command, output).await;
+        }
+        Ok(MaintenanceRunOutcome::LeaseLost(err)) => {
+            error!(
+                error = %err,
+                worker_job_id = %job.id,
+                "maintenance child terminated after lease heartbeat failure; terminal write suppressed"
+            );
         }
         Err(err) => {
             let output = MaintenanceCommandOutput {
@@ -293,49 +326,89 @@ async fn process_maintenance_worker_job(pool: &sqlx::PgPool, job: WorkerJob, lea
     }
 }
 
-async fn run_maintenance_command(
+async fn run_maintenance_command_supervised<Heartbeat, HeartbeatFuture>(
     command: MaintenanceCommand,
-) -> anyhow::Result<MaintenanceCommandOutput> {
-    tokio::task::spawn_blocking(move || {
-        let mut child = Command::new(&command.binary_path)
-            .args(&command.args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("maintenance child stdout pipe unavailable"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("maintenance child stderr pipe unavailable"))?;
-        let stdout_thread =
-            std::thread::spawn(move || capture_bounded_log(stdout, MAINTENANCE_LOG_CAPTURE_BYTES));
-        let stderr_thread =
-            std::thread::spawn(move || capture_bounded_log(stderr, MAINTENANCE_LOG_CAPTURE_BYTES));
-        let status = child.wait()?;
-        let stdout = stdout_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("maintenance stdout capture thread panicked"))??;
-        let stderr = stderr_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("maintenance stderr capture thread panicked"))??;
-        Ok::<_, anyhow::Error>(MaintenanceCommandOutput {
-            success: status.success(),
-            code: status.code(),
-            stdout: stdout.text,
-            stderr: stderr.text,
-            stdout_bytes: stdout.total_bytes,
-            stderr_bytes: stderr.total_bytes,
-            stdout_truncated: stdout.truncated,
-            stderr_truncated: stderr.truncated,
-        })
-    })
-    .await?
+    lease_seconds: i32,
+    mut heartbeat: Heartbeat,
+) -> anyhow::Result<MaintenanceRunOutcome>
+where
+    Heartbeat: FnMut() -> HeartbeatFuture,
+    HeartbeatFuture: Future<Output = anyhow::Result<()>>,
+{
+    let mut child = Command::new(&command.binary_path)
+        .args(&command.args)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("maintenance child stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("maintenance child stderr pipe unavailable"))?;
+    let stdout_task = tokio::spawn(capture_bounded_log_async(
+        stdout,
+        MAINTENANCE_LOG_CAPTURE_BYTES,
+    ));
+    let stderr_task = tokio::spawn(capture_bounded_log_async(
+        stderr,
+        MAINTENANCE_LOG_CAPTURE_BYTES,
+    ));
+    let mut heartbeat_interval = tokio::time::interval(
+        solver_worker::worker_jobs::lease_heartbeat_period(lease_seconds),
+    );
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat_interval.tick().await;
+
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = heartbeat_interval.tick() => {
+                if let Err(error) = heartbeat().await {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    return Ok(MaintenanceRunOutcome::LeaseLost(
+                        error.context("maintenance child lease heartbeat failed"),
+                    ));
+                }
+            }
+        }
+    };
+
+    if let Err(error) = heartbeat().await {
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return Ok(MaintenanceRunOutcome::LeaseLost(
+            error.context("maintenance child final lease heartbeat failed"),
+        ));
+    }
+    let stdout = stdout_task
+        .await
+        .map_err(|_| anyhow::anyhow!("maintenance stdout capture task panicked"))??;
+    let stderr = stderr_task
+        .await
+        .map_err(|_| anyhow::anyhow!("maintenance stderr capture task panicked"))??;
+    Ok(MaintenanceRunOutcome::Completed(MaintenanceCommandOutput {
+        success: status.success(),
+        code: status.code(),
+        stdout: stdout.text,
+        stderr: stderr.text,
+        stdout_bytes: stdout.total_bytes,
+        stderr_bytes: stderr.total_bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    }))
 }
 
-fn capture_bounded_log(mut reader: impl Read, max_bytes: usize) -> anyhow::Result<CapturedLog> {
+async fn capture_bounded_log_async(
+    mut reader: impl AsyncRead + Unpin,
+    max_bytes: usize,
+) -> anyhow::Result<CapturedLog> {
     if max_bytes == 0 {
         return Err(anyhow::anyhow!(
             "maintenance log capture limit must be greater than zero"
@@ -344,13 +417,12 @@ fn capture_bounded_log(mut reader: impl Read, max_bytes: usize) -> anyhow::Resul
     let mut capture = BoundedLogCapture::new(max_bytes);
     let mut buffer = [0_u8; 8192];
     loop {
-        let read_len = reader.read(&mut buffer)?;
-        if read_len == 0 {
-            break;
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(capture.finish());
         }
-        capture.push(&buffer[..read_len]);
+        capture.push(&buffer[..read]);
     }
-    Ok(capture.finish())
 }
 
 async fn record_invalid_maintenance_job(pool: &sqlx::PgPool, job: &WorkerJob, err_message: &str) {
@@ -575,7 +647,7 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
                 "artifact_gc",
                 ARTIFACT_GC_REQUEST_SCHEMA_VERSION,
                 ARTIFACT_GC_RESULT_SCHEMA_VERSION,
-                artifact_gc_args(job, payload, execute),
+                artifact_gc_args(payload, execute),
             ),
             SNAPSHOT_GC_JOB_KIND => (
                 "snapshot_gc",
@@ -628,13 +700,8 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
     })
 }
 
-fn artifact_gc_args(job: &WorkerJob, payload: &Map<String, Value>, execute: bool) -> Vec<String> {
-    let mut args = vec![
-        "--worker-job-id".to_owned(),
-        job.id.to_string(),
-        "--worker-lease-token".to_owned(),
-        job.lease_token.to_string(),
-    ];
+fn artifact_gc_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
+    let mut args = Vec::new();
     push_i64_arg(
         &mut args,
         "--batch-size",
@@ -913,14 +980,24 @@ fn tail_lines(value: &str, max_lines: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
+
     use serde_json::json;
 
     use super::{
         ARTIFACT_GC_JOB_KIND, ARTIFACT_GC_REQUEST_SCHEMA_VERSION, BoundedLogCapture,
-        PACKAGE_ARTIFACT_GC_JOB_KIND, PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION,
-        PROCESS_FLOW_GRAPH_CACHE_JOB_KIND, PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
-        RESULT_GC_JOB_KIND, RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND,
-        SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION, maintenance_command_for_job, parse_summary_line,
+        MaintenanceCommand, MaintenanceRunOutcome, PACKAGE_ARTIFACT_GC_JOB_KIND,
+        PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION, PROCESS_FLOW_GRAPH_CACHE_JOB_KIND,
+        PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION, RESULT_GC_JOB_KIND,
+        RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND, SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION,
+        maintenance_command_for_job, parse_summary_line, run_maintenance_command_supervised,
     };
     use solver_worker::worker_jobs::WorkerJob;
     use uuid::Uuid;
@@ -1045,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_generic_artifact_gc_with_worker_lease_fencing() {
+    fn maps_generic_artifact_gc_without_exposing_worker_lease_token() {
         let job = worker_job(
             ARTIFACT_GC_JOB_KIND,
             ARTIFACT_GC_REQUEST_SCHEMA_VERSION,
@@ -1062,10 +1139,6 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
-                "--worker-job-id".to_owned(),
-                job.id.to_string(),
-                "--worker-lease-token".to_owned(),
-                job.lease_token.to_string(),
                 "--batch-size".to_owned(),
                 "50".to_owned(),
                 "--max-batches".to_owned(),
@@ -1073,6 +1146,80 @@ mod tests {
                 "--execute".to_owned()
             ]
         );
+        let persisted = serde_json::to_string(&json!({
+            "args": command.args,
+            "diagnostics": {
+                "jobKind": command.job_kind,
+                "binary": command.binary_name,
+            }
+        }))
+        .unwrap();
+        assert!(!persisted.contains(job.lease_token.to_string().as_str()));
+        assert!(!persisted.contains("worker-lease-token"));
+    }
+
+    fn shell_command(script: &str) -> MaintenanceCommand {
+        MaintenanceCommand {
+            job_kind: ARTIFACT_GC_JOB_KIND.to_owned(),
+            binary_name: "artifact_gc",
+            binary_path: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            execute: true,
+            payload_schema_version: ARTIFACT_GC_REQUEST_SCHEMA_VERSION,
+            result_schema_version: "worker.artifact_gc.result.v1",
+        }
+    }
+
+    #[tokio::test]
+    async fn long_child_is_heartbeated_repeatedly_and_completes_with_final_fence() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let outcome = run_maintenance_command_supervised(
+            shell_command("sleep 2.2; printf completed"),
+            3,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        let MaintenanceRunOutcome::Completed(output) = outcome else {
+            panic!("healthy lease must allow child completion");
+        };
+        assert!(output.success);
+        assert_eq!(output.stdout, "completed");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "two periodic renewals plus the final fence are required"
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_loss_terminates_long_child_and_suppresses_terminal_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let started = Instant::now();
+        let mut command = shell_command("");
+        command.binary_path = PathBuf::from("/bin/sleep");
+        command.args = vec!["30".to_owned()];
+        let outcome = run_maintenance_command_supervised(command, 3, move || {
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call >= 1 {
+                    Err(anyhow::anyhow!("lease lost"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MaintenanceRunOutcome::LeaseLost(_)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
