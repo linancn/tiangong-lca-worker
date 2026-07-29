@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
-lastReviewedNote: "Reviewed for Issue #169: Worker-side external coalescing preserves the published raw TIDAS issue-stream hash and does not change package-worker import/export semantics."
+lastReviewedCommit: cd77d8dcd544fd7f23070115b1c2289dfa4f5cb3
+lastReviewedNote: "Reviewed for Issue #171: derived relation partitioning remains separate from the published raw TIDAS issue-stream hash and does not change package-worker import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
