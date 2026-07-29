@@ -2410,7 +2410,7 @@ struct SortedJsonlRunWriter {
 
 const SORT_MERGE_FAN_IN: usize = 64;
 const RELATION_TEMP_ADMISSION_SAFETY_PERCENT: u64 = 125;
-const AFFECTED_ROOT_RELATION_SAMPLE_BYTES: u64 = 673;
+const RELATION_TEMP_ACTIVE_WINDOW_COUNT: u64 = 4;
 
 impl SortedJsonlRunWriter {
     fn new(role: &'static str) -> anyhow::Result<Self> {
@@ -2481,7 +2481,11 @@ impl SortedJsonlRunWriter {
         if self.buffered.is_empty() {
             return Ok(());
         }
-        ensure_temp_free_space(self.temp.path(), u64::try_from(self.buffered_bytes)?)?;
+        ensure_relation_temp_free_space(
+            self.temp.path(),
+            u64::try_from(self.buffered_bytes)?,
+            self.role,
+        )?;
         let path = self.temp.path().join(format!(
             "{}-run-{:06}.jsonl",
             self.role,
@@ -2503,7 +2507,7 @@ impl SortedJsonlRunWriter {
                 let planned_bytes = group.iter().try_fold(0_u64, |total, path| {
                     Ok::<_, anyhow::Error>(total.saturating_add(fs::metadata(path)?.len()))
                 })?;
-                ensure_temp_free_space(self.temp.path(), planned_bytes)?;
+                ensure_relation_temp_free_space(self.temp.path(), planned_bytes, self.role)?;
                 let output = self.temp.path().join(format!(
                     "{}-merge-{pass:03}-{group_index:06}.jsonl",
                     self.role
@@ -2539,59 +2543,80 @@ impl SortedJsonlRuns {
     }
 }
 
-fn relation_temp_admission_bytes(scan: &ScopeClosureScan, events: &JsonlValueSpool) -> u64 {
-    let average_raw_event_bytes = events
-        .byte_size
-        .checked_add(events.event_count.saturating_sub(1))
-        .and_then(|bytes| bytes.checked_div(events.event_count.max(1)))
-        .unwrap_or(events.byte_size);
-    let raw_events = events.event_count;
-    let roots_per_event = u64::try_from(scan.roots.len()).unwrap_or(u64::MAX).max(1);
+fn relation_temp_admission_bytes(raw_event_count: u64, raw_byte_size: u64) -> u64 {
+    let average_raw_event_bytes = raw_byte_size
+        .checked_add(raw_event_count.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_div(raw_event_count.max(1)))
+        .unwrap_or(raw_byte_size);
 
-    // Merge records repeat the canonical issue and occurrence fields. These workload-derived
-    // projections deliberately use the observed raw-event width and the graph's root fan-out;
-    // they are admission estimates, not result caps.
+    // The initial admission covers only stages whose size can be derived from the observed raw
+    // stream. Affected-root fan-out is topology-dependent and is therefore admitted incrementally
+    // from actual bytes at each bounded sort-run and merge boundary. In particular, the number of
+    // requested roots is not a per-event fan-out estimate.
     let merge_runs = average_raw_event_bytes
-        .saturating_mul(raw_events)
+        .saturating_mul(raw_event_count)
         .saturating_mul(5);
     let issue_runs = merge_runs;
     let occurrence_runs = average_raw_event_bytes
-        .saturating_mul(raw_events)
+        .saturating_mul(raw_event_count)
         .saturating_mul(2);
-    let affected_root_runs = AFFECTED_ROOT_RELATION_SAMPLE_BYTES
-        .saturating_mul(raw_events)
-        .saturating_mul(roots_per_event);
-    let active_outputs = ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES.saturating_mul(2);
-    events
-        .byte_size
+    let active_outputs =
+        ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES.saturating_mul(RELATION_TEMP_ACTIVE_WINDOW_COUNT);
+    raw_byte_size
         .saturating_add(merge_runs.saturating_mul(2))
         .saturating_add(issue_runs)
         .saturating_add(occurrence_runs)
-        .saturating_add(affected_root_runs)
         .saturating_add(active_outputs)
         .saturating_mul(RELATION_TEMP_ADMISSION_SAFETY_PERCENT)
         .saturating_add(99)
         / 100
 }
 
-fn admit_relation_temp_space(
-    scan: &ScopeClosureScan,
-    events: &JsonlValueSpool,
-) -> anyhow::Result<()> {
-    let planned = relation_temp_admission_bytes(scan, events);
+fn admit_relation_temp_space(events: &JsonlValueSpool) -> anyhow::Result<u64> {
+    let planned = relation_temp_admission_bytes(events.event_count, events.byte_size);
     let available = fs2::available_space(events.path.as_path())?;
+    ensure_relation_temp_capacity(
+        available,
+        planned,
+        "initial_observed_raw",
+        Some(events.event_count),
+        Some(events.byte_size),
+    )?;
+    Ok(planned)
+}
+
+fn ensure_relation_temp_free_space(
+    path: &Path,
+    planned_bytes: u64,
+    stage: &str,
+) -> anyhow::Result<()> {
+    ensure_relation_temp_capacity(
+        fs2::available_space(path)?,
+        planned_bytes,
+        stage,
+        None,
+        None,
+    )
+}
+
+fn ensure_relation_temp_capacity(
+    available: u64,
+    planned: u64,
+    stage: &str,
+    raw_events: Option<u64>,
+    raw_bytes: Option<u64>,
+) -> anyhow::Result<()> {
     let required = planned
         .checked_add(SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES)
         .ok_or_else(|| anyhow::anyhow!("scope closure relation temp-space requirement overflow"))?;
-    if available < required {
-        return Err(anyhow::anyhow!(
-            "scope_closure_relation_temp_space_low: available={available}, required={required}, planned={planned}, raw_events={}, raw_bytes={}, root_upper_bound={}, safety_percent={RELATION_TEMP_ADMISSION_SAFETY_PERCENT}",
-            events.event_count,
-            events.byte_size,
-            scan.roots.len()
-        ));
+    if available >= required {
+        return Ok(());
     }
-    Ok(())
+    Err(anyhow::anyhow!(
+        "scope_closure_relation_temp_space_low: stage={stage}, available={available}, required={required}, planned={planned}, reserve={SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES}, raw_events={}, raw_bytes={}, safety_percent={RELATION_TEMP_ADMISSION_SAFETY_PERCENT}",
+        raw_events.map_or_else(|| "measured".to_owned(), |value| value.to_string()),
+        raw_bytes.map_or_else(|| "measured".to_owned(), |value| value.to_string())
+    ))
 }
 
 impl JsonlValueSpoolWriter {
@@ -5957,7 +5982,15 @@ fn build_issue_relation_spools(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
 ) -> anyhow::Result<()> {
-    admit_relation_temp_space(scan, events)?;
+    let initial_admission_bytes = admit_relation_temp_space(events)?;
+    tracing::info!(
+        initial_admission_bytes,
+        raw_events = events.event_count,
+        raw_bytes = events.byte_size,
+        root_count = scan.roots.len(),
+        admission_strategy = "observed_raw_then_measured_topology_watermarks",
+        "scope closure relation temporary space admitted"
+    );
     normalize_database_issue_severities(&mut scan.issues)?;
     let mut merge_input = SortedJsonlRunWriter::new("issue-merge-input")?;
     for issue in std::mem::take(&mut scan.issues) {
@@ -7421,6 +7454,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relation_temp_admission_uses_measured_topology_not_global_root_product() {
+        const VOLUME_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+        const RAW_EVENTS: u64 = 516_313;
+        const RAW_BYTES: u64 = 565_431_699;
+        const TOTAL_ROOTS: u64 = 5_608;
+        const REACHABLE_ROOTS_PER_EVENT: u64 = 7;
+        const AFFECTED_RELATIONS: u64 = 3_200_000;
+
+        let initial_planned = relation_temp_admission_bytes(RAW_EVENTS, RAW_BYTES);
+        ensure_relation_temp_capacity(
+            VOLUME_BYTES,
+            initial_planned,
+            "initial_observed_raw",
+            Some(RAW_EVENTS),
+            Some(RAW_BYTES),
+        )
+        .unwrap();
+
+        // Model the observed production-shaped persistent run footprint, then prove a maximum
+        // fan-in merge window plus reserve still fits. The global root count is intentionally not
+        // multiplied by raw events; actual topology yielded only about seven relations per event.
+        let observed_run_bytes = RAW_BYTES
+            .saturating_add(2_436_178_101)
+            .saturating_add(728_570_037)
+            .saturating_add(2_160_000_000);
+        let available_after_observed_runs = VOLUME_BYTES.saturating_sub(observed_run_bytes);
+        let merge_window =
+            ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES.saturating_mul(SORT_MERGE_FAN_IN as u64);
+        ensure_relation_temp_capacity(
+            available_after_observed_runs,
+            merge_window,
+            "coalesced-affected-roots",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(TOTAL_ROOTS, 5_608);
+        assert_eq!(REACHABLE_ROOTS_PER_EVENT, 7);
+        assert_eq!(AFFECTED_RELATIONS, 3_200_000);
+        assert!(
+            initial_planned + SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES < VOLUME_BYTES,
+            "24 GiB-class volume must admit the production-shaped workload"
+        );
+    }
+
+    #[test]
+    fn relation_temp_watermark_rejects_genuinely_insufficient_space() {
+        let planned = ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+        let required = planned + SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES;
+        let mut temp_path = None;
+        let result = (|| -> anyhow::Result<()> {
+            let writer = SortedJsonlRunWriter::new("coalesced-affected-roots")?;
+            temp_path = Some(writer.temp.path().to_path_buf());
+            ensure_relation_temp_capacity(
+                required - 1,
+                planned,
+                "coalesced-affected-roots",
+                None,
+                None,
+            )?;
+            drop(writer);
+            Ok(())
+        })();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("scope_closure_relation_temp_space_low"));
+        assert!(error.contains("stage=coalesced-affected-roots"));
+        assert!(error.contains(&format!("required={required}")));
+        assert!(error.contains("raw_events=measured"));
+        assert!(
+            !temp_path.unwrap().exists(),
+            "incremental admission failure must release its temporary directory"
+        );
+    }
+
     fn pad_capacity_event(event: &mut Value, target_jsonl_bytes: usize) {
         let current = canonical_json_bytes(event).unwrap().len().saturating_add(1);
         if current >= target_jsonl_bytes {
@@ -7762,6 +7871,19 @@ mod tests {
                 "issues": relations.issues.run_paths.len(),
                 "occurrences": relations.occurrences.run_paths.len(),
                 "affectedRoots": relations.affected_roots.run_paths.len(),
+            },
+            "tempAdmission": {
+                "strategy": "observed_raw_then_measured_topology_watermarks",
+                "initialPlannedBytes": relation_temp_admission_bytes(
+                    input_event_count,
+                    input_spool_bytes,
+                ),
+                "initialRequiredBytes": relation_temp_admission_bytes(
+                    input_event_count,
+                    input_spool_bytes,
+                )
+                    .saturating_add(SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES),
+                "reserveBytes": SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES,
             },
             "totalArtifactBytes": total_artifact_bytes,
             "partitionAndManifestBytes": partition_bytes,

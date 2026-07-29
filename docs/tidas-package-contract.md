@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: cd77d8dcd544fd7f23070115b1c2289dfa4f5cb3
-lastReviewedNote: "Reviewed for Issue #171: derived relation partitioning remains separate from the published raw TIDAS issue-stream hash and does not change package-worker import/export semantics."
+lastReviewedCommit: 5b8a6cdc75c91530eac9364b82b20c22e1ab7029
+lastReviewedNote: "Reviewed for Issue #174: measured-topology derived-relation admission remains separate from the published raw TIDAS issue-stream hash and package-worker import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
