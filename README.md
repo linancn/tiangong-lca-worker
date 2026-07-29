@@ -311,7 +311,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `TIDAS_MEMORY_BUDGET_MIB` / `TIDAS_QUEUE_CAPACITY`（由 `tidas` 消费的有界资源配置；package 与 scope-closure 子进程继承）
 - `SCOPE_CLOSURE_MEMORY_BUDGET_MIB`（Linux Worker scope-closure RSS 上限，默认 `2048` MiB；遍历、图收尾、验证与 issue 合并阶段超限时 fail closed）
 
-scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果写入 `manifest.json` 指向的确定性 NDJSON+zstd partitions；每个 partition 最多 25,000 条或 8 MiB 未压缩内容。XLSX 仅包含精确摘要、artifact index 与有界样本（5,000 issues、10,000 occurrences、10,000 affected roots），并在写 ZIP 前检查 worksheet 行数、单 member 和总未压缩体积；需要完整明细的消费者必须读取 manifest/partitions。
+scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只写入 `manifest.json` 指向的确定性 NDJSON+zstd partitions；不再重复发布 monolithic JSONL。每个 partition 最多 25,000 条或 8 MiB 未压缩内容。XLSX 仅包含精确摘要、artifact index 与有界样本（5,000 issues、10,000 occurrences、10,000 affected roots），并在写 ZIP 前检查 worksheet 行数、单 member 和总未压缩体积；需要完整明细的消费者必须读取 manifest/partitions。发布行记录 artifact role、实际 storage bucket/path、SHA-256、bytes、content type 和可信数据库时间计算的七天 expiry。
 
 数据库连接池与 `build_snapshot` 并发：
 
@@ -733,7 +733,7 @@ sudo systemctl restart package-worker.service
 
 ```bash
 cd /home/ubuntu/projects/lca_workspace/tiangong-lca-worker
-cargo build -p solver-worker --bin maintenance_worker --bin maintenance_enqueue --bin package_gc --bin snapshot_gc --bin result_gc --bin process_flow_graph_cache_builder --release
+cargo build -p solver-worker --bin maintenance_worker --bin maintenance_enqueue --bin artifact_gc --bin package_gc --bin snapshot_gc --bin result_gc --bin process_flow_graph_cache_builder --release
 ```
 
 创建常驻 worker 服务 `/etc/systemd/system/maintenance-worker.service`：
@@ -775,11 +775,14 @@ sudo systemctl enable --now maintenance-worker.service
 ```bash
 target/release/maintenance_enqueue snapshot-gc --environment main --batch-size 50
 target/release/maintenance_enqueue result-gc --environment main --batch-size 100 --max-batches 1
+target/release/maintenance_enqueue artifact-gc --environment main --batch-size 100 --max-batches 1
 target/release/maintenance_enqueue package-artifact-gc --environment main --batch-size 100 --max-batches 1
 target/release/maintenance_enqueue process-flow-graph-cache --environment main --limit-flows 10 --limit-processes 20 --max-edges 200
 ```
 
 destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 dry-run / execute 生成不同的 idempotency/concurrency key；execute 默认 `max_attempts=1`。
+
+`worker.artifact_gc` 是 application-level GC runner，通过 Database Engine #309 的 scope-closure lifecycle RPC claim bounded candidates。`object_delete` candidate 必须带 locator 且只删除一次对象；对象已不存在视为幂等成功，对象删除失败会释放 claim 并记录 retry count。若首轮 tombstone 后仍有 detail，数据库持久化 pending state；新 Worker 进程以新的 fenced token claim `detail_cleanup` candidate，其 `objectDeleteRequired=false` 且不含 bucket/path，然后继续 bounded cleanup 直到 `detailsRemaining=0`。checked-in fixture 已与 #309 commit `cc059eef` 的精确 payload 对齐。
 
 全国碳大屏全量过程-流关系图缓存构建属于 maintenance worker job：
 

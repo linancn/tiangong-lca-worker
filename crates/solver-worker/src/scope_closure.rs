@@ -4,12 +4,14 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fs::{self, File},
+    future::Future,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use serde::ser::{Error as SerdeError, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -29,8 +31,9 @@ use crate::{
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
     readiness::{MatrixReadinessReport, ReadinessStatus},
-    resource::{ResourceCounters, ResourceMeasurement, directory_bytes},
+    resource::{CancellationToken, ResourceCounters, ResourceMeasurement, directory_bytes},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
+    storage::ObjectTransferOptions,
     tidas_cli,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
@@ -64,6 +67,9 @@ const XLSX_MAX_WORKSHEET_ROWS: usize = 1_048_576;
 const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+const SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
 
 fn scope_closure_memory_budget_bytes() -> u64 {
     std::env::var("SCOPE_CLOSURE_MEMORY_BUDGET_MIB")
@@ -2251,10 +2257,19 @@ enum ScanExecutionClaim {
 #[serde(rename_all = "camelCase")]
 struct ArtifactManifestEntry {
     artifact_type: String,
+    artifact_role: ScopeClosureArtifactRole,
     file_name: String,
     content_type: String,
     byte_size: usize,
     checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopeClosureArtifactRole {
+    ClosureReport,
+    CompleteMachineResult,
+    ClosureBundle,
 }
 
 #[derive(Debug, Clone)]
@@ -2264,7 +2279,34 @@ struct PreparedArtifact {
     _temp: Arc<TempDir>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureArtifactWriteSet {
+    write_set_id: Uuid,
+    status: String,
+    write_token: Uuid,
+    items: Vec<ScopeClosureArtifactWriteSetItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureArtifactWriteSetItem {
+    artifact_id: Uuid,
+    client_key: String,
+    artifact_type: String,
+    artifact_role: ScopeClosureArtifactRole,
+    #[serde(rename = "bucket")]
+    storage_bucket: String,
+    #[serde(rename = "objectPath")]
+    storage_path: String,
+    #[serde(rename = "mediaType")]
+    content_type: String,
+    #[serde(rename = "size")]
+    byte_size: u64,
+    checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssuePartitionManifestEntry {
     relation: String,
@@ -2279,7 +2321,15 @@ struct IssuePartitionManifestEntry {
     last_issue_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueRelationStreamHashes {
+    issues: String,
+    occurrences: String,
+    affected_roots: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssuePartitionManifest {
     schema_version: String,
@@ -2291,6 +2341,7 @@ struct IssuePartitionManifest {
     issue_count: u64,
     occurrence_count: u64,
     affected_root_count: u64,
+    relation_stream_sha256: IssueRelationStreamHashes,
     rpc_issue_sample_limit: usize,
     rpc_occurrence_sample_limit_per_issue: usize,
     rpc_affected_root_sample_limit_per_issue: usize,
@@ -2308,6 +2359,7 @@ struct IssuePartitionAccumulator {
     active: Option<ActiveIssuePartition>,
     entries: Vec<IssuePartitionManifestEntry>,
     artifacts: Vec<PreparedArtifact>,
+    relation_uncompressed_digest: Sha256,
 }
 
 struct ActiveIssuePartition {
@@ -3494,6 +3546,7 @@ pub async fn execute_scope_closure_job(
                     worker_job_id,
                     lease_token,
                     completed_check_id,
+                    &progress,
                 )
                 .await;
             }
@@ -3779,6 +3832,7 @@ pub async fn execute_scope_closure_job(
         closure_check_id,
         &artifacts,
         content_artifact_manifest_hash.as_str(),
+        None,
         Some(&progress),
     )
     .await?;
@@ -3985,6 +4039,7 @@ async fn reuse_completed_scan_execution(
     worker_job_id: Uuid,
     lease_token: Uuid,
     completed_check_id: Uuid,
+    progress: &WorkerJobProgress<'_>,
 ) -> anyhow::Result<ScopeClosureExecutionResult> {
     let row = sqlx::query(
         r"
@@ -4017,6 +4072,7 @@ async fn reuse_completed_scan_execution(
     let artifact = prepare_file_artifact(
         temp,
         "closure_report_xlsx",
+        ScopeClosureArtifactRole::ClosureReport,
         "closure-report-v1.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         xlsx_path,
@@ -4028,7 +4084,8 @@ async fn reuse_completed_scan_execution(
         closure_check_id,
         std::slice::from_ref(&artifact),
         content_manifest_hash.as_str(),
-        None,
+        Some(completed_check_id),
+        Some(progress),
     )
     .await?;
     let report_artifact_id = persisted
@@ -4599,6 +4656,7 @@ impl IssuePartitionAccumulator {
             active: None,
             entries: Vec::new(),
             artifacts: Vec::new(),
+            relation_uncompressed_digest: Sha256::new(),
         }
     }
 
@@ -4619,6 +4677,7 @@ impl IssuePartitionAccumulator {
             active: None,
             entries: Vec::new(),
             artifacts: Vec::new(),
+            relation_uncompressed_digest: Sha256::new(),
         }
     }
 
@@ -4651,6 +4710,7 @@ impl IssuePartitionAccumulator {
         let active = self.active.as_mut().expect("active partition opened");
         active.encoder.write_all(&bytes)?;
         active.uncompressed_digest.update(&bytes);
+        self.relation_uncompressed_digest.update(&bytes);
         active.record_count = active
             .record_count
             .checked_add(1)
@@ -4691,7 +4751,6 @@ impl IssuePartitionAccumulator {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
-        let index = self.entries.len();
         let mut output = active.encoder.finish()?;
         output.flush()?;
         release_file_cache(output.get_ref());
@@ -4712,10 +4771,8 @@ impl IssuePartitionAccumulator {
         };
         self.artifacts.push(PreparedArtifact {
             descriptor: ArtifactManifestEntry {
-                artifact_type: format!(
-                    "closure_{}_partition_{index:06}",
-                    self.relation.replace('-', "_")
-                ),
+                artifact_type: "closure_complete_machine_result".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
                 file_name: active.relative_path,
                 content_type: "application/x-ndjson+zstd".to_owned(),
                 byte_size: usize::try_from(compressed_byte_size)?,
@@ -4730,9 +4787,17 @@ impl IssuePartitionAccumulator {
 
     fn finish(
         mut self,
-    ) -> anyhow::Result<(Vec<IssuePartitionManifestEntry>, Vec<PreparedArtifact>)> {
+    ) -> anyhow::Result<(
+        Vec<IssuePartitionManifestEntry>,
+        Vec<PreparedArtifact>,
+        String,
+    )> {
         self.flush()?;
-        Ok((self.entries, self.artifacts))
+        Ok((
+            self.entries,
+            self.artifacts,
+            hex::encode(self.relation_uncompressed_digest.finalize()),
+        ))
     }
 }
 
@@ -4847,11 +4912,13 @@ fn prepare_issue_partition_artifacts(
         affected_root_writer.push(issue_key, payload)
     })?;
 
-    let (mut entries, mut artifacts) = issue_writer.finish()?;
-    let (occurrence_entries, occurrence_artifacts) = occurrence_writer.finish()?;
+    let (mut entries, mut artifacts, issue_relation_sha256) = issue_writer.finish()?;
+    let (occurrence_entries, occurrence_artifacts, occurrence_relation_sha256) =
+        occurrence_writer.finish()?;
     entries.extend(occurrence_entries);
     artifacts.extend(occurrence_artifacts);
-    let (affected_root_entries, affected_root_artifacts) = affected_root_writer.finish()?;
+    let (affected_root_entries, affected_root_artifacts, affected_root_relation_sha256) =
+        affected_root_writer.finish()?;
     entries.extend(affected_root_entries);
     artifacts.extend(affected_root_artifacts);
     let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
@@ -4875,6 +4942,11 @@ fn prepare_issue_partition_artifacts(
         issue_count: relations.stats.issue_count,
         occurrence_count: relations.stats.occurrence_count,
         affected_root_count: relations.stats.affected_root_count,
+        relation_stream_sha256: IssueRelationStreamHashes {
+            issues: issue_relation_sha256,
+            occurrences: occurrence_relation_sha256,
+            affected_roots: affected_root_relation_sha256,
+        },
         rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
         rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
         rpc_affected_root_sample_limit_per_issue: ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT,
@@ -4887,7 +4959,8 @@ fn prepare_issue_partition_artifacts(
     fs::write(&manifest_path, canonical_json_bytes(&manifest)?)?;
     artifacts.push(prepare_file_artifact(
         temp,
-        "closure_issue_manifest",
+        "closure_complete_machine_result",
+        ScopeClosureArtifactRole::CompleteMachineResult,
         "manifest.json",
         "application/vnd.tiangong.scope-closure-manifest+json",
         manifest_path,
@@ -4907,8 +4980,6 @@ fn prepare_closure_content_artifacts(
         byte_size: bundle_byte_size,
         sha256: bundle_sha256,
     } = closure_bundle;
-    let issues_path = temp.path().join("closure-issues-v1.jsonl");
-    write_issue_jsonl_file(&issues_path, scan)?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
     build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
 
@@ -4916,6 +4987,7 @@ fn prepare_closure_content_artifacts(
         PreparedArtifact {
             descriptor: ArtifactManifestEntry {
                 artifact_type: "closure_bundle".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::ClosureBundle,
                 file_name: "closure-bundle-v1.json".to_owned(),
                 content_type: "application/json".to_owned(),
                 byte_size: usize::try_from(bundle_byte_size)?,
@@ -4926,14 +4998,8 @@ fn prepare_closure_content_artifacts(
         },
         prepare_file_artifact(
             Arc::clone(&temp),
-            "closure_issues_jsonl",
-            "closure-issues-v1.jsonl",
-            "application/x-ndjson",
-            issues_path,
-        )?,
-        prepare_file_artifact(
-            Arc::clone(&temp),
             "closure_report_xlsx",
+            ScopeClosureArtifactRole::ClosureReport,
             "closure-report-v1.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_path,
@@ -4951,6 +5017,7 @@ fn prepare_closure_content_artifacts(
 fn prepare_file_artifact(
     temp: Arc<TempDir>,
     artifact_type: &str,
+    artifact_role: ScopeClosureArtifactRole,
     file_name: &str,
     content_type: &str,
     path: PathBuf,
@@ -4959,6 +5026,7 @@ fn prepare_file_artifact(
     Ok(PreparedArtifact {
         descriptor: ArtifactManifestEntry {
             artifact_type: artifact_type.to_owned(),
+            artifact_role,
             file_name: file_name.to_owned(),
             content_type: content_type.to_owned(),
             byte_size: usize::try_from(byte_size)?,
@@ -4987,105 +5055,354 @@ fn file_size_and_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
     Ok((byte_size, hex::encode(digest.finalize())))
 }
 
+fn closure_artifact_metadata(
+    artifact: &PreparedArtifact,
+    closure_check_id: Uuid,
+    content_artifact_manifest_hash: &str,
+) -> Value {
+    let mut metadata = json!({
+        "schemaVersion": "lcia.scope-closure-artifact.v2",
+        "closureCheckId": closure_check_id,
+        "fileName": artifact.descriptor.file_name,
+        "artifactRole": artifact.descriptor.artifact_role,
+        "retentionSeconds": SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS,
+        "contentArtifactManifestHash": content_artifact_manifest_hash,
+    });
+    if artifact.descriptor.artifact_role == ScopeClosureArtifactRole::ClosureBundle {
+        metadata["completeMachineResultClientKey"] = json!("manifest.json");
+    }
+    metadata
+}
+
+fn is_semantic_closure_artifact(artifact: &PreparedArtifact) -> bool {
+    artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+        || artifact.descriptor.file_name == "manifest.json"
+}
+
+#[allow(clippy::too_many_lines)]
 async fn persist_closure_artifacts(
     state: &AppState,
-    worker_job_id: Uuid,
+    _worker_job_id: Uuid,
     closure_check_id: Uuid,
     artifacts: &[PreparedArtifact],
     content_artifact_manifest_hash: &str,
+    reused_from_check_id: Option<Uuid>,
     progress: Option<&WorkerJobProgress<'_>>,
 ) -> anyhow::Result<BTreeMap<String, Uuid>> {
-    let write_set_id = Uuid::new_v4();
+    let publication_id = Uuid::new_v4();
     let mut uploaded = Vec::<String>::new();
     let mut staged = Vec::<(&PreparedArtifact, String)>::new();
-    for (index, artifact) in artifacts.iter().enumerate() {
-        if let Err(error) =
-            heartbeat_closure_artifact_upload(progress, closure_check_id, index, artifacts.len())
-                .await
-        {
-            cleanup_uploaded_artifacts(state, &uploaded).await;
-            return Err(error);
-        }
+    for artifact in artifacts {
         let relative_key = format!(
-            "scope-closure/{closure_check_id}/{write_set_id}/{}",
+            "scope-closure/{closure_check_id}/{publication_id}/{}",
             artifact.descriptor.file_name
         );
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
-        if let Err(error) = state
-            .object_store
-            .upload_object_key_file(
-                object_key.as_str(),
-                artifact.descriptor.content_type.as_str(),
+        staged.push((artifact, object_key));
+    }
+    let request_items = staged
+        .iter()
+        .map(|(artifact, object_key)| {
+            json!({
+                "clientKey": artifact.descriptor.file_name,
+                "artifactType": artifact.descriptor.artifact_type,
+                "artifactRole": artifact.descriptor.artifact_role,
+                "bucket": state.object_store.bucket_name(),
+                "objectPath": object_key,
+                "mediaType": artifact.descriptor.content_type,
+                "size": artifact.descriptor.byte_size,
+                "checksumSha256": artifact.descriptor.checksum_sha256,
+                "metadata": closure_artifact_metadata(
+                    artifact,
+                    closure_check_id,
+                    content_artifact_manifest_hash,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let write_set = create_closure_artifact_write_set(
+        &state.pool,
+        closure_check_id,
+        publication_id.to_string().as_str(),
+        &request_items,
+        reused_from_check_id,
+    )
+    .await?;
+    validate_closure_artifact_write_set(
+        &write_set,
+        artifacts,
+        &request_items,
+        state.object_store.bucket_name(),
+        "staging",
+    )?;
+
+    for (index, item) in write_set.items.iter().enumerate() {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("write-set response returned an unknown client key"))?;
+        let cancellation = CancellationToken::default();
+        let heartbeat_period = progress.map_or(Duration::from_secs(3_600), |progress| {
+            lease_heartbeat_period(progress.lease_seconds())
+        });
+        let upload = Box::pin(
+            state.object_store.upload_object_key_file_bounded(
+                item.storage_path.as_str(),
+                item.content_type.as_str(),
                 &artifact.path,
-                u64::try_from(artifact.descriptor.byte_size)?,
-            )
+                ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES)
+                    .with_expected_sha256(item.checksum_sha256.clone())
+                    .with_cancellation(cancellation.clone()),
+            ),
+        );
+        if let Err(error) =
+            supervise_cancellable_operation(upload, cancellation, heartbeat_period, || {
+                heartbeat_closure_artifact_upload(
+                    progress,
+                    closure_check_id,
+                    index,
+                    write_set.items.len(),
+                )
+            })
             .await
         {
+            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
             cleanup_uploaded_artifacts(state, &uploaded).await;
             return Err(error.context("failed to upload closure artifact write set"));
         }
-        uploaded.push(object_key.clone());
-        staged.push((artifact, object_key));
+        uploaded.push(item.storage_path.clone());
     }
 
-    let mut transaction = match state.pool.begin().await {
-        Ok(transaction) => transaction,
+    let finalized = match fence_closure_artifact_finalize(
+        || {
+            heartbeat_closure_artifact_upload(
+                progress,
+                closure_check_id,
+                write_set.items.len(),
+                write_set.items.len(),
+            )
+        },
+        || finalize_closure_artifact_write_set(&state.pool, &write_set),
+    )
+    .await
+    {
+        Ok(finalized) => finalized,
         Err(error) => {
+            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
             cleanup_uploaded_artifacts(state, &uploaded).await;
-            return Err(anyhow::anyhow!(
-                "failed to begin closure artifact metadata transaction: {error}"
-            ));
+            return Err(error
+                .context("closure artifact pre-commit fence or atomic write-set finalize failed"));
         }
     };
+    validate_closure_artifact_write_set(
+        &finalized,
+        artifacts,
+        &request_items,
+        state.object_store.bucket_name(),
+        "ready",
+    )?;
     let mut persisted = BTreeMap::new();
-    for (artifact, object_key) in &staged {
-        let byte_size = i64::try_from(artifact.descriptor.byte_size)?;
-        let row = match sqlx::query(
-            r"
-            INSERT INTO public.worker_job_artifacts (
-                job_id, artifact_type, storage_path, content_type, byte_size,
-                checksum_sha256, metadata, visibility
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'operator')
-            RETURNING id
-            ",
-        )
-        .bind(worker_job_id)
-        .bind(artifact.descriptor.artifact_type.as_str())
-        .bind(object_key)
-        .bind(artifact.descriptor.content_type.as_str())
-        .bind(byte_size)
-        .bind(artifact.descriptor.checksum_sha256.as_str())
-        .bind(json!({
-            "schemaVersion": "lcia.scope-closure-artifact.v1",
-            "closureCheckId": closure_check_id,
-            "writeSetId": write_set_id,
-            "fileName": artifact.descriptor.file_name,
-            "contentArtifactManifestHash": content_artifact_manifest_hash,
-        }))
-        .fetch_one(&mut *transaction)
-        .await
-        {
-            Ok(row) => row,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                cleanup_uploaded_artifacts(state, &uploaded).await;
-                return Err(anyhow::anyhow!(
-                    "failed to persist closure artifact metadata write set: {error}"
-                ));
-            }
-        };
-        persisted.insert(
-            artifact.descriptor.artifact_type.clone(),
-            row.try_get::<Uuid, _>("id")?,
-        );
-    }
-    if let Err(error) = transaction.commit().await {
-        cleanup_uploaded_artifacts(state, &uploaded).await;
-        return Err(anyhow::anyhow!(
-            "failed to commit closure artifact metadata write set: {error}"
-        ));
+    for item in finalized.items {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("finalized write set returned unknown client key"))?;
+        if is_semantic_closure_artifact(artifact) {
+            persisted.insert(artifact.descriptor.artifact_type.clone(), item.artifact_id);
+        }
     }
     Ok(persisted)
+}
+
+async fn create_closure_artifact_write_set(
+    pool: &PgPool,
+    closure_check_id: Uuid,
+    idempotency_key: &str,
+    items: &[Value],
+    reused_from_check_id: Option<Uuid>,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_create(
+          $1, $2, $3::jsonb, $4, $5
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(closure_check_id)
+    .bind(idempotency_key)
+    .bind(Value::Array(items.to_vec()))
+    .bind(SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS)
+    .bind(reused_from_check_id)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_closure_artifact_write_set(&result, "svc_lcia_scope_closure_artifact_write_set_create")
+}
+
+async fn finalize_closure_artifact_write_set(
+    pool: &PgPool,
+    write_set: &ScopeClosureArtifactWriteSet,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_finalize($1, $2) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(write_set.write_set_id)
+    .bind(write_set.write_token)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_closure_artifact_write_set(
+        &result,
+        "svc_lcia_scope_closure_artifact_write_set_finalize",
+    )
+}
+
+async fn fail_closure_artifact_write_set(
+    pool: &PgPool,
+    write_set: &ScopeClosureArtifactWriteSet,
+    error: &anyhow::Error,
+) {
+    let message = format!("{error:#}").chars().take(1_000).collect::<String>();
+    let result = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_fail($1, $2, $3) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(write_set.write_set_id)
+    .bind(write_set.write_token)
+    .bind(message)
+    .fetch_one(pool)
+    .await;
+    match result {
+        Ok(row) => match row.try_get::<Value, _>("result").and_then(|value| {
+            ensure_rpc_ok(&value, "svc_lcia_scope_closure_artifact_write_set_fail")
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+        }) {
+            Ok(()) => {}
+            Err(failure_error) => {
+                tracing::warn!(
+                    write_set_id = %write_set.write_set_id,
+                    error = %failure_error,
+                    "Database rejected closure artifact write-set reconciliation mark"
+                );
+            }
+        },
+        Err(failure_error) => {
+            tracing::warn!(
+                write_set_id = %write_set.write_set_id,
+                error = %failure_error,
+                "failed to mark closure artifact write set for reconciliation"
+            );
+        }
+    }
+}
+
+fn parse_closure_artifact_write_set(
+    result: &Value,
+    rpc_name: &str,
+) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    ensure_rpc_ok(result, rpc_name)?;
+    let data = result
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{rpc_name} omitted data"))?;
+    Ok(serde_json::from_value(data)?)
+}
+
+fn validate_closure_artifact_write_set(
+    write_set: &ScopeClosureArtifactWriteSet,
+    artifacts: &[PreparedArtifact],
+    request_items: &[Value],
+    expected_bucket: &str,
+    expected_status: &str,
+) -> anyhow::Result<()> {
+    if write_set.status != expected_status
+        || write_set.write_token.is_nil()
+        || write_set.items.len() != artifacts.len()
+        || request_items.len() != artifacts.len()
+    {
+        return Err(anyhow::anyhow!(
+            "Database returned an inconsistent closure artifact write set"
+        ));
+    }
+    let mut observed_client_keys = BTreeSet::new();
+    let mut observed_artifact_ids = BTreeSet::new();
+    for item in &write_set.items {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == item.client_key)
+            .ok_or_else(|| anyhow::anyhow!("write set returned unknown clientKey"))?;
+        let requested = request_items
+            .iter()
+            .find(|request| {
+                request.get("clientKey").and_then(Value::as_str) == Some(item.client_key.as_str())
+            })
+            .ok_or_else(|| anyhow::anyhow!("write set omitted requested clientKey"))?;
+        if !observed_client_keys.insert(item.client_key.as_str())
+            || !observed_artifact_ids.insert(item.artifact_id)
+            || item.storage_bucket != expected_bucket
+            || requested.get("bucket").and_then(Value::as_str) != Some(item.storage_bucket.as_str())
+            || requested.get("objectPath").and_then(Value::as_str)
+                != Some(item.storage_path.as_str())
+            || item.artifact_type != artifact.descriptor.artifact_type
+            || item.artifact_role != artifact.descriptor.artifact_role
+            || item.content_type != artifact.descriptor.content_type
+            || item.byte_size != u64::try_from(artifact.descriptor.byte_size)?
+            || item.checksum_sha256 != artifact.descriptor.checksum_sha256
+        {
+            return Err(anyhow::anyhow!(
+                "Database changed closure artifact write-set identity for {}",
+                item.client_key
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn supervise_cancellable_operation<T, Operation, Heartbeat, HeartbeatFuture>(
+    operation: Operation,
+    cancellation: CancellationToken,
+    heartbeat_period: Duration,
+    mut heartbeat: Heartbeat,
+) -> anyhow::Result<T>
+where
+    Operation: Future<Output = anyhow::Result<T>>,
+    Heartbeat: FnMut() -> HeartbeatFuture,
+    HeartbeatFuture: Future<Output = anyhow::Result<()>>,
+{
+    heartbeat().await?;
+    tokio::pin!(operation);
+    let mut interval = tokio::time::interval(heartbeat_period.max(Duration::from_millis(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = interval.tick() => {
+                if let Err(error) = heartbeat().await {
+                    cancellation.cancel();
+                    let _ = (&mut operation).await;
+                    return Err(error.context(
+                        "operation cancelled after lease heartbeat failure",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn heartbeat_closure_artifact_upload(
@@ -5112,6 +5429,30 @@ async fn heartbeat_closure_artifact_upload(
         )
         .await
         .map_err(|error| error.context("closure artifact upload lease heartbeat failed"))
+}
+
+async fn fence_closure_artifact_finalize<
+    Heartbeat,
+    HeartbeatFuture,
+    Finalize,
+    FinalizeFuture,
+    Finalized,
+>(
+    heartbeat: Heartbeat,
+    finalize: Finalize,
+) -> anyhow::Result<Finalized>
+where
+    Heartbeat: FnOnce() -> HeartbeatFuture,
+    HeartbeatFuture: Future<Output = anyhow::Result<()>>,
+    Finalize: FnOnce() -> FinalizeFuture,
+    FinalizeFuture: Future<Output = anyhow::Result<Finalized>>,
+{
+    heartbeat()
+        .await
+        .context("closure artifact pre-commit lease fence failed")?;
+    finalize()
+        .await
+        .context("failed to atomically finalize closure artifact write set")
 }
 
 async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
@@ -5145,28 +5486,6 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
     .fetch_one(pool)
     .await?;
     Ok(row.try_get("manifest_hash")?)
-}
-
-fn write_issue_jsonl_file(path: &Path, scan: &ScopeClosureScan) -> anyhow::Result<()> {
-    let mut output = BufWriter::new(File::create(path)?);
-    if let Some(relations) = &scan.issue_relations {
-        relations.issues.visit(|record| {
-            let issue = record
-                .as_array()
-                .and_then(|fields| fields.get(1))
-                .ok_or_else(|| anyhow::anyhow!("issue relation omitted payload"))?;
-            output.write_all(&canonical_json_bytes(issue)?)?;
-            output.write_all(b"\n")?;
-            Ok(())
-        })?;
-    } else {
-        for issue in &scan.issues {
-            output.write_all(&canonical_json_bytes(issue)?)?;
-            output.write_all(b"\n")?;
-        }
-    }
-    output.flush()?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7197,6 +7516,296 @@ mod tests {
         assert_eq!(issue.occurrences.len(), 1);
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ReconstructedMachineResult {
+        partition_count: usize,
+        issue_count: u64,
+        occurrence_count: u64,
+        affected_root_count: u64,
+        uncompressed_byte_size: u64,
+        relation_stream_sha256: IssueRelationStreamHashes,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_complete_machine_result(
+        artifacts: &[PreparedArtifact],
+        expected_closure_check_id: Uuid,
+    ) -> anyhow::Result<ReconstructedMachineResult> {
+        let manifest_artifacts = artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .collect::<Vec<_>>();
+        if manifest_artifacts.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "complete machine result must contain exactly one manifest"
+            ));
+        }
+        let manifest_artifact = manifest_artifacts[0];
+        if manifest_artifact.descriptor.artifact_role
+            != ScopeClosureArtifactRole::CompleteMachineResult
+        {
+            return Err(anyhow::anyhow!(
+                "manifest artifact role is not complete_machine_result"
+            ));
+        }
+        let (manifest_size, manifest_sha256) = file_size_and_sha256(&manifest_artifact.path)?;
+        if manifest_size != u64::try_from(manifest_artifact.descriptor.byte_size)?
+            || manifest_sha256 != manifest_artifact.descriptor.checksum_sha256
+        {
+            return Err(anyhow::anyhow!("manifest descriptor identity mismatch"));
+        }
+        let manifest: IssuePartitionManifest =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+        if manifest.schema_version != "lcia.scope-closure-issue-manifest.v2"
+            || manifest.closure_check_id != expected_closure_check_id
+        {
+            return Err(anyhow::anyhow!(
+                "manifest schemaVersion or closureCheckId mismatch"
+            ));
+        }
+        let mut sorted_paths = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        let original_paths = sorted_paths.clone();
+        sorted_paths.sort_unstable();
+        if original_paths != sorted_paths {
+            return Err(anyhow::anyhow!(
+                "manifest partition membership is not deterministically ordered"
+            ));
+        }
+
+        let mut partition_artifacts = BTreeMap::new();
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+        {
+            if partition_artifacts
+                .insert(artifact.descriptor.file_name.as_str(), artifact)
+                .is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "duplicate partition artifact identity: {}",
+                    artifact.descriptor.file_name
+                ));
+            }
+        }
+        let manifest_paths = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<BTreeSet<_>>();
+        if manifest_paths.len() != manifest.partitions.len()
+            || manifest_paths != partition_artifacts.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(anyhow::anyhow!(
+                "manifest membership differs from local partition artifacts"
+            ));
+        }
+
+        let mut relation_partition_indexes = BTreeMap::<String, usize>::new();
+        let mut relation_counts = BTreeMap::<String, u64>::new();
+        let mut relation_digests = BTreeMap::<String, Sha256>::new();
+        let mut previous_sort_keys = BTreeMap::<String, String>::new();
+        let mut total_uncompressed_bytes = 0_u64;
+
+        for entry in &manifest.partitions {
+            if !matches!(
+                entry.relation.as_str(),
+                "issues" | "occurrences" | "affected-roots"
+            ) {
+                return Err(anyhow::anyhow!(
+                    "manifest contains unsupported relation: {}",
+                    entry.relation
+                ));
+            }
+            if Path::new(&entry.path).is_absolute()
+                || entry.path.contains('\\')
+                || entry
+                    .path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            {
+                return Err(anyhow::anyhow!(
+                    "manifest contains invalid relative partition identity: {}",
+                    entry.path
+                ));
+            }
+            let partition_index = relation_partition_indexes
+                .entry(entry.relation.clone())
+                .or_default();
+            let expected_path = format!("{}/part-{partition_index:06}.ndjson.zst", entry.relation);
+            if entry.path != expected_path {
+                return Err(anyhow::anyhow!(
+                    "partition identity is not contiguous: expected={expected_path} actual={}",
+                    entry.path
+                ));
+            }
+            *partition_index += 1;
+            if entry.media_type != "application/x-ndjson+zstd" {
+                return Err(anyhow::anyhow!(
+                    "partition media type mismatch: {}",
+                    entry.path
+                ));
+            }
+
+            let artifact = partition_artifacts
+                .get(entry.path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("partition artifact is missing"))?;
+            if artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+            {
+                return Err(anyhow::anyhow!(
+                    "partition artifact role is not complete_machine_result: {}",
+                    entry.path
+                ));
+            }
+            let (compressed_size, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
+            if compressed_size != entry.compressed_byte_size
+                || compressed_size != u64::try_from(artifact.descriptor.byte_size)?
+                || compressed_sha256 != entry.compressed_sha256
+                || compressed_sha256 != artifact.descriptor.checksum_sha256
+                || artifact.descriptor.content_type != entry.media_type
+            {
+                return Err(anyhow::anyhow!(
+                    "compressed partition descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+
+            let decoder = zstd::stream::read::Decoder::new(File::open(&artifact.path)?)?;
+            let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+            let mut line = Vec::new();
+            let mut partition_digest = Sha256::new();
+            let relation_digest = relation_digests.entry(entry.relation.clone()).or_default();
+            let mut partition_count = 0_u64;
+            let mut partition_bytes = 0_u64;
+            let mut first_issue_key = None::<String>;
+            let mut last_issue_key = None::<String>;
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
+                }
+                if line.last() != Some(&b'\n')
+                    || u64::try_from(line.len())? > manifest.partition_max_uncompressed_bytes
+                {
+                    return Err(anyhow::anyhow!(
+                        "partition record is unterminated or exceeds the bounded reader window: {}",
+                        entry.path
+                    ));
+                }
+                partition_digest.update(&line);
+                relation_digest.update(&line);
+                partition_bytes = partition_bytes
+                    .checked_add(u64::try_from(line.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("partition uncompressed byte count overflow"))?;
+                line.pop();
+                let record: Value = serde_json::from_slice(&line)?;
+                let issue_key = record
+                    .get("issueKey")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("partition record omitted issueKey"))?;
+                let sort_key = match entry.relation.as_str() {
+                    "issues" => issue_key.to_owned(),
+                    "occurrences" => format!(
+                        "{issue_key}\0{}",
+                        record
+                            .get("occurrenceKey")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "occurrence partition record omitted occurrenceKey"
+                            ))?
+                    ),
+                    "affected-roots" => format!(
+                        "{issue_key}\0{}",
+                        canonical_json_sha256(record.get("root").ok_or_else(
+                            || anyhow::anyhow!("affected-root partition record omitted root")
+                        )?)?
+                    ),
+                    _ => unreachable!(),
+                };
+                if previous_sort_keys
+                    .get(&entry.relation)
+                    .is_some_and(|previous| previous >= &sort_key)
+                {
+                    return Err(anyhow::anyhow!(
+                        "partition relation order is not strictly deterministic: {}",
+                        entry.path
+                    ));
+                }
+                previous_sort_keys.insert(entry.relation.clone(), sort_key);
+                first_issue_key.get_or_insert_with(|| issue_key.to_owned());
+                last_issue_key = Some(issue_key.to_owned());
+                partition_count = partition_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("partition record count overflow"))?;
+            }
+            if partition_count != entry.record_count
+                || partition_bytes != entry.uncompressed_byte_size
+                || hex::encode(partition_digest.finalize()) != entry.uncompressed_sha256
+                || first_issue_key.as_deref() != Some(entry.first_issue_key.as_str())
+                || last_issue_key.as_deref() != Some(entry.last_issue_key.as_str())
+            {
+                return Err(anyhow::anyhow!(
+                    "uncompressed partition descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+            *relation_counts.entry(entry.relation.clone()).or_default() += partition_count;
+            total_uncompressed_bytes = total_uncompressed_bytes
+                .checked_add(partition_bytes)
+                .ok_or_else(|| anyhow::anyhow!("machine result byte count overflow"))?;
+        }
+
+        let reconstructed_hashes = IssueRelationStreamHashes {
+            issues: hex::encode(
+                relation_digests
+                    .remove("issues")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+            occurrences: hex::encode(
+                relation_digests
+                    .remove("occurrences")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+            affected_roots: hex::encode(
+                relation_digests
+                    .remove("affected-roots")
+                    .unwrap_or_default()
+                    .finalize(),
+            ),
+        };
+        let reconstructed = ReconstructedMachineResult {
+            partition_count: manifest.partitions.len(),
+            issue_count: relation_counts.get("issues").copied().unwrap_or_default(),
+            occurrence_count: relation_counts
+                .get("occurrences")
+                .copied()
+                .unwrap_or_default(),
+            affected_root_count: relation_counts
+                .get("affected-roots")
+                .copied()
+                .unwrap_or_default(),
+            uncompressed_byte_size: total_uncompressed_bytes,
+            relation_stream_sha256: reconstructed_hashes,
+        };
+        if reconstructed.issue_count != manifest.issue_count
+            || reconstructed.occurrence_count != manifest.occurrence_count
+            || reconstructed.affected_root_count != manifest.affected_root_count
+            || reconstructed.relation_stream_sha256 != manifest.relation_stream_sha256
+        {
+            return Err(anyhow::anyhow!(
+                "reconstructed complete machine result differs from manifest global counts/hashes"
+            ));
+        }
+        Ok(reconstructed)
+    }
+
     #[test]
     fn generated_partitions_are_deterministic_and_bounded_at_1x_2x_5x_10x() {
         fn build(record_count: usize) -> (Vec<IssuePartitionManifestEntry>, Vec<Vec<u8>>) {
@@ -7215,7 +7824,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            let (entries, artifacts) = writer.finish().unwrap();
+            let (entries, artifacts, _) = writer.finish().unwrap();
             let compressed = artifacts
                 .iter()
                 .map(|artifact| fs::read(&artifact.path).unwrap())
@@ -7732,17 +8341,14 @@ mod tests {
         let artifacts =
             prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan, &validation)
                 .unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
         let relations = scan.issue_relations.as_ref().unwrap();
         let mut partition_bytes = 0_u64;
         let mut total_artifact_bytes = 0_u64;
         let mut artifact_manifest = Vec::new();
-        let mut recovered_issue_count = 0_u64;
-        let mut recovered_occurrence_count = 0_u64;
-        let mut recovered_affected_root_count = 0_u64;
-        let mut partition_uncompressed_bytes = 0_u64;
         let mut closure_bundle_bytes = 0_u64;
         let mut closure_bundle_sha256 = String::new();
-        let mut closure_issues_sha256 = String::new();
         let mut xlsx_bytes = 0_u64;
         let mut xlsx_sha256 = String::new();
         for artifact in &artifacts {
@@ -7757,11 +8363,6 @@ mod tests {
                     .descriptor
                     .checksum_sha256
                     .clone_into(&mut closure_bundle_sha256);
-            } else if artifact.descriptor.file_name == "closure-issues-v1.jsonl" {
-                artifact
-                    .descriptor
-                    .checksum_sha256
-                    .clone_into(&mut closure_issues_sha256);
             } else if artifact.descriptor.file_name == "closure-report-v1.xlsx" {
                 xlsx_bytes = artifact_bytes;
                 artifact
@@ -7774,41 +8375,15 @@ mod tests {
             {
                 partition_bytes = partition_bytes.saturating_add(artifact_bytes);
             }
-            if artifact.descriptor.file_name == "manifest.json" {
-                let manifest: Value =
-                    serde_json::from_slice(&fs::read(&artifact.path).unwrap()).unwrap();
-                partition_uncompressed_bytes = manifest["partitions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|entry| entry["uncompressedByteSize"].as_u64())
-                    .sum();
-            }
-            if artifact.descriptor.file_name.ends_with(".ndjson.zst") {
-                let decoded =
-                    zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap();
-                let records = u64::try_from(
-                    decoded
-                        .split(|byte| *byte == b'\n')
-                        .count()
-                        .saturating_sub(1),
-                )
-                .unwrap();
-                if artifact.descriptor.file_name.starts_with("issues/") {
-                    recovered_issue_count = recovered_issue_count.saturating_add(records);
-                } else if artifact.descriptor.file_name.starts_with("occurrences/") {
-                    recovered_occurrence_count = recovered_occurrence_count.saturating_add(records);
-                } else if artifact.descriptor.file_name.starts_with("affected-roots/") {
-                    recovered_affected_root_count =
-                        recovered_affected_root_count.saturating_add(records);
-                }
-            }
             artifact_manifest.push(artifact.descriptor.clone());
         }
-        assert_eq!(recovered_issue_count, relations.stats.issue_count);
-        assert_eq!(recovered_occurrence_count, relations.stats.occurrence_count);
+        assert_eq!(reconstructed.issue_count, relations.stats.issue_count);
         assert_eq!(
-            recovered_affected_root_count,
+            reconstructed.occurrence_count,
+            relations.stats.occurrence_count
+        );
+        assert_eq!(
+            reconstructed.affected_root_count,
             relations.stats.affected_root_count
         );
         if let Ok(target) = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS") {
@@ -7853,10 +8428,11 @@ mod tests {
             "occurrenceCount": relations.stats.occurrence_count,
             "affectedRootCount": relations.stats.affected_root_count,
             "recoveredRelationCounts": {
-                "issues": recovered_issue_count,
-                "occurrences": recovered_occurrence_count,
-                "affectedRoots": recovered_affected_root_count,
+                "issues": reconstructed.issue_count,
+                "occurrences": reconstructed.occurrence_count,
+                "affectedRoots": reconstructed.affected_root_count,
             },
+            "machineResultReconstruction": &reconstructed,
             "relationSpoolBytes": {
                 "issues": relations.issues.byte_size,
                 "occurrences": relations.occurrences.byte_size,
@@ -7887,10 +8463,9 @@ mod tests {
             },
             "totalArtifactBytes": total_artifact_bytes,
             "partitionAndManifestBytes": partition_bytes,
-            "partitionUncompressedBytes": partition_uncompressed_bytes,
+            "partitionUncompressedBytes": reconstructed.uncompressed_byte_size,
             "closureBundleBytes": closure_bundle_bytes,
             "closureBundleSha256": closure_bundle_sha256,
-            "closureIssuesSha256": closure_issues_sha256,
             "xlsxBytes": xlsx_bytes,
             "xlsxSha256": xlsx_sha256,
             "resourceMeasurements": {
@@ -7998,7 +8573,7 @@ mod tests {
                 enforce_scope_closure_memory_budget("qualified_relation_partition_scale").unwrap();
             }
         }
-        let (entries, artifacts) = writer.finish().unwrap();
+        let (entries, artifacts, _) = writer.finish().unwrap();
         let recovered_records = entries.iter().map(|entry| entry.record_count).sum::<u64>();
         let uncompressed_bytes = entries
             .iter()
@@ -8401,7 +8976,6 @@ mod tests {
             names,
             BTreeSet::from([
                 "closure-bundle-v1.json",
-                "closure-issues-v1.jsonl",
                 "closure-report-v1.xlsx",
                 "issues/part-000000.ndjson.zst",
                 "manifest.json",
@@ -8409,6 +8983,162 @@ mod tests {
             ])
         );
         assert!(!names.contains("closure-snapshot-v1.json"));
+        let roles = artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.descriptor.file_name.as_str(),
+                    artifact.descriptor.artifact_role,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            roles["closure-bundle-v1.json"],
+            ScopeClosureArtifactRole::ClosureBundle
+        );
+        assert_eq!(
+            roles["closure-report-v1.xlsx"],
+            ScopeClosureArtifactRole::ClosureReport
+        );
+        assert_eq!(
+            roles["manifest.json"],
+            ScopeClosureArtifactRole::CompleteMachineResult
+        );
+        assert_eq!(
+            roles["issues/part-000000.ndjson.zst"],
+            ScopeClosureArtifactRole::CompleteMachineResult
+        );
+        assert!(artifacts.iter().all(|artifact| {
+            artifact.descriptor.artifact_role != ScopeClosureArtifactRole::CompleteMachineResult
+                || artifact.descriptor.artifact_type == "closure_complete_machine_result"
+        }));
+    }
+
+    #[test]
+    fn scope_closure_publication_metadata_uses_db_first_manifest_binding() {
+        assert_eq!(SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS, 604_800);
+        assert_eq!(SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS, 3_600);
+
+        let temp = Arc::new(TempDir::new().unwrap());
+        let report = PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_report_xlsx".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::ClosureReport,
+                file_name: "closure-report-v1.xlsx".to_owned(),
+                content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                byte_size: 0,
+                checksum_sha256: "a".repeat(64),
+            },
+            path: temp.path().join("closure-report-v1.xlsx"),
+            _temp: temp,
+        };
+        let report_metadata = closure_artifact_metadata(&report, Uuid::nil(), "manifest");
+        assert!(
+            report_metadata
+                .get("completeMachineResultClientKey")
+                .is_none()
+        );
+        assert!(report_metadata.get("writeSetId").is_none());
+        assert!(report_metadata.get("lifecycleState").is_none());
+        let mut bundle = report.clone();
+        bundle.descriptor.artifact_role = ScopeClosureArtifactRole::ClosureBundle;
+        let bundle_metadata = closure_artifact_metadata(&bundle, Uuid::nil(), "manifest");
+        assert_eq!(
+            bundle_metadata["completeMachineResultClientKey"], "manifest.json",
+            "Database finalize resolves the preallocated manifest UUID atomically"
+        );
+        assert!(
+            bundle_metadata
+                .get("completeMachineResultArtifactId")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_artifact_operation_renews_lease_across_multiple_periods() {
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&heartbeats);
+        let result = supervise_cancellable_operation(
+            async {
+                tokio::time::sleep(Duration::from_millis(110)).await;
+                Ok::<_, anyhow::Error>("uploaded")
+            },
+            CancellationToken::default(),
+            Duration::from_millis(25),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "uploaded");
+        assert!(
+            heartbeats.load(Ordering::SeqCst) >= 5,
+            "initial heartbeat plus at least four periodic heartbeats are required"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_operation_is_really_cancelled_when_lease_is_lost_mid_request() {
+        let cancellation = CancellationToken::default();
+        let operation_cancellation = cancellation.clone();
+        let cleanup_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_cleanup = Arc::clone(&cleanup_observed);
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&heartbeats);
+
+        let error = supervise_cancellable_operation(
+            async move {
+                while !operation_cancellation.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                operation_cleanup.store(true, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("multipart aborted"))
+            },
+            cancellation.clone(),
+            Duration::from_millis(20),
+            move || {
+                let call = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call >= 2 {
+                        Err(anyhow::anyhow!("lease lost"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("lease lost"));
+        assert!(cancellation.is_cancelled());
+        assert!(cleanup_observed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn final_artifact_lease_loss_blocks_ready_finalize() {
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&finalize_calls);
+        let error = fence_closure_artifact_finalize(
+            || async { Err(anyhow::anyhow!("lease lost after final artifact")) },
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>("ready") }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("lease lost after final artifact"));
+        assert_eq!(
+            finalize_calls.load(Ordering::SeqCst),
+            0,
+            "a failed final heartbeat must never invoke the only ready-row transition"
+        );
     }
 
     #[test]
@@ -8699,7 +9429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn affected_root_partitions_preserve_complete_relations_beyond_inline_sample() {
+    async fn manifest_streaming_reconstructs_complete_relations_beyond_inline_sample() {
         let support = identity(
             DatasetCategory::Sources,
             "abababab-abab-4bab-8bab-abababababab",
@@ -8749,8 +9479,14 @@ mod tests {
             requested_target_version: None,
             message: "generated support issue".to_owned(),
             suggested_action: None,
-            occurrence_count: 0,
-            occurrences: Vec::new(),
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: "shared-support-occurrence".to_owned(),
+                source: None,
+                json_path: Some("$.fixture".to_owned()),
+                reference_role: None,
+                details: json!({"source": "reconstruction-proof"}),
+            }],
             affected_root_count: 0,
             affected_roots: Vec::new(),
             affected_root_witness_paths: Vec::new(),
@@ -8769,13 +9505,19 @@ mod tests {
             issue_events: JsonlValueSpool::empty("empty-root-partition-issues.jsonl").unwrap(),
         };
         build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd");
         let artifacts = prepare_issue_partition_artifacts(
-            id("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"),
+            closure_check_id,
             &scan,
             &validation,
             Arc::new(TempDir::new().unwrap()),
         )
         .unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
+        assert_eq!(reconstructed.issue_count, 1);
+        assert_eq!(reconstructed.occurrence_count, 1);
+        assert_eq!(reconstructed.affected_root_count, 101);
         let root_records = artifacts
             .iter()
             .filter(|artifact| artifact.descriptor.file_name.starts_with("affected-roots/"))
@@ -8786,6 +9528,215 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(root_records, roots.len());
+    }
+
+    fn clone_prepared_artifacts(artifacts: &[PreparedArtifact]) -> Vec<PreparedArtifact> {
+        let temp = Arc::new(TempDir::new().unwrap());
+        artifacts
+            .iter()
+            .map(|artifact| {
+                let path = temp.path().join(&artifact.descriptor.file_name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::copy(&artifact.path, &path).unwrap();
+                PreparedArtifact {
+                    descriptor: artifact.descriptor.clone(),
+                    path,
+                    _temp: Arc::clone(&temp),
+                }
+            })
+            .collect()
+    }
+
+    fn mutate_manifest(artifacts: &mut [PreparedArtifact], mutate: impl FnOnce(&mut Value)) {
+        let manifest = artifacts
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .unwrap();
+        let mut value: Value =
+            serde_json::from_reader(BufReader::new(File::open(&manifest.path).unwrap())).unwrap();
+        mutate(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&manifest.path, &bytes).unwrap();
+        manifest.descriptor.byte_size = bytes.len();
+        manifest.descriptor.checksum_sha256 = sha256_hex(&bytes);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn complete_machine_result_rejects_manifest_and_partition_tampering_matrix() {
+        let support = identity(
+            DatasetCategory::Sources,
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        );
+        let root = ExactDatasetIdentity {
+            category: DatasetCategory::Processes,
+            id: id("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            version: "01.00.000".to_owned(),
+        };
+        let provider = FakeProvider {
+            documents: BTreeMap::from([
+                (
+                    support.clone(),
+                    ClosureDocument {
+                        identity: support.clone(),
+                        payload: json!({}),
+                    },
+                ),
+                (
+                    root.clone(),
+                    ClosureDocument {
+                        identity: root.clone(),
+                        payload: json!({
+                            "referenceToSource": reference(
+                                "source",
+                                support.id,
+                                Some("01.00.000"),
+                            )
+                        }),
+                    },
+                ),
+            ]),
+            ..FakeProvider::default()
+        };
+        let mut scan = collect_scope_closure(&provider, &manifest(vec![root]))
+            .await
+            .unwrap();
+        scan.issues = vec![ClosureIssue {
+            issue_key: "tamper-matrix-issue".to_owned(),
+            severity: "warning".to_owned(),
+            blocking: false,
+            issue_code: "tamper_matrix".to_owned(),
+            source: Some(support),
+            json_path: None,
+            reference_role: None,
+            requested_target_type: None,
+            requested_target_id: None,
+            requested_target_version: None,
+            message: "tamper matrix".to_owned(),
+            suggested_action: None,
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: "tamper-matrix-occurrence".to_owned(),
+                source: None,
+                json_path: Some("$.fixture".to_owned()),
+                reference_role: None,
+                details: json!({}),
+            }],
+            affected_root_count: 0,
+            affected_roots: Vec::new(),
+            affected_root_witness_paths: Vec::new(),
+            witness_path: Vec::new(),
+        }];
+        populate_affected_roots(&mut scan);
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "fixture"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: JsonlValueSpool::empty("empty-tamper-matrix-issues.jsonl").unwrap(),
+        };
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        let artifacts = prepare_issue_partition_artifacts(
+            closure_check_id,
+            &scan,
+            &validation,
+            Arc::new(TempDir::new().unwrap()),
+        )
+        .unwrap();
+        reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
+
+        let assert_rejected = |case: &str, tampered: &[PreparedArtifact]| {
+            assert!(
+                reconstruct_complete_machine_result(tampered, closure_check_id).is_err(),
+                "{case} tampering must be rejected"
+            );
+        };
+
+        let mut missing = clone_prepared_artifacts(&artifacts);
+        let missing_index = missing
+            .iter()
+            .position(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap();
+        missing.remove(missing_index);
+        assert_rejected("missing partition", &missing);
+
+        let mut extra = clone_prepared_artifacts(&artifacts);
+        let mut extra_partition = extra
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .clone();
+        extra_partition.descriptor.file_name = "extra/part-000000.ndjson.zst".to_owned();
+        extra.push(extra_partition);
+        assert_rejected("extra partition", &extra);
+
+        let mut duplicate = clone_prepared_artifacts(&artifacts);
+        duplicate.push(
+            duplicate
+                .iter()
+                .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+                .unwrap()
+                .clone(),
+        );
+        assert_rejected("duplicate partition", &duplicate);
+
+        let mut renamed = clone_prepared_artifacts(&artifacts);
+        renamed
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .descriptor
+            .file_name = "issues/part-999999.ndjson.zst".to_owned();
+        assert_rejected("renamed partition", &renamed);
+
+        let corrupted = clone_prepared_artifacts(&artifacts);
+        let partition = corrupted
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap();
+        let mut bytes = fs::read(&partition.path).unwrap();
+        let midpoint = bytes.len() / 2;
+        bytes[midpoint] ^= 0x01;
+        fs::write(&partition.path, bytes).unwrap();
+        assert_rejected("partition bit corruption", &corrupted);
+
+        let mut wrong_count = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_count, |manifest| {
+            manifest["partitions"][0]["recordCount"] = json!(999);
+        });
+        assert_rejected("partition count", &wrong_count);
+
+        let mut wrong_hash = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_hash, |manifest| {
+            manifest["relationStreamSha256"]["issues"] = json!("0".repeat(64));
+        });
+        assert_rejected("global hash", &wrong_hash);
+
+        let mut wrong_order = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_order, |manifest| {
+            manifest["partitions"].as_array_mut().unwrap().swap(0, 1);
+        });
+        assert_rejected("manifest order", &wrong_order);
+
+        let mut wrong_schema = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_schema, |manifest| {
+            manifest["schemaVersion"] = json!("lcia.scope-closure-issue-manifest.v999");
+        });
+        assert_rejected("schemaVersion", &wrong_schema);
+
+        let mut wrong_check = clone_prepared_artifacts(&artifacts);
+        mutate_manifest(&mut wrong_check, |manifest| {
+            manifest["closureCheckId"] = json!(Uuid::nil());
+        });
+        assert_rejected("closureCheckId", &wrong_check);
+
+        let mut wrong_role = clone_prepared_artifacts(&artifacts);
+        wrong_role
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .unwrap()
+            .descriptor
+            .artifact_role = ScopeClosureArtifactRole::ClosureReport;
+        assert_rejected("artifact role", &wrong_role);
     }
 
     #[tokio::test]

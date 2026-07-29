@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MaintenanceJobKind {
+    #[value(name = "artifact-gc")]
+    Artifact,
     #[value(name = "snapshot-gc")]
     Snapshot,
     #[value(name = "result-gc")]
@@ -22,6 +24,7 @@ enum MaintenanceJobKind {
 impl MaintenanceJobKind {
     const fn job_kind(self) -> &'static str {
         match self {
+            Self::Artifact => "worker.artifact_gc",
             Self::Snapshot => "lca.snapshot_gc",
             Self::Result => "lca.result_gc",
             Self::PackageArtifact => "tidas.package_artifact_gc",
@@ -31,6 +34,7 @@ impl MaintenanceJobKind {
 
     const fn payload_schema_version(self) -> &'static str {
         match self {
+            Self::Artifact => "worker.artifact_gc.request.v1",
             Self::Snapshot => "lca.snapshot_gc.request.v1",
             Self::Result => "lca.result_gc.request.v1",
             Self::PackageArtifact => "tidas.package_artifact_gc.request.v1",
@@ -244,7 +248,7 @@ fn maintenance_payload(cli: &Cli, environment: &str) -> Value {
             insert_i64(&mut payload, "maxBytes", cli.max_bytes);
             insert_i64(&mut payload, "batchSize", cli.batch_size);
         }
-        MaintenanceJobKind::Result => {
+        MaintenanceJobKind::Artifact | MaintenanceJobKind::Result => {
             insert_i64(&mut payload, "batchSize", cli.batch_size);
             insert_i64(&mut payload, "maxBatches", cli.max_batches);
         }
@@ -386,6 +390,29 @@ mod tests {
                 "jobRetentionDays": 30,
                 "requestCacheRetentionDays": 7
             })
+        );
+    }
+
+    #[test]
+    fn builds_generic_artifact_gc_payload() {
+        let mut cli = base_cli(MaintenanceJobKind::Artifact);
+        cli.execute = true;
+        cli.batch_size = Some(100);
+        cli.max_batches = Some(4);
+
+        assert_eq!(
+            maintenance_payload(&cli, "main"),
+            json!({
+                "environment": "main",
+                "execute": true,
+                "batchSize": 100,
+                "maxBatches": 4
+            })
+        );
+        assert_eq!(cli.job_kind.job_kind(), "worker.artifact_gc");
+        assert_eq!(
+            cli.job_kind.payload_schema_version(),
+            "worker.artifact_gc.request.v1"
         );
     }
 

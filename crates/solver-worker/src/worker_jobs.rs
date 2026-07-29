@@ -219,6 +219,11 @@ impl<'a> WorkerJobProgress<'a> {
         )
         .await
     }
+
+    #[must_use]
+    pub const fn lease_seconds(&self) -> i32 {
+        self.lease_seconds
+    }
 }
 
 #[must_use]

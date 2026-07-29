@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    future::Future,
     io::{Read, Write},
     path::Path,
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -22,6 +24,8 @@ const MULTIPART_UPLOAD_PART_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const XML_CONTENT_TYPE: &str = "application/xml";
 const DEFAULT_OBJECT_TRANSFER_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const DEFAULT_OBJECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 type HmacSha256 = Hmac<Sha256>;
 const EMPTY_PAYLOAD_SHA256: &str =
@@ -53,6 +57,7 @@ pub struct ObjectTransferOptions {
     pub max_bytes: u64,
     pub expected_sha256: Option<String>,
     pub cancellation: CancellationToken,
+    pub request_timeout: Duration,
 }
 
 impl ObjectTransferOptions {
@@ -62,6 +67,7 @@ impl ObjectTransferOptions {
             max_bytes,
             expected_sha256: None,
             cancellation: CancellationToken::default(),
+            request_timeout: DEFAULT_OBJECT_REQUEST_TIMEOUT,
         }
     }
 
@@ -74,6 +80,12 @@ impl ObjectTransferOptions {
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
         self
     }
 }
@@ -137,6 +149,12 @@ impl std::fmt::Display for ObjectStoreUploadError {
 impl std::error::Error for ObjectStoreUploadError {}
 
 impl ObjectStoreClient {
+    /// Returns the configured bucket name used for object persistence.
+    #[must_use]
+    pub fn bucket_name(&self) -> &str {
+        self.bucket.as_str()
+    }
+
     /// Creates storage client from config.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -395,11 +413,16 @@ impl ObjectStoreClient {
         self.ensure_upload_size_allowed(upload_mode, Some(artifact_byte_size))?;
         let upload = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
             options.cancellation.check("upload_single_put")?;
-            self.upload_object(
-                key,
-                content_type,
-                std::fs::read(file_path)?,
-                Some(artifact_byte_size),
+            await_cancellable_request(
+                self.upload_object(
+                    key,
+                    content_type,
+                    std::fs::read(file_path)?,
+                    Some(artifact_byte_size),
+                ),
+                &options.cancellation,
+                options.request_timeout,
+                "upload_single_put",
             )
             .await?
         } else {
@@ -409,6 +432,7 @@ impl ObjectStoreClient {
                 file_path,
                 artifact_byte_size,
                 &options.cancellation,
+                options.request_timeout,
             )
             .await?
         };
@@ -760,6 +784,7 @@ impl ObjectStoreClient {
             file_path,
             object_byte_size,
             &CancellationToken::default(),
+            DEFAULT_OBJECT_REQUEST_TIMEOUT,
         )
         .await
     }
@@ -771,12 +796,17 @@ impl ObjectStoreClient {
         file_path: &Path,
         object_byte_size: u64,
         cancellation: &CancellationToken,
+        request_timeout: Duration,
     ) -> anyhow::Result<ObjectUploadResult> {
         self.ensure_upload_size_allowed("multipart", Some(object_byte_size))?;
         cancellation.check("upload_create_multipart")?;
-        let upload_id = self
-            .create_multipart_upload(key, content_type, object_byte_size)
-            .await?;
+        let upload_id = await_cancellable_request(
+            self.create_multipart_upload(key, content_type, object_byte_size),
+            cancellation,
+            request_timeout,
+            "upload_create_multipart",
+        )
+        .await?;
         let mut file = File::open(file_path)?;
         let mut parts = Vec::new();
         let mut part_number = 1usize;
@@ -784,7 +814,8 @@ impl ObjectStoreClient {
 
         loop {
             if let Err(err) = cancellation.check("upload_read_part") {
-                let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+                self.abort_multipart_upload_bounded(key, upload_id.as_str(), request_timeout)
+                    .await;
                 return Err(err.into());
             }
             let read_len = file.read(buffer.as_mut_slice())?;
@@ -792,19 +823,24 @@ impl ObjectStoreClient {
                 break;
             }
 
-            let etag = match self
-                .upload_multipart_part(
+            let etag = match await_cancellable_request(
+                self.upload_multipart_part(
                     key,
                     upload_id.as_str(),
                     part_number,
                     buffer[..read_len].to_vec(),
                     object_byte_size,
-                )
-                .await
+                ),
+                cancellation,
+                request_timeout,
+                "upload_multipart_part",
+            )
+            .await
             {
                 Ok(etag) => etag,
                 Err(err) => {
-                    let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+                    self.abort_multipart_upload_bounded(key, upload_id.as_str(), request_timeout)
+                        .await;
                     return Err(err);
                 }
             };
@@ -813,21 +849,33 @@ impl ObjectStoreClient {
         }
 
         if parts.is_empty() {
-            let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+            self.abort_multipart_upload_bounded(key, upload_id.as_str(), request_timeout)
+                .await;
             return Err(anyhow::anyhow!(
                 "multipart upload cannot start with an empty file"
             ));
         }
 
         if let Err(err) = cancellation.check("upload_complete_multipart") {
-            let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+            self.abort_multipart_upload_bounded(key, upload_id.as_str(), request_timeout)
+                .await;
             return Err(err.into());
         }
-        if let Err(err) = self
-            .complete_multipart_upload(key, upload_id.as_str(), parts.as_slice(), object_byte_size)
-            .await
+        if let Err(err) = await_cancellable_request(
+            self.complete_multipart_upload(
+                key,
+                upload_id.as_str(),
+                parts.as_slice(),
+                object_byte_size,
+            ),
+            cancellation,
+            request_timeout,
+            "upload_complete_multipart",
+        )
+        .await
         {
-            let _ = self.abort_multipart_upload(key, upload_id.as_str()).await;
+            self.abort_multipart_upload_bounded(key, upload_id.as_str(), request_timeout)
+                .await;
             return Err(err);
         }
 
@@ -1077,6 +1125,16 @@ impl ObjectStoreClient {
         ))
     }
 
+    async fn abort_multipart_upload_bounded(
+        &self,
+        key: &str,
+        upload_id: &str,
+        request_timeout: Duration,
+    ) {
+        let _ = tokio::time::timeout(request_timeout, self.abort_multipart_upload(key, upload_id))
+            .await;
+    }
+
     fn object_key(&self, snapshot_id: Uuid, job_id: Uuid, suffix: &str, extension: &str) -> String {
         if self.prefix.is_empty() {
             return format!("snapshots/{snapshot_id}/jobs/{job_id}/{suffix}.{extension}");
@@ -1209,6 +1267,12 @@ fn validate_transfer_options(options: &ObjectTransferOptions) -> anyhow::Result<
         )
         .into());
     }
+    if options.request_timeout.is_zero() {
+        return Err(ResourceError::InvalidProfile(
+            "object transfer request_timeout must be greater than zero".to_owned(),
+        )
+        .into());
+    }
     if let Some(expected) = options.expected_sha256.as_deref() {
         let normalized = expected.trim().to_ascii_lowercase();
         if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1218,6 +1282,36 @@ fn validate_transfer_options(options: &ObjectTransferOptions) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+async fn await_cancellable_request<T, Request>(
+    request: Request,
+    cancellation: &CancellationToken,
+    request_timeout: Duration,
+    stage: &'static str,
+) -> anyhow::Result<T>
+where
+    Request: Future<Output = anyhow::Result<T>>,
+{
+    cancellation.check(stage)?;
+    tokio::pin!(request);
+    let timeout = tokio::time::sleep(request_timeout);
+    tokio::pin!(timeout);
+    let mut cancellation_poll = tokio::time::interval(CANCELLATION_POLL_INTERVAL);
+    cancellation_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    cancellation_poll.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            () = &mut timeout => {
+                return Err(anyhow::anyhow!(
+                    "object-store request timed out during {stage} after {} ms",
+                    request_timeout.as_millis(),
+                ));
+            }
+            _ = cancellation_poll.tick() => cancellation.check(stage)?,
+        }
+    }
 }
 
 fn ensure_artifact_limit(resource: &'static str, observed: u64, limit: u64) -> anyhow::Result<()> {
@@ -1348,6 +1442,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
+        sync::{Arc, Mutex},
         thread,
         time::Duration,
     };
@@ -1501,6 +1596,47 @@ mod tests {
             stream.flush().expect("flush response header");
         });
         format!("http://{address}/bucket/object")
+    }
+
+    fn serve_slow_multipart() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind multipart server");
+        let address = listener.local_addr().expect("multipart server address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        thread::spawn(move || {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept multipart request");
+                let mut request = [0_u8; 8192];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                observed
+                    .lock()
+                    .expect("request log")
+                    .push(request.lines().next().unwrap_or_default().to_owned());
+                match request_index {
+                    0 => {
+                        let body = "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>";
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .expect("create multipart response");
+                    }
+                    1 => {
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    _ => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .expect("abort multipart response");
+                    }
+                }
+            }
+        });
+        (format!("http://{address}"), requests)
     }
 
     #[tokio::test]
@@ -1660,6 +1796,52 @@ mod tests {
                 .expect("cancellation error")
                 .error_code(),
             "operation_cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_multipart_part_aborts_remote_upload() {
+        let temp = tempdir().expect("temp directory");
+        let source = temp.path().join("multipart.bin");
+        std::fs::File::create(&source)
+            .expect("create multipart fixture")
+            .set_len(MULTIPART_UPLOAD_THRESHOLD_BYTES + 1)
+            .expect("size multipart fixture");
+        let (endpoint, requests) = serve_slow_multipart();
+        let cancellation = CancellationToken::default();
+        let canceller = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            canceller.cancel();
+        });
+
+        let error = test_client(&endpoint)
+            .upload_object_key_file_bounded(
+                "bounded/multipart.bin",
+                "application/octet-stream",
+                &source,
+                ObjectTransferOptions::new(MULTIPART_UPLOAD_THRESHOLD_BYTES + 1)
+                    .with_cancellation(cancellation)
+                    .with_request_timeout(Duration::from_secs(2)),
+            )
+            .await
+            .expect_err("mid-part cancellation must fail the upload");
+        cancel_task.await.expect("cancel task");
+
+        assert_eq!(
+            error
+                .downcast_ref::<ResourceError>()
+                .expect("cancellation error")
+                .error_code(),
+            "operation_cancelled"
+        );
+        let requests = requests.lock().expect("request log");
+        assert!(requests.iter().any(|line| line.starts_with("PUT ")));
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("uploadId=upload-1")),
+            "multipart cancellation must issue AbortMultipartUpload: {requests:?}"
         );
     }
 }

@@ -11,6 +11,7 @@ pub fn default_snapshot_process_states_arg() -> String {
         .join(",")
 }
 
+pub mod artifact_gc;
 pub mod artifacts;
 pub mod calculation_bundle;
 pub mod calculation_evidence;

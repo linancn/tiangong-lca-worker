@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-07-29"
-lastReviewedCommit: "5b8a6cdc75c91530eac9364b82b20c22e1ab7029"
-lastReviewedNote: "Reviewed for Issue #174: existing scope-closure ownership and routing cover measured-topology temp admission, staged free-space watermarks, and offline production-shape proof."
+lastReviewedCommit: "fb8293f5d2c83dfe845dd4149de5b5bfed5e7076"
+lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: bounded streaming machine-result reconstruction, direct deterministic publication, and phase-aware artifact GC remain Worker-owned while database-engine owns the read/download DTOs and fresh-process cleanup claim."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
