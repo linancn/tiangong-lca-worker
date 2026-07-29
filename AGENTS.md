@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-29
 lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
-lastReviewedNote: "Reviewed for Issue #169: bounded final issue merge and affected-root enrichment remain Worker-owned and do not change repository or workspace integration boundaries."
+lastReviewedNote: "Reviewed for Issue #171: derived relation external sorting, deterministic partition streaming, temp admission, and cache telemetry remain Worker-owned and do not change workspace boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

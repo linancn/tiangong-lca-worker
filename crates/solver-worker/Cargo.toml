@@ -16,6 +16,7 @@ hdf5.workspace = true
 hdf5-sys.workspace = true
 hex.workspace = true
 hmac.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 rayon.workspace = true
 sha2.workspace = true

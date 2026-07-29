@@ -19,6 +19,7 @@ pub mod config;
 pub mod contribution_path;
 pub mod db;
 pub mod db_pool;
+pub mod file_cache;
 pub mod graph_types;
 pub mod http;
 pub mod local_reports;

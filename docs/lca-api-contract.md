@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-29
-lastReviewedCommit: 0eeae80ff84ad76b8009142f3a417b7739a9d9eb
-lastReviewedNote: "Reviewed for Issue #169: streamed internal coalescing preserves the existing bounded API projections, exact counts, logical issue hash, and manifest-addressed complete relations."
+lastReviewedCommit: cd77d8dcd544fd7f23070115b1c2289dfa4f5cb3
+lastReviewedNote: "Reviewed for Issue #171: role-specific external relation runs and direct partitions preserve bounded API projections, exact counts, logical issue hash, and manifest-addressed complete relations."
 related:
   - AGENTS.md
   - .docpact/config.yaml

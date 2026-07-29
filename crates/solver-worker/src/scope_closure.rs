@@ -25,9 +25,11 @@ use crate::{
         ScopeClosureSnapshotFacts, fetch_scope_closure_snapshot_facts,
         run_scope_closure_snapshot_builder, scope_closure_evidence_hash,
     },
+    file_cache::{advise_sequential_access, release_file_cache},
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
     readiness::{MatrixReadinessReport, ReadinessStatus},
+    resource::{ResourceCounters, ResourceMeasurement, directory_bytes},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     tidas_cli,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
@@ -45,7 +47,7 @@ const FETCH_BATCH_SIZE: usize = 96;
 const VALIDATION_CACHE_LOOKUP_BATCH_SIZE: usize = 256;
 const VALIDATION_EXECUTION_BATCH_SIZE: usize = 64;
 const VALIDATION_CACHE_RECORD_BATCH_BYTES: usize = 8 * 1024 * 1024;
-const VALIDATION_SORT_RUN_BYTES: usize = 16 * 1024 * 1024;
+const VALIDATION_SORT_RUN_BYTES: usize = 32 * 1024 * 1024;
 const VALIDATION_ISSUE_SPOOL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const VALIDATION_ISSUE_SPOOL_MAX_EVENTS: u64 = 5_000_000;
 const SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -54,7 +56,7 @@ const ISSUE_INLINE_ISSUE_SAMPLE_LIMIT: usize = 5_000;
 const ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT: usize = 100;
 const ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 100;
 const ISSUE_PARTITION_MAX_RECORDS: u64 = 25_000;
-const ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024;
+const ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 const XLSX_ISSUE_SAMPLE_LIMIT: usize = 5_000;
 const XLSX_OCCURRENCE_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 10_000;
@@ -100,6 +102,22 @@ fn enforce_scope_closure_memory_budget(phase: &str) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn record_scope_closure_resources(phase: &str, temp_bytes: Option<u64>, rows: Option<u64>) {
+    let measurement = ResourceMeasurement::capture(
+        phase,
+        ResourceCounters {
+            temp_bytes,
+            rows,
+            ..ResourceCounters::default()
+        },
+    );
+    tracing::info!(
+        phase,
+        measurement = %serde_json::to_string(&measurement).unwrap_or_default(),
+        "scope closure resource measurement"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -667,9 +685,9 @@ struct IssueRelationStats {
 
 #[derive(Debug)]
 struct IssueRelationSpools {
-    issues: JsonlValueSpool,
-    occurrences: JsonlValueSpool,
-    affected_roots: JsonlValueSpool,
+    issues: SortedJsonlRuns,
+    occurrences: SortedJsonlRuns,
+    affected_roots: SortedJsonlRuns,
     stats: IssueRelationStats,
 }
 
@@ -2285,12 +2303,22 @@ struct IssuePartitionManifest {
 struct IssuePartitionAccumulator {
     temp: Arc<TempDir>,
     relation: &'static str,
-    records: Vec<Vec<u8>>,
-    uncompressed_bytes: u64,
-    first_issue_key: Option<String>,
-    last_issue_key: Option<String>,
+    max_records: u64,
+    max_uncompressed_bytes: u64,
+    active: Option<ActiveIssuePartition>,
     entries: Vec<IssuePartitionManifestEntry>,
     artifacts: Vec<PreparedArtifact>,
+}
+
+struct ActiveIssuePartition {
+    relative_path: String,
+    path: PathBuf,
+    encoder: zstd::stream::write::Encoder<'static, BufWriter<File>>,
+    uncompressed_digest: Sha256,
+    record_count: u64,
+    uncompressed_bytes: u64,
+    first_issue_key: String,
+    last_issue_key: String,
 }
 
 #[derive(Debug)]
@@ -2360,11 +2388,219 @@ struct JsonlValueSpoolWriter {
     byte_size: u64,
 }
 
+#[derive(Debug)]
+struct SortedJsonlRuns {
+    temp: TempDir,
+    run_paths: Vec<PathBuf>,
+    event_count: u64,
+    byte_size: u64,
+}
+
+struct SortedJsonlRunWriter {
+    role: &'static str,
+    run_bytes: usize,
+    merge_fan_in: usize,
+    temp: TempDir,
+    run_paths: Vec<PathBuf>,
+    buffered: Vec<Vec<u8>>,
+    buffered_bytes: usize,
+    event_count: u64,
+    byte_size: u64,
+}
+
+const SORT_MERGE_FAN_IN: usize = 64;
+const RELATION_TEMP_ADMISSION_SAFETY_PERCENT: u64 = 125;
+const AFFECTED_ROOT_RELATION_SAMPLE_BYTES: u64 = 673;
+
+impl SortedJsonlRunWriter {
+    fn new(role: &'static str) -> anyhow::Result<Self> {
+        Ok(Self {
+            role,
+            run_bytes: VALIDATION_SORT_RUN_BYTES,
+            merge_fan_in: SORT_MERGE_FAN_IN,
+            temp: TempDir::new()?,
+            run_paths: Vec::new(),
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            event_count: 0,
+            byte_size: 0,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_limits(
+        role: &'static str,
+        run_bytes: usize,
+        merge_fan_in: usize,
+    ) -> anyhow::Result<Self> {
+        if run_bytes == 0 || merge_fan_in < 2 {
+            return Err(anyhow::anyhow!(
+                "derived relation sort limits must use positive runs and fan-in >= 2"
+            ));
+        }
+        let mut writer = Self::new(role)?;
+        writer.run_bytes = run_bytes;
+        writer.merge_fan_in = merge_fan_in;
+        Ok(writer)
+    }
+
+    fn append(&mut self, value: &Value) -> anyhow::Result<()> {
+        let bytes = canonical_json_bytes(value)?;
+        let record_bytes = bytes
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("derived relation record byte count overflow"))?;
+        if u64::try_from(record_bytes)? > ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES {
+            return Err(anyhow::anyhow!(
+                "derived_relation_record_too_large: role={}, bytes={}, max={}",
+                self.role,
+                record_bytes,
+                ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES
+            ));
+        }
+        self.byte_size = self
+            .byte_size
+            .checked_add(u64::try_from(record_bytes)?)
+            .ok_or_else(|| anyhow::anyhow!("derived relation byte count overflow"))?;
+        self.event_count = self
+            .event_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("derived relation event count overflow"))?;
+        self.buffered_bytes = self
+            .buffered_bytes
+            .checked_add(record_bytes)
+            .ok_or_else(|| anyhow::anyhow!("derived relation run byte count overflow"))?;
+        self.buffered.push(bytes);
+        if self.buffered_bytes >= self.run_bytes {
+            self.flush_run()?;
+        }
+        Ok(())
+    }
+
+    fn flush_run(&mut self) -> anyhow::Result<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        ensure_temp_free_space(self.temp.path(), u64::try_from(self.buffered_bytes)?)?;
+        let path = self.temp.path().join(format!(
+            "{}-run-{:06}.jsonl",
+            self.role,
+            self.run_paths.len()
+        ));
+        write_sorted_jsonl_run_to_path(&path, &mut self.buffered)?;
+        self.run_paths.push(path);
+        self.buffered_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<SortedJsonlRuns> {
+        self.flush_run()?;
+        let mut pass = 0_usize;
+        while self.run_paths.len() > self.merge_fan_in {
+            let previous = std::mem::take(&mut self.run_paths);
+            let mut compacted = Vec::new();
+            for (group_index, group) in previous.chunks(self.merge_fan_in).enumerate() {
+                let planned_bytes = group.iter().try_fold(0_u64, |total, path| {
+                    Ok::<_, anyhow::Error>(total.saturating_add(fs::metadata(path)?.len()))
+                })?;
+                ensure_temp_free_space(self.temp.path(), planned_bytes)?;
+                let output = self.temp.path().join(format!(
+                    "{}-merge-{pass:03}-{group_index:06}.jsonl",
+                    self.role
+                ));
+                merge_sorted_jsonl_runs(group, Some(&output), |_| Ok(()))?;
+                for path in group {
+                    fs::remove_file(path)?;
+                }
+                compacted.push(output);
+            }
+            self.run_paths = compacted;
+            pass = pass.saturating_add(1);
+        }
+        Ok(SortedJsonlRuns {
+            temp: self.temp,
+            run_paths: self.run_paths,
+            event_count: self.event_count,
+            byte_size: self.byte_size,
+        })
+    }
+}
+
+impl SortedJsonlRuns {
+    fn visit(&self, mut visit: impl FnMut(Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        merge_sorted_jsonl_runs(&self.run_paths, None, |line| {
+            visit(serde_json::from_slice(line)?)
+        })?;
+        Ok(())
+    }
+
+    fn storage_bytes(&self) -> u64 {
+        directory_bytes(self.temp.path()).unwrap_or(0)
+    }
+}
+
+fn relation_temp_admission_bytes(scan: &ScopeClosureScan, events: &JsonlValueSpool) -> u64 {
+    let average_raw_event_bytes = events
+        .byte_size
+        .checked_add(events.event_count.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_div(events.event_count.max(1)))
+        .unwrap_or(events.byte_size);
+    let raw_events = events.event_count;
+    let roots_per_event = u64::try_from(scan.roots.len()).unwrap_or(u64::MAX).max(1);
+
+    // Merge records repeat the canonical issue and occurrence fields. These workload-derived
+    // projections deliberately use the observed raw-event width and the graph's root fan-out;
+    // they are admission estimates, not result caps.
+    let merge_runs = average_raw_event_bytes
+        .saturating_mul(raw_events)
+        .saturating_mul(5);
+    let issue_runs = merge_runs;
+    let occurrence_runs = average_raw_event_bytes
+        .saturating_mul(raw_events)
+        .saturating_mul(2);
+    let affected_root_runs = AFFECTED_ROOT_RELATION_SAMPLE_BYTES
+        .saturating_mul(raw_events)
+        .saturating_mul(roots_per_event);
+    let active_outputs = ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES.saturating_mul(2);
+    events
+        .byte_size
+        .saturating_add(merge_runs.saturating_mul(2))
+        .saturating_add(issue_runs)
+        .saturating_add(occurrence_runs)
+        .saturating_add(affected_root_runs)
+        .saturating_add(active_outputs)
+        .saturating_mul(RELATION_TEMP_ADMISSION_SAFETY_PERCENT)
+        .saturating_add(99)
+        / 100
+}
+
+fn admit_relation_temp_space(
+    scan: &ScopeClosureScan,
+    events: &JsonlValueSpool,
+) -> anyhow::Result<()> {
+    let planned = relation_temp_admission_bytes(scan, events);
+    let available = fs2::available_space(events.path.as_path())?;
+    let required = planned
+        .checked_add(SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("scope closure relation temp-space requirement overflow"))?;
+    if available < required {
+        return Err(anyhow::anyhow!(
+            "scope_closure_relation_temp_space_low: available={available}, required={required}, planned={planned}, raw_events={}, raw_bytes={}, root_upper_bound={}, safety_percent={RELATION_TEMP_ADMISSION_SAFETY_PERCENT}",
+            events.event_count,
+            events.byte_size,
+            scan.roots.len()
+        ));
+    }
+    Ok(())
+}
+
 impl JsonlValueSpoolWriter {
     fn new(file_name: &str) -> anyhow::Result<Self> {
         let temp = TempDir::new()?;
         let path = temp.path().join(file_name);
-        let writer = BufWriter::new(File::create(&path)?);
+        let file = File::create(&path)?;
+        advise_sequential_access(&file);
+        let writer = BufWriter::new(file);
         Ok(Self {
             temp,
             path,
@@ -2422,6 +2658,7 @@ impl JsonlValueSpoolWriter {
 
     fn finish(mut self) -> anyhow::Result<JsonlValueSpool> {
         self.writer.flush()?;
+        release_file_cache(self.writer.get_ref());
         drop(self.writer);
         Ok(JsonlValueSpool {
             _temp: self.temp,
@@ -2519,15 +2756,69 @@ fn write_sorted_jsonl_run(
     index: usize,
     buffered: &mut Vec<Vec<u8>>,
 ) -> anyhow::Result<PathBuf> {
-    buffered.sort();
     let path = directory.join(format!("run-{index:06}.jsonl"));
-    let mut writer = BufWriter::new(File::create(&path)?);
+    write_sorted_jsonl_run_to_path(&path, buffered)?;
+    Ok(path)
+}
+
+fn write_sorted_jsonl_run_to_path(path: &Path, buffered: &mut Vec<Vec<u8>>) -> anyhow::Result<()> {
+    buffered.sort();
+    let file = File::create(path)?;
+    advise_sequential_access(&file);
+    let mut writer = BufWriter::new(file);
     for line in buffered.drain(..) {
         writer.write_all(&line)?;
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
-    Ok(path)
+    release_file_cache(writer.get_ref());
+    Ok(())
+}
+
+fn merge_sorted_jsonl_runs(
+    run_paths: &[PathBuf],
+    output_path: Option<&Path>,
+    mut visit: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut readers = run_paths
+        .iter()
+        .map(|path| {
+            let file = File::open(path)?;
+            advise_sequential_access(&file);
+            Ok::<_, std::io::Error>(BufReader::new(file))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut output = output_path
+        .map(|path| {
+            let file = File::create(path)?;
+            advise_sequential_access(&file);
+            Ok::<_, std::io::Error>(BufWriter::new(file))
+        })
+        .transpose()?;
+    let mut heap = BinaryHeap::<Reverse<(Vec<u8>, usize)>>::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(line) = read_canonical_jsonl_line(reader)? {
+            heap.push(Reverse((line, index)));
+        }
+    }
+    while let Some(Reverse((line, index))) = heap.pop() {
+        if let Some(output) = output.as_mut() {
+            output.write_all(&line)?;
+            output.write_all(b"\n")?;
+        }
+        visit(&line)?;
+        if let Some(next) = read_canonical_jsonl_line(&mut readers[index])? {
+            heap.push(Reverse((next, index)));
+        }
+    }
+    for reader in &readers {
+        release_file_cache(reader.get_ref());
+    }
+    if let Some(mut output) = output {
+        output.flush()?;
+        release_file_cache(output.get_ref());
+    }
+    Ok(())
 }
 
 fn read_canonical_jsonl_line(reader: &mut BufReader<File>) -> anyhow::Result<Option<Vec<u8>>> {
@@ -2747,7 +3038,7 @@ fn write_scope_closure_scan<W: Write>(
 
 fn write_relation_payload_json_array<W: Write>(
     writer: &mut W,
-    spool: &JsonlValueSpool,
+    spool: &SortedJsonlRuns,
     payload_index: usize,
 ) -> anyhow::Result<()> {
     writer.write_all(b"[")?;
@@ -4278,10 +4569,29 @@ impl IssuePartitionAccumulator {
         Self {
             temp,
             relation,
-            records: Vec::new(),
-            uncompressed_bytes: 0,
-            first_issue_key: None,
-            last_issue_key: None,
+            max_records: ISSUE_PARTITION_MAX_RECORDS,
+            max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            active: None,
+            entries: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(
+        temp: Arc<TempDir>,
+        relation: &'static str,
+        max_records: u64,
+        max_uncompressed_bytes: u64,
+    ) -> Self {
+        assert!(max_records > 0);
+        assert!(max_uncompressed_bytes > 0);
+        Self {
+            temp,
+            relation,
+            max_records,
+            max_uncompressed_bytes,
+            active: None,
             entries: Vec::new(),
             artifacts: Vec::new(),
         }
@@ -4291,38 +4601,44 @@ impl IssuePartitionAccumulator {
         let mut bytes = canonical_json_bytes(value)?;
         bytes.push(b'\n');
         let record_bytes = u64::try_from(bytes.len())?;
-        if record_bytes > ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES {
+        if record_bytes > self.max_uncompressed_bytes {
             return Err(anyhow::anyhow!(
                 "artifact_limit_exceeded: relation={}, issue_key={}, record_bytes={}, max_partition_bytes={}",
                 self.relation,
                 issue_key,
                 record_bytes,
-                ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES
+                self.max_uncompressed_bytes
             ));
         }
-        let record_limit_reached =
-            u64::try_from(self.records.len())? >= ISSUE_PARTITION_MAX_RECORDS;
-        let byte_limit_reached = !self.records.is_empty()
-            && self.uncompressed_bytes.saturating_add(record_bytes)
-                > ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+        let record_limit_reached = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.record_count >= self.max_records);
+        let byte_limit_reached = self.active.as_ref().is_some_and(|active| {
+            active.uncompressed_bytes.saturating_add(record_bytes) > self.max_uncompressed_bytes
+        });
         if record_limit_reached || byte_limit_reached {
             self.flush()?;
         }
-        self.first_issue_key
-            .get_or_insert_with(|| issue_key.to_owned());
-        self.last_issue_key = Some(issue_key.to_owned());
-        self.uncompressed_bytes = self
+        if self.active.is_none() {
+            self.active = Some(self.open_partition(issue_key)?);
+        }
+        let active = self.active.as_mut().expect("active partition opened");
+        active.encoder.write_all(&bytes)?;
+        active.uncompressed_digest.update(&bytes);
+        active.record_count = active
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("partition record count overflow"))?;
+        active.uncompressed_bytes = active
             .uncompressed_bytes
             .checked_add(record_bytes)
             .ok_or_else(|| anyhow::anyhow!("partition uncompressed byte size overflow"))?;
-        self.records.push(bytes);
+        issue_key.clone_into(&mut active.last_issue_key);
         Ok(())
     }
 
-    fn flush(&mut self) -> anyhow::Result<()> {
-        if self.records.is_empty() {
-            return Ok(());
-        }
+    fn open_partition(&self, issue_key: &str) -> anyhow::Result<ActiveIssuePartition> {
         let index = self.entries.len();
         let relative_path = format!("{}/part-{index:06}.ndjson.zst", self.relation);
         let path = self.temp.path().join(&relative_path);
@@ -4330,30 +4646,44 @@ impl IssuePartitionAccumulator {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("partition path omitted parent"))?;
         fs::create_dir_all(parent)?;
+        let file = File::create(&path)?;
+        advise_sequential_access(&file);
+        let output = BufWriter::new(file);
+        let encoder = zstd::stream::write::Encoder::new(output, 6)?;
+        Ok(ActiveIssuePartition {
+            relative_path,
+            path,
+            encoder,
+            uncompressed_digest: Sha256::new(),
+            record_count: 0,
+            uncompressed_bytes: 0,
+            first_issue_key: issue_key.to_owned(),
+            last_issue_key: issue_key.to_owned(),
+        })
+    }
 
-        let mut uncompressed_digest = Sha256::new();
-        let output = BufWriter::new(File::create(&path)?);
-        let mut encoder = zstd::stream::write::Encoder::new(output, 6)?;
-        for record in &self.records {
-            uncompressed_digest.update(record);
-            encoder.write_all(record)?;
-        }
-        let mut output = encoder.finish()?;
+    fn flush(&mut self) -> anyhow::Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        let index = self.entries.len();
+        let mut output = active.encoder.finish()?;
         output.flush()?;
+        release_file_cache(output.get_ref());
         drop(output);
 
-        let (compressed_byte_size, compressed_sha256) = file_size_and_sha256(&path)?;
+        let (compressed_byte_size, compressed_sha256) = file_size_and_sha256(&active.path)?;
         let entry = IssuePartitionManifestEntry {
             relation: self.relation.to_owned(),
-            path: relative_path.clone(),
+            path: active.relative_path.clone(),
             media_type: "application/x-ndjson+zstd".to_owned(),
-            record_count: u64::try_from(self.records.len())?,
-            uncompressed_byte_size: self.uncompressed_bytes,
-            uncompressed_sha256: hex::encode(uncompressed_digest.finalize()),
+            record_count: active.record_count,
+            uncompressed_byte_size: active.uncompressed_bytes,
+            uncompressed_sha256: hex::encode(active.uncompressed_digest.finalize()),
             compressed_byte_size,
             compressed_sha256: compressed_sha256.clone(),
-            first_issue_key: self.first_issue_key.take().unwrap_or_default(),
-            last_issue_key: self.last_issue_key.take().unwrap_or_default(),
+            first_issue_key: active.first_issue_key,
+            last_issue_key: active.last_issue_key,
         };
         self.artifacts.push(PreparedArtifact {
             descriptor: ArtifactManifestEntry {
@@ -4361,17 +4691,15 @@ impl IssuePartitionAccumulator {
                     "closure_{}_partition_{index:06}",
                     self.relation.replace('-', "_")
                 ),
-                file_name: relative_path,
+                file_name: active.relative_path,
                 content_type: "application/x-ndjson+zstd".to_owned(),
                 byte_size: usize::try_from(compressed_byte_size)?,
                 checksum_sha256: compressed_sha256,
             },
-            path,
+            path: active.path,
             _temp: Arc::clone(&self.temp),
         });
         self.entries.push(entry);
-        self.records.clear();
-        self.uncompressed_bytes = 0;
         Ok(())
     }
 
@@ -4501,6 +4829,14 @@ fn prepare_issue_partition_artifacts(
     let (affected_root_entries, affected_root_artifacts) = affected_root_writer.finish()?;
     entries.extend(affected_root_entries);
     artifacts.extend(affected_root_artifacts);
+    let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
+        total.saturating_add(u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX))
+    });
+    record_scope_closure_resources(
+        "write_issue_partitions_complete",
+        Some(partition_bytes),
+        Some(relations.stats.affected_root_count),
+    );
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     artifacts.sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
 
@@ -5361,7 +5697,7 @@ fn issue_source_sort_key(source: Option<&ExactDatasetIdentity>) -> anyhow::Resul
 }
 
 fn append_issue_merge_records(
-    writer: &mut JsonlValueSpoolWriter,
+    writer: &mut SortedJsonlRunWriter,
     mut issue: ClosureIssue,
 ) -> anyhow::Result<()> {
     let source_key = issue_source_sort_key(issue.source.as_ref())?;
@@ -5441,7 +5777,7 @@ impl CoalescedIssueState {
     fn push_occurrence(
         &mut self,
         occurrence: Option<ClosureIssueOccurrence>,
-        writer: &mut JsonlValueSpoolWriter,
+        writer: &mut SortedJsonlRunWriter,
         stats: &mut IssueRelationStats,
     ) -> anyhow::Result<()> {
         let Some(occurrence) = occurrence else {
@@ -5516,8 +5852,8 @@ fn finalize_coalesced_issue(
     root_ids: &[Option<u32>],
     graph: &CompactReferenceGraph,
     reachability: &mut SourceReachability,
-    issue_writer: &mut JsonlValueSpoolWriter,
-    affected_writer: &mut JsonlValueSpoolWriter,
+    issue_writer: &mut SortedJsonlRunWriter,
+    affected_writer: &mut SortedJsonlRunWriter,
     relation_stats: &mut IssueRelationStats,
 ) -> anyhow::Result<()> {
     load_source_reachability(
@@ -5616,12 +5952,14 @@ fn finalize_coalesced_issue(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_issue_relation_spools(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
 ) -> anyhow::Result<()> {
+    admit_relation_temp_space(scan, events)?;
     normalize_database_issue_severities(&mut scan.issues)?;
-    let mut merge_input = JsonlValueSpoolWriter::new("issue-merge-input.jsonl")?;
+    let mut merge_input = SortedJsonlRunWriter::new("issue-merge-input")?;
     for issue in std::mem::take(&mut scan.issues) {
         append_issue_merge_records(&mut merge_input, issue)?;
     }
@@ -5636,10 +5974,10 @@ fn build_issue_relation_spools(
             tidas_event_issue(&scan.documents, &event)?,
         )
     })?;
-    let sorted_input = sort_jsonl_spool(&merge_input.finish()?)?;
-    let mut issues = JsonlValueSpoolWriter::new("coalesced-issues.jsonl")?;
-    let mut occurrences = JsonlValueSpoolWriter::new("coalesced-occurrences.jsonl")?;
-    let mut affected_roots = JsonlValueSpoolWriter::new("coalesced-affected-roots.jsonl")?;
+    let sorted_input = merge_input.finish()?;
+    let mut issues = SortedJsonlRunWriter::new("coalesced-issues")?;
+    let mut occurrences = SortedJsonlRunWriter::new("coalesced-occurrences")?;
+    let mut affected_roots = SortedJsonlRunWriter::new("coalesced-affected-roots")?;
     let mut stats = IssueRelationStats::default();
     let root_ids = scan
         .roots
@@ -5685,10 +6023,53 @@ fn build_issue_relation_spools(
             &mut stats,
         )?;
     }
+    let issues = issues.finish()?;
+    let occurrences = occurrences.finish()?;
+    let affected_roots = affected_roots.finish()?;
+    if issues.event_count != stats.issue_count
+        || occurrences.event_count != stats.occurrence_count
+        || affected_roots.event_count != stats.affected_root_count
+    {
+        return Err(anyhow::anyhow!(
+            "derived relation run counts diverged: issues={}/{}, occurrences={}/{}, affected_roots={}/{}",
+            issues.event_count,
+            stats.issue_count,
+            occurrences.event_count,
+            stats.occurrence_count,
+            affected_roots.event_count,
+            stats.affected_root_count
+        ));
+    }
+    let relation_bytes = issues
+        .storage_bytes()
+        .saturating_add(occurrences.storage_bytes())
+        .saturating_add(affected_roots.storage_bytes());
+    let logical_relation_bytes = issues
+        .byte_size
+        .saturating_add(occurrences.byte_size)
+        .saturating_add(affected_roots.byte_size);
+    tracing::info!(
+        logical_relation_bytes,
+        relation_run_storage_bytes = relation_bytes,
+        issue_run_count = issues.run_paths.len(),
+        occurrence_run_count = occurrences.run_paths.len(),
+        affected_root_run_count = affected_roots.run_paths.len(),
+        "scope closure derived relation runs completed"
+    );
+    record_scope_closure_resources(
+        "build_issue_relation_runs_complete",
+        Some(relation_bytes),
+        Some(
+            stats
+                .issue_count
+                .saturating_add(stats.occurrence_count)
+                .saturating_add(stats.affected_root_count),
+        ),
+    );
     let relations = IssueRelationSpools {
-        issues: sort_jsonl_spool(&issues.finish()?)?,
-        occurrences: sort_jsonl_spool(&occurrences.finish()?)?,
-        affected_roots: sort_jsonl_spool(&affected_roots.finish()?)?,
+        issues,
+        occurrences,
+        affected_roots,
         stats,
     };
     relations.issues.visit(|record| {
@@ -6693,6 +7074,58 @@ mod tests {
     }
 
     #[test]
+    fn derived_relation_runs_are_deterministic_across_bounded_fan_in() {
+        let values = (0..1_000_u64)
+            .rev()
+            .map(|index| {
+                json!([
+                    format!("{:064x}", index % 97),
+                    format!("{:064x}", index),
+                    {"ordinal": index, "details": "x".repeat(64)}
+                ])
+            })
+            .collect::<Vec<_>>();
+        let collect = || {
+            let mut writer = SortedJsonlRunWriter::with_limits("test-relations", 512, 3).unwrap();
+            for value in &values {
+                writer.append(value).unwrap();
+            }
+            let runs = writer.finish().unwrap();
+            let mut observed = Vec::new();
+            runs.visit(|value| {
+                observed.push(value);
+                Ok(())
+            })
+            .unwrap();
+            (runs, observed)
+        };
+        let (first_runs, first) = collect();
+        let (second_runs, second) = collect();
+        let mut expected = values.clone();
+        sort_by_canonical_value(&mut expected);
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert_eq!(first, second);
+        assert_eq!(first_runs.event_count, 1_000);
+        assert_eq!(first_runs.byte_size, second_runs.byte_size);
+        assert!(first_runs.run_paths.len() <= 3);
+        assert!(second_runs.run_paths.len() <= 3);
+    }
+
+    #[test]
+    fn derived_relation_runs_do_not_inherit_validation_total_caps() {
+        let mut writer = SortedJsonlRunWriter::with_limits("affected-roots", 64, 2).unwrap();
+        writer.byte_size = VALIDATION_ISSUE_SPOOL_MAX_BYTES;
+        writer.event_count = VALIDATION_ISSUE_SPOOL_MAX_EVENTS;
+        writer
+            .append(&json!(["issue", "root", {"complete": true}]))
+            .unwrap();
+        let runs = writer.finish().unwrap();
+        assert!(runs.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES);
+        assert!(runs.event_count > VALIDATION_ISSUE_SPOOL_MAX_EVENTS);
+    }
+
+    #[test]
     fn repeated_validation_occurrences_are_deduplicated_while_streaming() {
         let occurrence = ClosureIssueOccurrence {
             occurrence_key: "same-occurrence".to_owned(),
@@ -6912,6 +7345,102 @@ mod tests {
         }
     }
 
+    struct ProductionCapacityGraph {
+        sources: [ExactDatasetIdentity; 2],
+        roots: Vec<ExactDatasetIdentity>,
+        references: Vec<ResolvedReference>,
+        documents: Vec<ClosureDocument>,
+    }
+
+    fn production_capacity_graph() -> ProductionCapacityGraph {
+        let sources = [
+            ExactDatasetIdentity {
+                category: DatasetCategory::Sources,
+                id: Uuid::from_u128(171_001),
+                version: "01.00.000".to_owned(),
+            },
+            ExactDatasetIdentity {
+                category: DatasetCategory::Sources,
+                id: Uuid::from_u128(171_002),
+                version: "01.00.000".to_owned(),
+            },
+        ];
+        let roots = (0..7_u128)
+            .map(|index| ExactDatasetIdentity {
+                category: DatasetCategory::Processes,
+                id: Uuid::from_u128(171_100 + index),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let intermediates = (0..7_u128)
+            .map(|index| ExactDatasetIdentity {
+                category: DatasetCategory::Processes,
+                id: Uuid::from_u128(171_200 + index),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut references = Vec::new();
+        for (index, (root, intermediate)) in roots.iter().zip(&intermediates).enumerate() {
+            references.push(ResolvedReference {
+                source: root.clone(),
+                target: intermediate.clone(),
+                json_path: "$.processDataSet.exchanges.exchange.referenceToFlowDataSet".to_owned(),
+                reference_role: "process_exchange_flow".to_owned(),
+                requested_version_state: "explicit".to_owned(),
+            });
+            for source in sources
+                .iter()
+                .take(if index == roots.len() - 1 { 1 } else { 2 })
+            {
+                references.push(ResolvedReference {
+                    source: intermediate.clone(),
+                    target: source.clone(),
+                    json_path:
+                        "$.processDataSet.modellingAndValidation.dataSources.referenceToDataSource"
+                            .to_owned(),
+                    reference_role: "support_document".to_owned(),
+                    requested_version_state: "explicit".to_owned(),
+                });
+            }
+        }
+        let documents = roots
+            .iter()
+            .chain(&intermediates)
+            .chain(&sources)
+            .cloned()
+            .map(|identity| ClosureDocument {
+                identity,
+                payload: json!({}),
+            })
+            .collect();
+        ProductionCapacityGraph {
+            sources,
+            roots,
+            references,
+            documents,
+        }
+    }
+
+    fn pad_capacity_event(event: &mut Value, target_jsonl_bytes: usize) {
+        let current = canonical_json_bytes(event).unwrap().len().saturating_add(1);
+        if current >= target_jsonl_bytes {
+            return;
+        }
+        event["issue"]["capacity_padding"] =
+            Value::String("x".repeat(target_jsonl_bytes.saturating_sub(current)));
+        let adjusted = canonical_json_bytes(event).unwrap().len().saturating_add(1);
+        if adjusted < target_jsonl_bytes {
+            let padding = event["issue"]["capacity_padding"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            event["issue"]["capacity_padding"] = Value::String(format!(
+                "{padding}{}",
+                "x".repeat(target_jsonl_bytes - adjusted)
+            ));
+        }
+    }
+
     #[test]
     #[ignore = "local capacity gate: real package or high-unique generated issue merge/report"]
     #[allow(clippy::too_many_lines)]
@@ -6933,18 +7462,69 @@ mod tests {
                 collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap();
                 let issue_spool = std::env::var("SCOPE_CLOSURE_REAL_ISSUE_SPOOL")
                     .expect("real package mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
+                let target_raw_events = std::env::var("SCOPE_CLOSURE_PRODUCTION_RAW_EVENTS")
+                    .ok()
+                    .map_or(0, |value| {
+                        value.parse::<u64>().expect("production raw event target")
+                    });
+                let target_relations = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS")
+                    .ok()
+                    .map_or(0, |value| {
+                        value.parse::<u64>().expect("production relation target")
+                    });
+                let production_graph = (target_raw_events > 0).then(production_capacity_graph);
+                if let Some(graph) = &production_graph {
+                    for document in &graph.documents {
+                        documents.append(document).unwrap();
+                    }
+                    let six_roots = target_raw_events.saturating_mul(6);
+                    assert!(
+                        target_relations >= six_roots
+                            && target_relations <= target_raw_events.saturating_mul(7),
+                        "production relation target must be between six and seven roots per event"
+                    );
+                }
+                let seventh_root_events =
+                    target_relations.saturating_sub(target_raw_events.saturating_mul(6));
+                let mut observed_events = 0_u64;
                 tidas_cli::visit_jsonl(Path::new(&issue_spool), |mut event| {
-                    if let Some(document_key) = package_issue_document_key(&event) {
+                    if target_raw_events > 0 {
+                        if observed_events >= target_raw_events {
+                            return Ok(());
+                        }
+                        let graph = production_graph
+                            .as_ref()
+                            .expect("production graph requested by target");
+                        let source_index = usize::from(observed_events >= seventh_root_events);
+                        event["document_key"] = json!(graph.sources[source_index].document_key());
+                        let base_location = event
+                            .pointer("/issue/location")
+                            .or_else(|| event.pointer("/issue/path"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("$.productionCapacity");
+                        event["issue"]["location"] =
+                            json!(format!("{base_location}#capacity[{observed_events:06}]"));
+                        pad_capacity_event(&mut event, 1_096);
+                        observed_events = observed_events.saturating_add(1);
+                    } else if let Some(document_key) = package_issue_document_key(&event) {
                         event["document_key"] = json!(document_key);
                     }
                     event_writer.append(&event)
                 })
                 .unwrap();
-                (
-                    documents.finish().unwrap(),
-                    Vec::new(),
-                    CompactReferenceGraph::default(),
-                )
+                if target_raw_events > 0 {
+                    assert_eq!(observed_events, target_raw_events);
+                }
+                let (roots, reference_graph) = production_graph.map_or_else(
+                    || (Vec::new(), CompactReferenceGraph::default()),
+                    |graph| {
+                        let reference_graph =
+                            CompactReferenceGraph::from_references(&graph.references, &graph.roots)
+                                .unwrap();
+                        (graph.roots, reference_graph)
+                    },
+                );
+                (documents.finish().unwrap(), roots, reference_graph)
             } else {
                 let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
                     .ok()
@@ -7018,7 +7598,7 @@ mod tests {
         let input_spool_bytes = issue_events.byte_size;
         let input_spool_sha256 = issue_events.sha256.clone();
         let validation = TidasBatchValidation {
-            describe: json!({"asset_fingerprint": "issue-169-capacity"}),
+            describe: json!({"asset_fingerprint": "issue-171-capacity"}),
             final_event: json!({
                 "type": "final",
                 "completed": true,
@@ -7029,7 +7609,11 @@ mod tests {
         let mut scan = capacity_scan(documents, roots, reference_graph);
         let document_count = scan.documents.len();
         build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
-        let closure_check_id = id("16916916-9169-4169-8169-169169169169");
+        let after_relation_runs = ResourceMeasurement::capture(
+            "capacity_after_relation_runs",
+            ResourceCounters::default(),
+        );
+        let closure_check_id = id("17117117-1171-4171-8171-171171171171");
         let input: ScopeClosureWorkerInput =
             serde_json::from_value(scope_closure_worker_input_json()).unwrap();
         let resolution_map =
@@ -7046,6 +7630,7 @@ mod tests {
         let mut recovered_issue_count = 0_u64;
         let mut recovered_occurrence_count = 0_u64;
         let mut recovered_affected_root_count = 0_u64;
+        let mut partition_uncompressed_bytes = 0_u64;
         let mut closure_bundle_bytes = 0_u64;
         let mut closure_bundle_sha256 = String::new();
         let mut closure_issues_sha256 = String::new();
@@ -7080,6 +7665,16 @@ mod tests {
             {
                 partition_bytes = partition_bytes.saturating_add(artifact_bytes);
             }
+            if artifact.descriptor.file_name == "manifest.json" {
+                let manifest: Value =
+                    serde_json::from_slice(&fs::read(&artifact.path).unwrap()).unwrap();
+                partition_uncompressed_bytes = manifest["partitions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|entry| entry["uncompressedByteSize"].as_u64())
+                    .sum();
+            }
             if artifact.descriptor.file_name.ends_with(".ndjson.zst") {
                 let decoded =
                     zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap();
@@ -7107,6 +7702,38 @@ mod tests {
             recovered_affected_root_count,
             relations.stats.affected_root_count
         );
+        if let Ok(target) = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS") {
+            let target = target.parse::<u64>().unwrap();
+            assert_eq!(relations.stats.affected_root_count, target);
+            if target >= 3_191_153 {
+                assert!(
+                    relations.affected_roots.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES,
+                    "production-shaped affected-root relation stream must exceed the legacy 2 GiB cap: {}",
+                    relations.affected_roots.byte_size
+                );
+            }
+        }
+        let after_artifacts = ResourceMeasurement::capture(
+            "capacity_after_artifacts",
+            ResourceCounters {
+                temp_bytes: Some(
+                    relations
+                        .issues
+                        .storage_bytes()
+                        .saturating_add(relations.occurrences.storage_bytes())
+                        .saturating_add(relations.affected_roots.storage_bytes())
+                        .saturating_add(total_artifact_bytes),
+                ),
+                rows: Some(
+                    relations
+                        .stats
+                        .issue_count
+                        .saturating_add(relations.stats.occurrence_count)
+                        .saturating_add(relations.stats.affected_root_count),
+                ),
+                ..ResourceCounters::default()
+            },
+        );
         let summary = json!({
             "schemaVersion": "lcia.scope-closure-capacity-result.v1",
             "documentCount": document_count,
@@ -7126,13 +7753,28 @@ mod tests {
                 "occurrences": relations.occurrences.byte_size,
                 "affectedRoots": relations.affected_roots.byte_size,
             },
+            "relationRunStorageBytes": {
+                "issues": relations.issues.storage_bytes(),
+                "occurrences": relations.occurrences.storage_bytes(),
+                "affectedRoots": relations.affected_roots.storage_bytes(),
+            },
+            "relationRunCounts": {
+                "issues": relations.issues.run_paths.len(),
+                "occurrences": relations.occurrences.run_paths.len(),
+                "affectedRoots": relations.affected_roots.run_paths.len(),
+            },
             "totalArtifactBytes": total_artifact_bytes,
             "partitionAndManifestBytes": partition_bytes,
+            "partitionUncompressedBytes": partition_uncompressed_bytes,
             "closureBundleBytes": closure_bundle_bytes,
             "closureBundleSha256": closure_bundle_sha256,
             "closureIssuesSha256": closure_issues_sha256,
             "xlsxBytes": xlsx_bytes,
             "xlsxSha256": xlsx_sha256,
+            "resourceMeasurements": {
+                "afterRelationRuns": after_relation_runs,
+                "afterArtifacts": after_artifacts,
+            },
             "artifacts": artifact_manifest,
         });
         fs::write(
@@ -7140,6 +7782,134 @@ mod tests {
             canonical_json_bytes(&summary).unwrap(),
         )
         .unwrap();
+        println!("{}", canonical_value(&summary));
+    }
+
+    #[test]
+    #[ignore = "local regression proof: writes the production-shaped sidecar until the legacy 2 GiB cap fails"]
+    fn qualified_legacy_affected_root_spool_reproduces_two_gib_cap() {
+        let graph = production_capacity_graph();
+        let root = &graph.roots[0];
+        let intermediate = graph
+            .documents
+            .iter()
+            .map(|document| &document.identity)
+            .find(|identity| {
+                identity.category == DatasetCategory::Processes && !graph.roots.contains(identity)
+            })
+            .unwrap();
+        let witness = vec![root.clone(), intermediate.clone(), graph.sources[0].clone()];
+        let mut writer =
+            JsonlValueSpoolWriter::new("legacy-coalesced-affected-roots.jsonl").unwrap();
+        let mut failure = None;
+        for index in 0..3_200_000_u64 {
+            let issue_key = format!("{index:064x}");
+            let record = json!([
+                issue_key,
+                canonical_json_sha256(root).unwrap(),
+                affected_root_partition_record(&format!("{index:064x}"), root, &witness)
+            ]);
+            if index == 0 {
+                assert!(
+                    canonical_json_bytes(&record).unwrap().len() + 1 >= 673,
+                    "legacy reproduction record must retain the observed production size"
+                );
+            }
+            if let Err(error) = writer.append(&record) {
+                failure = Some((index + 1, error.to_string()));
+                break;
+            }
+        }
+        let (events, error) = failure.expect("legacy 2 GiB spool cap must fail");
+        assert!(events < 3_200_000);
+        assert!(error.contains("validation issue spool exceeded bounded capacity"));
+        assert!(error.contains("2147483648"));
+    }
+
+    #[test]
+    #[ignore = "local capacity gate: continuous production-sized affected-root partitions"]
+    fn qualified_streaming_affected_root_partition_scale() {
+        let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        assert!([1, 2, 5, 10].contains(&multiplier));
+        let base_relations = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(3_200_000);
+        let relation_count = base_relations.checked_mul(multiplier).unwrap();
+        let partition_mib = std::env::var("SCOPE_CLOSURE_PARTITION_CANDIDATE_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(32);
+        assert!([16, 32, 64].contains(&partition_mib));
+        let partition_bytes = partition_mib.checked_mul(1024 * 1024).unwrap();
+        let graph = production_capacity_graph();
+        let root = &graph.roots[0];
+        let intermediate = graph
+            .documents
+            .iter()
+            .map(|document| &document.identity)
+            .find(|identity| {
+                identity.category == DatasetCategory::Processes && !graph.roots.contains(identity)
+            })
+            .unwrap();
+        let witness = vec![root.clone(), intermediate.clone(), graph.sources[0].clone()];
+        let temp = Arc::new(TempDir::new().unwrap());
+        let mut writer = IssuePartitionAccumulator::with_limits(
+            Arc::clone(&temp),
+            "affected-roots",
+            ISSUE_PARTITION_MAX_RECORDS,
+            partition_bytes,
+        );
+        for index in 0..relation_count {
+            let issue_key = format!("{:064x}", index / 7);
+            let selected_root = &graph.roots[usize::try_from(index % 7).unwrap()];
+            writer
+                .push(
+                    &issue_key,
+                    &affected_root_partition_record(&issue_key, selected_root, &witness),
+                )
+                .unwrap();
+            if index.is_multiple_of(100_000) {
+                enforce_scope_closure_memory_budget("qualified_relation_partition_scale").unwrap();
+            }
+        }
+        let (entries, artifacts) = writer.finish().unwrap();
+        let recovered_records = entries.iter().map(|entry| entry.record_count).sum::<u64>();
+        let uncompressed_bytes = entries
+            .iter()
+            .map(|entry| entry.uncompressed_byte_size)
+            .sum::<u64>();
+        let compressed_bytes = entries
+            .iter()
+            .map(|entry| entry.compressed_byte_size)
+            .sum::<u64>();
+        assert_eq!(recovered_records, relation_count);
+        assert_eq!(entries.len(), artifacts.len());
+        let summary = json!({
+            "schemaVersion": "lcia.scope-closure-relation-scale-result.v1",
+            "multiplier": multiplier,
+            "partitionCandidateMiB": partition_mib,
+            "partitionMaxRecords": ISSUE_PARTITION_MAX_RECORDS,
+            "relationCount": relation_count,
+            "partitionCount": entries.len(),
+            "uncompressedBytes": uncompressed_bytes,
+            "compressedBytes": compressed_bytes,
+            "manifestEntriesSha256": canonical_json_sha256(&entries).unwrap(),
+            "resourceMeasurement": ResourceMeasurement::capture(
+                "qualified_relation_partition_scale_complete",
+                ResourceCounters {
+                    temp_bytes: Some(directory_bytes(temp.path()).unwrap_or(0)),
+                    rows: Some(relation_count),
+                    ..ResourceCounters::default()
+                }
+            ),
+        });
+        if let Ok(output) = std::env::var("SCOPE_CLOSURE_SCALE_OUTPUT") {
+            fs::write(output, canonical_json_bytes(&summary).unwrap()).unwrap();
+        }
         println!("{}", canonical_value(&summary));
     }
 
