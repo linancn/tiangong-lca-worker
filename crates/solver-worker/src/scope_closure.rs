@@ -617,11 +617,18 @@ pub struct ScopeClosureScan {
     pub provider_universe: Vec<ExactDatasetIdentity>,
     #[serde(skip)]
     reference_graph: CompactReferenceGraph,
+    #[serde(skip)]
+    tidas_issue_event_count: u64,
+    #[serde(skip)]
+    issue_relations: Option<IssueRelationSpools>,
 }
 
 impl ScopeClosureScan {
     #[must_use]
     pub fn blocker_codes(&self) -> Vec<String> {
+        if let Some(relations) = &self.issue_relations {
+            return relations.stats.blocker_codes.iter().cloned().collect();
+        }
         self.issues
             .iter()
             .filter(|issue| issue.blocking)
@@ -630,6 +637,40 @@ impl ScopeClosureScan {
             .into_iter()
             .collect()
     }
+
+    fn issue_count(&self) -> u64 {
+        self.issue_relations.as_ref().map_or_else(
+            || u64::try_from(self.issues.len()).unwrap_or(u64::MAX),
+            |relations| relations.stats.issue_count,
+        )
+    }
+
+    fn blocker_count(&self) -> u64 {
+        self.issue_relations.as_ref().map_or_else(
+            || {
+                u64::try_from(self.issues.iter().filter(|issue| issue.blocking).count())
+                    .unwrap_or(u64::MAX)
+            },
+            |relations| relations.stats.blocker_count,
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct IssueRelationStats {
+    issue_count: u64,
+    blocker_count: u64,
+    occurrence_count: u64,
+    affected_root_count: u64,
+    blocker_codes: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct IssueRelationSpools {
+    issues: JsonlValueSpool,
+    occurrences: JsonlValueSpool,
+    affected_roots: JsonlValueSpool,
+    stats: IssueRelationStats,
 }
 
 trait ScopeClosureProvider {
@@ -1273,6 +1314,8 @@ fn finalize_scope_closure_scan(
         frontier: Vec::new(),
         provider_universe: scheduled.into_iter().collect(),
         reference_graph,
+        tidas_issue_event_count: 0,
+        issue_relations: None,
     };
     let metrics = ScopeClosureFinalizeMetrics {
         sort_inputs,
@@ -1455,6 +1498,7 @@ fn reconstruct_witness_path(
     path
 }
 
+#[cfg(test)]
 fn populate_affected_roots(scan: &mut ScopeClosureScan) {
     compute_affected_roots_batch(&mut scan.issues, &scan.roots, &scan.reference_graph);
     scan.issues
@@ -2683,7 +2727,11 @@ fn write_scope_closure_scan<W: Write>(
     writer.write_all(b",\"frontier\":")?;
     write_canonical_array(writer, &scan.frontier)?;
     writer.write_all(b",\"issues\":")?;
-    write_canonical_array(writer, &scan.issues)?;
+    if let Some(relations) = &scan.issue_relations {
+        write_relation_payload_json_array(writer, &relations.issues, 1)?;
+    } else {
+        write_canonical_array(writer, &scan.issues)?;
+    }
     writer.write_all(b",\"omittedVersionResolutions\":")?;
     write_canonical_array(writer, &scan.omitted_version_resolutions)?;
     writer.write_all(b",\"providerUniverse\":")?;
@@ -2694,6 +2742,29 @@ fn write_scope_closure_scan<W: Write>(
     write_canonical_array(writer, &scan.roots)?;
     write_canonical_field(writer, "schemaVersion", &scan.schema_version, true)?;
     writer.write_all(b"}")?;
+    Ok(())
+}
+
+fn write_relation_payload_json_array<W: Write>(
+    writer: &mut W,
+    spool: &JsonlValueSpool,
+    payload_index: usize,
+) -> anyhow::Result<()> {
+    writer.write_all(b"[")?;
+    let mut comma = false;
+    spool.visit(|record| {
+        let payload = record
+            .as_array()
+            .and_then(|fields| fields.get(payload_index))
+            .ok_or_else(|| anyhow::anyhow!("relation spool record omitted payload"))?;
+        if comma {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(&canonical_json_bytes(payload)?)?;
+        comma = true;
+        Ok(())
+    })?;
+    writer.write_all(b"]")?;
     Ok(())
 }
 
@@ -2753,7 +2824,7 @@ fn spooled_json_array_sha256(spool: &JsonlValueSpool) -> anyhow::Result<String> 
 }
 
 fn closure_scan_allows_numerical_snapshot(scan: &ScopeClosureScan) -> bool {
-    scan.complete && scan.blocker_codes().is_empty()
+    scan.complete && scan.tidas_issue_event_count == 0 && scan.blocker_codes().is_empty()
 }
 
 fn scope_process_axis(scope: &RequestedScopeManifest) -> Vec<RequestRootProcess> {
@@ -3309,9 +3380,7 @@ pub async fn execute_scope_closure_job(
 
     let input_for_artifacts = input.clone();
     let prepare_artifacts = tokio::task::spawn_blocking(move || {
-        normalize_database_issue_severities(&mut scan.issues)?;
-        scan.issues
-            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+        build_issue_relation_spools(&mut scan, &validation.issue_events)?;
         let resolution_map =
             build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
         let resolution_map_hash = spooled_json_array_sha256(&resolution_map)?;
@@ -3507,10 +3576,10 @@ pub async fn execute_scope_closure_job(
         "schemaVersion": "lcia.scope-closure-summary.v1",
         "documentCount": scan.documents.len(),
         "referenceCount": scan.edges.len(),
-        "issueCount": scan.issues.len(),
+        "issueCount": scan.issue_count(),
         "issueSampleLimit": ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
-        "issueDetailsTruncated": scan.issues.len() > ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
-        "blockerCount": scan.issues.iter().filter(|issue| issue.blocking).count(),
+        "issueDetailsTruncated": scan.issue_count() > u64::try_from(ISSUE_INLINE_ISSUE_SAMPLE_LIMIT).unwrap_or(u64::MAX),
+        "blockerCount": scan.blocker_count(),
         "evidenceHash": evidence.evidence_hash,
         "snapshotId": evidence.snapshot_id,
         "snapshotHash": evidence.snapshot_hash,
@@ -4334,18 +4403,6 @@ fn issue_partition_record(issue: &ClosureIssue) -> Value {
     })
 }
 
-fn occurrence_partition_record(issue: &ClosureIssue, occurrence: &ClosureIssueOccurrence) -> Value {
-    json!({
-        "schemaVersion": "lcia.scope-closure-issue-occurrence.v1",
-        "issueKey": issue.issue_key,
-        "occurrenceKey": occurrence.occurrence_key,
-        "source": occurrence.source,
-        "jsonPath": occurrence.json_path,
-        "referenceRole": occurrence.reference_role,
-        "details": occurrence.details,
-    })
-}
-
 fn affected_root_partition_record(
     issue_key: &str,
     root: &ExactDatasetIdentity,
@@ -4371,89 +4428,71 @@ fn prepare_issue_partition_artifacts(
     let mut occurrence_writer = IssuePartitionAccumulator::new(Arc::clone(&temp), "occurrences");
     let mut affected_root_writer =
         IssuePartitionAccumulator::new(Arc::clone(&temp), "affected-roots");
-    let root_ids = scan
-        .roots
-        .iter()
-        .filter_map(|root| scan.reference_graph.identity_ids.get(root).copied())
-        .collect::<Vec<_>>();
-
-    let mut occurrence_count = 0_u64;
-    let mut affected_root_count = 0_u64;
-    let mut issues_by_source_id = BTreeMap::<u32, Vec<&ClosureIssue>>::new();
-    let mut issues_without_graph_source = Vec::<&ClosureIssue>::new();
-    for (index, issue) in scan.issues.iter().enumerate() {
-        if index.is_multiple_of(1_024) {
+    let relations = scan
+        .issue_relations
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("issue relation spools were not prepared"))?;
+    let mut observed = 0_u64;
+    relations.issues.visit(|record| {
+        observed = observed.saturating_add(1);
+        if observed.is_multiple_of(1_024) {
             enforce_scope_closure_memory_budget("write_issue_partitions")?;
         }
-        issue_writer.push(&issue.issue_key, &issue_partition_record(issue))?;
-        for occurrence in &issue.occurrences {
-            occurrence_writer.push(
-                &issue.issue_key,
-                &occurrence_partition_record(issue, occurrence),
-            )?;
-            occurrence_count = occurrence_count.saturating_add(1);
-        }
-
-        if let Some(source) = issue.source.as_ref()
-            && let Some(source_id) = scan.reference_graph.identity_ids.get(source).copied()
-        {
-            issues_by_source_id
-                .entry(source_id)
-                .or_default()
-                .push(issue);
-        } else {
-            issues_without_graph_source.push(issue);
-        }
-    }
-
-    for (source_id, source_issues) in issues_by_source_id {
-        visit_single_source_affected_roots(
-            source_id,
-            &root_ids,
-            &scan.reference_graph,
-            |root, witness| {
-                for issue in &source_issues {
-                    affected_root_writer.push(
-                        &issue.issue_key,
-                        &affected_root_partition_record(&issue.issue_key, root, witness),
-                    )?;
-                    affected_root_count = affected_root_count.saturating_add(1);
-                }
-                Ok(())
-            },
+        let fields = record
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("issue relation record must be an array"))?;
+        let issue_key = fields
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("issue relation omitted issue key"))?;
+        let issue: ClosureIssue = serde_json::from_value(
+            fields
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("issue relation omitted payload"))?,
         )?;
-    }
-    for issue in issues_without_graph_source {
-        if issue.source.is_none()
-            && usize::try_from(issue.affected_root_count).unwrap_or(usize::MAX)
-                > issue.affected_roots.len()
-            && usize::try_from(issue.affected_root_count).ok() == Some(scan.roots.len())
-        {
-            for root in &scan.roots {
-                affected_root_writer.push(
-                    &issue.issue_key,
-                    &affected_root_partition_record(
-                        &issue.issue_key,
-                        root,
-                        std::slice::from_ref(root),
-                    ),
-                )?;
-                affected_root_count = affected_root_count.saturating_add(1);
-            }
-            continue;
-        }
-        for (root_index, root) in issue.affected_roots.iter().enumerate() {
-            let witness = issue
-                .affected_root_witness_paths
-                .get(root_index)
-                .unwrap_or(&issue.witness_path);
-            affected_root_writer.push(
-                &issue.issue_key,
-                &affected_root_partition_record(&issue.issue_key, root, witness),
-            )?;
-            affected_root_count = affected_root_count.saturating_add(1);
-        }
-    }
+        issue_writer.push(issue_key, &issue_partition_record(&issue))
+    })?;
+    relations.occurrences.visit(|record| {
+        let fields = record
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("occurrence relation record must be an array"))?;
+        let issue_key = fields
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("occurrence relation omitted issue key"))?;
+        let occurrence: ClosureIssueOccurrence = serde_json::from_value(
+            fields
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("occurrence relation omitted payload"))?,
+        )?;
+        occurrence_writer.push(
+            issue_key,
+            &json!({
+                "schemaVersion": "lcia.scope-closure-issue-occurrence.v1",
+                "issueKey": issue_key,
+                "occurrenceKey": occurrence.occurrence_key,
+                "source": occurrence.source,
+                "jsonPath": occurrence.json_path,
+                "referenceRole": occurrence.reference_role,
+                "details": occurrence.details,
+            }),
+        )
+    })?;
+    relations.affected_roots.visit(|record| {
+        let fields = record
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("affected-root relation record must be an array"))?;
+        let issue_key = fields
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("affected-root relation omitted issue key"))?;
+        let payload = fields
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("affected-root relation omitted payload"))?;
+        affected_root_writer.push(issue_key, payload)
+    })?;
 
     let (mut entries, mut artifacts) = issue_writer.finish()?;
     let (occurrence_entries, occurrence_artifacts) = occurrence_writer.finish()?;
@@ -4472,9 +4511,9 @@ fn prepare_issue_partition_artifacts(
         logical_issue_event_count: validation.issue_events.event_count,
         partition_max_records: ISSUE_PARTITION_MAX_RECORDS,
         partition_max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
-        issue_count: u64::try_from(scan.issues.len())?,
-        occurrence_count,
-        affected_root_count,
+        issue_count: relations.stats.issue_count,
+        occurrence_count: relations.stats.occurrence_count,
+        affected_root_count: relations.stats.affected_root_count,
         rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
         rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
         rpc_affected_root_sample_limit_per_issue: ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT,
@@ -4508,9 +4547,9 @@ fn prepare_closure_content_artifacts(
         sha256: bundle_sha256,
     } = closure_bundle;
     let issues_path = temp.path().join("closure-issues-v1.jsonl");
-    write_issue_jsonl_file(&issues_path, &scan.issues)?;
+    write_issue_jsonl_file(&issues_path, scan)?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
-    build_xlsx_report_file(&xlsx_path, closure_check_id, &scan.issues)?;
+    build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
 
     let mut artifacts = vec![
         PreparedArtifact {
@@ -4747,11 +4786,23 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
     Ok(row.try_get("manifest_hash")?)
 }
 
-fn write_issue_jsonl_file(path: &Path, issues: &[ClosureIssue]) -> anyhow::Result<()> {
+fn write_issue_jsonl_file(path: &Path, scan: &ScopeClosureScan) -> anyhow::Result<()> {
     let mut output = BufWriter::new(File::create(path)?);
-    for issue in issues {
-        output.write_all(&canonical_json_bytes(issue)?)?;
-        output.write_all(b"\n")?;
+    if let Some(relations) = &scan.issue_relations {
+        relations.issues.visit(|record| {
+            let issue = record
+                .as_array()
+                .and_then(|fields| fields.get(1))
+                .ok_or_else(|| anyhow::anyhow!("issue relation omitted payload"))?;
+            output.write_all(&canonical_json_bytes(issue)?)?;
+            output.write_all(b"\n")?;
+            Ok(())
+        })?;
+    } else {
+        for issue in &scan.issues {
+            output.write_all(&canonical_json_bytes(issue)?)?;
+            output.write_all(b"\n")?;
+        }
     }
     output.flush()?;
     Ok(())
@@ -5240,78 +5291,418 @@ fn merge_tidas_validation_issues(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
 ) -> anyhow::Result<()> {
-    let mut issues = BTreeMap::<String, ClosureIssue>::new();
+    scan.tidas_issue_event_count = events.event_count;
+    enforce_scope_closure_memory_budget("stage_tidas_validation_issue_spool")?;
+    Ok(())
+}
+
+fn tidas_event_issue(
+    documents: &ClosureDocumentSpool,
+    event: &Value,
+) -> anyhow::Result<ClosureIssue> {
+    let document_key = event
+        .get("document_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source = find_document_identity(documents, document_key);
+    let details = event.get("issue").cloned().unwrap_or_else(|| json!({}));
+    let issue_code = details
+        .get("issue_code")
+        .or_else(|| details.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("tidas_document_invalid");
+    let location = details
+        .get("location")
+        .or_else(|| details.get("path"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let issue_key = canonical_json_sha256(&json!({
+        "code": issue_code,
+        "source": source,
+        "path": location,
+        "message": details.get("message"),
+    }))?;
+    Ok(ClosureIssue {
+        issue_key: issue_key.clone(),
+        severity: "blocker".to_owned(),
+        blocking: true,
+        issue_code: format!("tidas_{issue_code}"),
+        source: source.clone(),
+        json_path: location.clone(),
+        reference_role: None,
+        requested_target_type: None,
+        requested_target_id: None,
+        requested_target_version: None,
+        message: details
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("TIDAS document validation failed")
+            .to_owned(),
+        suggested_action: Some(
+            "Repair the schema-invalid document and rerun closure preflight.".to_owned(),
+        ),
+        occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source,
+            json_path: location,
+            reference_role: None,
+            details,
+        }],
+        affected_root_count: 0,
+        affected_roots: Vec::new(),
+        affected_root_witness_paths: Vec::new(),
+        witness_path: Vec::new(),
+    })
+}
+
+fn issue_source_sort_key(source: Option<&ExactDatasetIdentity>) -> anyhow::Result<String> {
+    source.map_or_else(|| Ok(String::new()), canonical_json_sha256)
+}
+
+fn append_issue_merge_records(
+    writer: &mut JsonlValueSpoolWriter,
+    mut issue: ClosureIssue,
+) -> anyhow::Result<()> {
+    let source_key = issue_source_sort_key(issue.source.as_ref())?;
+    let occurrences = std::mem::take(&mut issue.occurrences);
+    issue.occurrence_count = 0;
+    if occurrences.is_empty() {
+        writer.append(&json!([
+            source_key,
+            issue.issue_key,
+            "",
+            issue,
+            Value::Null
+        ]))?;
+        return Ok(());
+    }
+    for occurrence in occurrences {
+        writer.append(&json!([
+            source_key,
+            issue.issue_key,
+            occurrence.occurrence_key,
+            issue,
+            occurrence
+        ]))?;
+    }
+    Ok(())
+}
+
+fn issue_merge_record(
+    value: &Value,
+) -> anyhow::Result<(String, ClosureIssue, Option<ClosureIssueOccurrence>)> {
+    let mut fields = value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("issue merge record must be an array"))?;
+    if fields.len() != 5 {
+        return Err(anyhow::anyhow!(
+            "issue merge record field count mismatch: {}",
+            fields.len()
+        ));
+    }
+    let occurrence = if fields[4].is_null() {
+        None
+    } else {
+        Some(serde_json::from_value(
+            fields.pop().expect("field count checked"),
+        )?)
+    };
+    if occurrence.is_none() {
+        fields.pop();
+    }
+    let issue = serde_json::from_value(fields.pop().expect("field count checked"))?;
+    let source_key = fields
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("issue merge record source key must be text"))?
+        .to_owned();
+    Ok((source_key, issue, occurrence))
+}
+
+struct CoalescedIssueState {
+    source_key: String,
+    issue: ClosureIssue,
+    last_occurrence_key: Option<String>,
+}
+
+impl CoalescedIssueState {
+    fn new(source_key: String, mut issue: ClosureIssue) -> Self {
+        issue.occurrence_count = 0;
+        issue.occurrences.clear();
+        Self {
+            source_key,
+            issue,
+            last_occurrence_key: None,
+        }
+    }
+
+    fn push_occurrence(
+        &mut self,
+        occurrence: Option<ClosureIssueOccurrence>,
+        writer: &mut JsonlValueSpoolWriter,
+        stats: &mut IssueRelationStats,
+    ) -> anyhow::Result<()> {
+        let Some(occurrence) = occurrence else {
+            return Ok(());
+        };
+        if self.last_occurrence_key.as_deref() == Some(occurrence.occurrence_key.as_str()) {
+            return Ok(());
+        }
+        self.last_occurrence_key = Some(occurrence.occurrence_key.clone());
+        self.issue.occurrence_count = self.issue.occurrence_count.saturating_add(1);
+        stats.occurrence_count = stats.occurrence_count.saturating_add(1);
+        writer.append(&json!([
+            self.issue.issue_key,
+            occurrence.occurrence_key,
+            occurrence
+        ]))?;
+        if self.issue.occurrences.len() < ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT {
+            self.issue.occurrences.push(occurrence);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SourceReachability {
+    source_key: String,
+    visited: Vec<bool>,
+    parent: Vec<Option<u32>>,
+}
+
+fn load_source_reachability(
+    cache: &mut SourceReachability,
+    source_key: &str,
+    source: Option<&ExactDatasetIdentity>,
+    graph: &CompactReferenceGraph,
+) {
+    if cache.source_key == source_key {
+        return;
+    }
+    source_key.clone_into(&mut cache.source_key);
+    cache.visited.clear();
+    cache.parent.clear();
+    let Some(source_id) = source.and_then(|source| graph.identity_ids.get(source).copied()) else {
+        return;
+    };
+    cache.visited.resize(graph.identities.len(), false);
+    cache.parent.resize(graph.identities.len(), None);
+    let source_index = usize::try_from(source_id).expect("u32 identity index fits usize");
+    cache.visited[source_index] = true;
+    let mut queue = VecDeque::from([source_id]);
+    while let Some(node) = queue.pop_front() {
+        if let Some(predecessors) = graph
+            .reverse
+            .get(usize::try_from(node).expect("u32 identity index fits usize"))
+        {
+            for &predecessor in predecessors {
+                let index = usize::try_from(predecessor).expect("u32 identity index fits usize");
+                if !cache.visited[index] {
+                    cache.visited[index] = true;
+                    cache.parent[index] = Some(node);
+                    queue.push_back(predecessor);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_coalesced_issue(
+    mut pending: CoalescedIssueState,
+    roots: &[ExactDatasetIdentity],
+    root_ids: &[Option<u32>],
+    graph: &CompactReferenceGraph,
+    reachability: &mut SourceReachability,
+    issue_writer: &mut JsonlValueSpoolWriter,
+    affected_writer: &mut JsonlValueSpoolWriter,
+    relation_stats: &mut IssueRelationStats,
+) -> anyhow::Result<()> {
+    load_source_reachability(
+        reachability,
+        &pending.source_key,
+        pending.issue.source.as_ref(),
+        graph,
+    );
+    if !reachability.visited.is_empty() {
+        pending.issue.affected_root_count = 0;
+        pending.issue.affected_roots.clear();
+        pending.issue.affected_root_witness_paths.clear();
+        pending.issue.witness_path.clear();
+        for (&root_id, root) in root_ids.iter().zip(roots) {
+            let Some(root_id) = root_id else {
+                continue;
+            };
+            let root_index = usize::try_from(root_id).expect("u32 identity index fits usize");
+            if !reachability.visited[root_index] {
+                continue;
+            }
+            let witness =
+                reconstruct_witness_path(root_id, &reachability.parent, &graph.identities);
+            pending.issue.affected_root_count = pending.issue.affected_root_count.saturating_add(1);
+            relation_stats.affected_root_count =
+                relation_stats.affected_root_count.saturating_add(1);
+            affected_writer.append(&json!([
+                pending.issue.issue_key,
+                canonical_json_sha256(root)?,
+                affected_root_partition_record(&pending.issue.issue_key, root, &witness)
+            ]))?;
+            if pending.issue.affected_roots.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT {
+                pending.issue.affected_roots.push(root.clone());
+                pending
+                    .issue
+                    .affected_root_witness_paths
+                    .push(witness.clone());
+                if pending.issue.witness_path.is_empty() {
+                    pending.issue.witness_path = witness;
+                }
+            }
+        }
+    } else if pending.issue.source.is_none()
+        && usize::try_from(pending.issue.affected_root_count).ok() == Some(roots.len())
+    {
+        pending.issue.affected_roots.clear();
+        pending.issue.affected_root_witness_paths.clear();
+        for root in roots {
+            relation_stats.affected_root_count =
+                relation_stats.affected_root_count.saturating_add(1);
+            affected_writer.append(&json!([
+                pending.issue.issue_key,
+                canonical_json_sha256(root)?,
+                affected_root_partition_record(
+                    &pending.issue.issue_key,
+                    root,
+                    std::slice::from_ref(root)
+                )
+            ]))?;
+            if pending.issue.affected_roots.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT {
+                pending.issue.affected_roots.push(root.clone());
+                pending
+                    .issue
+                    .affected_root_witness_paths
+                    .push(vec![root.clone()]);
+            }
+        }
+    } else {
+        for (index, root) in pending.issue.affected_roots.iter().enumerate() {
+            let witness = pending
+                .issue
+                .affected_root_witness_paths
+                .get(index)
+                .unwrap_or(&pending.issue.witness_path);
+            relation_stats.affected_root_count =
+                relation_stats.affected_root_count.saturating_add(1);
+            affected_writer.append(&json!([
+                pending.issue.issue_key,
+                canonical_json_sha256(root)?,
+                affected_root_partition_record(&pending.issue.issue_key, root, witness)
+            ]))?;
+        }
+    }
+
+    relation_stats.issue_count = relation_stats.issue_count.saturating_add(1);
+    if pending.issue.blocking {
+        relation_stats.blocker_count = relation_stats.blocker_count.saturating_add(1);
+        relation_stats
+            .blocker_codes
+            .insert(pending.issue.issue_code.clone());
+    }
+    issue_writer.append(&json!([
+        pending.issue.issue_key,
+        serde_json::to_value(pending.issue)?
+    ]))?;
+    Ok(())
+}
+
+fn build_issue_relation_spools(
+    scan: &mut ScopeClosureScan,
+    events: &JsonlValueSpool,
+) -> anyhow::Result<()> {
+    normalize_database_issue_severities(&mut scan.issues)?;
+    let mut merge_input = JsonlValueSpoolWriter::new("issue-merge-input.jsonl")?;
     for issue in std::mem::take(&mut scan.issues) {
-        coalesce_issue_into(&mut issues, issue);
+        append_issue_merge_records(&mut merge_input, issue)?;
     }
     let mut event_count = 0_u64;
     events.visit(|event| {
         event_count = event_count.saturating_add(1);
         if event_count.is_multiple_of(4_096) {
-            enforce_scope_closure_memory_budget("merge_tidas_validation_issues")?;
+            enforce_scope_closure_memory_budget("prepare_issue_merge_runs")?;
         }
-        let document_key = event
-            .get("document_key")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let source = find_document_identity(&scan.documents, document_key);
-        let issue = event.get("issue").cloned().unwrap_or_else(|| json!({}));
-        let issue_code = issue
-            .get("issue_code")
-            .or_else(|| issue.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("tidas_document_invalid");
-        let location = issue
-            .get("location")
-            .or_else(|| issue.get("path"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let issue_key = canonical_json_sha256(&json!({
-            "code": issue_code,
-            "source": source,
-            "path": location,
-            "message": issue.get("message"),
-        }))
-        .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
-        coalesce_issue_into(
+        append_issue_merge_records(
+            &mut merge_input,
+            tidas_event_issue(&scan.documents, &event)?,
+        )
+    })?;
+    let sorted_input = sort_jsonl_spool(&merge_input.finish()?)?;
+    let mut issues = JsonlValueSpoolWriter::new("coalesced-issues.jsonl")?;
+    let mut occurrences = JsonlValueSpoolWriter::new("coalesced-occurrences.jsonl")?;
+    let mut affected_roots = JsonlValueSpoolWriter::new("coalesced-affected-roots.jsonl")?;
+    let mut stats = IssueRelationStats::default();
+    let root_ids = scan
+        .roots
+        .iter()
+        .map(|root| scan.reference_graph.identity_ids.get(root).copied())
+        .collect::<Vec<_>>();
+    let mut reachability = SourceReachability::default();
+    let mut current = None::<CoalescedIssueState>;
+    let mut observed = 0_u64;
+    sorted_input.visit(|record| {
+        observed = observed.saturating_add(1);
+        if observed.is_multiple_of(4_096) {
+            enforce_scope_closure_memory_budget("coalesce_sorted_issue_runs")?;
+        }
+        let (source_key, issue, occurrence) = issue_merge_record(&record)?;
+        let starts_new_issue = current
+            .as_ref()
+            .is_some_and(|state| state.issue.issue_key != issue.issue_key);
+        if starts_new_issue {
+            finalize_coalesced_issue(
+                current.take().expect("current issue exists"),
+                &scan.roots,
+                &root_ids,
+                &scan.reference_graph,
+                &mut reachability,
+                &mut issues,
+                &mut affected_roots,
+                &mut stats,
+            )?;
+        }
+        let pending = current.get_or_insert_with(|| CoalescedIssueState::new(source_key, issue));
+        pending.push_occurrence(occurrence, &mut occurrences, &mut stats)
+    })?;
+    if let Some(state) = current {
+        finalize_coalesced_issue(
+            state,
+            &scan.roots,
+            &root_ids,
+            &scan.reference_graph,
+            &mut reachability,
             &mut issues,
-            ClosureIssue {
-                issue_key: issue_key.clone(),
-                severity: "blocker".to_owned(),
-                blocking: true,
-                issue_code: format!("tidas_{issue_code}"),
-                source: source.clone(),
-                json_path: location.clone(),
-                reference_role: None,
-                requested_target_type: None,
-                requested_target_id: None,
-                requested_target_version: None,
-                message: issue
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("TIDAS document validation failed")
-                    .to_owned(),
-                suggested_action: Some(
-                    "Repair the schema-invalid document and rerun closure preflight.".to_owned(),
-                ),
-                occurrence_count: 1,
-                occurrences: vec![ClosureIssueOccurrence {
-                    occurrence_key: format!("{issue_key}:0"),
-                    source: source.clone(),
-                    json_path: location.clone(),
-                    reference_role: None,
-                    details: issue,
-                }],
-                affected_root_count: 0,
-                affected_roots: Vec::new(),
-                affected_root_witness_paths: Vec::new(),
-                witness_path: Vec::new(),
-            },
-        );
+            &mut affected_roots,
+            &mut stats,
+        )?;
+    }
+    let relations = IssueRelationSpools {
+        issues: sort_jsonl_spool(&issues.finish()?)?,
+        occurrences: sort_jsonl_spool(&occurrences.finish()?)?,
+        affected_roots: sort_jsonl_spool(&affected_roots.finish()?)?,
+        stats,
+    };
+    relations.issues.visit(|record| {
+        if scan.issues.len() < ISSUE_INLINE_ISSUE_SAMPLE_LIMIT {
+            let issue = record
+                .as_array()
+                .and_then(|fields| fields.get(1))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("coalesced issue record omitted payload"))?;
+            scan.issues.push(serde_json::from_value(issue)?);
+        }
         Ok(())
     })?;
-    scan.issues = finish_coalesced_issues(issues);
-    populate_affected_roots(scan);
+    scan.issue_relations = Some(relations);
     enforce_scope_closure_memory_budget("merge_tidas_validation_issues_complete")?;
     Ok(())
 }
@@ -5340,7 +5731,7 @@ fn find_document_identity(
 #[cfg(test)]
 fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(Vec::new());
-    Ok(write_xlsx_report(cursor, closure_check_id, issues)?.into_inner())
+    Ok(write_xlsx_report(cursor, closure_check_id, issues, None)?.into_inner())
 }
 
 fn build_xlsx_report_file(
@@ -5348,7 +5739,20 @@ fn build_xlsx_report_file(
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
 ) -> anyhow::Result<()> {
-    write_xlsx_report(File::create(path)?, closure_check_id, issues)?;
+    write_xlsx_report(File::create(path)?, closure_check_id, issues, None)?;
+    Ok(())
+}
+
+fn build_scan_xlsx_report_file(
+    path: &Path,
+    closure_check_id: Uuid,
+    scan: &ScopeClosureScan,
+) -> anyhow::Result<()> {
+    let stats = scan
+        .issue_relations
+        .as_ref()
+        .map(|relations| &relations.stats);
+    write_xlsx_report(File::create(path)?, closure_check_id, &scan.issues, stats)?;
     Ok(())
 }
 
@@ -5357,21 +5761,39 @@ fn write_xlsx_report<W: Write + Seek>(
     mut writer: W,
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
+    stats: Option<&IssueRelationStats>,
 ) -> anyhow::Result<W> {
-    let blocker_count = issues.iter().filter(|issue| issue.blocking).count();
-    let warning_count = issues.len().saturating_sub(blocker_count);
-    let occurrence_count = issues
-        .iter()
-        .map(|issue| u64::from(issue.occurrence_count))
-        .sum::<u64>();
-    let affected_root_count = issues
-        .iter()
-        .map(|issue| u64::from(issue.affected_root_count))
-        .sum::<u64>();
+    let issue_count = stats.map_or_else(
+        || u64::try_from(issues.len()).unwrap_or(u64::MAX),
+        |stats| stats.issue_count,
+    );
+    let blocker_count = stats.map_or_else(
+        || u64::try_from(issues.iter().filter(|issue| issue.blocking).count()).unwrap_or(u64::MAX),
+        |stats| stats.blocker_count,
+    );
+    let warning_count = issue_count.saturating_sub(blocker_count);
+    let occurrence_count = stats.map_or_else(
+        || {
+            issues
+                .iter()
+                .map(|issue| u64::from(issue.occurrence_count))
+                .sum::<u64>()
+        },
+        |stats| stats.occurrence_count,
+    );
+    let affected_root_count = stats.map_or_else(
+        || {
+            issues
+                .iter()
+                .map(|issue| u64::from(issue.affected_root_count))
+                .sum::<u64>()
+        },
+        |stats| stats.affected_root_count,
+    );
     let summary_rows = vec![
         vec!["Metric".to_owned(), "Value".to_owned()],
         vec!["Closure check ID".to_owned(), closure_check_id.to_string()],
-        vec!["Issue count".to_owned(), issues.len().to_string()],
+        vec!["Issue count".to_owned(), issue_count.to_string()],
         vec!["Blocker count".to_owned(), blocker_count.to_string()],
         vec!["Warning count".to_owned(), warning_count.to_string()],
         vec!["Occurrence count".to_owned(), occurrence_count.to_string()],
@@ -6417,6 +6839,310 @@ mod tests {
         );
     }
 
+    fn collect_real_package_documents(
+        directory: &Path,
+        writer: &mut ClosureDocumentSpoolWriter,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                collect_real_package_documents(&path, writer)?;
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                continue;
+            }
+            let category = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| anyhow::anyhow!("package document omitted category"))?;
+            let Some((id, version)) = path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.rsplit_once('_'))
+            else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(id) else {
+                continue;
+            };
+            writer.append(&ClosureDocument {
+                identity: ExactDatasetIdentity {
+                    category: parse_category(category)?,
+                    id,
+                    version: version.to_owned(),
+                },
+                payload: json!({}),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn package_issue_document_key(event: &Value) -> Option<String> {
+        let issue = event.get("issue")?;
+        let category = issue.get("category")?.as_str()?;
+        let file_stem = Path::new(issue.get("file_path")?.as_str()?)
+            .file_stem()?
+            .to_str()?;
+        let (id, version) = file_stem.rsplit_once('_')?;
+        Some(format!("{category}:{id}:{version}"))
+    }
+
+    fn capacity_scan(
+        documents: ClosureDocumentSpool,
+        roots: Vec<ExactDatasetIdentity>,
+        reference_graph: CompactReferenceGraph,
+    ) -> ScopeClosureScan {
+        ScopeClosureScan {
+            schema_version: "lcia.scope-closure-scan.v1".to_owned(),
+            complete: true,
+            roots,
+            documents,
+            edges: JsonlValueSpool::empty("capacity-edges.jsonl").unwrap(),
+            resolved_references: JsonlValueSpool::empty("capacity-resolved.jsonl").unwrap(),
+            omitted_version_resolutions: Vec::new(),
+            issues: Vec::new(),
+            frontier: Vec::new(),
+            provider_universe: Vec::new(),
+            reference_graph,
+            tidas_issue_event_count: 0,
+            issue_relations: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "local capacity gate: real package or high-unique generated issue merge/report"]
+    #[allow(clippy::too_many_lines)]
+    fn qualified_streaming_issue_merge_report_capacity() {
+        let output_dir = PathBuf::from(
+            std::env::var("SCOPE_CLOSURE_CAPACITY_OUTPUT").unwrap_or_else(|_| {
+                TempDir::new()
+                    .expect("capacity output temp")
+                    .keep()
+                    .display()
+                    .to_string()
+            }),
+        );
+        fs::create_dir_all(&output_dir).unwrap();
+        let mut event_writer = JsonlValueSpoolWriter::new("capacity-issue-events.jsonl").unwrap();
+        let (documents, roots, reference_graph) =
+            if let Ok(package_dir) = std::env::var("SCOPE_CLOSURE_REAL_PACKAGE_DIR") {
+                let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+                collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap();
+                let issue_spool = std::env::var("SCOPE_CLOSURE_REAL_ISSUE_SPOOL")
+                    .expect("real package mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
+                tidas_cli::visit_jsonl(Path::new(&issue_spool), |mut event| {
+                    if let Some(document_key) = package_issue_document_key(&event) {
+                        event["document_key"] = json!(document_key);
+                    }
+                    event_writer.append(&event)
+                })
+                .unwrap();
+                (
+                    documents.finish().unwrap(),
+                    Vec::new(),
+                    CompactReferenceGraph::default(),
+                )
+            } else {
+                let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let base_events = std::env::var("SCOPE_CLOSURE_SCALE_BASE_EVENTS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(50_000);
+                let event_count = base_events.checked_mul(multiplier).unwrap();
+                let details = "x".repeat(480);
+                let sources = (0..64_u128)
+                    .map(|index| ExactDatasetIdentity {
+                        category: DatasetCategory::Sources,
+                        id: Uuid::from_u128(10_000 + index),
+                        version: "01.00.000".to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                let roots = (0..4_u128)
+                    .map(|index| ExactDatasetIdentity {
+                        category: DatasetCategory::Processes,
+                        id: Uuid::from_u128(20_000 + index),
+                        version: "01.00.000".to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                let references = roots
+                    .iter()
+                    .flat_map(|root| {
+                        sources.iter().map(move |source| ResolvedReference {
+                            source: root.clone(),
+                            target: source.clone(),
+                            json_path: "$.generated".to_owned(),
+                            reference_role: "generated_capacity".to_owned(),
+                            requested_version_state: "explicit".to_owned(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let reference_graph =
+                    CompactReferenceGraph::from_references(&references, &roots).unwrap();
+                let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+                for identity in roots.iter().chain(&sources) {
+                    documents
+                        .append(&ClosureDocument {
+                            identity: identity.clone(),
+                            payload: json!({}),
+                        })
+                        .unwrap();
+                }
+                for index in 0..event_count {
+                    let source = &sources[usize::try_from(index).unwrap() % sources.len()];
+                    event_writer
+                    .append(&json!({
+                        "type": "issue",
+                        "document_key": source.document_key(),
+                        "issue": {
+                            "issue_code": "generated_high_unique",
+                            "location": format!("$.generated[{index}]"),
+                            "message": format!("generated high-unique issue {index}: {details}"),
+                            "context": {
+                                "distribution": "high-unique-key",
+                                "ordinal": index,
+                            },
+                        },
+                    }))
+                    .unwrap();
+                }
+                (documents.finish().unwrap(), roots, reference_graph)
+            };
+        let issue_events = event_writer.finish().unwrap();
+        let input_event_count = issue_events.event_count;
+        let input_spool_bytes = issue_events.byte_size;
+        let input_spool_sha256 = issue_events.sha256.clone();
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "issue-169-capacity"}),
+            final_event: json!({
+                "type": "final",
+                "completed": true,
+                "summary": {"issue_count": input_event_count},
+            }),
+            issue_events,
+        };
+        let mut scan = capacity_scan(documents, roots, reference_graph);
+        let document_count = scan.documents.len();
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("16916916-9169-4169-8169-169169169169");
+        let input: ScopeClosureWorkerInput =
+            serde_json::from_value(scope_closure_worker_input_json()).unwrap();
+        let resolution_map =
+            build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions).unwrap();
+        let closure_bundle =
+            build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
+        let artifacts =
+            prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan, &validation)
+                .unwrap();
+        let relations = scan.issue_relations.as_ref().unwrap();
+        let mut partition_bytes = 0_u64;
+        let mut total_artifact_bytes = 0_u64;
+        let mut artifact_manifest = Vec::new();
+        let mut recovered_issue_count = 0_u64;
+        let mut recovered_occurrence_count = 0_u64;
+        let mut recovered_affected_root_count = 0_u64;
+        let mut closure_bundle_bytes = 0_u64;
+        let mut closure_bundle_sha256 = String::new();
+        let mut closure_issues_sha256 = String::new();
+        let mut xlsx_bytes = 0_u64;
+        let mut xlsx_sha256 = String::new();
+        for artifact in &artifacts {
+            let destination = output_dir.join(&artifact.descriptor.file_name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(&artifact.path, &destination).unwrap();
+            let artifact_bytes = u64::try_from(artifact.descriptor.byte_size).unwrap();
+            total_artifact_bytes = total_artifact_bytes.saturating_add(artifact_bytes);
+            if artifact.descriptor.file_name == "closure-bundle-v1.json" {
+                closure_bundle_bytes = artifact_bytes;
+                artifact
+                    .descriptor
+                    .checksum_sha256
+                    .clone_into(&mut closure_bundle_sha256);
+            } else if artifact.descriptor.file_name == "closure-issues-v1.jsonl" {
+                artifact
+                    .descriptor
+                    .checksum_sha256
+                    .clone_into(&mut closure_issues_sha256);
+            } else if artifact.descriptor.file_name == "closure-report-v1.xlsx" {
+                xlsx_bytes = artifact_bytes;
+                artifact
+                    .descriptor
+                    .checksum_sha256
+                    .clone_into(&mut xlsx_sha256);
+            }
+            if artifact.descriptor.file_name == "manifest.json"
+                || artifact.descriptor.file_name.ends_with(".ndjson.zst")
+            {
+                partition_bytes = partition_bytes.saturating_add(artifact_bytes);
+            }
+            if artifact.descriptor.file_name.ends_with(".ndjson.zst") {
+                let decoded =
+                    zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap();
+                let records = u64::try_from(
+                    decoded
+                        .split(|byte| *byte == b'\n')
+                        .count()
+                        .saturating_sub(1),
+                )
+                .unwrap();
+                if artifact.descriptor.file_name.starts_with("issues/") {
+                    recovered_issue_count = recovered_issue_count.saturating_add(records);
+                } else if artifact.descriptor.file_name.starts_with("occurrences/") {
+                    recovered_occurrence_count = recovered_occurrence_count.saturating_add(records);
+                } else if artifact.descriptor.file_name.starts_with("affected-roots/") {
+                    recovered_affected_root_count =
+                        recovered_affected_root_count.saturating_add(records);
+                }
+            }
+            artifact_manifest.push(artifact.descriptor.clone());
+        }
+        assert_eq!(recovered_issue_count, relations.stats.issue_count);
+        assert_eq!(recovered_occurrence_count, relations.stats.occurrence_count);
+        assert_eq!(
+            recovered_affected_root_count,
+            relations.stats.affected_root_count
+        );
+        let summary = json!({
+            "schemaVersion": "lcia.scope-closure-capacity-result.v1",
+            "documentCount": document_count,
+            "inputEventCount": input_event_count,
+            "inputSpoolBytes": input_spool_bytes,
+            "inputSpoolSha256": input_spool_sha256,
+            "issueCount": relations.stats.issue_count,
+            "occurrenceCount": relations.stats.occurrence_count,
+            "affectedRootCount": relations.stats.affected_root_count,
+            "recoveredRelationCounts": {
+                "issues": recovered_issue_count,
+                "occurrences": recovered_occurrence_count,
+                "affectedRoots": recovered_affected_root_count,
+            },
+            "relationSpoolBytes": {
+                "issues": relations.issues.byte_size,
+                "occurrences": relations.occurrences.byte_size,
+                "affectedRoots": relations.affected_roots.byte_size,
+            },
+            "totalArtifactBytes": total_artifact_bytes,
+            "partitionAndManifestBytes": partition_bytes,
+            "closureBundleBytes": closure_bundle_bytes,
+            "closureBundleSha256": closure_bundle_sha256,
+            "closureIssuesSha256": closure_issues_sha256,
+            "xlsxBytes": xlsx_bytes,
+            "xlsxSha256": xlsx_sha256,
+            "artifacts": artifact_manifest,
+        });
+        fs::write(
+            output_dir.join("capacity-result.json"),
+            canonical_json_bytes(&summary).unwrap(),
+        )
+        .unwrap();
+        println!("{}", canonical_value(&summary));
+    }
+
     #[test]
     #[ignore = "requires a real Rust tidas binary selected by TIDAS_BIN"]
     fn release_tidas_non_empty_issue_stream_closes_raw_bytes() {
@@ -6464,6 +7190,8 @@ mod tests {
             frontier: Vec::new(),
             provider_universe: Vec::new(),
             reference_graph: CompactReferenceGraph::default(),
+            tidas_issue_event_count: 0,
+            issue_relations: None,
         };
         let expected = json!({
             "schemaVersion": "lcia.scope-closure-bundle.v1",
@@ -6720,7 +7448,7 @@ mod tests {
             DatasetCategory::Processes,
             "91919191-9191-9191-9191-919191919191",
         );
-        let scan = ScopeClosureScan {
+        let mut scan = ScopeClosureScan {
             schema_version: "lcia.scope-closure-scan.v1".to_owned(),
             complete: true,
             roots: vec![missing.clone()],
@@ -6732,6 +7460,8 @@ mod tests {
             frontier: Vec::new(),
             provider_universe: Vec::new(),
             reference_graph: CompactReferenceGraph::default(),
+            tidas_issue_event_count: 0,
+            issue_relations: None,
         };
         assert!(!closure_scan_allows_numerical_snapshot(&scan));
 
@@ -6758,6 +7488,7 @@ mod tests {
             final_event: json!({"type": "final", "completed": true}),
             issue_events: JsonlValueSpool::empty("empty-validation-issues.jsonl").unwrap(),
         };
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
         let artifacts = prepare_closure_content_artifacts(
             ClosureBundleFile {
                 temp,
@@ -7145,6 +7876,7 @@ mod tests {
             final_event: json!({"type": "final", "completed": true}),
             issue_events: JsonlValueSpool::empty("empty-root-partition-issues.jsonl").unwrap(),
         };
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
         let artifacts = prepare_issue_partition_artifacts(
             id("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"),
             &scan,

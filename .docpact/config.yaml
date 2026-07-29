@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-07-28"
-lastReviewedCommit: "2b0a3b215bf6c2a36cdf46cfe9c7d174471c0f5e"
-lastReviewedNote: "Reviewed while merging Issues #163, #164, and #165: existing ownership and routing cover bounded scope-closure reports, shared resource/object-I/O primitives, all-unit result delivery, and factorization cache controls."
+lastReviewedAt: "2026-07-29"
+lastReviewedCommit: "0eeae80ff84ad76b8009142f3a417b7739a9d9eb"
+lastReviewedNote: "Reviewed for Issue #169: existing scope-closure ownership and routing cover external issue coalescing, streamed affected-root sidecars, and offline capacity proof."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
