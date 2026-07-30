@@ -672,6 +672,22 @@ impl ObjectStoreClient {
         self.download_object_url(&object_url).await
     }
 
+    /// Downloads a bucket-relative object key to a bounded file.
+    pub async fn download_object_key_to_file(
+        &self,
+        object_key: &str,
+        destination: &Path,
+        options: ObjectTransferOptions,
+    ) -> anyhow::Result<ObjectTransferResult> {
+        let key = object_key.trim_start_matches('/');
+        if key.trim().is_empty() {
+            return Err(anyhow::anyhow!("object key must not be empty"));
+        }
+        let object_url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+        self.download_object_url_to_file(&object_url, destination, options)
+            .await
+    }
+
     fn package_object_key(&self, job_id: Uuid, suffix: &str, extension: &str) -> String {
         if self.prefix.is_empty() {
             format!("packages/jobs/{job_id}/{suffix}.{extension}")

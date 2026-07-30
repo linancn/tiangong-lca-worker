@@ -66,6 +66,9 @@ const ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT: usize = 100;
 const ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 100;
 const ISSUE_PARTITION_MAX_RECORDS: u64 = 25_000;
 const ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const ADMINISTRATIVE_PARTITION_MAX_RECORDS: u64 = 25_000;
+const ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 const ARTIFACT_REGISTRATION_BATCH_SIZE: usize = 500;
 const ROOT_IMPACT_INDEX_MAGIC: &[u8] = b"TGLCA-RI-V1\0";
 const FROZEN_REFERENCE_GRAPH_MAGIC: &[u8] = b"TGLCA-FG-V1\0";
@@ -77,7 +80,6 @@ const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
-const SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
 
 fn scope_closure_memory_budget_bytes() -> u64 {
@@ -414,6 +416,20 @@ impl ClosureDocumentSpool {
         &self.records
     }
 
+    fn visit(
+        &self,
+        mut visit: impl FnMut(&ExactDatasetIdentity, &[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut file = File::open(&self.path)?;
+        for record in &self.records {
+            file.seek(SeekFrom::Start(record.offset))?;
+            let mut bytes = vec![0_u8; usize::try_from(record.byte_size)?];
+            file.read_exact(&mut bytes)?;
+            visit(&record.identity, &bytes)?;
+        }
+        Ok(())
+    }
+
     fn load_batch(
         path: &Path,
         records: &[ClosureDocumentRecord],
@@ -433,27 +449,6 @@ impl ClosureDocumentSpool {
             documents.push(document);
         }
         Ok(documents)
-    }
-
-    fn write_json_array(&self, writer: &mut impl Write) -> anyhow::Result<()> {
-        let mut file = File::open(&self.path)?;
-        writer.write_all(b"[")?;
-        for (index, record) in self.records.iter().enumerate() {
-            if index > 0 {
-                writer.write_all(b",")?;
-            }
-            file.seek(SeekFrom::Start(record.offset))?;
-            let mut remaining = record.byte_size;
-            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-            while remaining > 0 {
-                let chunk = usize::try_from(remaining.min(buffer.len() as u64))?;
-                file.read_exact(&mut buffer[..chunk])?;
-                writer.write_all(&buffer[..chunk])?;
-                remaining -= u64::try_from(chunk)?;
-            }
-        }
-        writer.write_all(b"]")?;
-        Ok(())
     }
 }
 
@@ -3138,6 +3133,16 @@ struct CompleteMachineEvidenceEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AdministrativeEvidenceSummary {
+    relation: String,
+    record_count: u64,
+    logical_byte_size: u64,
+    logical_sha256: String,
+    partition_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IssueRelationStreamHashesV3 {
     issues: String,
     tidas_issue_stream: String,
@@ -3193,9 +3198,21 @@ struct IssuePartitionManifestV3 {
     partitions: Vec<IssuePartitionManifestEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeClosureManifestV4 {
+    #[serde(flatten)]
+    issue_manifest: IssuePartitionManifestV3,
+    administrative_evidence: Vec<AdministrativeEvidenceSummary>,
+    administrative_partitions: Vec<IssuePartitionManifestEntry>,
+    administrative_partition_max_records: u64,
+    administrative_partition_max_uncompressed_bytes: u64,
+    per_object_max_bytes: u64,
+}
+
 struct IssuePartitionAccumulator {
     temp: Arc<TempDir>,
-    relation: &'static str,
+    relation: String,
     max_records: u64,
     max_uncompressed_bytes: u64,
     active: Option<ActiveIssuePartition>,
@@ -3839,22 +3856,22 @@ fn build_closure_bundle(
     resolution_map: &JsonlValueSpool,
 ) -> anyhow::Result<ClosureBundleFile> {
     let temp = Arc::new(TempDir::new()?);
-    let projected_bundle_bytes = scan
-        .documents
-        .byte_size
-        .saturating_add(scan.edges.byte_size)
-        .saturating_add(scan.resolved_references.byte_size)
-        .saturating_add(resolution_map.byte_size)
-        .saturating_add(4 * 1024 * 1024);
-    ensure_temp_free_space(temp.path(), projected_bundle_bytes)?;
-    let path = temp.path().join("closure-bundle-v3.json");
+    ensure_temp_free_space(temp.path(), 4 * 1024 * 1024)?;
+    let administrative_evidence = administrative_evidence_summaries(scan, resolution_map)?;
+    let path = temp.path().join("closure-bundle-v4.json");
     let mut writer = BufWriter::new(File::create(&path)?);
     writer.write_all(b"{")?;
     write_canonical_field(
         &mut writer,
+        "administrativeEvidence",
+        &administrative_evidence,
+        false,
+    )?;
+    write_canonical_field(
+        &mut writer,
         "dataSnapshotToken",
         &input.data_snapshot_token,
-        false,
+        true,
     )?;
     write_canonical_field(
         &mut writer,
@@ -3868,18 +3885,45 @@ fn build_closure_bundle(
         &input.requested_scope_hash,
         true,
     )?;
-    writer.write_all(b",\"resolutionMap\":")?;
-    write_spooled_json_array(&mut writer, resolution_map)?;
-    writer.write_all(b",\"scan\":")?;
-    write_scope_closure_scan_v3(&mut writer, scan)?;
     write_canonical_field(
         &mut writer,
         "schemaVersion",
-        &"lcia.scope-closure-bundle.v3",
+        &"lcia.scope-closure-bundle.v4",
         true,
     )?;
-    writer.write_all(b",\"tidasValidation\":")?;
-    write_tidas_validation_v3(&mut writer, validation)?;
+    write_canonical_field(
+        &mut writer,
+        "scanSummary",
+        &json!({
+            "complete": scan.complete,
+            "documentCount": scan.documents.len(),
+            "edgeCount": scan.edges.event_count,
+            "frontierCount": scan.frontier.len(),
+            "omittedVersionResolutionCount": scan.omitted_version_resolutions.len(),
+            "providerUniverseCount": scan.provider_universe.len(),
+            "resolvedReferenceCount": scan.resolved_references.event_count,
+            "rootCount": scan.roots.len(),
+            "schemaVersion": scan.schema_version,
+        }),
+        true,
+    )?;
+    write_canonical_field(
+        &mut writer,
+        "tidasValidation",
+        &json!({
+            "describe": validation.describe,
+            "finalEvent": validation.final_event,
+            "issueStream": {
+                "compression": "zstd",
+                "eventCount": validation.issue_events.event_count,
+                "logicalByteSize": validation.issue_events.byte_size,
+                "logicalSha256": validation.issue_events.sha256,
+                "path": "tidas/issues.ndjson.zst",
+                "schemaVersion": "lcia.scope-closure-tidas-issue-stream.v1",
+            },
+        }),
+        true,
+    )?;
     write_canonical_field(
         &mut writer,
         "validatorScannerFingerprint",
@@ -3898,6 +3942,86 @@ fn build_closure_bundle(
     })
 }
 
+fn administrative_evidence_summaries(
+    scan: &ScopeClosureScan,
+    resolution_map: &JsonlValueSpool,
+) -> anyhow::Result<Vec<AdministrativeEvidenceSummary>> {
+    let mut summaries = vec![
+        summarize_document_records(&scan.documents)?,
+        summarize_jsonl_spool("edges", &scan.edges),
+        summarize_values("frontier", &scan.frontier)?,
+        summarize_values(
+            "omitted-version-resolutions",
+            &scan.omitted_version_resolutions,
+        )?,
+        summarize_values("provider-universe", &scan.provider_universe)?,
+        summarize_jsonl_spool("resolution-map", resolution_map),
+        summarize_jsonl_spool("resolved-references", &scan.resolved_references),
+        summarize_values("roots", &scan.roots)?,
+    ];
+    summaries.sort_by(|left, right| left.relation.cmp(&right.relation));
+    Ok(summaries)
+}
+
+fn administrative_partition_prefix(relation: &str) -> String {
+    format!("administrative/{relation}")
+}
+
+fn summarize_document_records(
+    documents: &ClosureDocumentSpool,
+) -> anyhow::Result<AdministrativeEvidenceSummary> {
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    documents.visit(|_, bytes| {
+        digest.update(bytes);
+        digest.update(b"\n");
+        byte_size = byte_size
+            .checked_add(u64::try_from(bytes.len())?.saturating_add(1))
+            .ok_or_else(|| anyhow::anyhow!("administrative evidence byte count overflow"))?;
+        Ok(())
+    })?;
+    Ok(AdministrativeEvidenceSummary {
+        relation: "documents".to_owned(),
+        record_count: u64::try_from(documents.len())?,
+        logical_byte_size: byte_size,
+        logical_sha256: hex::encode(digest.finalize()),
+        partition_prefix: administrative_partition_prefix("documents"),
+    })
+}
+
+fn summarize_jsonl_spool(relation: &str, spool: &JsonlValueSpool) -> AdministrativeEvidenceSummary {
+    AdministrativeEvidenceSummary {
+        relation: relation.to_owned(),
+        record_count: spool.event_count,
+        logical_byte_size: spool.byte_size,
+        logical_sha256: spool.sha256.clone(),
+        partition_prefix: administrative_partition_prefix(relation),
+    }
+}
+
+fn summarize_values<T: Serialize>(
+    relation: &str,
+    values: &[T],
+) -> anyhow::Result<AdministrativeEvidenceSummary> {
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    for value in values {
+        let bytes = canonical_json_bytes(value)?;
+        digest.update(&bytes);
+        digest.update(b"\n");
+        byte_size = byte_size
+            .checked_add(u64::try_from(bytes.len())?.saturating_add(1))
+            .ok_or_else(|| anyhow::anyhow!("administrative evidence byte count overflow"))?;
+    }
+    Ok(AdministrativeEvidenceSummary {
+        relation: relation.to_owned(),
+        record_count: u64::try_from(values.len())?,
+        logical_byte_size: byte_size,
+        logical_sha256: hex::encode(digest.finalize()),
+        partition_prefix: administrative_partition_prefix(relation),
+    })
+}
+
 fn write_canonical_field<W: Write, T: Serialize>(
     writer: &mut W,
     key: &str,
@@ -3910,117 +4034,6 @@ fn write_canonical_field<W: Write, T: Serialize>(
     serde_json::to_writer(&mut *writer, key)?;
     writer.write_all(b":")?;
     writer.write_all(&canonical_json_bytes(value)?)?;
-    Ok(())
-}
-
-fn write_canonical_array<'a, W, T>(
-    writer: &mut W,
-    values: impl IntoIterator<Item = &'a T>,
-) -> anyhow::Result<()>
-where
-    W: Write,
-    T: Serialize + 'a,
-{
-    writer.write_all(b"[")?;
-    let mut comma = false;
-    for value in values {
-        if comma {
-            writer.write_all(b",")?;
-        }
-        writer.write_all(&canonical_json_bytes(value)?)?;
-        comma = true;
-    }
-    writer.write_all(b"]")?;
-    Ok(())
-}
-
-fn write_scope_closure_scan_v3<W: Write>(
-    writer: &mut W,
-    scan: &ScopeClosureScan,
-) -> anyhow::Result<()> {
-    writer.write_all(b"{")?;
-    write_canonical_field(writer, "complete", &scan.complete, false)?;
-    writer.write_all(b",\"documents\":")?;
-    scan.documents.write_json_array(writer)?;
-    writer.write_all(b",\"edges\":")?;
-    write_spooled_json_array(writer, &scan.edges)?;
-    writer.write_all(b",\"frontier\":")?;
-    write_canonical_array(writer, &scan.frontier)?;
-    writer.write_all(b",\"issueSummary\":")?;
-    if let Some(relations) = scan.issue_relations.as_ref() {
-        writer.write_all(&canonical_json_bytes(&json!({
-            "affectedRootCount": relations.stats.affected_root_count,
-            "blockerCodes": relations.stats.blocker_codes,
-            "blockerCount": relations.stats.blocker_count,
-            "canonical": true,
-            "completeMachineResultClientKey": "manifest.json",
-            "expandedAffectedRootRecordCount": 0,
-            "issueCount": relations.stats.issue_count,
-            "issueSchemaVersion": "lcia.scope-closure-issue.v3",
-            "occurrenceCount": relations.stats.occurrence_count,
-            "rawTidasIssueEventCount": scan.tidas_issue_event_count,
-        }))?)?;
-    } else {
-        writer.write_all(&canonical_json_bytes(&json!({
-            "canonical": false,
-            "completeMachineResultClientKey": "manifest.json",
-            "issueCountBeforeTidasCoalescing": scan.issues.len(),
-            "issueSchemaVersion": "lcia.scope-closure-issue.v3",
-            "rawTidasIssueEventCount": scan.tidas_issue_event_count,
-        }))?)?;
-    }
-    writer.write_all(b",\"omittedVersionResolutions\":")?;
-    write_canonical_array(writer, &scan.omitted_version_resolutions)?;
-    writer.write_all(b",\"providerUniverse\":")?;
-    write_canonical_array(writer, &scan.provider_universe)?;
-    writer.write_all(b",\"resolvedReferences\":")?;
-    write_spooled_json_array(writer, &scan.resolved_references)?;
-    writer.write_all(b",\"roots\":")?;
-    write_canonical_array(writer, &scan.roots)?;
-    write_canonical_field(writer, "schemaVersion", &scan.schema_version, true)?;
-    writer.write_all(b"}")?;
-    Ok(())
-}
-
-fn write_tidas_validation_v3<W: Write>(
-    writer: &mut W,
-    validation: &TidasBatchValidation,
-) -> anyhow::Result<()> {
-    writer.write_all(b"{")?;
-    write_canonical_field(writer, "describe", &validation.describe, false)?;
-    write_canonical_field(writer, "finalEvent", &validation.final_event, true)?;
-    write_canonical_field(
-        writer,
-        "issueStream",
-        &json!({
-            "compression": "zstd",
-            "eventCount": validation.issue_events.event_count,
-            "logicalByteSize": validation.issue_events.byte_size,
-            "logicalSha256": validation.issue_events.sha256,
-            "path": "tidas/issues.ndjson.zst",
-            "schemaVersion": "lcia.scope-closure-tidas-issue-stream.v1",
-        }),
-        true,
-    )?;
-    writer.write_all(b"}")?;
-    Ok(())
-}
-
-fn write_spooled_json_array<W: Write>(
-    writer: &mut W,
-    spool: &JsonlValueSpool,
-) -> anyhow::Result<()> {
-    writer.write_all(b"[")?;
-    let mut comma = false;
-    spool.visit(|event| {
-        if comma {
-            writer.write_all(b",")?;
-        }
-        writer.write_all(&canonical_json_bytes(&event)?)?;
-        comma = true;
-        Ok(())
-    })?;
-    writer.write_all(b"]")?;
     Ok(())
 }
 
@@ -4641,6 +4654,7 @@ pub async fn execute_scope_closure_job(
             closure_check_id,
             &scan,
             &validation,
+            &resolution_map,
             &blocking_cancellation,
             Some(&blocking_progress),
         )?;
@@ -5549,10 +5563,10 @@ fn build_resolution_map_spool(
 }
 
 impl IssuePartitionAccumulator {
-    fn new(temp: Arc<TempDir>, relation: &'static str) -> Self {
+    fn new(temp: Arc<TempDir>, relation: impl Into<String>) -> Self {
         Self {
             temp,
-            relation,
+            relation: relation.into(),
             max_records: ISSUE_PARTITION_MAX_RECORDS,
             max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
             active: None,
@@ -5573,7 +5587,7 @@ impl IssuePartitionAccumulator {
         assert!(max_uncompressed_bytes > 0);
         Self {
             temp,
-            relation,
+            relation: relation.to_owned(),
             max_records,
             max_uncompressed_bytes,
             active: None,
@@ -5586,6 +5600,10 @@ impl IssuePartitionAccumulator {
     fn push(&mut self, issue_key: &str, value: &Value) -> anyhow::Result<()> {
         let mut bytes = canonical_json_bytes(value)?;
         bytes.push(b'\n');
+        self.push_bytes(issue_key, &bytes)
+    }
+
+    fn push_bytes(&mut self, issue_key: &str, bytes: &[u8]) -> anyhow::Result<()> {
         let record_bytes = u64::try_from(bytes.len())?;
         if record_bytes > self.max_uncompressed_bytes {
             return Err(anyhow::anyhow!(
@@ -5610,9 +5628,9 @@ impl IssuePartitionAccumulator {
             self.active = Some(self.open_partition(issue_key)?);
         }
         let active = self.active.as_mut().expect("active partition opened");
-        active.encoder.write_all(&bytes)?;
-        active.uncompressed_digest.update(&bytes);
-        self.relation_uncompressed_digest.update(&bytes);
+        active.encoder.write_all(bytes)?;
+        active.uncompressed_digest.update(bytes);
+        self.relation_uncompressed_digest.update(bytes);
         active.record_count = active
             .record_count
             .checked_add(1)
@@ -5660,7 +5678,7 @@ impl IssuePartitionAccumulator {
 
         let (compressed_byte_size, compressed_sha256) = file_size_and_sha256(&active.path)?;
         let entry = IssuePartitionManifestEntry {
-            relation: self.relation.to_owned(),
+            relation: self.relation.clone(),
             path: active.relative_path.clone(),
             media_type: "application/x-ndjson+zstd".to_owned(),
             record_count: active.record_count,
@@ -5783,10 +5801,13 @@ fn prepare_issue_partition_artifacts(
     validation: &TidasBatchValidation,
     temp: Arc<TempDir>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
+    let resolution_map =
+        build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
     prepare_issue_partition_artifacts_with_cancellation(
         closure_check_id,
         scan,
         validation,
+        &resolution_map,
         temp,
         &CancellationToken::default(),
         None,
@@ -5798,6 +5819,7 @@ fn prepare_issue_partition_artifacts_with_cancellation(
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
+    resolution_map: &JsonlValueSpool,
     temp: Arc<TempDir>,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
@@ -5823,6 +5845,14 @@ fn prepare_issue_partition_artifacts_with_cancellation(
     artifacts.push(relations.root_impact_index.prepared_artifact()?);
     artifacts.push(frozen_reference_graph.prepared_artifact()?);
     artifacts.push(tidas_issue_stream.prepared_artifact()?);
+    let (administrative_evidence, administrative_partitions, administrative_artifacts) =
+        prepare_administrative_partition_artifacts(
+            scan,
+            resolution_map,
+            Arc::clone(&temp),
+            cancellation,
+        )?;
+    artifacts.extend(administrative_artifacts);
     let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
         total.saturating_add(u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX))
     });
@@ -5852,8 +5882,8 @@ fn prepare_issue_partition_artifacts_with_cancellation(
                     .checked_add(u64::try_from(count)?)
                     .ok_or_else(|| anyhow::anyhow!("reference graph edge count overflow"))
             })?;
-    let manifest = IssuePartitionManifestV3 {
-        schema_version: "lcia.scope-closure-issue-manifest.v3".to_owned(),
+    let issue_manifest = IssuePartitionManifestV3 {
+        schema_version: "lcia.scope-closure-issue-manifest.v4".to_owned(),
         closure_check_id,
         logical_issue_stream_sha256: validation.issue_events.sha256.clone(),
         logical_issue_event_count: validation.issue_events.event_count,
@@ -5890,6 +5920,7 @@ fn prepare_issue_partition_artifacts_with_cancellation(
             readable_schema_versions: vec![
                 "lcia.scope-closure-issue-manifest.v2".to_owned(),
                 "lcia.scope-closure-issue-manifest.v3".to_owned(),
+                "lcia.scope-closure-issue-manifest.v4".to_owned(),
             ],
             v2_affected_root_projection:
                 "derive issue×root rows and witnesses on demand from rootImpact and frozen-reference-graph"
@@ -5898,6 +5929,15 @@ fn prepare_issue_partition_artifacts_with_cancellation(
         },
         evidence,
         partitions: entries,
+    };
+    let manifest = ScopeClosureManifestV4 {
+        issue_manifest,
+        administrative_evidence,
+        administrative_partitions,
+        administrative_partition_max_records: ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+        administrative_partition_max_uncompressed_bytes:
+            ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+        per_object_max_bytes: SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES,
     };
     let manifest_path = temp.path().join("manifest.json");
     fs::write(&manifest_path, canonical_json_bytes(&manifest)?)?;
@@ -5912,18 +5952,198 @@ fn prepare_issue_partition_artifacts_with_cancellation(
     Ok(artifacts)
 }
 
+fn prepare_administrative_partition_artifacts(
+    scan: &ScopeClosureScan,
+    resolution_map: &JsonlValueSpool,
+    temp: Arc<TempDir>,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<(
+    Vec<AdministrativeEvidenceSummary>,
+    Vec<IssuePartitionManifestEntry>,
+    Vec<PreparedArtifact>,
+)> {
+    let mut summaries = Vec::new();
+    let mut entries = Vec::new();
+    let mut artifacts = Vec::new();
+
+    let mut documents =
+        IssuePartitionAccumulator::new(Arc::clone(&temp), "administrative/documents");
+    documents.max_records = ADMINISTRATIVE_PARTITION_MAX_RECORDS;
+    documents.max_uncompressed_bytes = ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+    scan.documents.visit(|identity, bytes| {
+        cancellation.check("scope_closure_administrative_documents")?;
+        let mut record = bytes.to_vec();
+        record.push(b'\n');
+        documents.push_bytes(&identity.document_key(), &record)
+    })?;
+    finish_administrative_relation(
+        "documents",
+        documents,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+
+    prepare_spooled_administrative_relation(
+        "edges",
+        &scan.edges,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_values_administrative_relation(
+        "frontier",
+        &scan.frontier,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_values_administrative_relation(
+        "omitted-version-resolutions",
+        &scan.omitted_version_resolutions,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_values_administrative_relation(
+        "provider-universe",
+        &scan.provider_universe,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_spooled_administrative_relation(
+        "resolution-map",
+        resolution_map,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_spooled_administrative_relation(
+        "resolved-references",
+        &scan.resolved_references,
+        Arc::clone(&temp),
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+    prepare_values_administrative_relation(
+        "roots",
+        &scan.roots,
+        temp,
+        cancellation,
+        &mut summaries,
+        &mut entries,
+        &mut artifacts,
+    )?;
+
+    summaries.sort_by(|left, right| left.relation.cmp(&right.relation));
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    artifacts.sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
+    Ok((summaries, entries, artifacts))
+}
+
+fn prepare_spooled_administrative_relation(
+    relation: &'static str,
+    spool: &JsonlValueSpool,
+    temp: Arc<TempDir>,
+    cancellation: &CancellationToken,
+    summaries: &mut Vec<AdministrativeEvidenceSummary>,
+    entries: &mut Vec<IssuePartitionManifestEntry>,
+    artifacts: &mut Vec<PreparedArtifact>,
+) -> anyhow::Result<()> {
+    let mut accumulator =
+        IssuePartitionAccumulator::new(temp, administrative_partition_prefix(relation));
+    accumulator.max_records = ADMINISTRATIVE_PARTITION_MAX_RECORDS;
+    accumulator.max_uncompressed_bytes = ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+    let mut ordinal = 0_u64;
+    spool.visit(|value| {
+        cancellation.check("scope_closure_administrative_spool")?;
+        accumulator.push(&format!("{ordinal:020}"), &value)?;
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("administrative record ordinal overflow"))?;
+        Ok(())
+    })?;
+    finish_administrative_relation(relation, accumulator, summaries, entries, artifacts)
+}
+
+fn prepare_values_administrative_relation<T: Serialize>(
+    relation: &'static str,
+    values: &[T],
+    temp: Arc<TempDir>,
+    cancellation: &CancellationToken,
+    summaries: &mut Vec<AdministrativeEvidenceSummary>,
+    entries: &mut Vec<IssuePartitionManifestEntry>,
+    artifacts: &mut Vec<PreparedArtifact>,
+) -> anyhow::Result<()> {
+    let mut accumulator =
+        IssuePartitionAccumulator::new(temp, administrative_partition_prefix(relation));
+    accumulator.max_records = ADMINISTRATIVE_PARTITION_MAX_RECORDS;
+    accumulator.max_uncompressed_bytes = ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+    for (ordinal, value) in values.iter().enumerate() {
+        cancellation.check("scope_closure_administrative_values")?;
+        let value = serde_json::to_value(value)?;
+        accumulator.push(&format!("{ordinal:020}"), &value)?;
+    }
+    finish_administrative_relation(relation, accumulator, summaries, entries, artifacts)
+}
+
+fn finish_administrative_relation(
+    relation: &str,
+    accumulator: IssuePartitionAccumulator,
+    summaries: &mut Vec<AdministrativeEvidenceSummary>,
+    entries: &mut Vec<IssuePartitionManifestEntry>,
+    artifacts: &mut Vec<PreparedArtifact>,
+) -> anyhow::Result<()> {
+    let (relation_entries, relation_artifacts, logical_sha256) = accumulator.finish()?;
+    let record_count = relation_entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.record_count)
+            .ok_or_else(|| anyhow::anyhow!("administrative record count overflow"))
+    })?;
+    let logical_byte_size = relation_entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.uncompressed_byte_size)
+            .ok_or_else(|| anyhow::anyhow!("administrative byte count overflow"))
+    })?;
+    summaries.push(AdministrativeEvidenceSummary {
+        relation: relation.to_owned(),
+        record_count,
+        logical_byte_size,
+        logical_sha256,
+        partition_prefix: administrative_partition_prefix(relation),
+    });
+    entries.extend(relation_entries);
+    artifacts.extend(relation_artifacts);
+    Ok(())
+}
+
 #[cfg(test)]
 fn prepare_closure_content_artifacts(
     closure_bundle: ClosureBundleFile,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
+    resolution_map: &JsonlValueSpool,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
     prepare_closure_content_artifacts_with_cancellation(
         closure_bundle,
         closure_check_id,
         scan,
         validation,
+        resolution_map,
         &CancellationToken::default(),
         None,
     )
@@ -5934,6 +6154,7 @@ fn prepare_closure_content_artifacts_with_cancellation(
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
+    resolution_map: &JsonlValueSpool,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
@@ -5952,7 +6173,7 @@ fn prepare_closure_content_artifacts_with_cancellation(
             descriptor: ArtifactManifestEntry {
                 artifact_type: "closure_bundle".to_owned(),
                 artifact_role: ScopeClosureArtifactRole::ClosureBundle,
-                file_name: "closure-bundle-v3.json".to_owned(),
+                file_name: "closure-bundle-v4.json".to_owned(),
                 content_type: "application/json".to_owned(),
                 byte_size: usize::try_from(bundle_byte_size)?,
                 checksum_sha256: bundle_sha256,
@@ -5973,10 +6194,12 @@ fn prepare_closure_content_artifacts_with_cancellation(
         closure_check_id,
         scan,
         validation,
+        resolution_map,
         Arc::clone(&temp),
         cancellation,
         progress,
     )?);
+    enforce_scope_closure_object_ceiling(&artifacts)?;
     Ok(artifacts)
 }
 
@@ -6058,6 +6281,7 @@ async fn persist_closure_artifacts(
     let progress = progress.ok_or_else(|| {
         anyhow::anyhow!("v2 artifact registration requires an active Worker lease")
     })?;
+    enforce_scope_closure_object_ceiling(artifacts)?;
     let request_id = deterministic_contract_uuid(&format!(
         "scope-closure-write-set-v2:{closure_check_id}:{content_artifact_manifest_hash}"
     ));
@@ -6297,7 +6521,7 @@ async fn persist_closure_artifacts(
                 object_key,
                 artifact.descriptor.content_type.as_str(),
                 &artifact.path,
-                ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES)
+                ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES)
                     .with_expected_sha256(artifact.descriptor.checksum_sha256.clone())
                     .with_cancellation(cancellation.clone()),
             ),
@@ -6419,6 +6643,40 @@ async fn persist_closure_artifacts(
         );
     }
     semantic_closure_artifact_ids(&finalized, artifacts)
+}
+
+fn enforce_scope_closure_object_ceiling(artifacts: &[PreparedArtifact]) -> anyhow::Result<()> {
+    enforce_scope_closure_object_ceiling_with_limit(
+        artifacts,
+        SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES,
+    )
+}
+
+fn enforce_scope_closure_object_ceiling_with_limit(
+    artifacts: &[PreparedArtifact],
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    for artifact in artifacts {
+        let declared = u64::try_from(artifact.descriptor.byte_size)?;
+        let actual = fs::metadata(&artifact.path)?.len();
+        if declared != actual {
+            return Err(anyhow::anyhow!(
+                "closure_artifact_descriptor_size_mismatch: client_key={}, declared_bytes={}, actual_bytes={}",
+                artifact.descriptor.file_name,
+                declared,
+                actual
+            ));
+        }
+        if actual > max_bytes {
+            return Err(anyhow::anyhow!(
+                "artifact_limit_exceeded: role=scope_closure_object, client_key={}, bytes={}, max_bytes={}",
+                artifact.descriptor.file_name,
+                actual,
+                max_bytes
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn semantic_closure_artifact_ids(
@@ -9229,6 +9487,90 @@ mod tests {
         legacy_relation_stream_sha256: Option<IssueRelationStreamHashesV2>,
     }
 
+    fn validate_administrative_manifest_v4(
+        manifest: &ScopeClosureManifestV4,
+        artifacts: &BTreeMap<&str, &PreparedArtifact>,
+    ) -> anyhow::Result<()> {
+        if manifest.administrative_partition_max_records != ADMINISTRATIVE_PARTITION_MAX_RECORDS
+            || manifest.administrative_partition_max_uncompressed_bytes
+                != ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES
+            || manifest.per_object_max_bytes != SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES
+        {
+            return Err(anyhow::anyhow!(
+                "v4 administrative partition limits differ from the reader contract"
+            ));
+        }
+        let mut summaries = BTreeMap::<String, (u64, u64, Sha256)>::new();
+        for entry in &manifest.administrative_partitions {
+            let artifact = artifacts
+                .get(entry.path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("v4 administrative partition is missing"))?;
+            if u64::try_from(artifact.descriptor.byte_size)?
+                > SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES
+            {
+                return Err(anyhow::anyhow!(
+                    "v4 administrative partition exceeds the object ceiling"
+                ));
+            }
+            let (compressed_bytes, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
+            if compressed_bytes != entry.compressed_byte_size
+                || compressed_sha256 != entry.compressed_sha256
+            {
+                return Err(anyhow::anyhow!(
+                    "v4 administrative compressed descriptor mismatch"
+                ));
+            }
+            let mut decoder =
+                zstd::stream::read::Decoder::new(BufReader::new(File::open(&artifact.path)?))?;
+            let mut bytes = Vec::new();
+            decoder.read_to_end(&mut bytes)?;
+            if u64::try_from(bytes.len())? != entry.uncompressed_byte_size
+                || sha256_hex(&bytes) != entry.uncompressed_sha256
+            {
+                return Err(anyhow::anyhow!(
+                    "v4 administrative uncompressed descriptor mismatch"
+                ));
+            }
+            let relation = entry
+                .relation
+                .strip_prefix("administrative/")
+                .ok_or_else(|| anyhow::anyhow!("v4 administrative relation prefix is invalid"))?
+                .to_owned();
+            let summary = summaries
+                .entry(relation)
+                .or_insert_with(|| (0, 0, Sha256::new()));
+            summary.0 = summary
+                .0
+                .checked_add(entry.record_count)
+                .ok_or_else(|| anyhow::anyhow!("v4 administrative record count overflow"))?;
+            summary.1 = summary
+                .1
+                .checked_add(entry.uncompressed_byte_size)
+                .ok_or_else(|| anyhow::anyhow!("v4 administrative byte count overflow"))?;
+            summary.2.update(&bytes);
+        }
+        for expected in &manifest.administrative_evidence {
+            let (record_count, logical_byte_size, digest) = summaries
+                .remove(&expected.relation)
+                .unwrap_or_else(|| (0, 0, Sha256::new()));
+            if record_count != expected.record_count
+                || logical_byte_size != expected.logical_byte_size
+                || hex::encode(digest.finalize()) != expected.logical_sha256
+                || expected.partition_prefix != administrative_partition_prefix(&expected.relation)
+            {
+                return Err(anyhow::anyhow!(
+                    "v4 administrative relation summary mismatch"
+                ));
+            }
+        }
+        if !summaries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "v4 manifest contains an unbound administrative relation"
+            ));
+        }
+        Ok(())
+    }
+
     fn reconstruct_complete_machine_result(
         artifacts: &[PreparedArtifact],
         expected_closure_check_id: Uuid,
@@ -9247,9 +9589,9 @@ mod tests {
             Some("lcia.scope-closure-issue-manifest.v2") => {
                 reconstruct_complete_machine_result_v2(artifacts, expected_closure_check_id)
             }
-            Some("lcia.scope-closure-issue-manifest.v3") => {
-                reconstruct_complete_machine_result_v3(artifacts, expected_closure_check_id)
-            }
+            Some(
+                "lcia.scope-closure-issue-manifest.v3" | "lcia.scope-closure-issue-manifest.v4",
+            ) => reconstruct_complete_machine_result_v3(artifacts, expected_closure_check_id),
             _ => Err(anyhow::anyhow!(
                 "complete machine result manifest schema is unsupported"
             )),
@@ -9280,8 +9622,10 @@ mod tests {
         }
         let manifest: IssuePartitionManifestV3 =
             serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
-        if manifest.schema_version != "lcia.scope-closure-issue-manifest.v3"
-            || manifest.closure_check_id != expected_closure_check_id
+        if !matches!(
+            manifest.schema_version.as_str(),
+            "lcia.scope-closure-issue-manifest.v3" | "lcia.scope-closure-issue-manifest.v4"
+        ) || manifest.closure_check_id != expected_closure_check_id
             || manifest.expanded_affected_root_record_count != 0
             || manifest.ordering
                 != (IssueManifestOrdering {
@@ -9341,13 +9685,28 @@ mod tests {
                 ));
             }
         }
+        let administrative_partitions =
+            if manifest.schema_version == "lcia.scope-closure-issue-manifest.v4" {
+                let v4: ScopeClosureManifestV4 =
+                    serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+                validate_administrative_manifest_v4(&v4, &machine_artifacts)?;
+                v4.administrative_partitions
+            } else {
+                Vec::new()
+            };
         let expected_paths = manifest
             .partitions
             .iter()
             .map(|entry| entry.path.as_str())
             .chain(manifest.evidence.iter().map(|entry| entry.path.as_str()))
+            .chain(
+                administrative_partitions
+                    .iter()
+                    .map(|entry| entry.path.as_str()),
+            )
             .collect::<BTreeSet<_>>();
-        if expected_paths.len() != manifest.partitions.len() + manifest.evidence.len()
+        if expected_paths.len()
+            != manifest.partitions.len() + manifest.evidence.len() + administrative_partitions.len()
             || expected_paths != machine_artifacts.keys().copied().collect::<BTreeSet<_>>()
         {
             return Err(anyhow::anyhow!(
@@ -10536,9 +10895,14 @@ mod tests {
             build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions).unwrap();
         let closure_bundle =
             build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
-        let artifacts =
-            prepare_closure_content_artifacts(closure_bundle, closure_check_id, &scan, &validation)
-                .unwrap();
+        let artifacts = prepare_closure_content_artifacts(
+            closure_bundle,
+            closure_check_id,
+            &scan,
+            &validation,
+            &resolution_map,
+        )
+        .unwrap();
         let reconstructed =
             reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
         let relations = scan.issue_relations.as_ref().unwrap();
@@ -10549,13 +10913,15 @@ mod tests {
         let mut closure_bundle_sha256 = String::new();
         let mut xlsx_bytes = 0_u64;
         let mut xlsx_sha256 = String::new();
+        let mut max_object_bytes = 0_u64;
         for artifact in &artifacts {
             let destination = output_dir.join(&artifact.descriptor.file_name);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
             fs::copy(&artifact.path, &destination).unwrap();
             let artifact_bytes = u64::try_from(artifact.descriptor.byte_size).unwrap();
+            max_object_bytes = max_object_bytes.max(artifact_bytes);
             total_artifact_bytes = total_artifact_bytes.saturating_add(artifact_bytes);
-            if artifact.descriptor.file_name == "closure-bundle-v3.json" {
+            if artifact.descriptor.file_name == "closure-bundle-v4.json" {
                 closure_bundle_bytes = artifact_bytes;
                 artifact
                     .descriptor
@@ -10713,6 +11079,8 @@ mod tests {
             "totalArtifactBytes": total_artifact_bytes,
             "artifactCount": artifacts.len(),
             "descriptorCount": artifacts.len(),
+            "maxObjectBytes": max_object_bytes,
+            "perObjectMaxBytes": SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES,
             "partitionAndManifestBytes": partition_bytes,
             "partitionAndManifestCount": artifacts
                 .iter()
@@ -10901,7 +11269,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_closure_bundle_v3_references_the_single_tidas_stream() {
+    fn bounded_closure_bundle_v4_references_partitioned_evidence_and_single_tidas_stream() {
         let input: ScopeClosureWorkerInput =
             serde_json::from_value(scope_closure_worker_input_json()).unwrap();
         let event = json!({
@@ -10916,7 +11284,7 @@ mod tests {
             final_event: json!({"type": "final", "completed": true}),
             issue_events: spool.finish().unwrap(),
         };
-        let scan = ScopeClosureScan {
+        let mut scan = ScopeClosureScan {
             schema_version: "lcia.scope-closure-scan.v1".to_owned(),
             complete: true,
             roots: Vec::new(),
@@ -10931,57 +11299,28 @@ mod tests {
             tidas_issue_event_count: 1,
             issue_relations: None,
         };
-        let expected = json!({
-            "schemaVersion": "lcia.scope-closure-bundle.v3",
-            "requestedScopeHash": input.requested_scope_hash,
-            "policyFingerprint": input.policy_fingerprint,
-            "dataSnapshotToken": input.data_snapshot_token,
-            "validatorScannerFingerprint": input.expected_validator_scanner_fingerprint,
-            "tidasValidation": {
-                "describe": validation.describe,
-                "finalEvent": validation.final_event,
-                "issueStream": {
-                    "compression": "zstd",
-                    "eventCount": validation.issue_events.event_count,
-                    "logicalByteSize": validation.issue_events.byte_size,
-                    "logicalSha256": validation.issue_events.sha256,
-                    "path": "tidas/issues.ndjson.zst",
-                    "schemaVersion": "lcia.scope-closure-tidas-issue-stream.v1",
-                },
-            },
-            "scan": {
-                "complete": true,
-                "documents": [],
-                "edges": [],
-                "frontier": [],
-                "issueSummary": {
-                    "canonical": false,
-                    "completeMachineResultClientKey": "manifest.json",
-                    "issueCountBeforeTidasCoalescing": 0,
-                    "issueSchemaVersion": "lcia.scope-closure-issue.v3",
-                    "rawTidasIssueEventCount": 1,
-                },
-                "omittedVersionResolutions": [],
-                "providerUniverse": [],
-                "resolvedReferences": [],
-                "roots": [],
-                "schemaVersion": "lcia.scope-closure-scan.v1",
-            },
-            "resolutionMap": [],
-        });
-
         let resolution_map =
             build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions).unwrap();
         let bundle = build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
-
+        let value: Value = serde_json::from_reader(File::open(&bundle.path).unwrap()).unwrap();
+        assert_eq!(value["schemaVersion"], "lcia.scope-closure-bundle.v4");
+        assert_eq!(value["dataSnapshotToken"], input.data_snapshot_token);
         assert_eq!(
-            fs::read(&bundle.path).unwrap(),
-            canonical_json_bytes(&expected).unwrap()
+            value["tidasValidation"]["issueStream"]["logicalSha256"],
+            validation.issue_events.sha256
         );
         assert_eq!(
-            bundle.sha256,
-            sha256_hex(&canonical_json_bytes(&expected).unwrap())
+            value["tidasValidation"]["issueStream"]["eventCount"],
+            validation.issue_events.event_count
         );
+        assert!(value.get("scan").is_none());
+        assert!(value.get("resolutionMap").is_none());
+        assert_eq!(value["administrativeEvidence"].as_array().unwrap().len(), 8);
+        assert!(bundle.byte_size < 64 * 1024);
+        assert_eq!(bundle.sha256, file_size_and_sha256(&bundle.path).unwrap().1);
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let rebuilt = build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
+        assert_eq!(rebuilt.sha256, bundle.sha256);
     }
 
     #[tokio::test]
@@ -11247,8 +11586,8 @@ mod tests {
         assert_eq!(evidence.evidence_hash, None);
 
         let temp = Arc::new(TempDir::new().unwrap());
-        let path = temp.path().join("closure-bundle-v3.json");
-        let bytes = br#"{"schemaVersion":"lcia.scope-closure-bundle.v3"}"#;
+        let path = temp.path().join("closure-bundle-v4.json");
+        let bytes = br#"{"schemaVersion":"lcia.scope-closure-bundle.v4"}"#;
         fs::write(&path, bytes).unwrap();
         let validation = TidasBatchValidation {
             describe: json!({"asset_fingerprint": "fixture"}),
@@ -11256,6 +11595,8 @@ mod tests {
             issue_events: JsonlValueSpool::empty("empty-validation-issues.jsonl").unwrap(),
         };
         build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let resolution_map =
+            build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions).unwrap();
         let artifacts = prepare_closure_content_artifacts(
             ClosureBundleFile {
                 temp,
@@ -11266,6 +11607,7 @@ mod tests {
             id("91919191-9191-4191-8191-919191919191"),
             &scan,
             &validation,
+            &resolution_map,
         )
         .unwrap();
         let names = artifacts
@@ -11275,7 +11617,8 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from([
-                "closure-bundle-v3.json",
+                "administrative/roots/part-000000.ndjson.zst",
+                "closure-bundle-v4.json",
                 "closure-report-v1.xlsx",
                 "evidence/frozen-reference-graph-v1.bin.zst",
                 "evidence/root-impact-index-v1.bin.zst",
@@ -11295,7 +11638,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            roles["closure-bundle-v3.json"],
+            roles["closure-bundle-v4.json"],
             ScopeClosureArtifactRole::ClosureBundle
         );
         assert_eq!(
@@ -11618,6 +11961,63 @@ mod tests {
         let ready = header("ready", false, 1, artifact_map);
         validate_closure_artifact_write_set_header(&ready, &expectation, "ready", false).unwrap();
         validate_closure_artifact_map(&ready, std::slice::from_ref(&artifact)).unwrap();
+    }
+
+    #[test]
+    fn oversized_scope_closure_object_is_rejected_before_write_set_creation() {
+        let temp = Arc::new(TempDir::new().unwrap());
+        let path = temp.path().join("legacy-monolith.json");
+        fs::write(&path, vec![b'x'; 1025]).unwrap();
+        let artifact = PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_bundle".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::ClosureBundle,
+                file_name: "legacy-monolith.json".to_owned(),
+                content_type: "application/json".to_owned(),
+                byte_size: 1025,
+                checksum_sha256: file_size_and_sha256(&path).unwrap().1,
+            },
+            path,
+            _temp: temp,
+        };
+        let error = enforce_scope_closure_object_ceiling_with_limit(&[artifact], 1024).unwrap_err();
+        assert!(error.to_string().contains("artifact_limit_exceeded"));
+        assert!(error.to_string().contains("legacy-monolith.json"));
+        assert!(error.to_string().contains("max_bytes=1024"));
+    }
+
+    #[test]
+    fn simulated_storage_limit_rejects_legacy_monolith_but_accepts_bounded_partitions() {
+        const SIMULATED_OBJECT_LIMIT: u64 = 1024 * 1024;
+        let temp = Arc::new(TempDir::new().unwrap());
+        let mut partitions = IssuePartitionAccumulator::with_limits(
+            Arc::clone(&temp),
+            "administrative/documents",
+            32,
+            256 * 1024,
+        );
+        let mut legacy_monolith_bytes = 2_u64;
+        for ordinal in 0..256_u64 {
+            let value = json!({
+                "ordinal": ordinal,
+                "payload": format!("{ordinal:016x}{}", "x".repeat(8 * 1024)),
+            });
+            let bytes = canonical_json_bytes(&value).unwrap();
+            legacy_monolith_bytes = legacy_monolith_bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap())
+                .saturating_add(u64::from(ordinal > 0));
+            partitions.push(&format!("{ordinal:020}"), &value).unwrap();
+        }
+        assert!(legacy_monolith_bytes > SIMULATED_OBJECT_LIMIT);
+        let (entries, artifacts, _) = partitions.finish().unwrap();
+        assert!(entries.len() > 1);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.uncompressed_byte_size <= 256 * 1024)
+        );
+        enforce_scope_closure_object_ceiling_with_limit(&artifacts, SIMULATED_OBJECT_LIMIT)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -12293,7 +12693,7 @@ mod tests {
             reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
         assert_eq!(
             reconstructed.schema_version,
-            "lcia.scope-closure-issue-manifest.v3"
+            "lcia.scope-closure-issue-manifest.v4"
         );
         assert_eq!(reconstructed.issue_count, 7);
         assert_eq!(reconstructed.occurrence_count, 7);

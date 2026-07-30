@@ -1,6 +1,7 @@
 use std::{
+    fs::File,
     future::Future,
-    io::ErrorKind,
+    io::{BufReader, ErrorKind},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -46,7 +47,7 @@ use crate::{
         SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
     },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
-    storage::ObjectStoreClient,
+    storage::{ObjectStoreClient, ObjectTransferOptions},
     types::{JobPayload, SolveOptionsPayload},
 };
 
@@ -2748,29 +2749,52 @@ async fn verify_certified_closure_bundle_artifact(
         ));
     }
 
-    let bytes = state
+    let expected_byte_size = u64::try_from(byte_size)?;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("certified-closure-bundle.json");
+    state
         .object_store
-        .download_object_key(storage_path.as_str())
-        .await?;
-    if i64::try_from(bytes.len())? != byte_size
-        || hex::encode(Sha256::digest(bytes.as_slice())) != expected_bundle_hash
-    {
+        .download_object_key_to_file(
+            storage_path.as_str(),
+            &path,
+            ObjectTransferOptions::new(8 * 1024 * 1024 * 1024)
+                .with_expected_sha256(expected_bundle_hash.to_owned()),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("certified_closure_bundle_artifact_content_mismatch: {error:#}")
+        })?;
+    if std::fs::metadata(&path)?.len() != expected_byte_size {
         return Err(anyhow::anyhow!(
             "certified_closure_bundle_artifact_content_mismatch"
         ));
     }
-    let bundle = serde_json::from_slice::<Value>(bytes.as_slice())?;
+    let bundle = read_certified_closure_bundle_binding(BufReader::new(File::open(&path)?))?;
     if !matches!(
-        bundle.get("schemaVersion").and_then(Value::as_str),
-        Some("lcia.scope-closure-bundle.v1" | "lcia.scope-closure-bundle.v3")
-    ) || bundle.get("dataSnapshotToken").and_then(Value::as_str)
-        != Some(expected_data_snapshot_token)
+        bundle.schema_version.as_str(),
+        "lcia.scope-closure-bundle.v1"
+            | "lcia.scope-closure-bundle.v3"
+            | "lcia.scope-closure-bundle.v4"
+    ) || bundle.data_snapshot_token != expected_data_snapshot_token
     {
         return Err(anyhow::anyhow!(
             "certified_closure_bundle_artifact_binding_mismatch"
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertifiedClosureBundleBinding {
+    schema_version: String,
+    data_snapshot_token: String,
+}
+
+fn read_certified_closure_bundle_binding(
+    reader: impl std::io::Read,
+) -> anyhow::Result<CertifiedClosureBundleBinding> {
+    Ok(serde_json::from_reader(reader)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -4260,10 +4284,10 @@ mod tests {
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, package_snapshot_execution_mode,
         parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
-        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
-        snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
-        validate_certified_process_axis,
+        read_certified_closure_bundle_binding, redact_sensitive_diagnostics,
+        redacted_builder_command, resolve_solve_all_unit_options, run_snapshot_builder_job,
+        run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_wall_timeout_seconds_from,
+        tail_text, utf8_safe_tail, validate_certified_process_axis,
     };
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -4885,5 +4909,27 @@ mod tests {
             lcia_result_package_version(build_id),
             "lcia-result-3d620e54-2b83-47f6-9809-0b65ab00bfd9"
         );
+    }
+
+    #[test]
+    fn certified_closure_bundle_binding_reader_accepts_v1_v3_and_v4_without_arrays() {
+        for schema_version in [
+            "lcia.scope-closure-bundle.v1",
+            "lcia.scope-closure-bundle.v3",
+            "lcia.scope-closure-bundle.v4",
+        ] {
+            let input = serde_json::to_vec(&json!({
+                "schemaVersion": schema_version,
+                "dataSnapshotToken": "snapshot-token",
+                "scan": {
+                    "documents": [{"payload": "ignored"}],
+                },
+                "administrativeEvidence": [{"relation": "documents"}],
+            }))
+            .unwrap();
+            let binding = read_certified_closure_bundle_binding(input.as_slice()).expect("binding");
+            assert_eq!(binding.schema_version, schema_version);
+            assert_eq!(binding.data_snapshot_token, "snapshot-token");
+        }
     }
 }
