@@ -7,7 +7,10 @@ use std::{
     future::Future,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -31,12 +34,15 @@ use crate::{
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
     readiness::{MatrixReadinessReport, ReadinessStatus},
-    resource::{CancellationToken, ResourceCounters, ResourceMeasurement, directory_bytes},
+    resource::{CancellationToken, ResourceCounters, ResourceMeasurement},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
     tidas_cli,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
+
+#[cfg(test)]
+use crate::resource::directory_bytes;
 
 pub const SCOPE_CLOSURE_JOB_KIND: &str = "lcia.scope_closure_check";
 pub const SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION: &str = "lcia.scope_closure_check.request.v1";
@@ -60,6 +66,9 @@ const ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT: usize = 100;
 const ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 100;
 const ISSUE_PARTITION_MAX_RECORDS: u64 = 25_000;
 const ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const ARTIFACT_REGISTRATION_BATCH_SIZE: usize = 500;
+const ROOT_IMPACT_INDEX_MAGIC: &[u8] = b"TGLCA-RI-V1\0";
+const FROZEN_REFERENCE_GRAPH_MAGIC: &[u8] = b"TGLCA-FG-V1\0";
 const XLSX_ISSUE_SAMPLE_LIMIT: usize = 5_000;
 const XLSX_OCCURRENCE_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 10_000;
@@ -124,6 +133,40 @@ fn record_scope_closure_resources(phase: &str, temp_bytes: Option<u64>, rows: Op
         measurement = %serde_json::to_string(&measurement).unwrap_or_default(),
         "scope closure resource measurement"
     );
+}
+
+#[derive(Debug, Default)]
+struct ScopeClosureArtifactProgress {
+    stage: AtomicU8,
+    records: AtomicU64,
+    bytes: AtomicU64,
+    partitions: AtomicU64,
+}
+
+impl ScopeClosureArtifactProgress {
+    fn update(&self, stage: u8, records: u64, bytes: u64, partitions: u64) {
+        self.records.store(records, AtomicOrdering::Release);
+        self.bytes.store(bytes, AtomicOrdering::Release);
+        self.partitions.store(partitions, AtomicOrdering::Release);
+        self.stage.store(stage, AtomicOrdering::Release);
+    }
+
+    fn snapshot(&self) -> Value {
+        let stage = match self.stage.load(AtomicOrdering::Acquire) {
+            1 => "merge_input",
+            2 => "coalesce",
+            3 => "partition_write",
+            4 => "compact_evidence",
+            5 => "report_finalize",
+            _ => "starting",
+        };
+        json!({
+            "stage": stage,
+            "records": self.records.load(AtomicOrdering::Acquire),
+            "bytes": self.bytes.load(AtomicOrdering::Acquire),
+            "partitions": self.partitions.load(AtomicOrdering::Acquire),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -691,10 +734,720 @@ struct IssueRelationStats {
 
 #[derive(Debug)]
 struct IssueRelationSpools {
-    issues: SortedJsonlRuns,
-    occurrences: SortedJsonlRuns,
-    affected_roots: SortedJsonlRuns,
+    issues: JsonlValueSpool,
+    issue_partition_entries: Vec<IssuePartitionManifestEntry>,
+    issue_partition_artifacts: Vec<PreparedArtifact>,
+    issue_relation_sha256: String,
+    root_impact_index: CompactEvidenceFile,
     stats: IssueRelationStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RootImpactMode {
+    None,
+    AllRoots,
+    IncludedOrdinals,
+    ExcludedOrdinals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootImpactReference {
+    mode: RootImpactMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    impact_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_node_ordinal: Option<u32>,
+    evidence_schema_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompactEvidenceFile {
+    temp: Arc<TempDir>,
+    path: PathBuf,
+    relative_path: String,
+    media_type: String,
+    record_count: u64,
+    uncompressed_byte_size: u64,
+    uncompressed_sha256: String,
+    compressed_byte_size: u64,
+    compressed_sha256: String,
+}
+
+impl CompactEvidenceFile {
+    fn manifest_entry(&self, relation: &str) -> CompleteMachineEvidenceEntry {
+        CompleteMachineEvidenceEntry {
+            relation: relation.to_owned(),
+            path: self.relative_path.clone(),
+            media_type: self.media_type.clone(),
+            record_count: self.record_count,
+            uncompressed_byte_size: self.uncompressed_byte_size,
+            uncompressed_sha256: self.uncompressed_sha256.clone(),
+            compressed_byte_size: self.compressed_byte_size,
+            compressed_sha256: self.compressed_sha256.clone(),
+        }
+    }
+
+    fn prepared_artifact(&self) -> anyhow::Result<PreparedArtifact> {
+        Ok(PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_complete_machine_result".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
+                file_name: self.relative_path.clone(),
+                content_type: self.media_type.clone(),
+                byte_size: usize::try_from(self.compressed_byte_size)?,
+                checksum_sha256: self.compressed_sha256.clone(),
+            },
+            path: self.path.clone(),
+            _temp: Arc::clone(&self.temp),
+        })
+    }
+}
+
+struct CompactEvidenceWriter {
+    temp: Arc<TempDir>,
+    path: PathBuf,
+    relative_path: String,
+    media_type: String,
+    encoder: zstd::stream::write::Encoder<'static, BufWriter<File>>,
+    uncompressed_digest: Sha256,
+    uncompressed_byte_size: u64,
+    record_count: u64,
+}
+
+impl CompactEvidenceWriter {
+    fn new(relative_path: &str, media_type: &str) -> anyhow::Result<Self> {
+        let temp = Arc::new(TempDir::new()?);
+        let path = temp.path().join(relative_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("compact evidence path omitted parent"))?;
+        fs::create_dir_all(parent)?;
+        let file = File::create(&path)?;
+        advise_sequential_access(&file);
+        let encoder = zstd::stream::write::Encoder::new(BufWriter::new(file), 6)?;
+        Ok(Self {
+            temp,
+            path,
+            relative_path: relative_path.to_owned(),
+            media_type: media_type.to_owned(),
+            encoder,
+            uncompressed_digest: Sha256::new(),
+            uncompressed_byte_size: 0,
+            record_count: 0,
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.encoder.write_all(bytes)?;
+        self.uncompressed_digest.update(bytes);
+        self.uncompressed_byte_size = self
+            .uncompressed_byte_size
+            .checked_add(u64::try_from(bytes.len())?)
+            .ok_or_else(|| anyhow::anyhow!("compact evidence byte count overflow"))?;
+        Ok(())
+    }
+
+    fn record_completed(&mut self) -> anyhow::Result<()> {
+        self.record_count = self
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("compact evidence record count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<CompactEvidenceFile> {
+        let Self {
+            temp,
+            path,
+            relative_path,
+            media_type,
+            encoder,
+            uncompressed_digest,
+            uncompressed_byte_size,
+            record_count,
+        } = self;
+        let mut output = encoder.finish()?;
+        output.flush()?;
+        release_file_cache(output.get_ref());
+        drop(output);
+        let (compressed_byte_size, compressed_sha256) = file_size_and_sha256(&path)?;
+        Ok(CompactEvidenceFile {
+            temp,
+            path,
+            relative_path,
+            media_type,
+            record_count,
+            uncompressed_byte_size,
+            uncompressed_sha256: hex::encode(uncompressed_digest.finalize()),
+            compressed_byte_size,
+            compressed_sha256,
+        })
+    }
+}
+
+fn write_u16(writer: &mut CompactEvidenceWriter, value: u16) -> anyhow::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_u32(writer: &mut CompactEvidenceWriter, value: u32) -> anyhow::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_u64(writer: &mut CompactEvidenceWriter, value: u64) -> anyhow::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_compact_string(writer: &mut CompactEvidenceWriter, value: &str) -> anyhow::Result<()> {
+    write_u32(writer, u32::try_from(value.len())?)?;
+    writer.write_all(value.as_bytes())
+}
+
+fn write_delta_varint(writer: &mut CompactEvidenceWriter, ordinals: &[u32]) -> anyhow::Result<()> {
+    let mut previous = 0_u32;
+    for (index, &ordinal) in ordinals.iter().enumerate() {
+        let mut delta = if index == 0 {
+            ordinal
+        } else {
+            ordinal
+                .checked_sub(previous)
+                .ok_or_else(|| anyhow::anyhow!("root impact ordinals are not sorted"))?
+        };
+        loop {
+            let mut byte = u8::try_from(delta & 0x7f)?;
+            delta >>= 7;
+            if delta != 0 {
+                byte |= 0x80;
+            }
+            writer.write_all(&[byte])?;
+            if delta == 0 {
+                break;
+            }
+        }
+        previous = ordinal;
+    }
+    Ok(())
+}
+
+struct RootImpactIndexWriter {
+    evidence: CompactEvidenceWriter,
+    last_key: Option<String>,
+}
+
+impl RootImpactIndexWriter {
+    fn new(root_count: usize) -> anyhow::Result<Self> {
+        let mut evidence = CompactEvidenceWriter::new(
+            "evidence/root-impact-index-v1.bin.zst",
+            "application/vnd.tiangong.scope-closure-root-impact-index+zstd",
+        )?;
+        evidence.write_all(ROOT_IMPACT_INDEX_MAGIC)?;
+        write_u16(&mut evidence, 1)?;
+        write_u32(&mut evidence, u32::try_from(root_count)?)?;
+        Ok(Self {
+            evidence,
+            last_key: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append(
+        &mut self,
+        impact_key: &str,
+        kind: u8,
+        source_node_ordinal: Option<u32>,
+        mode: RootImpactMode,
+        affected_root_count: u32,
+        encoded_ordinals: &[u32],
+    ) -> anyhow::Result<()> {
+        if self
+            .last_key
+            .as_deref()
+            .is_some_and(|previous| previous >= impact_key)
+        {
+            return Err(anyhow::anyhow!(
+                "root impact keys are not strictly ordered: {impact_key}"
+            ));
+        }
+        self.last_key = Some(impact_key.to_owned());
+        write_u16(&mut self.evidence, u16::try_from(impact_key.len())?)?;
+        self.evidence.write_all(impact_key.as_bytes())?;
+        self.evidence.write_all(&[kind])?;
+        write_u32(&mut self.evidence, source_node_ordinal.unwrap_or(u32::MAX))?;
+        self.evidence.write_all(&[match mode {
+            RootImpactMode::None => 0,
+            RootImpactMode::AllRoots => 1,
+            RootImpactMode::IncludedOrdinals => 2,
+            RootImpactMode::ExcludedOrdinals => 3,
+        }])?;
+        write_u32(&mut self.evidence, affected_root_count)?;
+        write_u32(&mut self.evidence, u32::try_from(encoded_ordinals.len())?)?;
+        write_delta_varint(&mut self.evidence, encoded_ordinals)?;
+        self.evidence.record_completed()
+    }
+
+    fn finish(self) -> anyhow::Result<CompactEvidenceFile> {
+        self.evidence.finish()
+    }
+}
+
+#[derive(Debug)]
+struct StableRootOrdinals {
+    roots: Vec<ExactDatasetIdentity>,
+    ordinal_by_identity: BTreeMap<ExactDatasetIdentity, u32>,
+    graph_node_ordinals: Vec<u32>,
+}
+
+impl StableRootOrdinals {
+    fn new(roots: &[ExactDatasetIdentity], graph: &CompactReferenceGraph) -> anyhow::Result<Self> {
+        let roots = roots
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let ordinal_by_identity = roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| Ok((root.clone(), u32::try_from(index)?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let graph_node_ordinals = roots
+            .iter()
+            .map(|root| {
+                graph
+                    .identity_ids
+                    .get(root)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("reference graph omitted requested root"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            roots,
+            ordinal_by_identity,
+            graph_node_ordinals,
+        })
+    }
+}
+
+fn compact_root_impact_encoding(
+    included_ordinals: &[u32],
+    root_count: usize,
+) -> anyhow::Result<(RootImpactMode, Vec<u32>)> {
+    if included_ordinals.is_empty() {
+        return Ok((RootImpactMode::None, Vec::new()));
+    }
+    if included_ordinals.len() == root_count {
+        return Ok((RootImpactMode::AllRoots, Vec::new()));
+    }
+    if included_ordinals.len() <= root_count.saturating_sub(included_ordinals.len()) {
+        return Ok((RootImpactMode::IncludedOrdinals, included_ordinals.to_vec()));
+    }
+    let included = included_ordinals.iter().copied().collect::<BTreeSet<_>>();
+    let excluded = (0..u32::try_from(root_count)?)
+        .filter(|ordinal| !included.contains(ordinal))
+        .collect::<Vec<_>>();
+    Ok((RootImpactMode::ExcludedOrdinals, excluded))
+}
+
+fn build_frozen_reference_graph_file(
+    graph: &CompactReferenceGraph,
+    roots: &StableRootOrdinals,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<CompactEvidenceFile> {
+    let mut evidence = CompactEvidenceWriter::new(
+        "evidence/frozen-reference-graph-v1.bin.zst",
+        "application/vnd.tiangong.scope-closure-frozen-reference-graph+zstd",
+    )?;
+    evidence.write_all(FROZEN_REFERENCE_GRAPH_MAGIC)?;
+    write_u16(&mut evidence, 1)?;
+    write_u32(&mut evidence, u32::try_from(graph.identities.len())?)?;
+    write_u32(&mut evidence, u32::try_from(roots.roots.len())?)?;
+    let edge_count = graph
+        .reverse
+        .iter()
+        .map(Vec::len)
+        .try_fold(0_u64, |total, count| {
+            total
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("reference graph edge count overflow"))
+        })?;
+    write_u64(&mut evidence, edge_count)?;
+    for (index, identity) in graph.identities.iter().enumerate() {
+        if index.is_multiple_of(4_096) {
+            cancellation.check("scope_closure_frozen_graph_nodes")?;
+        }
+        write_compact_string(&mut evidence, identity.category.table_name())?;
+        evidence.write_all(identity.id.as_bytes())?;
+        write_compact_string(&mut evidence, &identity.version)?;
+    }
+    for &node_ordinal in &roots.graph_node_ordinals {
+        write_u32(&mut evidence, node_ordinal)?;
+    }
+    for (index, predecessors) in graph.reverse.iter().enumerate() {
+        if index.is_multiple_of(4_096) {
+            cancellation.check("scope_closure_frozen_graph_edges")?;
+        }
+        write_u32(&mut evidence, u32::try_from(predecessors.len())?)?;
+        write_delta_varint(&mut evidence, predecessors)?;
+    }
+    evidence.record_count = u64::try_from(graph.identities.len())?;
+    evidence.finish()
+}
+
+fn compress_tidas_issue_stream(
+    events: &JsonlValueSpool,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<CompactEvidenceFile> {
+    let mut evidence =
+        CompactEvidenceWriter::new("tidas/issues.ndjson.zst", "application/x-ndjson+zstd")?;
+    let file = File::open(&events.path)?;
+    advise_sequential_access(&file);
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        cancellation.check("scope_closure_tidas_artifact_write")?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        evidence.write_all(&buffer[..read])?;
+    }
+    evidence.record_count = events.event_count;
+    let evidence = evidence.finish()?;
+    if evidence.uncompressed_byte_size != events.byte_size
+        || evidence.uncompressed_sha256 != events.sha256
+    {
+        return Err(anyhow::anyhow!(
+            "compressed TIDAS issue stream changed logical bytes"
+        ));
+    }
+    Ok(evidence)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedRootImpactRecord {
+    impact_key: String,
+    kind: u8,
+    source_node_ordinal: Option<u32>,
+    mode: RootImpactMode,
+    affected_root_count: u32,
+    encoded_ordinals: Vec<u32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedRootImpactIndex {
+    root_count: u32,
+    records: Vec<DecodedRootImpactRecord>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedFrozenReferenceGraph {
+    identities: Vec<ExactDatasetIdentity>,
+    root_node_ordinals: Vec<u32>,
+    reverse: Vec<Vec<u32>>,
+}
+
+#[allow(dead_code)]
+fn read_exact_array<const N: usize>(
+    reader: &mut std::io::Cursor<&[u8]>,
+) -> anyhow::Result<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+fn read_u8(reader: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<u8> {
+    Ok(read_exact_array::<1>(reader)?[0])
+}
+
+#[allow(dead_code)]
+fn read_u16(reader: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<u16> {
+    Ok(u16::from_le_bytes(read_exact_array(reader)?))
+}
+
+#[allow(dead_code)]
+fn read_u32(reader: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<u32> {
+    Ok(u32::from_le_bytes(read_exact_array(reader)?))
+}
+
+#[allow(dead_code)]
+fn read_u64(reader: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<u64> {
+    Ok(u64::from_le_bytes(read_exact_array(reader)?))
+}
+
+#[allow(dead_code)]
+fn read_compact_string(reader: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<String> {
+    let length = usize::try_from(read_u32(reader)?)?;
+    let mut bytes = vec![0_u8; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+#[allow(dead_code)]
+fn read_delta_varints(
+    reader: &mut std::io::Cursor<&[u8]>,
+    count: usize,
+) -> anyhow::Result<Vec<u32>> {
+    let mut ordinals = Vec::with_capacity(count);
+    let mut previous = 0_u32;
+    for index in 0..count {
+        let mut value = 0_u32;
+        let mut shift = 0_u32;
+        loop {
+            if shift >= 35 {
+                return Err(anyhow::anyhow!("compact ordinal varint overflow"));
+            }
+            let byte = read_u8(reader)?;
+            value = value
+                .checked_add(u32::from(byte & 0x7f) << shift)
+                .ok_or_else(|| anyhow::anyhow!("compact ordinal varint overflow"))?;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let ordinal = if index == 0 {
+            value
+        } else {
+            previous
+                .checked_add(value)
+                .ok_or_else(|| anyhow::anyhow!("compact ordinal delta overflow"))?
+        };
+        if index > 0 && ordinal <= previous {
+            return Err(anyhow::anyhow!(
+                "compact ordinals are not strictly ascending"
+            ));
+        }
+        ordinals.push(ordinal);
+        previous = ordinal;
+    }
+    Ok(ordinals)
+}
+
+#[allow(dead_code)]
+fn decode_root_impact_index(bytes: &[u8]) -> anyhow::Result<DecodedRootImpactIndex> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let mut magic = vec![0_u8; ROOT_IMPACT_INDEX_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != ROOT_IMPACT_INDEX_MAGIC || read_u16(&mut reader)? != 1 {
+        return Err(anyhow::anyhow!("root impact index header mismatch"));
+    }
+    let root_count = read_u32(&mut reader)?;
+    let mut records = Vec::new();
+    let mut previous_key = None::<String>;
+    while usize::try_from(reader.position())? < bytes.len() {
+        let key_length = usize::from(read_u16(&mut reader)?);
+        let mut key_bytes = vec![0_u8; key_length];
+        reader.read_exact(&mut key_bytes)?;
+        let impact_key = String::from_utf8(key_bytes)?;
+        if previous_key
+            .as_deref()
+            .is_some_and(|previous| previous >= impact_key.as_str())
+        {
+            return Err(anyhow::anyhow!(
+                "root impact index keys are not strictly ordered"
+            ));
+        }
+        previous_key = Some(impact_key.clone());
+        let kind = read_u8(&mut reader)?;
+        if !matches!(kind, 1 | 2) {
+            return Err(anyhow::anyhow!("root impact index kind is invalid"));
+        }
+        let source_node = read_u32(&mut reader)?;
+        let source_node_ordinal = (source_node != u32::MAX).then_some(source_node);
+        let mode = match read_u8(&mut reader)? {
+            0 => RootImpactMode::None,
+            1 => RootImpactMode::AllRoots,
+            2 => RootImpactMode::IncludedOrdinals,
+            3 => RootImpactMode::ExcludedOrdinals,
+            _ => return Err(anyhow::anyhow!("root impact index mode is invalid")),
+        };
+        let affected_root_count = read_u32(&mut reader)?;
+        let encoded_count = usize::try_from(read_u32(&mut reader)?)?;
+        let encoded_ordinals = read_delta_varints(&mut reader, encoded_count)?;
+        if encoded_ordinals
+            .last()
+            .is_some_and(|ordinal| *ordinal >= root_count)
+        {
+            return Err(anyhow::anyhow!("root impact index ordinal is out of range"));
+        }
+        let decoded_count = match mode {
+            RootImpactMode::None => {
+                if !encoded_ordinals.is_empty() {
+                    return Err(anyhow::anyhow!("none root impact has an ordinal payload"));
+                }
+                0
+            }
+            RootImpactMode::AllRoots => {
+                if !encoded_ordinals.is_empty() {
+                    return Err(anyhow::anyhow!("all-roots impact has an ordinal payload"));
+                }
+                root_count
+            }
+            RootImpactMode::IncludedOrdinals => u32::try_from(encoded_ordinals.len())?,
+            RootImpactMode::ExcludedOrdinals => root_count
+                .checked_sub(u32::try_from(encoded_ordinals.len())?)
+                .ok_or_else(|| anyhow::anyhow!("excluded root impact exceeds root count"))?,
+        };
+        if decoded_count != affected_root_count {
+            return Err(anyhow::anyhow!("root impact encoded cardinality mismatch"));
+        }
+        records.push(DecodedRootImpactRecord {
+            impact_key,
+            kind,
+            source_node_ordinal,
+            mode,
+            affected_root_count,
+            encoded_ordinals,
+        });
+    }
+    Ok(DecodedRootImpactIndex {
+        root_count,
+        records,
+    })
+}
+
+#[allow(dead_code)]
+fn decode_frozen_reference_graph(bytes: &[u8]) -> anyhow::Result<DecodedFrozenReferenceGraph> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let mut magic = vec![0_u8; FROZEN_REFERENCE_GRAPH_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != FROZEN_REFERENCE_GRAPH_MAGIC || read_u16(&mut reader)? != 1 {
+        return Err(anyhow::anyhow!("frozen reference graph header mismatch"));
+    }
+    let node_count = usize::try_from(read_u32(&mut reader)?)?;
+    let root_count = usize::try_from(read_u32(&mut reader)?)?;
+    let expected_edge_count = read_u64(&mut reader)?;
+    let mut identities = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        let category = parse_category(&read_compact_string(&mut reader)?)?;
+        let id = Uuid::from_bytes(read_exact_array(&mut reader)?);
+        let version = read_compact_string(&mut reader)?;
+        let identity = ExactDatasetIdentity {
+            category,
+            id,
+            version,
+        };
+        if identities
+            .last()
+            .is_some_and(|previous| previous >= &identity)
+        {
+            return Err(anyhow::anyhow!(
+                "frozen reference graph identities are not strictly ordered"
+            ));
+        }
+        identities.push(identity);
+    }
+    let mut root_node_ordinals = Vec::with_capacity(root_count);
+    for _ in 0..root_count {
+        let ordinal = read_u32(&mut reader)?;
+        if usize::try_from(ordinal)? >= node_count {
+            return Err(anyhow::anyhow!(
+                "frozen reference graph root ordinal is out of range"
+            ));
+        }
+        root_node_ordinals.push(ordinal);
+    }
+    let mut reverse = Vec::with_capacity(node_count);
+    let mut observed_edge_count = 0_u64;
+    for _ in 0..node_count {
+        let count = usize::try_from(read_u32(&mut reader)?)?;
+        let predecessors = read_delta_varints(&mut reader, count)?;
+        if predecessors
+            .last()
+            .is_some_and(|ordinal| usize::try_from(*ordinal).unwrap_or(usize::MAX) >= node_count)
+        {
+            return Err(anyhow::anyhow!(
+                "frozen reference graph predecessor is out of range"
+            ));
+        }
+        observed_edge_count = observed_edge_count
+            .checked_add(u64::try_from(predecessors.len())?)
+            .ok_or_else(|| anyhow::anyhow!("frozen reference graph edge count overflow"))?;
+        reverse.push(predecessors);
+    }
+    if usize::try_from(reader.position())? != bytes.len()
+        || observed_edge_count != expected_edge_count
+    {
+        return Err(anyhow::anyhow!(
+            "frozen reference graph byte or edge count mismatch"
+        ));
+    }
+    Ok(DecodedFrozenReferenceGraph {
+        identities,
+        root_node_ordinals,
+        reverse,
+    })
+}
+
+#[allow(dead_code)]
+fn decoded_impact_contains_root(
+    record: &DecodedRootImpactRecord,
+    root_ordinal: u32,
+    root_count: u32,
+) -> bool {
+    match record.mode {
+        RootImpactMode::None => false,
+        RootImpactMode::AllRoots => root_ordinal < root_count,
+        RootImpactMode::IncludedOrdinals => {
+            record.encoded_ordinals.binary_search(&root_ordinal).is_ok()
+        }
+        RootImpactMode::ExcludedOrdinals => {
+            root_ordinal < root_count
+                && record
+                    .encoded_ordinals
+                    .binary_search(&root_ordinal)
+                    .is_err()
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn reconstruct_frozen_graph_witness(
+    graph: &DecodedFrozenReferenceGraph,
+    source_node_ordinal: u32,
+    root_ordinal: u32,
+) -> anyhow::Result<Vec<ExactDatasetIdentity>> {
+    let root_node_ordinal = *graph
+        .root_node_ordinals
+        .get(usize::try_from(root_ordinal)?)
+        .ok_or_else(|| anyhow::anyhow!("requested root ordinal is out of range"))?;
+    let source_index = usize::try_from(source_node_ordinal)?;
+    if source_index >= graph.identities.len() {
+        return Err(anyhow::anyhow!("source node ordinal is out of range"));
+    }
+    let mut visited = vec![false; graph.identities.len()];
+    let mut parent = vec![None; graph.identities.len()];
+    visited[source_index] = true;
+    let mut queue = VecDeque::from([source_node_ordinal]);
+    while let Some(node) = queue.pop_front() {
+        if node == root_node_ordinal {
+            return Ok(reconstruct_witness_path(
+                root_node_ordinal,
+                &parent,
+                &graph.identities,
+            ));
+        }
+        for &predecessor in graph
+            .reverse
+            .get(usize::try_from(node)?)
+            .ok_or_else(|| anyhow::anyhow!("frozen graph node is out of range"))?
+        {
+            let predecessor_index = usize::try_from(predecessor)?;
+            if !visited[predecessor_index] {
+                visited[predecessor_index] = true;
+                parent[predecessor_index] = Some(node);
+                queue.push_back(predecessor);
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "frozen reference graph cannot reconstruct requested witness"
+    ))
 }
 
 trait ScopeClosureProvider {
@@ -2281,29 +3034,46 @@ struct PreparedArtifact {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ScopeClosureArtifactWriteSet {
+struct ScopeClosureArtifactWriteSetHeader {
     write_set_id: Uuid,
+    closure_check_id: Uuid,
+    worker_job_id: Uuid,
+    request_id: Uuid,
+    publication_mode: String,
+    reused_from_check_id: Option<Uuid>,
     status: String,
     write_token: Uuid,
-    items: Vec<ScopeClosureArtifactWriteSetItem>,
+    contract_version: String,
+    expected_descriptor_count: u64,
+    registered_descriptor_count: u64,
+    registered_batch_count: u64,
+    descriptor_set_sha256: String,
+    required_primary_roles: Value,
+    upload_eligible: bool,
+    #[serde(default)]
+    artifact_map: BTreeMap<String, Uuid>,
+    #[serde(default)]
+    batches: Vec<ScopeClosureArtifactWriteSetBatch>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ScopeClosureArtifactWriteSetItem {
-    artifact_id: Uuid,
-    client_key: String,
-    artifact_type: String,
-    artifact_role: ScopeClosureArtifactRole,
-    #[serde(rename = "bucket")]
-    storage_bucket: String,
-    #[serde(rename = "objectPath")]
-    storage_path: String,
-    #[serde(rename = "mediaType")]
-    content_type: String,
-    #[serde(rename = "size")]
-    byte_size: u64,
-    checksum_sha256: String,
+struct ScopeClosureArtifactWriteSetBatch {
+    batch_id: Uuid,
+    item_count: u64,
+    first_ordinal: u64,
+    last_ordinal: u64,
+}
+
+struct ScopeClosureArtifactWriteSetExpectation<'a> {
+    closure_check_id: Uuid,
+    worker_job_id: Uuid,
+    request_id: Uuid,
+    publication_mode: &'static str,
+    reused_from_check_id: Option<Uuid>,
+    expected_descriptor_count: u64,
+    descriptor_set_sha256: &'a str,
+    required_primary_roles: &'a Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2323,7 +3093,8 @@ struct IssuePartitionManifestEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct IssueRelationStreamHashes {
+#[cfg_attr(not(test), allow(dead_code))]
+struct IssueRelationStreamHashesV2 {
     issues: String,
     occurrences: String,
     affected_roots: String,
@@ -2331,7 +3102,8 @@ struct IssueRelationStreamHashes {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct IssuePartitionManifest {
+#[cfg_attr(not(test), allow(dead_code))]
+struct IssuePartitionManifestV2 {
     schema_version: String,
     closure_check_id: Uuid,
     logical_issue_stream_sha256: String,
@@ -2341,13 +3113,83 @@ struct IssuePartitionManifest {
     issue_count: u64,
     occurrence_count: u64,
     affected_root_count: u64,
-    relation_stream_sha256: IssueRelationStreamHashes,
+    relation_stream_sha256: IssueRelationStreamHashesV2,
     rpc_issue_sample_limit: usize,
     rpc_occurrence_sample_limit_per_issue: usize,
     rpc_affected_root_sample_limit_per_issue: usize,
     xlsx_issue_sample_limit: usize,
     xlsx_occurrence_sample_limit: usize,
     xlsx_affected_root_sample_limit: usize,
+    partitions: Vec<IssuePartitionManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteMachineEvidenceEntry {
+    relation: String,
+    path: String,
+    media_type: String,
+    record_count: u64,
+    uncompressed_byte_size: u64,
+    uncompressed_sha256: String,
+    compressed_byte_size: u64,
+    compressed_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueRelationStreamHashesV3 {
+    issues: String,
+    tidas_issue_stream: String,
+    root_impact_index: String,
+    frozen_reference_graph: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueManifestOrdering {
+    issue_key: String,
+    root_ordinal: String,
+    graph_node_ordinal: String,
+    root_impact_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueManifestCompatibility {
+    readable_schema_versions: Vec<String>,
+    v2_affected_root_projection: String,
+    public_transport: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssuePartitionManifestV3 {
+    schema_version: String,
+    closure_check_id: Uuid,
+    logical_issue_stream_sha256: String,
+    logical_issue_event_count: u64,
+    logical_issue_stream_byte_size: u64,
+    partition_max_records: u64,
+    partition_max_uncompressed_bytes: u64,
+    issue_count: u64,
+    occurrence_count: u64,
+    affected_root_count: u64,
+    expanded_affected_root_record_count: u64,
+    root_impact_record_count: u64,
+    root_count: u64,
+    graph_node_count: u64,
+    graph_edge_count: u64,
+    relation_stream_sha256: IssueRelationStreamHashesV3,
+    ordering: IssueManifestOrdering,
+    rpc_issue_sample_limit: usize,
+    rpc_occurrence_sample_limit_per_issue: usize,
+    rpc_affected_root_sample_limit_per_issue: usize,
+    xlsx_issue_sample_limit: usize,
+    xlsx_occurrence_sample_limit: usize,
+    xlsx_affected_root_sample_limit: usize,
+    compatibility: IssueManifestCompatibility,
+    evidence: Vec<CompleteMachineEvidenceEntry>,
     partitions: Vec<IssuePartitionManifestEntry>,
 }
 
@@ -2438,11 +3280,13 @@ struct JsonlValueSpoolWriter {
     digest: Sha256,
     event_count: u64,
     byte_size: u64,
+    enforce_validation_limits: bool,
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct SortedJsonlRuns {
-    temp: TempDir,
+    _temp: TempDir,
     run_paths: Vec<PathBuf>,
     event_count: u64,
     byte_size: u64,
@@ -2574,7 +3418,7 @@ impl SortedJsonlRunWriter {
             pass = pass.saturating_add(1);
         }
         Ok(SortedJsonlRuns {
-            temp: self.temp,
+            _temp: self.temp,
             run_paths: self.run_paths,
             event_count: self.event_count,
             byte_size: self.byte_size,
@@ -2588,10 +3432,6 @@ impl SortedJsonlRuns {
             visit(serde_json::from_slice(line)?)
         })?;
         Ok(())
-    }
-
-    fn storage_bytes(&self) -> u64 {
-        directory_bytes(self.temp.path()).unwrap_or(0)
     }
 }
 
@@ -2685,7 +3525,14 @@ impl JsonlValueSpoolWriter {
             digest: Sha256::new(),
             event_count: 0,
             byte_size: 0,
+            enforce_validation_limits: true,
         })
+    }
+
+    fn new_derived(file_name: &str) -> anyhow::Result<Self> {
+        let mut writer = Self::new(file_name)?;
+        writer.enforce_validation_limits = false;
+        Ok(writer)
     }
 
     fn append(&mut self, event: &Value) -> anyhow::Result<()> {
@@ -2719,8 +3566,9 @@ impl JsonlValueSpoolWriter {
             .event_count
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("validation issue spool event count overflow"))?;
-        if self.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES
-            || self.event_count > VALIDATION_ISSUE_SPOOL_MAX_EVENTS
+        if self.enforce_validation_limits
+            && (self.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES
+                || self.event_count > VALIDATION_ISSUE_SPOOL_MAX_EVENTS)
         {
             return Err(anyhow::anyhow!(
                 "validation issue spool exceeded bounded capacity: bytes={}/{}, events={}/{}",
@@ -2991,11 +3839,15 @@ fn build_closure_bundle(
     resolution_map: &JsonlValueSpool,
 ) -> anyhow::Result<ClosureBundleFile> {
     let temp = Arc::new(TempDir::new()?);
-    ensure_temp_free_space(
-        temp.path(),
-        validation.issue_events.byte_size.saturating_mul(2),
-    )?;
-    let path = temp.path().join("closure-bundle-v1.json");
+    let projected_bundle_bytes = scan
+        .documents
+        .byte_size
+        .saturating_add(scan.edges.byte_size)
+        .saturating_add(scan.resolved_references.byte_size)
+        .saturating_add(resolution_map.byte_size)
+        .saturating_add(4 * 1024 * 1024);
+    ensure_temp_free_space(temp.path(), projected_bundle_bytes)?;
+    let path = temp.path().join("closure-bundle-v3.json");
     let mut writer = BufWriter::new(File::create(&path)?);
     writer.write_all(b"{")?;
     write_canonical_field(
@@ -3019,15 +3871,15 @@ fn build_closure_bundle(
     writer.write_all(b",\"resolutionMap\":")?;
     write_spooled_json_array(&mut writer, resolution_map)?;
     writer.write_all(b",\"scan\":")?;
-    write_scope_closure_scan(&mut writer, scan)?;
+    write_scope_closure_scan_v3(&mut writer, scan)?;
     write_canonical_field(
         &mut writer,
         "schemaVersion",
-        &"lcia.scope-closure-bundle.v1",
+        &"lcia.scope-closure-bundle.v3",
         true,
     )?;
     writer.write_all(b",\"tidasValidation\":")?;
-    write_tidas_validation(&mut writer, validation)?;
+    write_tidas_validation_v3(&mut writer, validation)?;
     write_canonical_field(
         &mut writer,
         "validatorScannerFingerprint",
@@ -3082,7 +3934,7 @@ where
     Ok(())
 }
 
-fn write_scope_closure_scan<W: Write>(
+fn write_scope_closure_scan_v3<W: Write>(
     writer: &mut W,
     scan: &ScopeClosureScan,
 ) -> anyhow::Result<()> {
@@ -3094,11 +3946,28 @@ fn write_scope_closure_scan<W: Write>(
     write_spooled_json_array(writer, &scan.edges)?;
     writer.write_all(b",\"frontier\":")?;
     write_canonical_array(writer, &scan.frontier)?;
-    writer.write_all(b",\"issues\":")?;
-    if let Some(relations) = &scan.issue_relations {
-        write_relation_payload_json_array(writer, &relations.issues, 1)?;
+    writer.write_all(b",\"issueSummary\":")?;
+    if let Some(relations) = scan.issue_relations.as_ref() {
+        writer.write_all(&canonical_json_bytes(&json!({
+            "affectedRootCount": relations.stats.affected_root_count,
+            "blockerCodes": relations.stats.blocker_codes,
+            "blockerCount": relations.stats.blocker_count,
+            "canonical": true,
+            "completeMachineResultClientKey": "manifest.json",
+            "expandedAffectedRootRecordCount": 0,
+            "issueCount": relations.stats.issue_count,
+            "issueSchemaVersion": "lcia.scope-closure-issue.v3",
+            "occurrenceCount": relations.stats.occurrence_count,
+            "rawTidasIssueEventCount": scan.tidas_issue_event_count,
+        }))?)?;
     } else {
-        write_canonical_array(writer, &scan.issues)?;
+        writer.write_all(&canonical_json_bytes(&json!({
+            "canonical": false,
+            "completeMachineResultClientKey": "manifest.json",
+            "issueCountBeforeTidasCoalescing": scan.issues.len(),
+            "issueSchemaVersion": "lcia.scope-closure-issue.v3",
+            "rawTidasIssueEventCount": scan.tidas_issue_event_count,
+        }))?)?;
     }
     writer.write_all(b",\"omittedVersionResolutions\":")?;
     write_canonical_array(writer, &scan.omitted_version_resolutions)?;
@@ -3113,47 +3982,27 @@ fn write_scope_closure_scan<W: Write>(
     Ok(())
 }
 
-fn write_relation_payload_json_array<W: Write>(
-    writer: &mut W,
-    spool: &SortedJsonlRuns,
-    payload_index: usize,
-) -> anyhow::Result<()> {
-    writer.write_all(b"[")?;
-    let mut comma = false;
-    spool.visit(|record| {
-        let payload = record
-            .as_array()
-            .and_then(|fields| fields.get(payload_index))
-            .ok_or_else(|| anyhow::anyhow!("relation spool record omitted payload"))?;
-        if comma {
-            writer.write_all(b",")?;
-        }
-        writer.write_all(&canonical_json_bytes(payload)?)?;
-        comma = true;
-        Ok(())
-    })?;
-    writer.write_all(b"]")?;
-    Ok(())
-}
-
-fn write_tidas_validation<W: Write>(
+fn write_tidas_validation_v3<W: Write>(
     writer: &mut W,
     validation: &TidasBatchValidation,
 ) -> anyhow::Result<()> {
     writer.write_all(b"{")?;
     write_canonical_field(writer, "describe", &validation.describe, false)?;
     write_canonical_field(writer, "finalEvent", &validation.final_event, true)?;
-    writer.write_all(b",\"issueEvents\":[")?;
-    let mut comma = false;
-    validation.issue_events.visit(|event| {
-        if comma {
-            writer.write_all(b",")?;
-        }
-        writer.write_all(&canonical_json_bytes(&event)?)?;
-        comma = true;
-        Ok(())
-    })?;
-    writer.write_all(b"]}")?;
+    write_canonical_field(
+        writer,
+        "issueStream",
+        &json!({
+            "compression": "zstd",
+            "eventCount": validation.issue_events.event_count,
+            "logicalByteSize": validation.issue_events.byte_size,
+            "logicalSha256": validation.issue_events.sha256,
+            "path": "tidas/issues.ndjson.zst",
+            "schemaVersion": "lcia.scope-closure-tidas-issue-stream.v1",
+        }),
+        true,
+    )?;
+    writer.write_all(b"}")?;
     Ok(())
 }
 
@@ -3303,6 +4152,21 @@ fn freeze_discovered_process_axis(
     Ok(frozen)
 }
 
+fn bounded_all_root_evidence(
+    roots: &[ExactDatasetIdentity],
+) -> (Vec<ExactDatasetIdentity>, Vec<Vec<ExactDatasetIdentity>>) {
+    let affected_roots = roots
+        .iter()
+        .take(ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let witness_paths = affected_roots
+        .iter()
+        .map(|root| vec![root.clone()])
+        .collect();
+    (affected_roots, witness_paths)
+}
+
 fn add_process_axis_drift_issue(
     scan: &mut ScopeClosureScan,
     frozen_axis: &[RequestRootProcess],
@@ -3330,6 +4194,7 @@ fn add_process_axis_drift_issue(
             .map(|(id, version)| format!("{id}@{version}"))
             .collect::<Vec<_>>(),
     });
+    let (affected_roots, affected_root_witness_paths) = bounded_all_root_evidence(&scan.roots);
     scan.issues.push(ClosureIssue {
         issue_key: format!(
             "scope_closure_process_axis_drift:{}",
@@ -3358,8 +4223,8 @@ fn add_process_axis_drift_issue(
             details,
         }],
         affected_root_count: u32::try_from(scan.roots.len()).unwrap_or(u32::MAX),
-        affected_roots: scan.roots.clone(),
-        affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+        affected_roots,
+        affected_root_witness_paths,
         witness_path: Vec::new(),
     });
     Ok(())
@@ -3378,6 +4243,7 @@ fn merge_matrix_readiness_blockers(
             "nextAction": readiness.next_action,
             "finding": blocker,
         });
+        let (affected_roots, affected_root_witness_paths) = bounded_all_root_evidence(&scan.roots);
         scan.issues.push(ClosureIssue {
             issue_key: format!(
                 "matrix_readiness:{}:{}",
@@ -3404,12 +4270,13 @@ fn merge_matrix_readiness_blockers(
                 details,
             }],
             affected_root_count: u32::try_from(scan.roots.len()).unwrap_or(u32::MAX),
-            affected_roots: scan.roots.clone(),
-            affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+            affected_roots,
+            affected_root_witness_paths,
             witness_path: Vec::new(),
         });
     }
     if readiness.status == ReadinessStatus::Failed && readiness.blockers.is_empty() {
+        let (affected_roots, affected_root_witness_paths) = bounded_all_root_evidence(&scan.roots);
         scan.issues.push(ClosureIssue {
             issue_key: "matrix_readiness_failed_without_blockers".to_owned(),
             severity: "error".to_owned(),
@@ -3426,8 +4293,8 @@ fn merge_matrix_readiness_blockers(
             occurrence_count: 1,
             occurrences: Vec::new(),
             affected_root_count: u32::try_from(scan.roots.len()).unwrap_or(u32::MAX),
-            affected_roots: scan.roots.clone(),
-            affected_root_witness_paths: scan.roots.iter().map(|root| vec![root.clone()]).collect(),
+            affected_roots,
+            affected_root_witness_paths,
             witness_path: Vec::new(),
         });
     }
@@ -3748,21 +4615,48 @@ pub async fn execute_scope_closure_job(
     }
 
     let input_for_artifacts = input.clone();
+    let artifact_build_cancellation = CancellationToken::default();
+    let blocking_cancellation = artifact_build_cancellation.clone();
+    let artifact_build_progress = Arc::new(ScopeClosureArtifactProgress::default());
+    let blocking_progress = Arc::clone(&artifact_build_progress);
     let prepare_artifacts = tokio::task::spawn_blocking(move || {
-        build_issue_relation_spools(&mut scan, &validation.issue_events)?;
+        build_issue_relation_spools_with_cancellation_and_progress(
+            &mut scan,
+            &validation.issue_events,
+            &blocking_cancellation,
+            Some(&blocking_progress),
+        )?;
+        blocking_cancellation.check("scope_closure_resolution_map")?;
         let resolution_map =
             build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
         let resolution_map_hash = spooled_json_array_sha256(&resolution_map)?;
+        blocking_cancellation.check("scope_closure_bundle")?;
         let closure_bundle =
             build_closure_bundle(&input_for_artifacts, &validation, &scan, &resolution_map)?;
         let closure_bundle_hash = closure_bundle.sha256.clone();
         let source_fingerprint = source_fingerprint(&scan.documents)?;
-        let mut artifacts = prepare_closure_content_artifacts(
+        blocking_cancellation.check("scope_closure_artifact_finalize")?;
+        let mut artifacts = prepare_closure_content_artifacts_with_cancellation(
             closure_bundle,
             closure_check_id,
             &scan,
             &validation,
+            &blocking_cancellation,
+            Some(&blocking_progress),
         )?;
+        let artifact_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
+            total
+                .checked_add(u64::try_from(artifact.descriptor.byte_size)?)
+                .ok_or_else(|| anyhow::anyhow!("closure artifact byte count overflow"))
+        })?;
+        blocking_progress.update(
+            5,
+            scan.issue_relations
+                .as_ref()
+                .map_or(0, |relations| relations.stats.issue_count),
+            artifact_bytes,
+            u64::try_from(artifacts.len())?,
+        );
         enforce_scope_closure_memory_budget("closure_artifacts_built")?;
         artifacts.sort_by(|left, right| {
             left.descriptor
@@ -3798,16 +4692,24 @@ pub async fn execute_scope_closure_job(
         tokio::select! {
             result = &mut prepare_artifacts => break result??,
             _ = artifact_heartbeat.tick() => {
-                progress
+                if let Err(error) = progress
                     .heartbeat(
                         "prepare_closure_artifacts",
                         0.82,
                         Some(json!({
                             "closureCheckId": closure_check_id,
                             "longRunningOperation": true,
+                            "progressCounters": artifact_build_progress.snapshot(),
                         })),
                     )
-                    .await?;
+                    .await
+                {
+                    artifact_build_cancellation.cancel();
+                    let _ = (&mut prepare_artifacts).await;
+                    return Err(error.context(
+                        "closure artifact preparation cancelled after lease heartbeat failure",
+                    ));
+                }
             }
         }
     };
@@ -4801,15 +5703,45 @@ impl IssuePartitionAccumulator {
     }
 }
 
-fn issue_partition_record(issue: &ClosureIssue) -> Value {
-    json!({
-        "schemaVersion": "lcia.scope-closure-issue.v2",
+fn issue_partition_record_v3(
+    issue: &ClosureIssue,
+    root_impact: &RootImpactReference,
+    roots: &StableRootOrdinals,
+) -> anyhow::Result<Value> {
+    let occurrence_samples = issue
+        .occurrences
+        .iter()
+        .take(ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT)
+        .collect::<Vec<_>>();
+    let affected_root_samples = issue
+        .affected_roots
+        .iter()
+        .enumerate()
+        .take(ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT)
+        .map(|(index, root)| {
+            let root_ordinal = roots
+                .ordinal_by_identity
+                .get(root)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("issue sample references an unknown root"))?;
+            Ok(json!({
+                "rootOrdinal": root_ordinal,
+                "root": root,
+                "witnessPath": issue
+                    .affected_root_witness_paths
+                    .get(index)
+                    .unwrap_or(&issue.witness_path),
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(json!({
+        "schemaVersion": "lcia.scope-closure-issue.v3",
         "issueKey": issue.issue_key,
         "severity": issue.severity,
-        "blocking": issue.blocking,
-        "issueCode": issue.issue_code,
+        "blocker": issue.blocking,
+        "code": issue.issue_code,
         "source": issue.source,
-        "jsonPath": issue.json_path,
+        "path": issue.json_path,
         "referenceRole": issue.reference_role,
         "requestedTargetType": issue.requested_target_type,
         "requestedTargetId": issue.requested_target_id,
@@ -4818,9 +5750,17 @@ fn issue_partition_record(issue: &ClosureIssue) -> Value {
         "suggestedAction": issue.suggested_action,
         "occurrenceCount": issue.occurrence_count,
         "affectedRootCount": issue.affected_root_count,
-    })
+        "rootImpact": root_impact,
+        "occurrenceSamples": occurrence_samples,
+        "occurrenceSamplesTruncated": usize::try_from(issue.occurrence_count)
+            .unwrap_or(usize::MAX) > occurrence_samples.len(),
+        "affectedRootSamples": affected_root_samples,
+        "affectedRootSamplesTruncated": usize::try_from(issue.affected_root_count)
+            .unwrap_or(usize::MAX) > affected_root_samples.len(),
+    }))
 }
 
+#[cfg(test)]
 fn affected_root_partition_record(
     issue_key: &str,
     root: &ExactDatasetIdentity,
@@ -4836,116 +5776,109 @@ fn affected_root_partition_record(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn prepare_issue_partition_artifacts(
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
     temp: Arc<TempDir>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
-    let mut issue_writer = IssuePartitionAccumulator::new(Arc::clone(&temp), "issues");
-    let mut occurrence_writer = IssuePartitionAccumulator::new(Arc::clone(&temp), "occurrences");
-    let mut affected_root_writer =
-        IssuePartitionAccumulator::new(Arc::clone(&temp), "affected-roots");
+    prepare_issue_partition_artifacts_with_cancellation(
+        closure_check_id,
+        scan,
+        validation,
+        temp,
+        &CancellationToken::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_issue_partition_artifacts_with_cancellation(
+    closure_check_id: Uuid,
+    scan: &ScopeClosureScan,
+    validation: &TidasBatchValidation,
+    temp: Arc<TempDir>,
+    cancellation: &CancellationToken,
+    progress: Option<&ScopeClosureArtifactProgress>,
+) -> anyhow::Result<Vec<PreparedArtifact>> {
+    cancellation.check("scope_closure_issue_artifact_start")?;
     let relations = scan
         .issue_relations
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("issue relation spools were not prepared"))?;
-    let mut observed = 0_u64;
-    relations.issues.visit(|record| {
-        observed = observed.saturating_add(1);
-        if observed.is_multiple_of(1_024) {
-            enforce_scope_closure_memory_budget("write_issue_partitions")?;
-        }
-        let fields = record
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("issue relation record must be an array"))?;
-        let issue_key = fields
-            .first()
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("issue relation omitted issue key"))?;
-        let issue: ClosureIssue = serde_json::from_value(
-            fields
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("issue relation omitted payload"))?,
-        )?;
-        issue_writer.push(issue_key, &issue_partition_record(&issue))
-    })?;
-    relations.occurrences.visit(|record| {
-        let fields = record
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("occurrence relation record must be an array"))?;
-        let issue_key = fields
-            .first()
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("occurrence relation omitted issue key"))?;
-        let occurrence: ClosureIssueOccurrence = serde_json::from_value(
-            fields
-                .get(2)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("occurrence relation omitted payload"))?,
-        )?;
-        occurrence_writer.push(
-            issue_key,
-            &json!({
-                "schemaVersion": "lcia.scope-closure-issue-occurrence.v1",
-                "issueKey": issue_key,
-                "occurrenceKey": occurrence.occurrence_key,
-                "source": occurrence.source,
-                "jsonPath": occurrence.json_path,
-                "referenceRole": occurrence.reference_role,
-                "details": occurrence.details,
-            }),
-        )
-    })?;
-    relations.affected_roots.visit(|record| {
-        let fields = record
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("affected-root relation record must be an array"))?;
-        let issue_key = fields
-            .first()
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("affected-root relation omitted issue key"))?;
-        let payload = fields
-            .get(2)
-            .ok_or_else(|| anyhow::anyhow!("affected-root relation omitted payload"))?;
-        affected_root_writer.push(issue_key, payload)
-    })?;
-
-    let (mut entries, mut artifacts, issue_relation_sha256) = issue_writer.finish()?;
-    let (occurrence_entries, occurrence_artifacts, occurrence_relation_sha256) =
-        occurrence_writer.finish()?;
-    entries.extend(occurrence_entries);
-    artifacts.extend(occurrence_artifacts);
-    let (affected_root_entries, affected_root_artifacts, affected_root_relation_sha256) =
-        affected_root_writer.finish()?;
-    entries.extend(affected_root_entries);
-    artifacts.extend(affected_root_artifacts);
+    let stable_roots = StableRootOrdinals::new(&scan.roots, &scan.reference_graph)?;
+    let frozen_reference_graph =
+        build_frozen_reference_graph_file(&scan.reference_graph, &stable_roots, cancellation)?;
+    let tidas_issue_stream = compress_tidas_issue_stream(&validation.issue_events, cancellation)?;
+    let mut entries = relations.issue_partition_entries.clone();
+    let mut artifacts = relations.issue_partition_artifacts.clone();
+    let mut evidence = vec![
+        relations
+            .root_impact_index
+            .manifest_entry("root-impact-index"),
+        frozen_reference_graph.manifest_entry("frozen-reference-graph"),
+        tidas_issue_stream.manifest_entry("tidas-issue-stream"),
+    ];
+    artifacts.push(relations.root_impact_index.prepared_artifact()?);
+    artifacts.push(frozen_reference_graph.prepared_artifact()?);
+    artifacts.push(tidas_issue_stream.prepared_artifact()?);
     let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
         total.saturating_add(u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX))
     });
+    if let Some(progress) = progress {
+        progress.update(
+            4,
+            relations.stats.issue_count,
+            partition_bytes,
+            u64::try_from(artifacts.len())?,
+        );
+    }
     record_scope_closure_resources(
         "write_issue_partitions_complete",
         Some(partition_bytes),
         Some(relations.stats.affected_root_count),
     );
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    evidence.sort_by(|left, right| left.path.cmp(&right.path));
     artifacts.sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
-
-    let manifest = IssuePartitionManifest {
-        schema_version: "lcia.scope-closure-issue-manifest.v2".to_owned(),
+    let graph_edge_count =
+        scan.reference_graph
+            .reverse
+            .iter()
+            .map(Vec::len)
+            .try_fold(0_u64, |total, count| {
+                total
+                    .checked_add(u64::try_from(count)?)
+                    .ok_or_else(|| anyhow::anyhow!("reference graph edge count overflow"))
+            })?;
+    let manifest = IssuePartitionManifestV3 {
+        schema_version: "lcia.scope-closure-issue-manifest.v3".to_owned(),
         closure_check_id,
         logical_issue_stream_sha256: validation.issue_events.sha256.clone(),
         logical_issue_event_count: validation.issue_events.event_count,
+        logical_issue_stream_byte_size: validation.issue_events.byte_size,
         partition_max_records: ISSUE_PARTITION_MAX_RECORDS,
         partition_max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
         issue_count: relations.stats.issue_count,
         occurrence_count: relations.stats.occurrence_count,
         affected_root_count: relations.stats.affected_root_count,
-        relation_stream_sha256: IssueRelationStreamHashes {
-            issues: issue_relation_sha256,
-            occurrences: occurrence_relation_sha256,
-            affected_roots: affected_root_relation_sha256,
+        expanded_affected_root_record_count: 0,
+        root_impact_record_count: relations.root_impact_index.record_count,
+        root_count: u64::try_from(stable_roots.roots.len())?,
+        graph_node_count: u64::try_from(scan.reference_graph.identities.len())?,
+        graph_edge_count,
+        relation_stream_sha256: IssueRelationStreamHashesV3 {
+            issues: relations.issue_relation_sha256.clone(),
+            tidas_issue_stream: tidas_issue_stream.uncompressed_sha256,
+            root_impact_index: relations.root_impact_index.uncompressed_sha256.clone(),
+            frozen_reference_graph: frozen_reference_graph.uncompressed_sha256,
+        },
+        ordering: IssueManifestOrdering {
+            issue_key: "UTF-8 ascending".to_owned(),
+            root_ordinal: "exact dataset identity ascending".to_owned(),
+            graph_node_ordinal: "exact dataset identity ascending".to_owned(),
+            root_impact_key: "UTF-8 ascending".to_owned(),
         },
         rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
         rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
@@ -4953,6 +5886,17 @@ fn prepare_issue_partition_artifacts(
         xlsx_issue_sample_limit: XLSX_ISSUE_SAMPLE_LIMIT,
         xlsx_occurrence_sample_limit: XLSX_OCCURRENCE_SAMPLE_LIMIT,
         xlsx_affected_root_sample_limit: XLSX_AFFECTED_ROOT_SAMPLE_LIMIT,
+        compatibility: IssueManifestCompatibility {
+            readable_schema_versions: vec![
+                "lcia.scope-closure-issue-manifest.v2".to_owned(),
+                "lcia.scope-closure-issue-manifest.v3".to_owned(),
+            ],
+            v2_affected_root_projection:
+                "derive issue×root rows and witnesses on demand from rootImpact and frozen-reference-graph"
+                    .to_owned(),
+            public_transport: vec!["closure-report-v1.xlsx".to_owned(), "manifest.json".to_owned()],
+        },
+        evidence,
         partitions: entries,
     };
     let manifest_path = temp.path().join("manifest.json");
@@ -4968,11 +5912,30 @@ fn prepare_issue_partition_artifacts(
     Ok(artifacts)
 }
 
+#[cfg(test)]
 fn prepare_closure_content_artifacts(
     closure_bundle: ClosureBundleFile,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
+) -> anyhow::Result<Vec<PreparedArtifact>> {
+    prepare_closure_content_artifacts_with_cancellation(
+        closure_bundle,
+        closure_check_id,
+        scan,
+        validation,
+        &CancellationToken::default(),
+        None,
+    )
+}
+
+fn prepare_closure_content_artifacts_with_cancellation(
+    closure_bundle: ClosureBundleFile,
+    closure_check_id: Uuid,
+    scan: &ScopeClosureScan,
+    validation: &TidasBatchValidation,
+    cancellation: &CancellationToken,
+    progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
     let ClosureBundleFile {
         temp,
@@ -4980,6 +5943,7 @@ fn prepare_closure_content_artifacts(
         byte_size: bundle_byte_size,
         sha256: bundle_sha256,
     } = closure_bundle;
+    cancellation.check("scope_closure_xlsx_report")?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
     build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
 
@@ -4988,7 +5952,7 @@ fn prepare_closure_content_artifacts(
             descriptor: ArtifactManifestEntry {
                 artifact_type: "closure_bundle".to_owned(),
                 artifact_role: ScopeClosureArtifactRole::ClosureBundle,
-                file_name: "closure-bundle-v1.json".to_owned(),
+                file_name: "closure-bundle-v3.json".to_owned(),
                 content_type: "application/json".to_owned(),
                 byte_size: usize::try_from(bundle_byte_size)?,
                 checksum_sha256: bundle_sha256,
@@ -5005,11 +5969,13 @@ fn prepare_closure_content_artifacts(
             xlsx_path,
         )?,
     ];
-    artifacts.extend(prepare_issue_partition_artifacts(
+    artifacts.extend(prepare_issue_partition_artifacts_with_cancellation(
         closure_check_id,
         scan,
         validation,
         Arc::clone(&temp),
+        cancellation,
+        progress,
     )?);
     Ok(artifacts)
 }
@@ -5082,28 +6048,49 @@ fn is_semantic_closure_artifact(artifact: &PreparedArtifact) -> bool {
 #[allow(clippy::too_many_lines)]
 async fn persist_closure_artifacts(
     state: &AppState,
-    _worker_job_id: Uuid,
+    worker_job_id: Uuid,
     closure_check_id: Uuid,
     artifacts: &[PreparedArtifact],
     content_artifact_manifest_hash: &str,
     reused_from_check_id: Option<Uuid>,
     progress: Option<&WorkerJobProgress<'_>>,
 ) -> anyhow::Result<BTreeMap<String, Uuid>> {
-    let publication_id = Uuid::new_v4();
+    let progress = progress.ok_or_else(|| {
+        anyhow::anyhow!("v2 artifact registration requires an active Worker lease")
+    })?;
+    let request_id = deterministic_contract_uuid(&format!(
+        "scope-closure-write-set-v2:{closure_check_id}:{content_artifact_manifest_hash}"
+    ));
     let mut uploaded = Vec::<String>::new();
     let mut staged = Vec::<(&PreparedArtifact, String)>::new();
     for artifact in artifacts {
         let relative_key = format!(
-            "scope-closure/{closure_check_id}/{publication_id}/{}",
+            "scope-closure/{closure_check_id}/{request_id}/{}",
             artifact.descriptor.file_name
         );
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
         staged.push((artifact, object_key));
     }
+    staged.sort_by(|left, right| {
+        left.0
+            .descriptor
+            .file_name
+            .cmp(&right.0.descriptor.file_name)
+    });
+    if staged
+        .windows(2)
+        .any(|pair| pair[0].0.descriptor.file_name == pair[1].0.descriptor.file_name)
+    {
+        return Err(anyhow::anyhow!(
+            "closure artifact descriptors contain duplicate client keys"
+        ));
+    }
     let request_items = staged
         .iter()
-        .map(|(artifact, object_key)| {
-            json!({
+        .enumerate()
+        .map(|(ordinal, (artifact, object_key))| {
+            Ok(json!({
+                "ordinal": ordinal + 1,
                 "clientKey": artifact.descriptor.file_name,
                 "artifactType": artifact.descriptor.artifact_type,
                 "artifactRole": artifact.descriptor.artifact_role,
@@ -5117,159 +6104,602 @@ async fn persist_closure_artifacts(
                     closure_check_id,
                     content_artifact_manifest_hash,
                 ),
-            })
+            }))
         })
-        .collect::<Vec<_>>();
-    let write_set = create_closure_artifact_write_set(
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let descriptor_set_sha256 = canonical_descriptor_set_sha256(&request_items)?;
+    let required_primary_roles = closure_artifact_required_primary_roles(reused_from_check_id);
+    let expected_descriptor_count = u64::try_from(request_items.len())?;
+    let expectation = ScopeClosureArtifactWriteSetExpectation {
+        closure_check_id,
+        worker_job_id,
+        request_id,
+        publication_mode: if reused_from_check_id.is_some() {
+            "reused"
+        } else {
+            "fresh"
+        },
+        reused_from_check_id,
+        expected_descriptor_count,
+        descriptor_set_sha256: &descriptor_set_sha256,
+        required_primary_roles: &required_primary_roles,
+    };
+    let mut header = create_closure_artifact_write_set_v2(
         &state.pool,
         closure_check_id,
-        publication_id.to_string().as_str(),
-        &request_items,
+        worker_job_id,
+        progress.lease_token(),
+        request_id,
+        u64::try_from(request_items.len())?,
+        &descriptor_set_sha256,
+        &required_primary_roles,
         reused_from_check_id,
     )
     .await?;
-    validate_closure_artifact_write_set(
-        &write_set,
-        artifacts,
-        &request_items,
-        state.object_store.bucket_name(),
-        "staging",
-    )?;
+    match header.status.as_str() {
+        "ready" => {
+            validate_closure_artifact_write_set_header(&header, &expectation, "ready", false)?;
+            validate_closure_artifact_map(&header, artifacts)?;
+            return semantic_closure_artifact_ids(&header, artifacts);
+        }
+        "staging" => {
+            validate_closure_artifact_write_set_header(&header, &expectation, "staging", true)?;
+            validate_closure_artifact_map(&header, artifacts)?;
+        }
+        "registration_open" => {
+            validate_closure_artifact_write_set_header(
+                &header,
+                &expectation,
+                "registration_open",
+                false,
+            )?;
+            for (batch_index, batch) in request_items
+                .chunks(ARTIFACT_REGISTRATION_BATCH_SIZE)
+                .enumerate()
+            {
+                let batch_digest = canonical_json_sha256(&Value::Array(batch.to_vec()))?;
+                let batch_id = deterministic_contract_uuid(&format!(
+                    "scope-closure-write-set-v2:{request_id}:batch-{batch_index:06}:{batch_digest}"
+                ));
+                let registration = register_closure_artifact_write_set_batch_v2(
+                    &state.pool,
+                    &header,
+                    worker_job_id,
+                    progress.lease_token(),
+                    batch_id,
+                    batch,
+                )
+                .await;
+                let status = read_closure_artifact_write_set_status_v2(
+                    &state.pool,
+                    closure_check_id,
+                    worker_job_id,
+                    progress.lease_token(),
+                    request_id,
+                )
+                .await;
+                header = resolve_artifact_registration_readback(registration, status)?;
+                validate_closure_artifact_write_set_header(
+                    &header,
+                    &expectation,
+                    "registration_open",
+                    false,
+                )?;
+                let expected_registered = u64::try_from(
+                    request_items
+                        .len()
+                        .min((batch_index + 1) * ARTIFACT_REGISTRATION_BATCH_SIZE),
+                )?;
+                if header.registered_descriptor_count < expected_registered {
+                    let error = anyhow::anyhow!(
+                        "artifact_write_set_v2_batch_replay_mismatch: expected_at_least={expected_registered}, actual={}",
+                        header.registered_descriptor_count
+                    );
+                    fail_closure_artifact_write_set(
+                        &state.pool,
+                        &header,
+                        worker_job_id,
+                        progress.lease_token(),
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                heartbeat_closure_artifact_registration(
+                    progress,
+                    closure_check_id,
+                    header.registered_descriptor_count,
+                    expected_descriptor_count,
+                    request_items
+                        .iter()
+                        .take(usize::try_from(header.registered_descriptor_count)?)
+                        .filter_map(|item| item.get("size").and_then(Value::as_u64))
+                        .sum(),
+                )
+                .await?;
+            }
+            header = read_closure_artifact_write_set_status_v2(
+                &state.pool,
+                closure_check_id,
+                worker_job_id,
+                progress.lease_token(),
+                request_id,
+            )
+            .await?;
+            validate_closure_artifact_write_set_header(
+                &header,
+                &expectation,
+                "registration_open",
+                false,
+            )?;
+            if header.registered_descriptor_count != header.expected_descriptor_count {
+                let error = anyhow::anyhow!("artifact_write_set_v2_incomplete");
+                fail_closure_artifact_write_set(
+                    &state.pool,
+                    &header,
+                    worker_job_id,
+                    progress.lease_token(),
+                    &error,
+                )
+                .await;
+                return Err(error
+                    .context("artifact write set remained incomplete after bounded registration"));
+            }
+            let seal = seal_closure_artifact_write_set_v2(
+                &state.pool,
+                &header,
+                worker_job_id,
+                progress.lease_token(),
+            )
+            .await;
+            let status = read_closure_artifact_write_set_status_v2(
+                &state.pool,
+                closure_check_id,
+                worker_job_id,
+                progress.lease_token(),
+                request_id,
+            )
+            .await;
+            let (sealed_header, seal_error) = resolve_artifact_seal_readback(seal, status)?;
+            header = sealed_header;
+            if let Err(error) =
+                validate_closure_artifact_write_set_header(&header, &expectation, "staging", true)
+                    .and_then(|()| validate_closure_artifact_map(&header, artifacts))
+            {
+                fail_closure_artifact_write_set(
+                    &state.pool,
+                    &header,
+                    worker_job_id,
+                    progress.lease_token(),
+                    &error,
+                )
+                .await;
+                return Err(match seal_error {
+                    None => error,
+                    Some(seal_error) => seal_error.context(format!(
+                        "atomic seal failed and readback did not prove staging: {error:#}"
+                    )),
+                });
+            }
+        }
+        status => {
+            return Err(anyhow::anyhow!(
+                "artifact_write_set_v2_invalid_state: {status}"
+            ));
+        }
+    }
 
-    for (index, item) in write_set.items.iter().enumerate() {
-        let artifact = artifacts
-            .iter()
-            .find(|artifact| artifact.descriptor.file_name == item.client_key)
-            .ok_or_else(|| anyhow::anyhow!("write-set response returned an unknown client key"))?;
+    for (index, (artifact, object_key)) in staged.iter().enumerate() {
         let cancellation = CancellationToken::default();
-        let heartbeat_period = progress.map_or(Duration::from_secs(3_600), |progress| {
-            lease_heartbeat_period(progress.lease_seconds())
-        });
+        let heartbeat_period = lease_heartbeat_period(progress.lease_seconds());
         let upload = Box::pin(
             state.object_store.upload_object_key_file_bounded(
-                item.storage_path.as_str(),
-                item.content_type.as_str(),
+                object_key,
+                artifact.descriptor.content_type.as_str(),
                 &artifact.path,
                 ObjectTransferOptions::new(SCOPE_CLOSURE_ARTIFACT_MAX_UPLOAD_BYTES)
-                    .with_expected_sha256(item.checksum_sha256.clone())
+                    .with_expected_sha256(artifact.descriptor.checksum_sha256.clone())
                     .with_cancellation(cancellation.clone()),
             ),
         );
         if let Err(error) =
             supervise_cancellable_operation(upload, cancellation, heartbeat_period, || {
                 heartbeat_closure_artifact_upload(
-                    progress,
+                    Some(progress),
                     closure_check_id,
                     index,
-                    write_set.items.len(),
+                    staged.len(),
                 )
             })
             .await
         {
-            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
-            cleanup_uploaded_artifacts(state, &uploaded).await;
+            fail_closure_artifact_write_set(
+                &state.pool,
+                &header,
+                worker_job_id,
+                progress.lease_token(),
+                &error,
+            )
+            .await;
+            let mut cleanup_keys = uploaded.clone();
+            cleanup_keys.push(object_key.clone());
+            cleanup_uploaded_artifacts(state, &cleanup_keys).await;
             return Err(error.context("failed to upload closure artifact write set"));
         }
-        uploaded.push(item.storage_path.clone());
+        uploaded.push(object_key.clone());
     }
 
-    let finalized = match fence_closure_artifact_finalize(
+    let finalize_attempt = fence_closure_artifact_finalize(
         || {
             heartbeat_closure_artifact_upload(
-                progress,
+                Some(progress),
                 closure_check_id,
-                write_set.items.len(),
-                write_set.items.len(),
+                staged.len(),
+                staged.len(),
             )
         },
-        || finalize_closure_artifact_write_set(&state.pool, &write_set),
+        || {
+            finalize_closure_artifact_write_set(
+                &state.pool,
+                &header,
+                closure_check_id,
+                worker_job_id,
+                progress.lease_token(),
+                request_id,
+            )
+        },
     )
-    .await
-    {
+    .await;
+    let finalized = match finalize_attempt {
         Ok(finalized) => finalized,
         Err(error) => {
-            fail_closure_artifact_write_set(&state.pool, &write_set, &error).await;
-            cleanup_uploaded_artifacts(state, &uploaded).await;
-            return Err(error
-                .context("closure artifact pre-commit fence or atomic write-set finalize failed"));
+            let readback = read_closure_artifact_write_set_status_v2(
+                &state.pool,
+                closure_check_id,
+                worker_job_id,
+                progress.lease_token(),
+                request_id,
+            )
+            .await;
+            match readback {
+                Ok(candidate)
+                    if validate_closure_artifact_write_set_header(
+                        &candidate,
+                        &expectation,
+                        "ready",
+                        false,
+                    )
+                    .and_then(|()| validate_closure_artifact_map(&candidate, artifacts))
+                    .is_ok() =>
+                {
+                    candidate
+                }
+                Ok(candidate) => {
+                    if candidate.status != "ready" {
+                        fail_closure_artifact_write_set(
+                            &state.pool,
+                            &candidate,
+                            worker_job_id,
+                            progress.lease_token(),
+                            &error,
+                        )
+                        .await;
+                        cleanup_uploaded_artifacts(state, &uploaded).await;
+                    }
+                    return Err(error.context(format!(
+                        "finalize failed and status readback did not prove the exact ready set: status={}",
+                        candidate.status
+                    )));
+                }
+                Err(readback_error) => {
+                    return Err(error.context(format!(
+                        "finalize outcome is unknown; deterministic staged objects were retained for retry/reconciliation because status readback failed: {readback_error:#}"
+                    )));
+                }
+            }
         }
     };
-    validate_closure_artifact_write_set(
-        &finalized,
-        artifacts,
-        &request_items,
-        state.object_store.bucket_name(),
-        "ready",
-    )?;
+    if let Err(error) =
+        validate_closure_artifact_write_set_header(&finalized, &expectation, "ready", false)
+            .and_then(|()| validate_closure_artifact_map(&finalized, artifacts))
+    {
+        if finalized.status != "ready" {
+            fail_closure_artifact_write_set(
+                &state.pool,
+                &finalized,
+                worker_job_id,
+                progress.lease_token(),
+                &error,
+            )
+            .await;
+            cleanup_uploaded_artifacts(state, &uploaded).await;
+        }
+        return Err(
+            error.context("closure artifact finalize returned an inconsistent write-set readback")
+        );
+    }
+    semantic_closure_artifact_ids(&finalized, artifacts)
+}
+
+fn semantic_closure_artifact_ids(
+    header: &ScopeClosureArtifactWriteSetHeader,
+    artifacts: &[PreparedArtifact],
+) -> anyhow::Result<BTreeMap<String, Uuid>> {
     let mut persisted = BTreeMap::new();
-    for item in finalized.items {
-        let artifact = artifacts
-            .iter()
-            .find(|artifact| artifact.descriptor.file_name == item.client_key)
-            .ok_or_else(|| anyhow::anyhow!("finalized write set returned unknown client key"))?;
+    for artifact in artifacts {
         if is_semantic_closure_artifact(artifact) {
-            persisted.insert(artifact.descriptor.artifact_type.clone(), item.artifact_id);
+            let artifact_id = header
+                .artifact_map
+                .get(&artifact.descriptor.file_name)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("finalized artifact map omitted semantic key"))?;
+            persisted.insert(artifact.descriptor.artifact_type.clone(), artifact_id);
         }
     }
     Ok(persisted)
 }
 
-async fn create_closure_artifact_write_set(
+fn resolve_artifact_registration_readback(
+    registration: anyhow::Result<()>,
+    status: anyhow::Result<ScopeClosureArtifactWriteSetHeader>,
+) -> anyhow::Result<ScopeClosureArtifactWriteSetHeader> {
+    match (registration, status) {
+        (_, Ok(status)) => Ok(status),
+        (Err(registration_error), Err(status_error)) => Err(registration_error.context(format!(
+            "artifact registration status readback also failed: {status_error:#}"
+        ))),
+        (Ok(()), Err(status_error)) => {
+            Err(status_error.context("artifact registration status readback failed"))
+        }
+    }
+}
+
+fn resolve_artifact_seal_readback(
+    seal: anyhow::Result<()>,
+    status: anyhow::Result<ScopeClosureArtifactWriteSetHeader>,
+) -> anyhow::Result<(ScopeClosureArtifactWriteSetHeader, Option<anyhow::Error>)> {
+    match status {
+        Ok(status) => Ok((status, seal.err())),
+        Err(status_error) => match seal {
+            Ok(()) => Err(status_error.context(
+                "sealed artifact write set could not be read back; upload was not started",
+            )),
+            Err(seal_error) => Err(seal_error.context(format!(
+                "seal status is unknown and readback failed; upload was not started: {status_error:#}"
+            ))),
+        },
+    }
+}
+
+fn canonical_descriptor_set_sha256(descriptors: &[Value]) -> anyhow::Result<String> {
+    canonical_json_sha256(&json!({
+        "contractVersion": "lcia.scope-closure-artifact-write-set.v2",
+        "descriptors": descriptors,
+    }))
+}
+
+fn deterministic_contract_uuid(identity: &str) -> Uuid {
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn closure_artifact_required_primary_roles(reused_from_check_id: Option<Uuid>) -> Value {
+    if reused_from_check_id.is_some() {
+        return json!([{
+            "artifactRole": "closure_report",
+            "artifactType": "closure_report_xlsx",
+            "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "exactCount": 1,
+        }]);
+    }
+    json!([
+        {
+            "artifactRole": "closure_report",
+            "artifactType": "closure_report_xlsx",
+            "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "exactCount": 1,
+        },
+        {
+            "artifactRole": "complete_machine_result",
+            "artifactType": "closure_complete_machine_result",
+            "mediaType": "application/vnd.tiangong.scope-closure-manifest+json",
+            "exactCount": 1,
+        },
+        {
+            "artifactRole": "closure_bundle",
+            "artifactType": "closure_bundle",
+            "mediaType": "application/json",
+            "exactCount": 1,
+        },
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_closure_artifact_write_set_v2(
     pool: &PgPool,
     closure_check_id: Uuid,
-    idempotency_key: &str,
-    items: &[Value],
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    request_id: Uuid,
+    expected_descriptor_count: u64,
+    descriptor_set_sha256: &str,
+    required_primary_roles: &Value,
     reused_from_check_id: Option<Uuid>,
-) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+) -> anyhow::Result<ScopeClosureArtifactWriteSetHeader> {
     let row = sqlx::query(
         r"
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_create(
-          $1, $2, $3::jsonb, $4, $5
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_create_v2(
+          $1, $2, $3, $4, 'lcia.scope-closure-artifact-write-set.v2',
+          $5, $6, $7::jsonb, $8, $9
         ) AS result
         FROM _service_role
         ",
     )
     .bind(closure_check_id)
-    .bind(idempotency_key)
-    .bind(Value::Array(items.to_vec()))
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .bind(request_id)
+    .bind(i32::try_from(expected_descriptor_count)?)
+    .bind(descriptor_set_sha256)
+    .bind(required_primary_roles)
     .bind(SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS)
     .bind(reused_from_check_id)
     .fetch_one(pool)
     .await?;
     let result = row.try_get::<Value, _>("result")?;
-    parse_closure_artifact_write_set(&result, "svc_lcia_scope_closure_artifact_write_set_create")
+    parse_closure_artifact_write_set_header(
+        &result,
+        "svc_lcia_scope_closure_artifact_write_set_create_v2",
+    )
 }
 
-async fn finalize_closure_artifact_write_set(
+async fn register_closure_artifact_write_set_batch_v2(
     pool: &PgPool,
-    write_set: &ScopeClosureArtifactWriteSet,
-) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+    header: &ScopeClosureArtifactWriteSetHeader,
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    batch_id: Uuid,
+    items: &[Value],
+) -> anyhow::Result<()> {
+    if items.is_empty() || items.len() > ARTIFACT_REGISTRATION_BATCH_SIZE {
+        return Err(anyhow::anyhow!("artifact_write_set_v2_invalid"));
+    }
     let row = sqlx::query(
         r"
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_finalize($1, $2) AS result
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
+          $1, $2, $3, $4, $5, $6::jsonb
+        ) AS result
         FROM _service_role
         ",
     )
-    .bind(write_set.write_set_id)
-    .bind(write_set.write_token)
+    .bind(header.write_set_id)
+    .bind(header.write_token)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .bind(batch_id)
+    .bind(Value::Array(items.to_vec()))
     .fetch_one(pool)
     .await?;
     let result = row.try_get::<Value, _>("result")?;
-    parse_closure_artifact_write_set(
+    ensure_rpc_ok(
         &result,
-        "svc_lcia_scope_closure_artifact_write_set_finalize",
+        "svc_lcia_scope_closure_artifact_write_set_register_batch_v2",
     )
+}
+
+async fn read_closure_artifact_write_set_status_v2(
+    pool: &PgPool,
+    closure_check_id: Uuid,
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    request_id: Uuid,
+) -> anyhow::Result<ScopeClosureArtifactWriteSetHeader> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_status_v2(
+          $1, $2, $3, $4
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(closure_check_id)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .bind(request_id)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_closure_artifact_write_set_header(
+        &result,
+        "svc_lcia_scope_closure_artifact_write_set_status_v2",
+    )
+}
+
+async fn seal_closure_artifact_write_set_v2(
+    pool: &PgPool,
+    header: &ScopeClosureArtifactWriteSetHeader,
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_seal_v2(
+          $1, $2, $3, $4
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(header.write_set_id)
+    .bind(header.write_token)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    ensure_rpc_ok(&result, "svc_lcia_scope_closure_artifact_write_set_seal_v2")
+}
+
+async fn finalize_closure_artifact_write_set(
+    pool: &PgPool,
+    header: &ScopeClosureArtifactWriteSetHeader,
+    closure_check_id: Uuid,
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    request_id: Uuid,
+) -> anyhow::Result<ScopeClosureArtifactWriteSetHeader> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_finalize_v2(
+          $1, $2, $3, $4
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(header.write_set_id)
+    .bind(header.write_token)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    ensure_rpc_ok(
+        &result,
+        "svc_lcia_scope_closure_artifact_write_set_finalize_v2",
+    )?;
+    read_closure_artifact_write_set_status_v2(
+        pool,
+        closure_check_id,
+        worker_job_id,
+        worker_lease_token,
+        request_id,
+    )
+    .await
 }
 
 async fn fail_closure_artifact_write_set(
     pool: &PgPool,
-    write_set: &ScopeClosureArtifactWriteSet,
+    header: &ScopeClosureArtifactWriteSetHeader,
+    worker_job_id: Uuid,
+    worker_lease_token: Uuid,
     error: &anyhow::Error,
 ) {
     let message = format!("{error:#}").chars().take(1_000).collect::<String>();
@@ -5278,24 +6708,28 @@ async fn fail_closure_artifact_write_set(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_fail($1, $2, $3) AS result
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_fail_v2(
+          $1, $2, $3, $4, $5
+        ) AS result
         FROM _service_role
         ",
     )
-    .bind(write_set.write_set_id)
-    .bind(write_set.write_token)
+    .bind(header.write_set_id)
+    .bind(header.write_token)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
     .bind(message)
     .fetch_one(pool)
     .await;
     match result {
         Ok(row) => match row.try_get::<Value, _>("result").and_then(|value| {
-            ensure_rpc_ok(&value, "svc_lcia_scope_closure_artifact_write_set_fail")
+            ensure_rpc_ok(&value, "svc_lcia_scope_closure_artifact_write_set_fail_v2")
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))
         }) {
             Ok(()) => {}
             Err(failure_error) => {
                 tracing::warn!(
-                    write_set_id = %write_set.write_set_id,
+                    write_set_id = %header.write_set_id,
                     error = %failure_error,
                     "Database rejected closure artifact write-set reconciliation mark"
                 );
@@ -5303,7 +6737,7 @@ async fn fail_closure_artifact_write_set(
         },
         Err(failure_error) => {
             tracing::warn!(
-                write_set_id = %write_set.write_set_id,
+                write_set_id = %header.write_set_id,
                 error = %failure_error,
                 "failed to mark closure artifact write set for reconciliation"
             );
@@ -5311,10 +6745,10 @@ async fn fail_closure_artifact_write_set(
     }
 }
 
-fn parse_closure_artifact_write_set(
+fn parse_closure_artifact_write_set_header(
     result: &Value,
     rpc_name: &str,
-) -> anyhow::Result<ScopeClosureArtifactWriteSet> {
+) -> anyhow::Result<ScopeClosureArtifactWriteSetHeader> {
     ensure_rpc_ok(result, rpc_name)?;
     let data = result
         .get("data")
@@ -5323,52 +6757,92 @@ fn parse_closure_artifact_write_set(
     Ok(serde_json::from_value(data)?)
 }
 
-fn validate_closure_artifact_write_set(
-    write_set: &ScopeClosureArtifactWriteSet,
-    artifacts: &[PreparedArtifact],
-    request_items: &[Value],
-    expected_bucket: &str,
+fn validate_closure_artifact_write_set_header(
+    header: &ScopeClosureArtifactWriteSetHeader,
+    expected: &ScopeClosureArtifactWriteSetExpectation<'_>,
     expected_status: &str,
+    expected_upload_eligible: bool,
 ) -> anyhow::Result<()> {
-    if write_set.status != expected_status
-        || write_set.write_token.is_nil()
-        || write_set.items.len() != artifacts.len()
-        || request_items.len() != artifacts.len()
+    if header.status != expected_status
+        || header.write_token.is_nil()
+        || header.closure_check_id != expected.closure_check_id
+        || header.worker_job_id != expected.worker_job_id
+        || header.request_id != expected.request_id
+        || header.publication_mode != expected.publication_mode
+        || header.reused_from_check_id != expected.reused_from_check_id
+        || header.contract_version != "lcia.scope-closure-artifact-write-set.v2"
+        || header.expected_descriptor_count != expected.expected_descriptor_count
+        || header.registered_descriptor_count > expected.expected_descriptor_count
+        || header.descriptor_set_sha256 != expected.descriptor_set_sha256
+        || header.required_primary_roles != *expected.required_primary_roles
+        || header.upload_eligible != expected_upload_eligible
+        || header.registered_batch_count != u64::try_from(header.batches.len())?
     {
         return Err(anyhow::anyhow!(
-            "Database returned an inconsistent closure artifact write set"
+            "Database returned an inconsistent closure artifact write-set header"
         ));
     }
-    let mut observed_client_keys = BTreeSet::new();
-    let mut observed_artifact_ids = BTreeSet::new();
-    for item in &write_set.items {
-        let artifact = artifacts
-            .iter()
-            .find(|artifact| artifact.descriptor.file_name == item.client_key)
-            .ok_or_else(|| anyhow::anyhow!("write set returned unknown clientKey"))?;
-        let requested = request_items
-            .iter()
-            .find(|request| {
-                request.get("clientKey").and_then(Value::as_str) == Some(item.client_key.as_str())
-            })
-            .ok_or_else(|| anyhow::anyhow!("write set omitted requested clientKey"))?;
-        if !observed_client_keys.insert(item.client_key.as_str())
-            || !observed_artifact_ids.insert(item.artifact_id)
-            || item.storage_bucket != expected_bucket
-            || requested.get("bucket").and_then(Value::as_str) != Some(item.storage_bucket.as_str())
-            || requested.get("objectPath").and_then(Value::as_str)
-                != Some(item.storage_path.as_str())
-            || item.artifact_type != artifact.descriptor.artifact_type
-            || item.artifact_role != artifact.descriptor.artifact_role
-            || item.content_type != artifact.descriptor.content_type
-            || item.byte_size != u64::try_from(artifact.descriptor.byte_size)?
-            || item.checksum_sha256 != artifact.descriptor.checksum_sha256
+    let mut next_ordinal = 1_u64;
+    let mut batch_ids = BTreeSet::new();
+    for batch in &header.batches {
+        let expected_last = batch
+            .first_ordinal
+            .checked_add(batch.item_count.saturating_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("artifact batch ordinal overflow"))?;
+        if batch.batch_id.is_nil()
+            || !batch_ids.insert(batch.batch_id)
+            || batch.item_count == 0
+            || batch.first_ordinal != next_ordinal
+            || batch.last_ordinal != expected_last
         {
             return Err(anyhow::anyhow!(
-                "Database changed closure artifact write-set identity for {}",
-                item.client_key
+                "Database returned an inconsistent artifact batch receipt"
             ));
         }
+        next_ordinal = batch
+            .last_ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("artifact batch ordinal overflow"))?;
+    }
+    if next_ordinal.saturating_sub(1) != header.registered_descriptor_count
+        || (header.status == "registration_open" && !header.artifact_map.is_empty())
+        || (matches!(header.status.as_str(), "staging" | "ready")
+            && header.registered_descriptor_count != header.expected_descriptor_count)
+    {
+        return Err(anyhow::anyhow!(
+            "Database returned inconsistent staged artifact registration evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_closure_artifact_map(
+    header: &ScopeClosureArtifactWriteSetHeader,
+    artifacts: &[PreparedArtifact],
+) -> anyhow::Result<()> {
+    let expected_keys = artifacts
+        .iter()
+        .map(|artifact| artifact.descriptor.file_name.as_str())
+        .collect::<BTreeSet<_>>();
+    if header.artifact_map.len() != artifacts.len()
+        || header
+            .artifact_map
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_keys
+        || header.artifact_map.values().any(Uuid::is_nil)
+        || header
+            .artifact_map
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != artifacts.len()
+    {
+        return Err(anyhow::anyhow!(
+            "Database returned an inconsistent closure artifact map"
+        ));
     }
     Ok(())
 }
@@ -5429,6 +6903,36 @@ async fn heartbeat_closure_artifact_upload(
         )
         .await
         .map_err(|error| error.context("closure artifact upload lease heartbeat failed"))
+}
+
+async fn heartbeat_closure_artifact_registration(
+    progress: &WorkerJobProgress<'_>,
+    closure_check_id: Uuid,
+    registered_records: u64,
+    total_records: u64,
+    registered_bytes: u64,
+) -> anyhow::Result<()> {
+    progress
+        .heartbeat(
+            "register_closure_artifacts",
+            0.80 + 0.02
+                * bounded_progress_ratio(
+                    usize::try_from(registered_records).unwrap_or(usize::MAX),
+                    usize::try_from(total_records).unwrap_or(usize::MAX),
+                ),
+            Some(json!({
+                "closureCheckId": closure_check_id,
+                "progressCounters": {
+                    "records": registered_records,
+                    "bytes": registered_bytes,
+                    "partitions": registered_records,
+                    "totalRecords": total_records,
+                    "unit": "artifactDescriptors"
+                },
+            })),
+        )
+        .await
+        .map_err(|error| error.context("closure artifact registration lease heartbeat failed"))
 }
 
 async fn fence_closure_artifact_finalize<
@@ -6121,35 +7625,32 @@ impl CoalescedIssueState {
     fn push_occurrence(
         &mut self,
         occurrence: Option<ClosureIssueOccurrence>,
-        writer: &mut SortedJsonlRunWriter,
         stats: &mut IssueRelationStats,
-    ) -> anyhow::Result<()> {
+    ) {
         let Some(occurrence) = occurrence else {
-            return Ok(());
+            return;
         };
         if self.last_occurrence_key.as_deref() == Some(occurrence.occurrence_key.as_str()) {
-            return Ok(());
+            return;
         }
         self.last_occurrence_key = Some(occurrence.occurrence_key.clone());
         self.issue.occurrence_count = self.issue.occurrence_count.saturating_add(1);
         stats.occurrence_count = stats.occurrence_count.saturating_add(1);
-        writer.append(&json!([
-            self.issue.issue_key,
-            occurrence.occurrence_key,
-            occurrence
-        ]))?;
         if self.issue.occurrences.len() < ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT {
             self.issue.occurrences.push(occurrence);
         }
-        Ok(())
     }
 }
 
 #[derive(Default)]
 struct SourceReachability {
-    source_key: String,
+    source_key: Option<String>,
+    source_node_ordinal: Option<u32>,
     visited: Vec<bool>,
     parent: Vec<Option<u32>>,
+    affected_root_ordinals: Vec<u32>,
+    impact_mode: Option<RootImpactMode>,
+    encoded_ordinals: Vec<u32>,
 }
 
 fn load_source_reachability(
@@ -6157,22 +7658,34 @@ fn load_source_reachability(
     source_key: &str,
     source: Option<&ExactDatasetIdentity>,
     graph: &CompactReferenceGraph,
-) {
-    if cache.source_key == source_key {
-        return;
+    roots: &StableRootOrdinals,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<bool> {
+    if cache.source_key.as_deref() == Some(source_key) {
+        return Ok(false);
     }
-    source_key.clone_into(&mut cache.source_key);
+    cache.source_key = Some(source_key.to_owned());
+    cache.source_node_ordinal = None;
     cache.visited.clear();
     cache.parent.clear();
+    cache.affected_root_ordinals.clear();
+    cache.impact_mode = None;
+    cache.encoded_ordinals.clear();
     let Some(source_id) = source.and_then(|source| graph.identity_ids.get(source).copied()) else {
-        return;
+        return Ok(true);
     };
+    cache.source_node_ordinal = Some(source_id);
     cache.visited.resize(graph.identities.len(), false);
     cache.parent.resize(graph.identities.len(), None);
     let source_index = usize::try_from(source_id).expect("u32 identity index fits usize");
     cache.visited[source_index] = true;
     let mut queue = VecDeque::from([source_id]);
+    let mut visited_nodes = 0_u64;
     while let Some(node) = queue.pop_front() {
+        visited_nodes = visited_nodes.saturating_add(1);
+        if visited_nodes.is_multiple_of(4_096) {
+            cancellation.check("scope_closure_root_impact")?;
+        }
         if let Some(predecessors) = graph
             .reverse
             .get(usize::try_from(node).expect("u32 identity index fits usize"))
@@ -6187,100 +7700,176 @@ fn load_source_reachability(
             }
         }
     }
+    for (root_ordinal, &root_node_ordinal) in roots.graph_node_ordinals.iter().enumerate() {
+        let root_index = usize::try_from(root_node_ordinal).expect("u32 identity index fits usize");
+        if cache.visited[root_index] {
+            cache
+                .affected_root_ordinals
+                .push(u32::try_from(root_ordinal)?);
+        }
+    }
+    let (mode, encoded_ordinals) =
+        compact_root_impact_encoding(&cache.affected_root_ordinals, roots.roots.len())?;
+    cache.impact_mode = Some(mode);
+    cache.encoded_ordinals = encoded_ordinals;
+    Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn finalize_coalesced_issue(
     mut pending: CoalescedIssueState,
-    roots: &[ExactDatasetIdentity],
-    root_ids: &[Option<u32>],
+    roots: &StableRootOrdinals,
     graph: &CompactReferenceGraph,
     reachability: &mut SourceReachability,
-    issue_writer: &mut SortedJsonlRunWriter,
-    affected_writer: &mut SortedJsonlRunWriter,
+    canonical_issue_writer: &mut SortedJsonlRunWriter,
+    root_impact_writer: &mut RootImpactIndexWriter,
+    cancellation: &CancellationToken,
     relation_stats: &mut IssueRelationStats,
 ) -> anyhow::Result<()> {
-    load_source_reachability(
+    let changed_source = load_source_reachability(
         reachability,
         &pending.source_key,
         pending.issue.source.as_ref(),
         graph,
-    );
+        roots,
+        cancellation,
+    )?;
+    let root_impact = if pending.issue.source.is_some() {
+        let impact_key = format!("source:{}", pending.source_key);
+        let mode = reachability
+            .impact_mode
+            .ok_or_else(|| anyhow::anyhow!("source impact omitted compact encoding"))?;
+        if changed_source {
+            root_impact_writer.append(
+                &impact_key,
+                1,
+                reachability.source_node_ordinal,
+                mode,
+                u32::try_from(reachability.affected_root_ordinals.len())?,
+                &reachability.encoded_ordinals,
+            )?;
+        }
+        RootImpactReference {
+            mode,
+            impact_key: Some(impact_key),
+            source_node_ordinal: reachability.source_node_ordinal,
+            evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
+        }
+    } else {
+        let expected_count = usize::try_from(pending.issue.affected_root_count)?;
+        let included_ordinals = if expected_count == roots.roots.len() {
+            (0..u32::try_from(roots.roots.len())?).collect::<Vec<_>>()
+        } else {
+            if expected_count != pending.issue.affected_roots.len() {
+                return Err(anyhow::anyhow!(
+                    "source-less issue {} has incomplete affected-root evidence: count={}, samples={}",
+                    pending.issue.issue_key,
+                    expected_count,
+                    pending.issue.affected_roots.len()
+                ));
+            }
+            let mut ordinals = pending
+                .issue
+                .affected_roots
+                .iter()
+                .map(|root| {
+                    roots.ordinal_by_identity.get(root).copied().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source-less issue {} references an unknown root",
+                            pending.issue.issue_key
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ordinals.sort_unstable();
+            ordinals.dedup();
+            if ordinals.len() != expected_count {
+                return Err(anyhow::anyhow!(
+                    "source-less issue {} affected-root identities are not unique",
+                    pending.issue.issue_key
+                ));
+            }
+            ordinals
+        };
+        let (mode, encoded_ordinals) =
+            compact_root_impact_encoding(&included_ordinals, roots.roots.len())?;
+        let impact_key = if matches!(
+            mode,
+            RootImpactMode::IncludedOrdinals | RootImpactMode::ExcludedOrdinals
+        ) {
+            let impact_key = format!("issue:{}", pending.issue.issue_key);
+            root_impact_writer.append(
+                &impact_key,
+                2,
+                None,
+                mode,
+                u32::try_from(included_ordinals.len())?,
+                &encoded_ordinals,
+            )?;
+            Some(impact_key)
+        } else {
+            None
+        };
+        RootImpactReference {
+            mode,
+            impact_key,
+            source_node_ordinal: None,
+            evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
+        }
+    };
+
     if !reachability.visited.is_empty() {
-        pending.issue.affected_root_count = 0;
+        pending.issue.affected_root_count =
+            u32::try_from(reachability.affected_root_ordinals.len())?;
         pending.issue.affected_roots.clear();
         pending.issue.affected_root_witness_paths.clear();
         pending.issue.witness_path.clear();
-        for (&root_id, root) in root_ids.iter().zip(roots) {
-            let Some(root_id) = root_id else {
-                continue;
-            };
-            let root_index = usize::try_from(root_id).expect("u32 identity index fits usize");
-            if !reachability.visited[root_index] {
-                continue;
-            }
-            let witness =
-                reconstruct_witness_path(root_id, &reachability.parent, &graph.identities);
-            pending.issue.affected_root_count = pending.issue.affected_root_count.saturating_add(1);
-            relation_stats.affected_root_count =
-                relation_stats.affected_root_count.saturating_add(1);
-            affected_writer.append(&json!([
-                pending.issue.issue_key,
-                canonical_json_sha256(root)?,
-                affected_root_partition_record(&pending.issue.issue_key, root, &witness)
-            ]))?;
-            if pending.issue.affected_roots.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT {
-                pending.issue.affected_roots.push(root.clone());
-                pending
-                    .issue
-                    .affected_root_witness_paths
-                    .push(witness.clone());
-                if pending.issue.witness_path.is_empty() {
-                    pending.issue.witness_path = witness;
-                }
+        for &root_ordinal in reachability
+            .affected_root_ordinals
+            .iter()
+            .take(ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT)
+        {
+            let root_index = usize::try_from(root_ordinal)?;
+            let root = roots
+                .roots
+                .get(root_index)
+                .ok_or_else(|| anyhow::anyhow!("root ordinal is out of bounds"))?;
+            let root_node_ordinal = roots.graph_node_ordinals[root_index];
+            let witness = reconstruct_witness_path(
+                root_node_ordinal,
+                &reachability.parent,
+                &graph.identities,
+            );
+            pending.issue.affected_roots.push(root.clone());
+            pending
+                .issue
+                .affected_root_witness_paths
+                .push(witness.clone());
+            if pending.issue.witness_path.is_empty() {
+                pending.issue.witness_path = witness;
             }
         }
     } else if pending.issue.source.is_none()
-        && usize::try_from(pending.issue.affected_root_count).ok() == Some(roots.len())
+        && usize::try_from(pending.issue.affected_root_count).ok() == Some(roots.roots.len())
     {
         pending.issue.affected_roots.clear();
         pending.issue.affected_root_witness_paths.clear();
-        for root in roots {
-            relation_stats.affected_root_count =
-                relation_stats.affected_root_count.saturating_add(1);
-            affected_writer.append(&json!([
-                pending.issue.issue_key,
-                canonical_json_sha256(root)?,
-                affected_root_partition_record(
-                    &pending.issue.issue_key,
-                    root,
-                    std::slice::from_ref(root)
-                )
-            ]))?;
-            if pending.issue.affected_roots.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT {
-                pending.issue.affected_roots.push(root.clone());
-                pending
-                    .issue
-                    .affected_root_witness_paths
-                    .push(vec![root.clone()]);
-            }
-        }
-    } else {
-        for (index, root) in pending.issue.affected_roots.iter().enumerate() {
-            let witness = pending
+        for root in roots
+            .roots
+            .iter()
+            .take(ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT)
+        {
+            pending.issue.affected_roots.push(root.clone());
+            pending
                 .issue
                 .affected_root_witness_paths
-                .get(index)
-                .unwrap_or(&pending.issue.witness_path);
-            relation_stats.affected_root_count =
-                relation_stats.affected_root_count.saturating_add(1);
-            affected_writer.append(&json!([
-                pending.issue.issue_key,
-                canonical_json_sha256(root)?,
-                affected_root_partition_record(&pending.issue.issue_key, root, witness)
-            ]))?;
+                .push(vec![root.clone()]);
         }
     }
+    relation_stats.affected_root_count = relation_stats
+        .affected_root_count
+        .checked_add(u64::from(pending.issue.affected_root_count))
+        .ok_or_else(|| anyhow::anyhow!("logical affected-root count overflow"))?;
 
     relation_stats.issue_count = relation_stats.issue_count.saturating_add(1);
     if pending.issue.blocking {
@@ -6289,18 +7878,45 @@ fn finalize_coalesced_issue(
             .blocker_codes
             .insert(pending.issue.issue_code.clone());
     }
-    issue_writer.append(&json!([
+    let partition_record = issue_partition_record_v3(&pending.issue, &root_impact, roots)?;
+    canonical_issue_writer.append(&json!([
         pending.issue.issue_key,
-        serde_json::to_value(pending.issue)?
+        pending.issue,
+        partition_record,
     ]))?;
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn build_issue_relation_spools(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
 ) -> anyhow::Result<()> {
+    build_issue_relation_spools_with_cancellation(scan, events, &CancellationToken::default())
+}
+
+#[allow(clippy::too_many_lines)]
+#[cfg(test)]
+fn build_issue_relation_spools_with_cancellation(
+    scan: &mut ScopeClosureScan,
+    events: &JsonlValueSpool,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<()> {
+    build_issue_relation_spools_with_cancellation_and_progress(scan, events, cancellation, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_issue_relation_spools_with_cancellation_and_progress(
+    scan: &mut ScopeClosureScan,
+    events: &JsonlValueSpool,
+    cancellation: &CancellationToken,
+    progress: Option<&ScopeClosureArtifactProgress>,
+) -> anyhow::Result<()> {
+    cancellation.check("scope_closure_coalesce_start")?;
+    if let Some(progress) = progress {
+        progress.update(1, 0, events.byte_size, 0);
+    }
     let initial_admission_bytes = admit_relation_temp_space(events)?;
     tracing::info!(
         initial_admission_bytes,
@@ -6319,7 +7935,11 @@ fn build_issue_relation_spools(
     events.visit(|event| {
         event_count = event_count.saturating_add(1);
         if event_count.is_multiple_of(4_096) {
+            cancellation.check("scope_closure_merge_input")?;
             enforce_scope_closure_memory_budget("prepare_issue_merge_runs")?;
+            if let Some(progress) = progress {
+                progress.update(1, event_count, events.byte_size, 0);
+            }
         }
         append_issue_merge_records(
             &mut merge_input,
@@ -6327,22 +7947,24 @@ fn build_issue_relation_spools(
         )
     })?;
     let sorted_input = merge_input.finish()?;
-    let mut issues = SortedJsonlRunWriter::new("coalesced-issues")?;
-    let mut occurrences = SortedJsonlRunWriter::new("coalesced-occurrences")?;
-    let mut affected_roots = SortedJsonlRunWriter::new("coalesced-affected-roots")?;
+    let stable_roots = StableRootOrdinals::new(&scan.roots, &scan.reference_graph)?;
+    let mut canonical_issue_writer = SortedJsonlRunWriter::new("canonical-issues-v3")?;
+    let mut root_impact_writer = RootImpactIndexWriter::new(stable_roots.roots.len())?;
     let mut stats = IssueRelationStats::default();
-    let root_ids = scan
-        .roots
-        .iter()
-        .map(|root| scan.reference_graph.identity_ids.get(root).copied())
-        .collect::<Vec<_>>();
     let mut reachability = SourceReachability::default();
     let mut current = None::<CoalescedIssueState>;
     let mut observed = 0_u64;
+    if let Some(progress) = progress {
+        progress.update(2, 0, sorted_input.byte_size, 0);
+    }
     sorted_input.visit(|record| {
         observed = observed.saturating_add(1);
         if observed.is_multiple_of(4_096) {
+            cancellation.check("scope_closure_coalesce")?;
             enforce_scope_closure_memory_budget("coalesce_sorted_issue_runs")?;
+            if let Some(progress) = progress {
+                progress.update(2, observed, sorted_input.byte_size, 0);
+            }
         }
         let (source_key, issue, occurrence) = issue_merge_record(&record)?;
         let starts_new_issue = current
@@ -6351,87 +7973,136 @@ fn build_issue_relation_spools(
         if starts_new_issue {
             finalize_coalesced_issue(
                 current.take().expect("current issue exists"),
-                &scan.roots,
-                &root_ids,
+                &stable_roots,
                 &scan.reference_graph,
                 &mut reachability,
-                &mut issues,
-                &mut affected_roots,
+                &mut canonical_issue_writer,
+                &mut root_impact_writer,
+                cancellation,
                 &mut stats,
             )?;
         }
         let pending = current.get_or_insert_with(|| CoalescedIssueState::new(source_key, issue));
-        pending.push_occurrence(occurrence, &mut occurrences, &mut stats)
+        pending.push_occurrence(occurrence, &mut stats);
+        Ok(())
     })?;
     if let Some(state) = current {
         finalize_coalesced_issue(
             state,
-            &scan.roots,
-            &root_ids,
+            &stable_roots,
             &scan.reference_graph,
             &mut reachability,
-            &mut issues,
-            &mut affected_roots,
+            &mut canonical_issue_writer,
+            &mut root_impact_writer,
+            cancellation,
             &mut stats,
         )?;
     }
-    let issues = issues.finish()?;
-    let occurrences = occurrences.finish()?;
-    let affected_roots = affected_roots.finish()?;
+    let canonical_issues = canonical_issue_writer.finish()?;
+    let partition_temp = Arc::new(TempDir::new()?);
+    let mut issue_partition_writer =
+        IssuePartitionAccumulator::new(Arc::clone(&partition_temp), "issues");
+    let mut issue_spool_writer = JsonlValueSpoolWriter::new_derived("coalesced-issues-v3.jsonl")?;
+    let mut partitioned = 0_u64;
+    if let Some(progress) = progress {
+        progress.update(3, 0, 0, 0);
+    }
+    canonical_issues.visit(|record| {
+        partitioned = partitioned.saturating_add(1);
+        if partitioned.is_multiple_of(1_024) {
+            cancellation.check("scope_closure_partition_write")?;
+            enforce_scope_closure_memory_budget("write_canonical_issue_partitions")?;
+            if let Some(progress) = progress {
+                progress.update(
+                    3,
+                    partitioned,
+                    issue_spool_writer.byte_size,
+                    u64::try_from(
+                        issue_partition_writer.entries.len()
+                            + usize::from(issue_partition_writer.active.is_some()),
+                    )?,
+                );
+            }
+        }
+        let fields = record
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("canonical issue record must be an array"))?;
+        let issue_key = fields
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("canonical issue record omitted key"))?;
+        let issue = fields
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("canonical issue record omitted issue"))?;
+        let partition_record = fields
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("canonical issue record omitted partition payload"))?;
+        issue_spool_writer.append(issue)?;
+        issue_partition_writer.push(issue_key, partition_record)
+    })?;
+    let issues = issue_spool_writer.finish()?;
+    let (issue_partition_entries, issue_partition_artifacts, issue_relation_sha256) =
+        issue_partition_writer.finish()?;
+    let root_impact_index = root_impact_writer.finish()?;
     if issues.event_count != stats.issue_count
-        || occurrences.event_count != stats.occurrence_count
-        || affected_roots.event_count != stats.affected_root_count
+        || issue_partition_entries
+            .iter()
+            .map(|entry| entry.record_count)
+            .sum::<u64>()
+            != stats.issue_count
     {
         return Err(anyhow::anyhow!(
-            "derived relation run counts diverged: issues={}/{}, occurrences={}/{}, affected_roots={}/{}",
+            "canonical issue counts diverged: spool={}/{}, partitions={}/{}",
             issues.event_count,
             stats.issue_count,
-            occurrences.event_count,
-            stats.occurrence_count,
-            affected_roots.event_count,
-            stats.affected_root_count
+            issue_partition_entries
+                .iter()
+                .map(|entry| entry.record_count)
+                .sum::<u64>(),
+            stats.issue_count,
         ));
     }
+    let issue_partition_bytes = issue_partition_artifacts
+        .iter()
+        .fold(0_u64, |total, artifact| {
+            total.saturating_add(u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX))
+        });
     let relation_bytes = issues
-        .storage_bytes()
-        .saturating_add(occurrences.storage_bytes())
-        .saturating_add(affected_roots.storage_bytes());
-    let logical_relation_bytes = issues
         .byte_size
-        .saturating_add(occurrences.byte_size)
-        .saturating_add(affected_roots.byte_size);
+        .saturating_add(issue_partition_bytes)
+        .saturating_add(root_impact_index.compressed_byte_size);
     tracing::info!(
-        logical_relation_bytes,
-        relation_run_storage_bytes = relation_bytes,
-        issue_run_count = issues.run_paths.len(),
-        occurrence_run_count = occurrences.run_paths.len(),
-        affected_root_run_count = affected_roots.run_paths.len(),
-        "scope closure derived relation runs completed"
+        logical_issue_bytes = issues.byte_size,
+        canonical_issue_partition_bytes = issue_partition_bytes,
+        root_impact_index_bytes = root_impact_index.compressed_byte_size,
+        root_impact_record_count = root_impact_index.record_count,
+        expanded_affected_root_records = 0,
+        "scope closure issue-oriented v3 artifacts completed"
     );
     record_scope_closure_resources(
         "build_issue_relation_runs_complete",
         Some(relation_bytes),
-        Some(
-            stats
-                .issue_count
-                .saturating_add(stats.occurrence_count)
-                .saturating_add(stats.affected_root_count),
-        ),
+        Some(stats.issue_count),
     );
+    if let Some(progress) = progress {
+        progress.update(
+            3,
+            stats.issue_count,
+            relation_bytes,
+            u64::try_from(issue_partition_entries.len())?.saturating_add(1),
+        );
+    }
     let relations = IssueRelationSpools {
         issues,
-        occurrences,
-        affected_roots,
+        issue_partition_entries,
+        issue_partition_artifacts,
+        issue_relation_sha256,
+        root_impact_index,
         stats,
     };
     relations.issues.visit(|record| {
         if scan.issues.len() < ISSUE_INLINE_ISSUE_SAMPLE_LIMIT {
-            let issue = record
-                .as_array()
-                .and_then(|fields| fields.get(1))
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("coalesced issue record omitted payload"))?;
-            scan.issues.push(serde_json::from_value(issue)?);
+            scan.issues.push(serde_json::from_value(record)?);
         }
         Ok(())
     })?;
@@ -7025,6 +8696,33 @@ mod tests {
         value.parse().unwrap()
     }
 
+    fn test_artifact_write_set_header(status: &str) -> ScopeClosureArtifactWriteSetHeader {
+        ScopeClosureArtifactWriteSetHeader {
+            write_set_id: id("17717717-0677-4677-8677-177177177177"),
+            closure_check_id: id("17717717-0177-4177-8177-177177177177"),
+            worker_job_id: id("17717717-0277-4277-8277-177177177177"),
+            request_id: id("17717717-0477-4477-8477-177177177177"),
+            publication_mode: "fresh".to_owned(),
+            reused_from_check_id: None,
+            status: status.to_owned(),
+            write_token: id("17717717-0777-4777-8777-177177177177"),
+            contract_version: "lcia.scope-closure-artifact-write-set.v2".to_owned(),
+            expected_descriptor_count: 1,
+            registered_descriptor_count: 1,
+            registered_batch_count: 1,
+            descriptor_set_sha256: "d".repeat(64),
+            required_primary_roles: closure_artifact_required_primary_roles(None),
+            upload_eligible: status == "staging",
+            artifact_map: BTreeMap::new(),
+            batches: vec![ScopeClosureArtifactWriteSetBatch {
+                batch_id: id("17717717-0877-4877-8877-177177177177"),
+                item_count: 1,
+                first_ordinal: 1,
+                last_ordinal: 1,
+            }],
+        }
+    }
+
     fn scope_closure_worker_input_json() -> Value {
         json!({
             "closureCheckId": "10101010-1010-4010-8010-101010101010",
@@ -7519,16 +9217,534 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "camelCase")]
     struct ReconstructedMachineResult {
+        schema_version: String,
         partition_count: usize,
         issue_count: u64,
         occurrence_count: u64,
         affected_root_count: u64,
+        expanded_affected_root_record_count: u64,
+        root_impact_record_count: u64,
         uncompressed_byte_size: u64,
-        relation_stream_sha256: IssueRelationStreamHashes,
+        issue_stream_sha256: String,
+        legacy_relation_stream_sha256: Option<IssueRelationStreamHashesV2>,
+    }
+
+    fn reconstruct_complete_machine_result(
+        artifacts: &[PreparedArtifact],
+        expected_closure_check_id: Uuid,
+    ) -> anyhow::Result<ReconstructedMachineResult> {
+        let manifest = artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .collect::<Vec<_>>();
+        if manifest.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "complete machine result must contain exactly one manifest"
+            ));
+        }
+        let value: Value = serde_json::from_reader(BufReader::new(File::open(&manifest[0].path)?))?;
+        match value.get("schemaVersion").and_then(Value::as_str) {
+            Some("lcia.scope-closure-issue-manifest.v2") => {
+                reconstruct_complete_machine_result_v2(artifacts, expected_closure_check_id)
+            }
+            Some("lcia.scope-closure-issue-manifest.v3") => {
+                reconstruct_complete_machine_result_v3(artifacts, expected_closure_check_id)
+            }
+            _ => Err(anyhow::anyhow!(
+                "complete machine result manifest schema is unsupported"
+            )),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
-    fn reconstruct_complete_machine_result(
+    fn reconstruct_complete_machine_result_v3(
+        artifacts: &[PreparedArtifact],
+        expected_closure_check_id: Uuid,
+    ) -> anyhow::Result<ReconstructedMachineResult> {
+        let manifest_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .ok_or_else(|| anyhow::anyhow!("complete machine result omitted manifest"))?;
+        if manifest_artifact.descriptor.artifact_role
+            != ScopeClosureArtifactRole::CompleteMachineResult
+        {
+            return Err(anyhow::anyhow!(
+                "manifest artifact role is not complete_machine_result"
+            ));
+        }
+        let (manifest_size, manifest_sha256) = file_size_and_sha256(&manifest_artifact.path)?;
+        if manifest_size != u64::try_from(manifest_artifact.descriptor.byte_size)?
+            || manifest_sha256 != manifest_artifact.descriptor.checksum_sha256
+        {
+            return Err(anyhow::anyhow!("manifest descriptor identity mismatch"));
+        }
+        let manifest: IssuePartitionManifestV3 =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+        if manifest.schema_version != "lcia.scope-closure-issue-manifest.v3"
+            || manifest.closure_check_id != expected_closure_check_id
+            || manifest.expanded_affected_root_record_count != 0
+            || manifest.ordering
+                != (IssueManifestOrdering {
+                    issue_key: "UTF-8 ascending".to_owned(),
+                    root_ordinal: "exact dataset identity ascending".to_owned(),
+                    graph_node_ordinal: "exact dataset identity ascending".to_owned(),
+                    root_impact_key: "UTF-8 ascending".to_owned(),
+                })
+        {
+            return Err(anyhow::anyhow!(
+                "v3 manifest identity, expansion, or ordering contract mismatch"
+            ));
+        }
+        let mut sorted_partitions = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        let original_partitions = sorted_partitions.clone();
+        sorted_partitions.sort_unstable();
+        if original_partitions != sorted_partitions {
+            return Err(anyhow::anyhow!(
+                "v3 manifest partitions are not deterministically ordered"
+            ));
+        }
+        let mut sorted_evidence = manifest
+            .evidence
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        let original_evidence = sorted_evidence.clone();
+        sorted_evidence.sort_unstable();
+        if original_evidence != sorted_evidence {
+            return Err(anyhow::anyhow!(
+                "v3 manifest evidence is not deterministically ordered"
+            ));
+        }
+        let valid_relative_path = |path: &str| {
+            !Path::new(path).is_absolute()
+                && !path.contains('\\')
+                && path
+                    .split('/')
+                    .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        };
+        let mut machine_artifacts = BTreeMap::new();
+        for artifact in artifacts.iter().filter(|artifact| {
+            artifact.descriptor.artifact_role == ScopeClosureArtifactRole::CompleteMachineResult
+                && artifact.descriptor.file_name != "manifest.json"
+        }) {
+            if !valid_relative_path(&artifact.descriptor.file_name)
+                || machine_artifacts
+                    .insert(artifact.descriptor.file_name.as_str(), artifact)
+                    .is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 complete machine result contains a duplicate or invalid artifact path"
+                ));
+            }
+        }
+        let expected_paths = manifest
+            .partitions
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .chain(manifest.evidence.iter().map(|entry| entry.path.as_str()))
+            .collect::<BTreeSet<_>>();
+        if expected_paths.len() != manifest.partitions.len() + manifest.evidence.len()
+            || expected_paths != machine_artifacts.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(anyhow::anyhow!(
+                "v3 manifest membership differs from complete machine artifacts"
+            ));
+        }
+
+        let mut decoded_root_impact = None::<DecodedRootImpactIndex>;
+        let mut decoded_graph = None::<DecodedFrozenReferenceGraph>;
+        let mut total_uncompressed_bytes = 0_u64;
+        for entry in &manifest.evidence {
+            if !valid_relative_path(&entry.path)
+                || !matches!(
+                    entry.relation.as_str(),
+                    "root-impact-index" | "frozen-reference-graph" | "tidas-issue-stream"
+                )
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 evidence relation or path is unsupported"
+                ));
+            }
+            let artifact = machine_artifacts
+                .get(entry.path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("v3 evidence artifact is missing"))?;
+            let (compressed_size, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
+            if compressed_size != entry.compressed_byte_size
+                || compressed_size != u64::try_from(artifact.descriptor.byte_size)?
+                || compressed_sha256 != entry.compressed_sha256
+                || compressed_sha256 != artifact.descriptor.checksum_sha256
+                || artifact.descriptor.content_type != entry.media_type
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 compressed evidence descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+            let compressed_reader = zstd::stream::read::Decoder::new(File::open(&artifact.path)?)?;
+            let mut reader = BufReader::with_capacity(64 * 1024, compressed_reader);
+            let collect_binary = entry.relation != "tidas-issue-stream";
+            let mut logical = collect_binary.then(Vec::new);
+            let mut digest = Sha256::new();
+            let mut byte_count = 0_u64;
+            let mut newline_count = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let chunk = &buffer[..read];
+                digest.update(chunk);
+                byte_count = byte_count
+                    .checked_add(u64::try_from(read)?)
+                    .ok_or_else(|| anyhow::anyhow!("v3 evidence byte count overflow"))?;
+                let mut chunk_newline_count = 0_u64;
+                for &byte in chunk {
+                    chunk_newline_count =
+                        chunk_newline_count.saturating_add(u64::from(byte == b'\n'));
+                }
+                newline_count = newline_count
+                    .checked_add(chunk_newline_count)
+                    .ok_or_else(|| anyhow::anyhow!("v3 evidence record count overflow"))?;
+                if let Some(logical) = &mut logical {
+                    logical.extend_from_slice(chunk);
+                }
+            }
+            let logical_sha256 = hex::encode(digest.finalize());
+            if byte_count != entry.uncompressed_byte_size
+                || logical_sha256 != entry.uncompressed_sha256
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 logical evidence descriptor mismatch: {}",
+                    entry.path
+                ));
+            }
+            match entry.relation.as_str() {
+                "root-impact-index" => {
+                    let root_impact_index = decode_root_impact_index(
+                        logical
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("root impact bytes not collected"))?,
+                    )?;
+                    if u64::try_from(root_impact_index.records.len())? != entry.record_count
+                        || entry.record_count != manifest.root_impact_record_count
+                        || u64::from(root_impact_index.root_count) != manifest.root_count
+                        || logical_sha256 != manifest.relation_stream_sha256.root_impact_index
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v3 root impact index count or hash mismatch"
+                        ));
+                    }
+                    decoded_root_impact = Some(root_impact_index);
+                }
+                "frozen-reference-graph" => {
+                    let frozen_graph = decode_frozen_reference_graph(
+                        logical
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("frozen graph bytes not collected"))?,
+                    )?;
+                    let edge_count = frozen_graph.reverse.iter().map(Vec::len).try_fold(
+                        0_u64,
+                        |total, count| {
+                            total.checked_add(u64::try_from(count)?).ok_or_else(|| {
+                                anyhow::anyhow!("decoded reference edge count overflow")
+                            })
+                        },
+                    )?;
+                    if u64::try_from(frozen_graph.identities.len())? != manifest.graph_node_count
+                        || u64::try_from(frozen_graph.root_node_ordinals.len())?
+                            != manifest.root_count
+                        || edge_count != manifest.graph_edge_count
+                        || entry.record_count != manifest.graph_node_count
+                        || logical_sha256 != manifest.relation_stream_sha256.frozen_reference_graph
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v3 frozen reference graph count or hash mismatch"
+                        ));
+                    }
+                    decoded_graph = Some(frozen_graph);
+                }
+                "tidas-issue-stream" => {
+                    if newline_count != entry.record_count
+                        || entry.record_count != manifest.logical_issue_event_count
+                        || byte_count != manifest.logical_issue_stream_byte_size
+                        || logical_sha256 != manifest.logical_issue_stream_sha256
+                        || logical_sha256 != manifest.relation_stream_sha256.tidas_issue_stream
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v3 TIDAS logical stream count or hash mismatch"
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            total_uncompressed_bytes = total_uncompressed_bytes
+                .checked_add(byte_count)
+                .ok_or_else(|| anyhow::anyhow!("v3 machine result byte count overflow"))?;
+        }
+        let root_impact = decoded_root_impact
+            .ok_or_else(|| anyhow::anyhow!("v3 root impact evidence is missing"))?;
+        let graph =
+            decoded_graph.ok_or_else(|| anyhow::anyhow!("v3 frozen graph evidence is missing"))?;
+        let impact_by_key = root_impact
+            .records
+            .iter()
+            .map(|record| (record.impact_key.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        let mut referenced_impacts = BTreeSet::<String>::new();
+        let mut previous_issue_key = None::<String>;
+        let mut issue_count = 0_u64;
+        let mut occurrence_count = 0_u64;
+        let mut affected_root_count = 0_u64;
+        let mut issue_digest = Sha256::new();
+        for (partition_index, entry) in manifest.partitions.iter().enumerate() {
+            let expected_path = format!("issues/part-{partition_index:06}.ndjson.zst");
+            if entry.relation != "issues"
+                || entry.path != expected_path
+                || entry.media_type != "application/x-ndjson+zstd"
+                || !valid_relative_path(&entry.path)
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 issue partition identity is invalid: {}",
+                    entry.path
+                ));
+            }
+            let artifact = machine_artifacts
+                .get(entry.path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("v3 issue partition is missing"))?;
+            let (compressed_size, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
+            if compressed_size != entry.compressed_byte_size
+                || compressed_size != u64::try_from(artifact.descriptor.byte_size)?
+                || compressed_sha256 != entry.compressed_sha256
+                || compressed_sha256 != artifact.descriptor.checksum_sha256
+                || artifact.descriptor.content_type != entry.media_type
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 compressed issue partition descriptor mismatch"
+                ));
+            }
+            let decoder = zstd::stream::read::Decoder::new(File::open(&artifact.path)?)?;
+            let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+            let mut line = Vec::new();
+            let mut partition_digest = Sha256::new();
+            let mut partition_count = 0_u64;
+            let mut partition_bytes = 0_u64;
+            let mut first_issue_key = None::<String>;
+            let mut last_issue_key = None::<String>;
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
+                }
+                if line.last() != Some(&b'\n')
+                    || u64::try_from(line.len())? > manifest.partition_max_uncompressed_bytes
+                {
+                    return Err(anyhow::anyhow!(
+                        "v3 issue record is unterminated or exceeds the reader window"
+                    ));
+                }
+                partition_digest.update(&line);
+                issue_digest.update(&line);
+                partition_bytes = partition_bytes
+                    .checked_add(u64::try_from(line.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue partition byte count overflow"))?;
+                line.pop();
+                let record: Value = serde_json::from_slice(&line)?;
+                if record.get("schemaVersion").and_then(Value::as_str)
+                    != Some("lcia.scope-closure-issue.v3")
+                {
+                    return Err(anyhow::anyhow!("v3 issue record schema mismatch"));
+                }
+                let issue_key = record
+                    .get("issueKey")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue record omitted issueKey"))?;
+                if previous_issue_key
+                    .as_deref()
+                    .is_some_and(|previous| previous >= issue_key)
+                {
+                    return Err(anyhow::anyhow!(
+                        "v3 issue order is not strictly deterministic"
+                    ));
+                }
+                previous_issue_key = Some(issue_key.to_owned());
+                first_issue_key.get_or_insert_with(|| issue_key.to_owned());
+                last_issue_key = Some(issue_key.to_owned());
+                if record.get("severity").and_then(Value::as_str).is_none()
+                    || record.get("blocker").and_then(Value::as_bool).is_none()
+                    || record.get("code").and_then(Value::as_str).is_none()
+                    || record.get("message").and_then(Value::as_str).is_none()
+                    || !record
+                        .get("path")
+                        .is_some_and(|value| value.is_null() || value.as_str().is_some())
+                {
+                    return Err(anyhow::anyhow!(
+                        "v3 issue record omitted a canonical issue field"
+                    ));
+                }
+                let issue_occurrences = record
+                    .get("occurrenceCount")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue omitted occurrenceCount"))?;
+                let issue_roots = record
+                    .get("affectedRootCount")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue omitted affectedRootCount"))?;
+                let occurrence_samples = record
+                    .get("occurrenceSamples")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue omitted occurrenceSamples"))?;
+                let root_samples = record
+                    .get("affectedRootSamples")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue omitted affectedRootSamples"))?;
+                if occurrence_samples.len() > manifest.rpc_occurrence_sample_limit_per_issue
+                    || root_samples.len() > manifest.rpc_affected_root_sample_limit_per_issue
+                    || record
+                        .get("occurrenceSamplesTruncated")
+                        .and_then(Value::as_bool)
+                        != Some(issue_occurrences > u64::try_from(occurrence_samples.len())?)
+                    || record
+                        .get("affectedRootSamplesTruncated")
+                        .and_then(Value::as_bool)
+                        != Some(issue_roots > u64::try_from(root_samples.len())?)
+                {
+                    return Err(anyhow::anyhow!(
+                        "v3 issue samples are unbounded or truncation flags drifted"
+                    ));
+                }
+                let impact: RootImpactReference = serde_json::from_value(
+                    record
+                        .get("rootImpact")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("v3 issue omitted rootImpact"))?,
+                )?;
+                if let Some(impact_key) = impact.impact_key.as_deref() {
+                    let indexed = impact_by_key.get(impact_key).ok_or_else(|| {
+                        anyhow::anyhow!("v3 issue references an unknown root impact")
+                    })?;
+                    if indexed.mode != impact.mode
+                        || indexed.source_node_ordinal != impact.source_node_ordinal
+                        || u64::from(indexed.affected_root_count) != issue_roots
+                    {
+                        return Err(anyhow::anyhow!("v3 issue root impact projection mismatch"));
+                    }
+                    referenced_impacts.insert(impact_key.to_owned());
+                    for sample in root_samples {
+                        let root_ordinal = u32::try_from(
+                            sample
+                                .get("rootOrdinal")
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| anyhow::anyhow!("root sample omitted ordinal"))?,
+                        )?;
+                        if !decoded_impact_contains_root(
+                            indexed,
+                            root_ordinal,
+                            root_impact.root_count,
+                        ) {
+                            return Err(anyhow::anyhow!(
+                                "v3 root sample is absent from compact impact index"
+                            ));
+                        }
+                        if let Some(source_node_ordinal) = indexed.source_node_ordinal {
+                            let witness = reconstruct_frozen_graph_witness(
+                                &graph,
+                                source_node_ordinal,
+                                root_ordinal,
+                            )?;
+                            if serde_json::to_value(witness)?
+                                != sample.get("witnessPath").cloned().unwrap_or(Value::Null)
+                            {
+                                return Err(anyhow::anyhow!(
+                                    "v3 on-demand witness differs from bounded sample"
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    let expected = match impact.mode {
+                        RootImpactMode::None => 0,
+                        RootImpactMode::AllRoots => manifest.root_count,
+                        RootImpactMode::IncludedOrdinals | RootImpactMode::ExcludedOrdinals => {
+                            return Err(anyhow::anyhow!(
+                                "v3 compact impact mode omitted its index key"
+                            ));
+                        }
+                    };
+                    if issue_roots != expected {
+                        return Err(anyhow::anyhow!(
+                            "v3 inline all/none root impact count mismatch"
+                        ));
+                    }
+                }
+                occurrence_count = occurrence_count
+                    .checked_add(issue_occurrences)
+                    .ok_or_else(|| anyhow::anyhow!("v3 occurrence count overflow"))?;
+                affected_root_count = affected_root_count
+                    .checked_add(issue_roots)
+                    .ok_or_else(|| anyhow::anyhow!("v3 affected-root count overflow"))?;
+                issue_count = issue_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("v3 issue count overflow"))?;
+                partition_count = partition_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("v3 partition record count overflow"))?;
+            }
+            if partition_count != entry.record_count
+                || partition_bytes != entry.uncompressed_byte_size
+                || hex::encode(partition_digest.finalize()) != entry.uncompressed_sha256
+                || first_issue_key.as_deref() != Some(entry.first_issue_key.as_str())
+                || last_issue_key.as_deref() != Some(entry.last_issue_key.as_str())
+            {
+                return Err(anyhow::anyhow!(
+                    "v3 uncompressed issue partition descriptor mismatch"
+                ));
+            }
+            total_uncompressed_bytes = total_uncompressed_bytes
+                .checked_add(partition_bytes)
+                .ok_or_else(|| anyhow::anyhow!("v3 machine result byte count overflow"))?;
+        }
+        if referenced_impacts
+            != impact_by_key
+                .keys()
+                .map(|key| (*key).to_owned())
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(anyhow::anyhow!(
+                "v3 root impact index contains unreferenced records"
+            ));
+        }
+        let issue_stream_sha256 = hex::encode(issue_digest.finalize());
+        if issue_count != manifest.issue_count
+            || occurrence_count != manifest.occurrence_count
+            || affected_root_count != manifest.affected_root_count
+            || issue_stream_sha256 != manifest.relation_stream_sha256.issues
+        {
+            return Err(anyhow::anyhow!(
+                "v3 reconstructed counts or issue hash differ from manifest"
+            ));
+        }
+        Ok(ReconstructedMachineResult {
+            schema_version: manifest.schema_version,
+            partition_count: manifest.partitions.len(),
+            issue_count,
+            occurrence_count,
+            affected_root_count,
+            expanded_affected_root_record_count: 0,
+            root_impact_record_count: manifest.root_impact_record_count,
+            uncompressed_byte_size: total_uncompressed_bytes,
+            issue_stream_sha256,
+            legacy_relation_stream_sha256: None,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_complete_machine_result_v2(
         artifacts: &[PreparedArtifact],
         expected_closure_check_id: Uuid,
     ) -> anyhow::Result<ReconstructedMachineResult> {
@@ -7555,7 +9771,7 @@ mod tests {
         {
             return Err(anyhow::anyhow!("manifest descriptor identity mismatch"));
         }
-        let manifest: IssuePartitionManifest =
+        let manifest: IssuePartitionManifestV2 =
             serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
         if manifest.schema_version != "lcia.scope-closure-issue-manifest.v2"
             || manifest.closure_check_id != expected_closure_check_id
@@ -7760,7 +9976,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("machine result byte count overflow"))?;
         }
 
-        let reconstructed_hashes = IssueRelationStreamHashes {
+        let reconstructed_hashes = IssueRelationStreamHashesV2 {
             issues: hex::encode(
                 relation_digests
                     .remove("issues")
@@ -7781,6 +9997,7 @@ mod tests {
             ),
         };
         let reconstructed = ReconstructedMachineResult {
+            schema_version: manifest.schema_version.clone(),
             partition_count: manifest.partitions.len(),
             issue_count: relation_counts.get("issues").copied().unwrap_or_default(),
             occurrence_count: relation_counts
@@ -7791,13 +10008,20 @@ mod tests {
                 .get("affected-roots")
                 .copied()
                 .unwrap_or_default(),
+            expanded_affected_root_record_count: relation_counts
+                .get("affected-roots")
+                .copied()
+                .unwrap_or_default(),
+            root_impact_record_count: 0,
             uncompressed_byte_size: total_uncompressed_bytes,
-            relation_stream_sha256: reconstructed_hashes,
+            issue_stream_sha256: reconstructed_hashes.issues.clone(),
+            legacy_relation_stream_sha256: Some(reconstructed_hashes),
         };
         if reconstructed.issue_count != manifest.issue_count
             || reconstructed.occurrence_count != manifest.occurrence_count
             || reconstructed.affected_root_count != manifest.affected_root_count
-            || reconstructed.relation_stream_sha256 != manifest.relation_stream_sha256
+            || reconstructed.legacy_relation_stream_sha256.as_ref()
+                != Some(&manifest.relation_stream_sha256)
         {
             return Err(anyhow::anyhow!(
                 "reconstructed complete machine result differs from manifest global counts/hashes"
@@ -8161,7 +10385,7 @@ mod tests {
 
     #[test]
     #[ignore = "local capacity gate: real package or high-unique generated issue merge/report"]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
     fn qualified_streaming_issue_merge_report_capacity() {
         let output_dir = PathBuf::from(
             std::env::var("SCOPE_CLOSURE_CAPACITY_OUTPUT").unwrap_or_else(|_| {
@@ -8174,143 +10398,117 @@ mod tests {
         );
         fs::create_dir_all(&output_dir).unwrap();
         let mut event_writer = JsonlValueSpoolWriter::new("capacity-issue-events.jsonl").unwrap();
-        let (documents, roots, reference_graph) =
-            if let Ok(package_dir) = std::env::var("SCOPE_CLOSURE_REAL_PACKAGE_DIR") {
-                let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
-                collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap();
-                let issue_spool = std::env::var("SCOPE_CLOSURE_REAL_ISSUE_SPOOL")
-                    .expect("real package mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
-                let target_raw_events = std::env::var("SCOPE_CLOSURE_PRODUCTION_RAW_EVENTS")
-                    .ok()
-                    .map_or(0, |value| {
-                        value.parse::<u64>().expect("production raw event target")
-                    });
-                let target_relations = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS")
-                    .ok()
-                    .map_or(0, |value| {
-                        value.parse::<u64>().expect("production relation target")
-                    });
-                let production_graph = (target_raw_events > 0).then(production_capacity_graph);
-                if let Some(graph) = &production_graph {
-                    for document in &graph.documents {
-                        documents.append(document).unwrap();
-                    }
-                    let six_roots = target_raw_events.saturating_mul(6);
-                    assert!(
-                        target_relations >= six_roots
-                            && target_relations <= target_raw_events.saturating_mul(7),
-                        "production relation target must be between six and seven roots per event"
-                    );
+        let (documents, roots, reference_graph) = if let Ok(package_dir) =
+            std::env::var("SCOPE_CLOSURE_REAL_PACKAGE_DIR")
+        {
+            let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+            collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap();
+            let issue_spool = std::env::var("SCOPE_CLOSURE_REAL_ISSUE_SPOOL")
+                .expect("real package mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
+            let target_raw_events = std::env::var("SCOPE_CLOSURE_PRODUCTION_RAW_EVENTS")
+                .ok()
+                .map_or(0, |value| {
+                    value.parse::<u64>().expect("production raw event target")
+                });
+            let target_relations = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS")
+                .ok()
+                .map_or(0, |value| {
+                    value.parse::<u64>().expect("production relation target")
+                });
+            let production_graph = (target_raw_events > 0).then(production_capacity_graph);
+            if let Some(graph) = &production_graph {
+                for document in &graph.documents {
+                    documents.append(document).unwrap();
                 }
-                let seventh_root_events =
-                    target_relations.saturating_sub(target_raw_events.saturating_mul(6));
-                let mut observed_events = 0_u64;
-                tidas_cli::visit_jsonl(Path::new(&issue_spool), |mut event| {
-                    if target_raw_events > 0 {
-                        if observed_events >= target_raw_events {
-                            return Ok(());
-                        }
-                        let graph = production_graph
-                            .as_ref()
-                            .expect("production graph requested by target");
-                        let source_index = usize::from(observed_events >= seventh_root_events);
-                        event["document_key"] = json!(graph.sources[source_index].document_key());
-                        let base_location = event
-                            .pointer("/issue/location")
-                            .or_else(|| event.pointer("/issue/path"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("$.productionCapacity");
-                        event["issue"]["location"] =
-                            json!(format!("{base_location}#capacity[{observed_events:06}]"));
-                        pad_capacity_event(&mut event, 1_096);
-                        observed_events = observed_events.saturating_add(1);
-                    } else if let Some(document_key) = package_issue_document_key(&event) {
-                        event["document_key"] = json!(document_key);
-                    }
-                    event_writer.append(&event)
-                })
-                .unwrap();
-                if target_raw_events > 0 {
-                    assert_eq!(observed_events, target_raw_events);
-                }
-                let (roots, reference_graph) = production_graph.map_or_else(
-                    || (Vec::new(), CompactReferenceGraph::default()),
-                    |graph| {
-                        let reference_graph =
-                            CompactReferenceGraph::from_references(&graph.references, &graph.roots)
-                                .unwrap();
-                        (graph.roots, reference_graph)
-                    },
+                let six_roots = target_raw_events.saturating_mul(6);
+                assert!(
+                    target_relations >= six_roots
+                        && target_relations <= target_raw_events.saturating_mul(7),
+                    "production relation target must be between six and seven roots per event"
                 );
-                (documents.finish().unwrap(), roots, reference_graph)
-            } else {
-                let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(1);
-                let base_events = std::env::var("SCOPE_CLOSURE_SCALE_BASE_EVENTS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(50_000);
-                let event_count = base_events.checked_mul(multiplier).unwrap();
-                let details = "x".repeat(480);
-                let sources = (0..64_u128)
-                    .map(|index| ExactDatasetIdentity {
-                        category: DatasetCategory::Sources,
-                        id: Uuid::from_u128(10_000 + index),
-                        version: "01.00.000".to_owned(),
-                    })
-                    .collect::<Vec<_>>();
-                let roots = (0..4_u128)
-                    .map(|index| ExactDatasetIdentity {
-                        category: DatasetCategory::Processes,
-                        id: Uuid::from_u128(20_000 + index),
-                        version: "01.00.000".to_owned(),
-                    })
-                    .collect::<Vec<_>>();
-                let references = roots
-                    .iter()
-                    .flat_map(|root| {
-                        sources.iter().map(move |source| ResolvedReference {
-                            source: root.clone(),
-                            target: source.clone(),
-                            json_path: "$.generated".to_owned(),
-                            reference_role: "generated_capacity".to_owned(),
-                            requested_version_state: "explicit".to_owned(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let reference_graph =
-                    CompactReferenceGraph::from_references(&references, &roots).unwrap();
-                let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
-                for identity in roots.iter().chain(&sources) {
-                    documents
-                        .append(&ClosureDocument {
-                            identity: identity.clone(),
-                            payload: json!({}),
-                        })
-                        .unwrap();
+            }
+            let seventh_root_events =
+                target_relations.saturating_sub(target_raw_events.saturating_mul(6));
+            let mut observed_events = 0_u64;
+            tidas_cli::visit_jsonl(Path::new(&issue_spool), |mut event| {
+                if target_raw_events > 0 {
+                    if observed_events >= target_raw_events {
+                        return Ok(());
+                    }
+                    let graph = production_graph
+                        .as_ref()
+                        .expect("production graph requested by target");
+                    let source_index = usize::from(observed_events >= seventh_root_events);
+                    event["document_key"] = json!(graph.sources[source_index].document_key());
+                    let base_location = event
+                        .pointer("/issue/location")
+                        .or_else(|| event.pointer("/issue/path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("$.productionCapacity");
+                    event["issue"]["location"] =
+                        json!(format!("{base_location}#capacity[{observed_events:06}]"));
+                    pad_capacity_event(&mut event, 1_096);
+                    observed_events = observed_events.saturating_add(1);
+                } else if let Some(document_key) = package_issue_document_key(&event) {
+                    event["document_key"] = json!(document_key);
                 }
-                for index in 0..event_count {
-                    let source = &sources[usize::try_from(index).unwrap() % sources.len()];
-                    event_writer
-                    .append(&json!({
-                        "type": "issue",
-                        "document_key": source.document_key(),
-                        "issue": {
-                            "issue_code": "generated_high_unique",
-                            "location": format!("$.generated[{index}]"),
-                            "message": format!("generated high-unique issue {index}: {details}"),
-                            "context": {
-                                "distribution": "high-unique-key",
-                                "ordinal": index,
-                            },
+                event_writer.append(&event)
+            })
+            .unwrap();
+            if target_raw_events > 0 {
+                assert_eq!(observed_events, target_raw_events);
+            }
+            let (roots, reference_graph) = production_graph.map_or_else(
+                || (Vec::new(), CompactReferenceGraph::default()),
+                |graph| {
+                    let reference_graph =
+                        CompactReferenceGraph::from_references(&graph.references, &graph.roots)
+                            .unwrap();
+                    (graph.roots, reference_graph)
+                },
+            );
+            (documents.finish().unwrap(), roots, reference_graph)
+        } else {
+            let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1);
+            assert!([1, 2, 5, 10].contains(&multiplier));
+            let base_events = std::env::var("SCOPE_CLOSURE_SCALE_BASE_EVENTS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(50_000);
+            let event_count = base_events.checked_mul(multiplier).unwrap();
+            let details = "x".repeat(480);
+            let graph = production_capacity_graph();
+            let reference_graph =
+                CompactReferenceGraph::from_references(&graph.references, &graph.roots).unwrap();
+            let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+            for document in &graph.documents {
+                documents.append(document).unwrap();
+            }
+            for index in 0..event_count {
+                // Match the observed production relation density: one seventh-root source
+                // occurrence for every four six-root source occurrences (6.2 roots/event).
+                let source = &graph.sources[usize::from(!index.is_multiple_of(5))];
+                let mut event = json!({
+                    "type": "issue",
+                    "document_key": source.document_key(),
+                    "issue": {
+                        "issue_code": "generated_high_unique",
+                        "location": format!("$.generated[{index}]"),
+                        "message": format!("generated high-unique issue {index}: {details}"),
+                        "context": {
+                            "distribution": "high-unique-key",
+                            "ordinal": index,
                         },
-                    }))
-                    .unwrap();
-                }
-                (documents.finish().unwrap(), roots, reference_graph)
-            };
+                    },
+                });
+                pad_capacity_event(&mut event, 1_096);
+                event_writer.append(&event).unwrap();
+            }
+            (documents.finish().unwrap(), graph.roots, reference_graph)
+        };
         let issue_events = event_writer.finish().unwrap();
         let input_event_count = issue_events.event_count;
         let input_spool_bytes = issue_events.byte_size;
@@ -8357,7 +10555,7 @@ mod tests {
             fs::copy(&artifact.path, &destination).unwrap();
             let artifact_bytes = u64::try_from(artifact.descriptor.byte_size).unwrap();
             total_artifact_bytes = total_artifact_bytes.saturating_add(artifact_bytes);
-            if artifact.descriptor.file_name == "closure-bundle-v1.json" {
+            if artifact.descriptor.file_name == "closure-bundle-v3.json" {
                 closure_bundle_bytes = artifact_bytes;
                 artifact
                     .descriptor
@@ -8370,13 +10568,44 @@ mod tests {
                     .checksum_sha256
                     .clone_into(&mut xlsx_sha256);
             }
-            if artifact.descriptor.file_name == "manifest.json"
-                || artifact.descriptor.file_name.ends_with(".ndjson.zst")
+            if artifact.descriptor.artifact_role == ScopeClosureArtifactRole::CompleteMachineResult
             {
                 partition_bytes = partition_bytes.saturating_add(artifact_bytes);
             }
             artifact_manifest.push(artifact.descriptor.clone());
         }
+        let mut temp_roots = BTreeSet::from([
+            scan.documents._temp.path().to_path_buf(),
+            scan.edges._temp.path().to_path_buf(),
+            resolution_map._temp.path().to_path_buf(),
+            validation.issue_events._temp.path().to_path_buf(),
+            relations.issues._temp.path().to_path_buf(),
+            relations.root_impact_index.temp.path().to_path_buf(),
+        ]);
+        for artifact in &artifacts {
+            temp_roots.insert(artifact._temp.path().to_path_buf());
+        }
+        let temporary_bytes = temp_roots.iter().fold(0_u64, |total, path| {
+            total.saturating_add(directory_bytes(path).unwrap_or(0))
+        });
+        let cache_reclaim_before = ResourceMeasurement::capture(
+            "capacity_before_cache_reclaim",
+            ResourceCounters {
+                temp_bytes: Some(temporary_bytes),
+                ..ResourceCounters::default()
+            },
+        );
+        for artifact in &artifacts {
+            let file = File::open(&artifact.path).unwrap();
+            release_file_cache(&file);
+        }
+        let cache_reclaim_after = ResourceMeasurement::capture(
+            "capacity_after_cache_reclaim",
+            ResourceCounters {
+                temp_bytes: Some(temporary_bytes),
+                ..ResourceCounters::default()
+            },
+        );
         assert_eq!(reconstructed.issue_count, relations.stats.issue_count);
         assert_eq!(
             reconstructed.occurrence_count,
@@ -8386,40 +10615,67 @@ mod tests {
             reconstructed.affected_root_count,
             relations.stats.affected_root_count
         );
+        assert_eq!(reconstructed.expanded_affected_root_record_count, 0);
+        assert!(
+            relations.root_impact_index.record_count <= relations.stats.issue_count,
+            "root impact must be indexed once per source/exception, never once per relation"
+        );
         if let Ok(target) = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS") {
             let target = target.parse::<u64>().unwrap();
             assert_eq!(relations.stats.affected_root_count, target);
-            if target >= 3_191_153 {
-                assert!(
-                    relations.affected_roots.byte_size > VALIDATION_ISSUE_SPOOL_MAX_BYTES,
-                    "production-shaped affected-root relation stream must exceed the legacy 2 GiB cap: {}",
-                    relations.affected_roots.byte_size
-                );
-            }
+        } else if std::env::var_os("SCOPE_CLOSURE_REAL_PACKAGE_DIR").is_none() {
+            let expected_relations = input_event_count
+                .saturating_mul(6)
+                .saturating_add(input_event_count.saturating_add(4) / 5);
+            assert_eq!(relations.stats.affected_root_count, expected_relations);
+            assert_eq!(
+                relations.root_impact_index.record_count, 2,
+                "the generated production distribution must stay source-indexed"
+            );
         }
+        let issue_partition_bytes =
+            relations
+                .issue_partition_artifacts
+                .iter()
+                .fold(0_u64, |total, artifact| {
+                    total.saturating_add(
+                        u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX),
+                    )
+                });
         let after_artifacts = ResourceMeasurement::capture(
             "capacity_after_artifacts",
             ResourceCounters {
                 temp_bytes: Some(
                     relations
                         .issues
-                        .storage_bytes()
-                        .saturating_add(relations.occurrences.storage_bytes())
-                        .saturating_add(relations.affected_roots.storage_bytes())
+                        .byte_size
+                        .saturating_add(issue_partition_bytes)
+                        .saturating_add(relations.root_impact_index.compressed_byte_size)
                         .saturating_add(total_artifact_bytes),
                 ),
                 rows: Some(
                     relations
                         .stats
                         .issue_count
-                        .saturating_add(relations.stats.occurrence_count)
-                        .saturating_add(relations.stats.affected_root_count),
+                        .saturating_add(relations.root_impact_index.record_count),
                 ),
                 ..ResourceCounters::default()
             },
         );
         let summary = json!({
-            "schemaVersion": "lcia.scope-closure-capacity-result.v1",
+            "schemaVersion": "lcia.scope-closure-capacity-result.v2",
+            "inputMode": if std::env::var_os("SCOPE_CLOSURE_REAL_PACKAGE_DIR").is_some() {
+                "external-open-data-package"
+            } else {
+                "production-distribution-generated"
+            },
+            "scaleMultiplier": std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1),
+            "scaleBaseEvents": std::env::var("SCOPE_CLOSURE_SCALE_BASE_EVENTS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
             "documentCount": document_count,
             "inputEventCount": input_event_count,
             "inputSpoolBytes": input_spool_bytes,
@@ -8433,20 +10689,13 @@ mod tests {
                 "affectedRoots": reconstructed.affected_root_count,
             },
             "machineResultReconstruction": &reconstructed,
-            "relationSpoolBytes": {
-                "issues": relations.issues.byte_size,
-                "occurrences": relations.occurrences.byte_size,
-                "affectedRoots": relations.affected_roots.byte_size,
-            },
-            "relationRunStorageBytes": {
-                "issues": relations.issues.storage_bytes(),
-                "occurrences": relations.occurrences.storage_bytes(),
-                "affectedRoots": relations.affected_roots.storage_bytes(),
-            },
-            "relationRunCounts": {
-                "issues": relations.issues.run_paths.len(),
-                "occurrences": relations.occurrences.run_paths.len(),
-                "affectedRoots": relations.affected_roots.run_paths.len(),
+            "physicalRepresentation": {
+                "expandedAffectedRootRecords": reconstructed.expanded_affected_root_record_count,
+                "issueSpoolBytes": relations.issues.byte_size,
+                "issuePartitionBytes": issue_partition_bytes,
+                "issuePartitionCount": relations.issue_partition_entries.len(),
+                "rootImpactIndexBytes": relations.root_impact_index.compressed_byte_size,
+                "rootImpactRecordCount": relations.root_impact_index.record_count,
             },
             "tempAdmission": {
                 "strategy": "observed_raw_then_measured_topology_watermarks",
@@ -8462,8 +10711,18 @@ mod tests {
                 "reserveBytes": SCOPE_CLOSURE_TEMP_FREE_SPACE_RESERVE_BYTES,
             },
             "totalArtifactBytes": total_artifact_bytes,
+            "artifactCount": artifacts.len(),
+            "descriptorCount": artifacts.len(),
             "partitionAndManifestBytes": partition_bytes,
+            "partitionAndManifestCount": artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.descriptor.artifact_role
+                        == ScopeClosureArtifactRole::CompleteMachineResult
+                })
+                .count(),
             "partitionUncompressedBytes": reconstructed.uncompressed_byte_size,
+            "temporaryBytes": temporary_bytes,
             "closureBundleBytes": closure_bundle_bytes,
             "closureBundleSha256": closure_bundle_sha256,
             "xlsxBytes": xlsx_bytes,
@@ -8471,6 +10730,18 @@ mod tests {
             "resourceMeasurements": {
                 "afterRelationRuns": after_relation_runs,
                 "afterArtifacts": after_artifacts,
+            },
+            "cacheReclaim": {
+                "requestedFileCount": artifacts.len(),
+                "mechanism": if cfg!(target_os = "linux") {
+                    "posix_fadvise_dontneed"
+                } else if cfg!(target_os = "macos") {
+                    "f_nocache_and_sync"
+                } else {
+                    "best_effort_noop"
+                },
+                "before": cache_reclaim_before,
+                "after": cache_reclaim_after,
             },
             "artifacts": artifact_manifest,
         });
@@ -8630,7 +10901,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_closure_bundle_preserves_v1_canonical_bytes() {
+    fn file_backed_closure_bundle_v3_references_the_single_tidas_stream() {
         let input: ScopeClosureWorkerInput =
             serde_json::from_value(scope_closure_worker_input_json()).unwrap();
         let event = json!({
@@ -8657,11 +10928,11 @@ mod tests {
             frontier: Vec::new(),
             provider_universe: Vec::new(),
             reference_graph: CompactReferenceGraph::default(),
-            tidas_issue_event_count: 0,
+            tidas_issue_event_count: 1,
             issue_relations: None,
         };
         let expected = json!({
-            "schemaVersion": "lcia.scope-closure-bundle.v1",
+            "schemaVersion": "lcia.scope-closure-bundle.v3",
             "requestedScopeHash": input.requested_scope_hash,
             "policyFingerprint": input.policy_fingerprint,
             "dataSnapshotToken": input.data_snapshot_token,
@@ -8669,9 +10940,33 @@ mod tests {
             "tidasValidation": {
                 "describe": validation.describe,
                 "finalEvent": validation.final_event,
-                "issueEvents": [event],
+                "issueStream": {
+                    "compression": "zstd",
+                    "eventCount": validation.issue_events.event_count,
+                    "logicalByteSize": validation.issue_events.byte_size,
+                    "logicalSha256": validation.issue_events.sha256,
+                    "path": "tidas/issues.ndjson.zst",
+                    "schemaVersion": "lcia.scope-closure-tidas-issue-stream.v1",
+                },
             },
-            "scan": scan,
+            "scan": {
+                "complete": true,
+                "documents": [],
+                "edges": [],
+                "frontier": [],
+                "issueSummary": {
+                    "canonical": false,
+                    "completeMachineResultClientKey": "manifest.json",
+                    "issueCountBeforeTidasCoalescing": 0,
+                    "issueSchemaVersion": "lcia.scope-closure-issue.v3",
+                    "rawTidasIssueEventCount": 1,
+                },
+                "omittedVersionResolutions": [],
+                "providerUniverse": [],
+                "resolvedReferences": [],
+                "roots": [],
+                "schemaVersion": "lcia.scope-closure-scan.v1",
+            },
             "resolutionMap": [],
         });
 
@@ -8910,6 +11205,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn blocked_closure_has_no_numerical_snapshot_or_pseudo_snapshot_artifact() {
         let missing = identity(
             DatasetCategory::Processes,
@@ -8926,7 +11222,11 @@ mod tests {
             issues: vec![missing_dataset_issue(&missing, true)],
             frontier: Vec::new(),
             provider_universe: Vec::new(),
-            reference_graph: CompactReferenceGraph::default(),
+            reference_graph: CompactReferenceGraph::from_references(
+                &[],
+                std::slice::from_ref(&missing),
+            )
+            .unwrap(),
             tidas_issue_event_count: 0,
             issue_relations: None,
         };
@@ -8947,8 +11247,8 @@ mod tests {
         assert_eq!(evidence.evidence_hash, None);
 
         let temp = Arc::new(TempDir::new().unwrap());
-        let path = temp.path().join("closure-bundle-v1.json");
-        let bytes = br#"{"schemaVersion":"lcia.scope-closure-bundle.v1"}"#;
+        let path = temp.path().join("closure-bundle-v3.json");
+        let bytes = br#"{"schemaVersion":"lcia.scope-closure-bundle.v3"}"#;
         fs::write(&path, bytes).unwrap();
         let validation = TidasBatchValidation {
             describe: json!({"asset_fingerprint": "fixture"}),
@@ -8975,11 +11275,13 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from([
-                "closure-bundle-v1.json",
+                "closure-bundle-v3.json",
                 "closure-report-v1.xlsx",
+                "evidence/frozen-reference-graph-v1.bin.zst",
+                "evidence/root-impact-index-v1.bin.zst",
                 "issues/part-000000.ndjson.zst",
                 "manifest.json",
-                "occurrences/part-000000.ndjson.zst",
+                "tidas/issues.ndjson.zst",
             ])
         );
         assert!(!names.contains("closure-snapshot-v1.json"));
@@ -8993,7 +11295,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            roles["closure-bundle-v1.json"],
+            roles["closure-bundle-v3.json"],
             ScopeClosureArtifactRole::ClosureBundle
         );
         assert_eq!(
@@ -9053,6 +11355,269 @@ mod tests {
                 .get("completeMachineResultArtifactId")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn database_316_descriptor_fixture_digest_and_ordinals_match_exactly() {
+        let closure_check_id = "11111111-1111-4111-8111-111111111111";
+        let content_hash = "a".repeat(64);
+        let descriptors = vec![
+            json!({
+                "ordinal": 1,
+                "clientKey": "closure-bundle-v3.json",
+                "artifactType": "closure_bundle",
+                "artifactRole": "closure_bundle",
+                "bucket": "scope-closure-artifacts",
+                "objectPath": "scope-closure/11111111-1111-4111-8111-111111111111/99999999-9999-4999-8999-999999999999/closure-bundle-v3.json",
+                "mediaType": "application/json",
+                "size": 128,
+                "checksumSha256": "1".repeat(64),
+                "metadata": {
+                    "schemaVersion": "lcia.scope-closure-artifact.v2",
+                    "closureCheckId": closure_check_id,
+                    "fileName": "closure-bundle-v3.json",
+                    "artifactRole": "closure_bundle",
+                    "retentionSeconds": 604_800,
+                    "contentArtifactManifestHash": content_hash,
+                    "completeMachineResultClientKey": "manifest.json",
+                },
+            }),
+            json!({
+                "ordinal": 2,
+                "clientKey": "closure-report-v3.xlsx",
+                "artifactType": "closure_report_xlsx",
+                "artifactRole": "closure_report",
+                "bucket": "scope-closure-artifacts",
+                "objectPath": "scope-closure/11111111-1111-4111-8111-111111111111/99999999-9999-4999-8999-999999999999/closure-report-v3.xlsx",
+                "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "size": 256,
+                "checksumSha256": "2".repeat(64),
+                "metadata": {
+                    "schemaVersion": "lcia.scope-closure-artifact.v2",
+                    "closureCheckId": closure_check_id,
+                    "fileName": "closure-report-v3.xlsx",
+                    "artifactRole": "closure_report",
+                    "retentionSeconds": 604_800,
+                    "contentArtifactManifestHash": content_hash,
+                },
+            }),
+            json!({
+                "ordinal": 3,
+                "clientKey": "issues/part-000000.ndjson.zst",
+                "artifactType": "closure_complete_machine_result",
+                "artifactRole": "complete_machine_result",
+                "bucket": "scope-closure-artifacts",
+                "objectPath": "scope-closure/11111111-1111-4111-8111-111111111111/99999999-9999-4999-8999-999999999999/issues/part-000000.ndjson.zst",
+                "mediaType": "application/x-ndjson+zstd",
+                "size": 512,
+                "checksumSha256": "3".repeat(64),
+                "metadata": {
+                    "schemaVersion": "lcia.scope-closure-artifact.v2",
+                    "closureCheckId": closure_check_id,
+                    "fileName": "issues/part-000000.ndjson.zst",
+                    "artifactRole": "complete_machine_result",
+                    "retentionSeconds": 604_800,
+                    "contentArtifactManifestHash": content_hash,
+                },
+            }),
+            json!({
+                "ordinal": 4,
+                "clientKey": "manifest.json",
+                "artifactType": "closure_complete_machine_result",
+                "artifactRole": "complete_machine_result",
+                "bucket": "scope-closure-artifacts",
+                "objectPath": "scope-closure/11111111-1111-4111-8111-111111111111/99999999-9999-4999-8999-999999999999/manifest.json",
+                "mediaType": "application/vnd.tiangong.scope-closure-manifest+json",
+                "size": 1024,
+                "checksumSha256": "4".repeat(64),
+                "metadata": {
+                    "schemaVersion": "lcia.scope-closure-artifact.v2",
+                    "closureCheckId": closure_check_id,
+                    "fileName": "manifest.json",
+                    "artifactRole": "complete_machine_result",
+                    "retentionSeconds": 604_800,
+                    "contentArtifactManifestHash": content_hash,
+                },
+            }),
+        ];
+        assert_eq!(
+            canonical_descriptor_set_sha256(&descriptors).unwrap(),
+            "11723d5becbb3c1c3a9a3c6d7d23f021044f260857558c4520c40614fd14e27f"
+        );
+        assert_eq!(ARTIFACT_REGISTRATION_BATCH_SIZE, 500);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor["ordinal"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let request_identity = "scope-closure-write-set-v2:fixture";
+        assert_eq!(
+            deterministic_contract_uuid(request_identity),
+            deterministic_contract_uuid(request_identity)
+        );
+    }
+
+    #[test]
+    fn database_316_registration_retry_uses_exact_status_readback() {
+        let expected = test_artifact_write_set_header("registration_open");
+        let recovered = resolve_artifact_registration_readback(
+            Err(anyhow::anyhow!("simulated response loss after commit")),
+            Ok(expected.clone()),
+        )
+        .unwrap();
+        assert_eq!(recovered.write_set_id, expected.write_set_id);
+        assert_eq!(recovered.registered_descriptor_count, 1);
+        assert_eq!(recovered.registered_batch_count, 1);
+
+        let status_lost = resolve_artifact_registration_readback(
+            Ok(()),
+            Err(anyhow::anyhow!("simulated status outage")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(status_lost.contains("artifact registration status readback failed"));
+
+        let both_lost = format!(
+            "{:#}",
+            resolve_artifact_registration_readback(
+                Err(anyhow::anyhow!("simulated batch failure")),
+                Err(anyhow::anyhow!("simulated status outage")),
+            )
+            .unwrap_err()
+        );
+        assert!(both_lost.contains("simulated batch failure"));
+        assert!(both_lost.contains("simulated status outage"));
+    }
+
+    #[test]
+    fn database_316_seal_retry_never_guesses_upload_eligibility() {
+        let staging = test_artifact_write_set_header("staging");
+        let (recovered, seal_error) = resolve_artifact_seal_readback(
+            Err(anyhow::anyhow!("simulated seal response loss")),
+            Ok(staging),
+        )
+        .unwrap();
+        assert_eq!(recovered.status, "staging");
+        assert!(recovered.upload_eligible);
+        assert!(seal_error.is_some());
+
+        let unknown =
+            resolve_artifact_seal_readback(Ok(()), Err(anyhow::anyhow!("simulated status outage")))
+                .unwrap_err()
+                .to_string();
+        assert!(unknown.contains("upload was not started"));
+
+        let registration_open = test_artifact_write_set_header("registration_open");
+        let (not_sealed, seal_error) = resolve_artifact_seal_readback(
+            Err(anyhow::anyhow!("simulated seal rejection")),
+            Ok(registration_open),
+        )
+        .unwrap();
+        assert_eq!(not_sealed.status, "registration_open");
+        assert!(!not_sealed.upload_eligible);
+        assert!(seal_error.is_some());
+    }
+
+    #[test]
+    fn database_316_state_fence_blocks_upload_before_atomic_seal() {
+        let closure_check_id = id("17717717-0177-4177-8177-177177177177");
+        let worker_job_id = id("17717717-0277-4277-8277-177177177177");
+        let request_id = id("17717717-0477-4477-8477-177177177177");
+        let artifact_id = id("17717717-0577-4577-8577-177177177177");
+        let digest = "d".repeat(64);
+        let required_primary_roles = closure_artifact_required_primary_roles(None);
+        let temp = Arc::new(TempDir::new().unwrap());
+        let artifact = PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_complete_machine_result".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
+                file_name: "manifest.json".to_owned(),
+                content_type: "application/vnd.tiangong.scope-closure-manifest+json".to_owned(),
+                byte_size: 0,
+                checksum_sha256: sha256_hex(&[]),
+            },
+            path: temp.path().join("manifest.json"),
+            _temp: temp,
+        };
+        let header = |status: &str,
+                      upload_eligible: bool,
+                      registered_descriptor_count: u64,
+                      artifact_map: BTreeMap<String, Uuid>| {
+            ScopeClosureArtifactWriteSetHeader {
+                write_set_id: id("17717717-0677-4677-8677-177177177177"),
+                closure_check_id,
+                worker_job_id,
+                request_id,
+                publication_mode: "fresh".to_owned(),
+                reused_from_check_id: None,
+                status: status.to_owned(),
+                write_token: id("17717717-0777-4777-8777-177177177177"),
+                contract_version: "lcia.scope-closure-artifact-write-set.v2".to_owned(),
+                expected_descriptor_count: 1,
+                registered_descriptor_count,
+                registered_batch_count: u64::from(registered_descriptor_count > 0),
+                descriptor_set_sha256: digest.clone(),
+                required_primary_roles: required_primary_roles.clone(),
+                upload_eligible,
+                artifact_map,
+                batches: if registered_descriptor_count == 0 {
+                    Vec::new()
+                } else {
+                    vec![ScopeClosureArtifactWriteSetBatch {
+                        batch_id: id("17717717-0877-4877-8877-177177177177"),
+                        item_count: 1,
+                        first_ordinal: 1,
+                        last_ordinal: 1,
+                    }]
+                },
+            }
+        };
+        let expectation = ScopeClosureArtifactWriteSetExpectation {
+            closure_check_id,
+            worker_job_id,
+            request_id,
+            publication_mode: "fresh",
+            reused_from_check_id: None,
+            expected_descriptor_count: 1,
+            descriptor_set_sha256: &digest,
+            required_primary_roles: &required_primary_roles,
+        };
+
+        let registration = header("registration_open", false, 1, BTreeMap::new());
+        validate_closure_artifact_write_set_header(
+            &registration,
+            &expectation,
+            "registration_open",
+            false,
+        )
+        .unwrap();
+        assert!(
+            validate_closure_artifact_write_set_header(
+                &registration,
+                &expectation,
+                "staging",
+                true,
+            )
+            .is_err(),
+            "registration_open must never satisfy the upload fence"
+        );
+
+        let artifact_map = BTreeMap::from([("manifest.json".to_owned(), artifact_id)]);
+        let staging = header("staging", true, 1, artifact_map.clone());
+        validate_closure_artifact_write_set_header(&staging, &expectation, "staging", true)
+            .unwrap();
+        validate_closure_artifact_map(&staging, std::slice::from_ref(&artifact)).unwrap();
+
+        let incomplete_map = header("staging", true, 1, BTreeMap::new());
+        assert!(
+            validate_closure_artifact_map(&incomplete_map, std::slice::from_ref(&artifact))
+                .is_err()
+        );
+        let ready = header("ready", false, 1, artifact_map);
+        validate_closure_artifact_write_set_header(&ready, &expectation, "ready", false).unwrap();
+        validate_closure_artifact_map(&ready, std::slice::from_ref(&artifact)).unwrap();
     }
 
     #[tokio::test]
@@ -9429,6 +11994,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn manifest_streaming_reconstructs_complete_relations_beyond_inline_sample() {
         let support = identity(
             DatasetCategory::Sources,
@@ -9471,7 +12037,7 @@ mod tests {
             severity: "warning".to_owned(),
             blocking: false,
             issue_code: "generated_support_issue".to_owned(),
-            source: Some(support),
+            source: Some(support.clone()),
             json_path: None,
             reference_role: None,
             requested_target_type: None,
@@ -9498,6 +12064,11 @@ mod tests {
             scan.issues[0].affected_roots.len(),
             ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT
         );
+        let beyond_sample_root = roots[100].clone();
+        assert!(
+            !scan.issues[0].affected_roots.contains(&beyond_sample_root),
+            "fixture root must be outside the bounded inline sample"
+        );
 
         let validation = TidasBatchValidation {
             describe: json!({"asset_fingerprint": "fixture"}),
@@ -9518,6 +12089,8 @@ mod tests {
         assert_eq!(reconstructed.issue_count, 1);
         assert_eq!(reconstructed.occurrence_count, 1);
         assert_eq!(reconstructed.affected_root_count, 101);
+        assert_eq!(reconstructed.expanded_affected_root_record_count, 0);
+        assert_eq!(reconstructed.root_impact_record_count, 1);
         let root_records = artifacts
             .iter()
             .filter(|artifact| artifact.descriptor.file_name.starts_with("affected-roots/"))
@@ -9527,7 +12100,62 @@ mod tests {
                 decoded.split(|byte| *byte == b'\n').count() - 1
             })
             .sum::<usize>();
-        assert_eq!(root_records, roots.len());
+        assert_eq!(root_records, 0);
+        let impact_artifact = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.descriptor.file_name == "evidence/root-impact-index-v1.bin.zst"
+            })
+            .unwrap();
+        let impact_bytes =
+            zstd::stream::decode_all(File::open(&impact_artifact.path).unwrap()).unwrap();
+        let impact = decode_root_impact_index(&impact_bytes).unwrap();
+        assert_eq!(impact.records.len(), 1);
+        assert_eq!(impact.records[0].affected_root_count, 101);
+        assert!(decoded_impact_contains_root(
+            &impact.records[0],
+            100,
+            impact.root_count
+        ));
+        let graph_artifact = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.descriptor.file_name == "evidence/frozen-reference-graph-v1.bin.zst"
+            })
+            .unwrap();
+        let graph_bytes =
+            zstd::stream::decode_all(File::open(&graph_artifact.path).unwrap()).unwrap();
+        let graph = decode_frozen_reference_graph(&graph_bytes).unwrap();
+        let witness = reconstruct_frozen_graph_witness(
+            &graph,
+            impact.records[0].source_node_ordinal.unwrap(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(witness, vec![support, beyond_sample_root]);
+    }
+
+    #[test]
+    fn all_roots_administrative_evidence_is_explicit_and_bounded() {
+        let roots = (0..101_u128)
+            .map(|index| ExactDatasetIdentity {
+                category: DatasetCategory::Processes,
+                id: Uuid::from_u128(index + 1),
+                version: "01.00.000".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let (sample, witnesses) = bounded_all_root_evidence(&roots);
+        assert_eq!(sample.len(), ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT);
+        assert_eq!(witnesses.len(), ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT);
+        assert_eq!(sample.first(), roots.first());
+        assert_eq!(
+            sample.last(),
+            roots.get(ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT - 1)
+        );
+        assert_eq!(
+            witnesses.last(),
+            sample.last().map(|root| vec![root.clone()]).as_ref()
+        );
     }
 
     fn clone_prepared_artifacts(artifacts: &[PreparedArtifact]) -> Vec<PreparedArtifact> {
@@ -9545,6 +12173,325 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn read_v3_issue_records(artifacts: &[PreparedArtifact]) -> Vec<Value> {
+        let mut partitions = artifacts
+            .iter()
+            .filter(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
+            .collect::<Vec<_>>();
+        partitions
+            .sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
+        partitions
+            .into_iter()
+            .flat_map(|artifact| {
+                let decoded =
+                    zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap();
+                decoded
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn canonical_v3_preserves_the_unified_issue_set_without_expanded_relations() {
+        let graph = production_capacity_graph();
+        let reference_graph =
+            CompactReferenceGraph::from_references(&graph.references, &graph.roots).unwrap();
+        let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+        for document in &graph.documents {
+            documents.append(document).unwrap();
+        }
+        let mut scan = capacity_scan(
+            documents.finish().unwrap(),
+            graph.roots.clone(),
+            reference_graph,
+        );
+        let issue =
+            |ordinal: usize, code: &str, source: Option<ExactDatasetIdentity>, blocking: bool| {
+                ClosureIssue {
+                    issue_key: format!("unified-{ordinal:02}-{code}"),
+                    severity: if blocking { "blocker" } else { "warning" }.to_owned(),
+                    blocking,
+                    issue_code: code.to_owned(),
+                    source: source.clone(),
+                    json_path: Some(format!("$.unified[{ordinal}]")),
+                    reference_role: Some("qualification_fixture".to_owned()),
+                    requested_target_type: None,
+                    requested_target_id: None,
+                    requested_target_version: None,
+                    message: format!("unified fixture {code}"),
+                    suggested_action: Some("repair fixture".to_owned()),
+                    occurrence_count: 1,
+                    occurrences: vec![ClosureIssueOccurrence {
+                        occurrence_key: format!("unified-occurrence-{ordinal:02}"),
+                        source,
+                        json_path: Some(format!("$.unified[{ordinal}]")),
+                        reference_role: Some("qualification_fixture".to_owned()),
+                        details: json!({"family": code}),
+                    }],
+                    affected_root_count: u32::try_from(graph.roots.len()).unwrap(),
+                    affected_roots: graph.roots.clone(),
+                    affected_root_witness_paths: Vec::new(),
+                    witness_path: Vec::new(),
+                }
+            };
+        scan.issues = vec![
+            issue(
+                1,
+                "reference_exact_version_missing",
+                Some(graph.sources[0].clone()),
+                true,
+            ),
+            issue(
+                2,
+                "snapshot_source_drift",
+                Some(graph.sources[0].clone()),
+                true,
+            ),
+            issue(
+                3,
+                "provider_outside_scope_universe",
+                Some(graph.sources[0].clone()),
+                true,
+            ),
+            issue(4, "matrix_readiness_matrix_not_ready", None, true),
+            issue(5, "matrix_readiness_factorization_failed", None, true),
+            issue(6, "lcia_readiness_blocked", None, true),
+        ];
+        let mut events = JsonlValueSpoolWriter::new("unified-tidas-events.jsonl").unwrap();
+        events
+            .append(&json!({
+                "type": "issue",
+                "document_key": graph.sources[0].document_key(),
+                "issue": {
+                    "issue_code": "schema_invalid",
+                    "location": "$.tidas",
+                    "message": "TIDAS qualification fixture"
+                }
+            }))
+            .unwrap();
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "unified-v3"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: events.finish().unwrap(),
+        };
+        build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
+        let closure_check_id = id("17717717-0177-4177-8177-177177177177");
+        let artifacts = prepare_issue_partition_artifacts(
+            closure_check_id,
+            &scan,
+            &validation,
+            Arc::new(TempDir::new().unwrap()),
+        )
+        .unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
+        assert_eq!(
+            reconstructed.schema_version,
+            "lcia.scope-closure-issue-manifest.v3"
+        );
+        assert_eq!(reconstructed.issue_count, 7);
+        assert_eq!(reconstructed.occurrence_count, 7);
+        assert_eq!(reconstructed.affected_root_count, 49);
+        assert_eq!(reconstructed.expanded_affected_root_record_count, 0);
+        assert_eq!(reconstructed.root_impact_record_count, 1);
+        assert!(!artifacts.iter().any(|artifact| {
+            artifact.descriptor.file_name.starts_with("occurrences/")
+                || artifact.descriptor.file_name.starts_with("affected-roots/")
+        }));
+
+        let records = read_v3_issue_records(&artifacts);
+        let codes = records
+            .iter()
+            .map(|record| record["code"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            codes,
+            BTreeSet::from([
+                "lcia_readiness_blocked",
+                "matrix_readiness_factorization_failed",
+                "matrix_readiness_matrix_not_ready",
+                "provider_outside_scope_universe",
+                "reference_exact_version_missing",
+                "snapshot_source_drift",
+                "tidas_schema_invalid",
+            ])
+        );
+        assert!(records.iter().all(|record| {
+            record["schemaVersion"] == "lcia.scope-closure-issue.v3"
+                && record["blocker"] == true
+                && record["occurrenceCount"] == 1
+                && record["affectedRootCount"] == 7
+        }));
+        assert!(
+            records
+                .iter()
+                .filter(|record| record["source"].is_null())
+                .all(|record| {
+                    record["rootImpact"]["mode"] == "all_roots"
+                        && record["rootImpact"].get("impactKey").is_none()
+                })
+        );
+    }
+
+    #[test]
+    fn canonical_v3_cancellation_is_cooperative_during_coalesce_and_partition_write() {
+        let build_fixture = || {
+            let graph = production_capacity_graph();
+            let reference_graph =
+                CompactReferenceGraph::from_references(&graph.references, &graph.roots).unwrap();
+            let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
+            for document in &graph.documents {
+                documents.append(document).unwrap();
+            }
+            let scan = capacity_scan(documents.finish().unwrap(), graph.roots, reference_graph);
+            let mut events = JsonlValueSpoolWriter::new("cancel-v3-events.jsonl").unwrap();
+            for index in 0..4_097_u64 {
+                events
+                    .append(&json!({
+                        "type": "issue",
+                        "document_key": graph.sources[0].document_key(),
+                        "issue": {
+                            "issue_code": "cancel_fixture",
+                            "location": format!("$.cancel[{index}]"),
+                            "message": format!("cancel fixture {index}")
+                        }
+                    }))
+                    .unwrap();
+            }
+            (scan, events.finish().unwrap())
+        };
+
+        for stage in ["scope_closure_coalesce", "scope_closure_partition_write"] {
+            let (mut scan, events) = build_fixture();
+            let cancellation = CancellationToken::default();
+            cancellation.cancel_at_stage(stage);
+            let error =
+                build_issue_relation_spools_with_cancellation(&mut scan, &events, &cancellation)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains(stage),
+                "unexpected cancellation error at {stage}: {error:#}"
+            );
+            assert!(cancellation.is_cancelled());
+            assert!(
+                scan.issue_relations.is_none(),
+                "cancelled v3 preparation must not publish partial relation spools"
+            );
+        }
+    }
+
+    #[test]
+    fn version_dispatch_reader_preserves_legacy_v2_migration_support() {
+        let closure_check_id = id("17717717-0277-4277-8277-177177177177");
+        let issue_key = "legacy-v2-issue";
+        let root = identity(
+            DatasetCategory::Processes,
+            "17717717-0377-4377-8377-177177177177",
+        );
+        let temp = Arc::new(TempDir::new().unwrap());
+
+        let mut issues = IssuePartitionAccumulator::new(Arc::clone(&temp), "issues");
+        issues
+            .push(
+                issue_key,
+                &json!({
+                    "schemaVersion": "lcia.scope-closure-issue.v2",
+                    "issueKey": issue_key,
+                    "code": "legacy_fixture",
+                }),
+            )
+            .unwrap();
+        let (issue_entries, issue_artifacts, issue_hash) = issues.finish().unwrap();
+
+        let mut occurrences = IssuePartitionAccumulator::new(Arc::clone(&temp), "occurrences");
+        occurrences
+            .push(
+                issue_key,
+                &json!({
+                    "schemaVersion": "lcia.scope-closure-occurrence.v1",
+                    "issueKey": issue_key,
+                    "occurrenceKey": "legacy-v2-occurrence",
+                }),
+            )
+            .unwrap();
+        let (occurrence_entries, occurrence_artifacts, occurrence_hash) =
+            occurrences.finish().unwrap();
+
+        let mut affected_roots =
+            IssuePartitionAccumulator::new(Arc::clone(&temp), "affected-roots");
+        affected_roots
+            .push(
+                issue_key,
+                &affected_root_partition_record(issue_key, &root, std::slice::from_ref(&root)),
+            )
+            .unwrap();
+        let (affected_entries, affected_artifacts, affected_hash) =
+            affected_roots.finish().unwrap();
+
+        let mut entries = issue_entries
+            .into_iter()
+            .chain(occurrence_entries)
+            .chain(affected_entries)
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = IssuePartitionManifestV2 {
+            schema_version: "lcia.scope-closure-issue-manifest.v2".to_owned(),
+            closure_check_id,
+            logical_issue_stream_sha256: sha256_hex(&[]),
+            logical_issue_event_count: 0,
+            partition_max_records: ISSUE_PARTITION_MAX_RECORDS,
+            partition_max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            issue_count: 1,
+            occurrence_count: 1,
+            affected_root_count: 1,
+            relation_stream_sha256: IssueRelationStreamHashesV2 {
+                issues: issue_hash,
+                occurrences: occurrence_hash,
+                affected_roots: affected_hash,
+            },
+            rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
+            rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
+            rpc_affected_root_sample_limit_per_issue: ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT,
+            xlsx_issue_sample_limit: XLSX_ISSUE_SAMPLE_LIMIT,
+            xlsx_occurrence_sample_limit: XLSX_OCCURRENCE_SAMPLE_LIMIT,
+            xlsx_affected_root_sample_limit: XLSX_AFFECTED_ROOT_SAMPLE_LIMIT,
+            partitions: entries,
+        };
+        let manifest_path = temp.path().join("manifest.json");
+        fs::write(&manifest_path, canonical_json_bytes(&manifest).unwrap()).unwrap();
+        let manifest_artifact = prepare_file_artifact(
+            Arc::clone(&temp),
+            "closure_complete_machine_result",
+            ScopeClosureArtifactRole::CompleteMachineResult,
+            "manifest.json",
+            "application/vnd.tiangong.scope-closure-manifest+json",
+            manifest_path,
+        )
+        .unwrap();
+        let mut artifacts = issue_artifacts
+            .into_iter()
+            .chain(occurrence_artifacts)
+            .chain(affected_artifacts)
+            .collect::<Vec<_>>();
+        artifacts.push(manifest_artifact);
+
+        let reconstructed =
+            reconstruct_complete_machine_result(&artifacts, closure_check_id).unwrap();
+        assert_eq!(
+            reconstructed.schema_version,
+            "lcia.scope-closure-issue-manifest.v2"
+        );
+        assert_eq!(reconstructed.issue_count, 1);
+        assert_eq!(reconstructed.occurrence_count, 1);
+        assert_eq!(reconstructed.affected_root_count, 1);
+        assert_eq!(reconstructed.expanded_affected_root_record_count, 1);
+        assert!(reconstructed.legacy_relation_stream_sha256.is_some());
     }
 
     fn mutate_manifest(artifacts: &mut [PreparedArtifact], mutate: impl FnOnce(&mut Value)) {
@@ -9654,7 +12601,7 @@ mod tests {
         let mut missing = clone_prepared_artifacts(&artifacts);
         let missing_index = missing
             .iter()
-            .position(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .position(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
             .unwrap();
         missing.remove(missing_index);
         assert_rejected("missing partition", &missing);
@@ -9662,7 +12609,7 @@ mod tests {
         let mut extra = clone_prepared_artifacts(&artifacts);
         let mut extra_partition = extra
             .iter()
-            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .find(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
             .unwrap()
             .clone();
         extra_partition.descriptor.file_name = "extra/part-000000.ndjson.zst".to_owned();
@@ -9673,7 +12620,7 @@ mod tests {
         duplicate.push(
             duplicate
                 .iter()
-                .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+                .find(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
                 .unwrap()
                 .clone(),
         );
@@ -9682,7 +12629,7 @@ mod tests {
         let mut renamed = clone_prepared_artifacts(&artifacts);
         renamed
             .iter_mut()
-            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .find(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
             .unwrap()
             .descriptor
             .file_name = "issues/part-999999.ndjson.zst".to_owned();
@@ -9691,7 +12638,7 @@ mod tests {
         let corrupted = clone_prepared_artifacts(&artifacts);
         let partition = corrupted
             .iter()
-            .find(|artifact| artifact.descriptor.file_name.ends_with(".ndjson.zst"))
+            .find(|artifact| artifact.descriptor.file_name.starts_with("issues/"))
             .unwrap();
         let mut bytes = fs::read(&partition.path).unwrap();
         let midpoint = bytes.len() / 2;
@@ -9713,7 +12660,7 @@ mod tests {
 
         let mut wrong_order = clone_prepared_artifacts(&artifacts);
         mutate_manifest(&mut wrong_order, |manifest| {
-            manifest["partitions"].as_array_mut().unwrap().swap(0, 1);
+            manifest["evidence"].as_array_mut().unwrap().swap(0, 1);
         });
         assert_rejected("manifest order", &wrong_order);
 

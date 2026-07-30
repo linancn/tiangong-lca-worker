@@ -224,6 +224,11 @@ impl<'a> WorkerJobProgress<'a> {
     pub const fn lease_seconds(&self) -> i32 {
         self.lease_seconds
     }
+
+    #[must_use]
+    pub const fn lease_token(&self) -> Uuid {
+        self.lease_token
+    }
 }
 
 #[must_use]

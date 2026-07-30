@@ -1,0 +1,133 @@
+---
+title: Scope Closure Memory and Result Contract
+docType: contract
+scope: repo
+status: active
+authoritative: true
+owner: worker
+language: en
+whenToUse:
+  - when changing scope-closure issue aggregation, affected-root impact, witness evidence, or artifact layout
+  - when changing scope-closure memory, temporary-space, cancellation, publication, or determinism behavior
+  - when reviewing compatibility between canonical v3 artifacts and legacy v2 readers
+whenToUpdate:
+  - when the canonical issue schema, compact evidence format, manifest, publication handshake, or qualification gates change
+checkPaths:
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+  - docs/scope-closure-contract.md
+  - docs/agents/repo-validation.md
+  - docs/agents/repo-architecture.md
+  - .docpact/config.yaml
+  - crates/solver-worker/src/scope_closure.rs
+  - crates/solver-worker/src/worker_jobs.rs
+  - crates/solver-worker/tests/artifact_gc_database_contract.rs
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177 TIDAS v0.1.2 production qualification: canonical v3 keeps one coalesced issue record, compact source impact and frozen-graph evidence, and no expanded issue×root×witness relation."
+related:
+  - ../../../AGENTS.md
+  - ../../../.docpact/config.yaml
+  - ../../scope-closure-contract.md
+  - ../repo-validation.md
+  - ../repo-architecture.md
+---
+
+# Scope Closure Memory and Result Contract
+
+## Canonical semantic result
+
+`lcia.scope-closure-issue-manifest.v3` is the canonical complete machine-result contract for a fresh scope-closure scan. It represents one unified issue set, not a TIDAS-only validation result. The set includes:
+
+- TIDAS document-conformance issues;
+- exact-reference, missing-reference, frozen-release, and source-drift issues;
+- process-provider and provider-universe issues;
+- requested-scope and reference-graph issues;
+- matrix construction, signed-flow/provider, factorization, and LCIA-readiness blockers.
+
+Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Its stable semantic fields are `issueKey`, `source`, `code`, `path`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and a bounded sample of occurrences and affected roots. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and XLSX views are bounded projections and are never completeness authorities.
+
+Issue identity and order are deterministic:
+
+- `issueKey` is the coalescing identity and partitions are globally ordered by UTF-8 ascending `issueKey`;
+- exact dataset identities and root ordinals are ordered by dataset category, UUID, and exact version;
+- object keys are canonicalized recursively, arrays preserve semantic order, NDJSON has one canonical JSON record plus `\n`, and zstd uses a fixed level;
+- manifest logical and physical hashes bind the exact bytes and counts required to reconstruct the result.
+
+The raw TIDAS issue-event NDJSON is preserved exactly once as `tidas/issues.ndjson.zst`. Its logical SHA-256, logical byte size, and event count are those of the original verified NDJSON stream, including line framing and excluding the terminal final event. It is not expanded or copied into occurrence partitions. Non-TIDAS issue occurrences are represented by their exact coalesced count and bounded samples; their source graph, reference, provider, matrix, and readiness evidence remains in the frozen closure inputs and bundle.
+
+## Compact root impact and witnesses
+
+Production must not materialize or publish the Cartesian physical relation `issue × affected root × full witness path`.
+
+Root impact uses stable zero-based root ordinals and `lcia.scope-closure-root-impact-index.v1`. A source-level impact record is written once and referenced by every issue from that source. Source-less issues use an issue-level impact record only when an explicit partial root set is required. Each impact has one explicit mode:
+
+- `none`;
+- `allRoots`;
+- `includedOrdinals`;
+- `excludedOrdinals`.
+
+`allRoots` is never inferred from a missing list. For partial sets, the writer chooses the smaller deterministic included or excluded delta-varint ordinal set. `affectedRootCount` remains exact even when the inline sample is truncated.
+
+`evidence/frozen-reference-graph-v1.bin.zst` stores the exact sorted identity table, stable root-to-node ordinals, and compact reverse predecessor adjacency once per result. Given a source node ordinal and affected root ordinal, a reader reconstructs the witness deterministically by breadth-first traversal over predecessors in stable identity order. The v3 compatibility reader verifies every impact reference, cardinality, root membership, sample witness, evidence hash, and graph boundary before accepting the result.
+
+## Files and manifest
+
+A fresh v3 result contains:
+
+- `closure-bundle-v3.json`, retaining the existing certificate and reuse boundary without copying issue rows or raw TIDAS events; historical v1 bundles remain readable;
+- `closure-report-v1.xlsx`, retained for the existing public operator transport;
+- `manifest.json` with schema `lcia.scope-closure-issue-manifest.v3`;
+- `issues/part-NNNNNN.ndjson.zst`, containing the globally ordered coalesced v3 issue records;
+- `tidas/issues.ndjson.zst`, containing the byte-exact logical TIDAS event stream once;
+- `evidence/root-impact-index-v1.bin.zst`;
+- `evidence/frozen-reference-graph-v1.bin.zst`.
+
+There are no production `occurrences/*` or `affected-roots/*` partitions in v3, and `expandedAffectedRootRecordCount` is exactly zero. Issue partitions close at the first configured record or canonical uncompressed-byte limit. The manifest binds every artifact path, media type, compressed and uncompressed byte size and SHA-256, record count, first/last key, global relation hashes, root count, graph node/edge count, partition limits, sample limits, and ordering rules.
+
+The version-dispatch reader accepts v2 and v3 manifests. V2 remains readable through its original issue/occurrence/affected-root partitions. V3 can project the legacy affected-root view on demand from issue records, the compact root-impact index, and the frozen graph. The reader rejects missing, extra, duplicate, reordered, truncated, hash-mismatched, boundary-inconsistent, or cardinality-inconsistent files. Writers always emit v3; they never silently downgrade.
+
+Next and Edge continue to expose the existing XLSX and manifest download selectors and descriptors. V3 does not change their public DTO. Access to subordinate manifest members remains governed by the existing authorized artifact boundary; Worker does not create a new cross-repo public API.
+
+## Bounded execution and cleanup
+
+The implementation is window-bounded rather than relation-cardinality-bounded:
+
+- raw TIDAS events retain their existing 2 GiB and 5,000,000-event validation-input caps;
+- issue coalescing uses bounded external sort runs and one current coalesced issue;
+- reverse reachability keeps one source's compact visited/parent/ordinal state at a time and is reused for adjacent issues with the same source;
+- one active issue partition writer, root-impact writer, frozen-graph writer, and TIDAS compression buffer is retained per stage;
+- residual sort records contain the compact issue key and coalesced record, not repeated affected-root identities or JSON witness paths;
+- temporary-space admission uses observed input and measured intermediate bytes plus the configured reserve, never `issue count × global root count`.
+
+Cancellation is checked during raw merge, issue coalescing, graph reachability, partition writing, frozen-graph writing, TIDAS compression, and between bundle/report stages. A lease-heartbeat failure cancels the blocking task and waits for it to exit before returning. Temporary directories own all runs and artifacts, so success, cancellation, admission failure, crash recovery, and retry do not leave committed partial files. Object upload uses cancellable bounded file transfer; multipart cancellation aborts the remote upload.
+
+Progress and qualification evidence distinguish records, logical bytes, compressed/artifact bytes, partition/artifact counts, and publication state. Linux evidence additionally records process-tree RSS and cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`; qualification records temporary bytes, descriptor count, and cache-reclaim evidence.
+
+## Database #316 staged publication
+
+Database owns durable registration and atomic visibility. Worker implements the shared `lcia.scope-closure-artifact-write-set.v2` fixture and digest contract:
+
+1. Sort descriptors by UTF-8 `clientKey` and assign contiguous one-based ordinals.
+2. Hash canonical compact JSON for `{"contractVersion":"lcia.scope-closure-artifact-write-set.v2","descriptors":[...]}`.
+3. Create an idempotent header with the closure ID, Worker job and lease token, deterministic request ID, descriptor count/digest, required primary roles, staging lease, and optional reuse source.
+4. Register deterministic batches of at most 500 descriptors. Re-read status after every batch.
+5. Atomically seal only when the exact descriptor set is complete. Re-read `status=staging`, `uploadEligible=true`, and the exact bounded `clientKey -> artifactId` map.
+6. Upload no object before the successful seal/readback fence.
+7. Upload the locally staged files under deterministic request-scoped keys, then finalize atomically and require `status=ready` with the same artifact map.
+
+Registration, seal, upload, and finalize failures call the fenced fail transition when possible. Uploaded objects are deleted best-effort after an observed failure; deterministic request IDs, keys, batch IDs, and database idempotency make retries converge. `ready` is the only publicly visible completed set. The legacy one-shot database operation is a compatibility adapter, not the v3 production path.
+
+The shared fixture, digest, ordinals, states, and stable v2 error codes are recorded identically on Worker #177 and Database #316. Database's canonical migration fixture is the cross-repository source of truth for RPC signatures and result fields.
+
+## Mandatory local qualification
+
+Before merge, the v3 implementation must pass the Worker baseline gates and the scope-closure qualification in `docs/agents/repo-validation.md`. At minimum:
+
+- two complete runs over the external open-data package produce byte-identical non-summary artifacts, manifests, order, and logical hashes;
+- native TIDAS completes within 60 seconds and 512 MiB peak RSS;
+- the production-shaped closure completes within 10 minutes and 4 GiB process-tree peak RSS;
+- 1×, 2×, 5×, and 10× production-distribution runs record wall time, RSS/cgroup breakdown, temporary bytes, artifact/partition bytes and counts, descriptor count, and cache reclaim;
+- the unified issue set, blockers, verdict/certificate inputs, counts, root membership, and reconstructed witnesses are semantically equivalent to the pre-v3 result while physical expanded relations remain zero;
+- cancellation, crash, and retry are exercised at coalesce, partition write, batch registration, seal, upload, and finalization boundaries, with no visible partial set, orphan, or local temporary leak.
+
+The package fixture and generated outputs stay outside git. Qualification never deploys, restarts a server, enqueues a production task, mutates production state, or updates the root workspace submodule pointer.

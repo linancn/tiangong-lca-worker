@@ -16,13 +16,15 @@ use solver_worker::pgbouncer_sqlx::{self as sqlx, Row};
 use solver_worker::storage::{ObjectStoreClient, ObjectTransferOptions};
 use uuid::Uuid;
 
-const DATABASE_CONTRACT_COMMIT: &str = "7d40ab62fcf26de42f2c9b4aeb33acd47caa5f20";
+const DATABASE_CONTRACT_COMMIT: &str = "bf1add3dc9f78bbc1aaf2750a1fca9c45d788c4d";
 const DATABASE_CONTRACT_FIXTURE: &str =
-    "supabase/tests/fixtures/20260729_scope_closure_public_artifact_contract.json";
+    "supabase/tests/fixtures/20260730_scope_closure_staged_write_set_v2_contract.json";
+const DATABASE_CONTRACT_FIXTURE_SHA256: &str =
+    "89d0c82a6f6a3a487be5ba77a450e5a474e68b59fad3ce752444d8894eb166be";
 
-fn authoritative_database_fixture() -> serde_json::Value {
+fn authoritative_database_fixture() -> (serde_json::Value, Vec<u8>) {
     let database_root = std::env::var("DATABASE_ENGINE_ROOT")
-        .expect("DATABASE_ENGINE_ROOT points to Database #309");
+        .expect("DATABASE_ENGINE_ROOT points to Database #316");
     let revision = format!("{DATABASE_CONTRACT_COMMIT}:{DATABASE_CONTRACT_FIXTURE}");
     let output = Command::new("git")
         .args(["-C", &database_root, "show", &revision])
@@ -30,10 +32,48 @@ fn authoritative_database_fixture() -> serde_json::Value {
         .expect("read authoritative Database #309 fixture");
     assert!(
         output.status.success(),
-        "cannot read Database #309 fixture at {DATABASE_CONTRACT_COMMIT}: {}",
+        "cannot read Database #316 fixture at {DATABASE_CONTRACT_COMMIT}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse authoritative Database #309 fixture")
+    let fixture =
+        serde_json::from_slice(&output.stdout).expect("parse authoritative Database #316 fixture");
+    (fixture, output.stdout)
+}
+
+fn canonical_json_sha256(value: &serde_json::Value) -> String {
+    fn write(value: &serde_json::Value, output: &mut Vec<u8>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                output.push(b'{');
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                for (index, (key, item)) in entries.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    serde_json::to_writer(&mut *output, key).expect("serialize canonical key");
+                    output.push(b':');
+                    write(item, output);
+                }
+                output.push(b'}');
+            }
+            serde_json::Value::Array(items) => {
+                output.push(b'[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    write(item, output);
+                }
+                output.push(b']');
+            }
+            _ => serde_json::to_writer(output, value).expect("serialize canonical scalar"),
+        }
+    }
+
+    let mut bytes = Vec::new();
+    write(value, &mut bytes);
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn fake_s3_delete_server() -> (String, thread::JoinHandle<Option<String>>) {
@@ -190,6 +230,7 @@ async fn seed_crash_closure(
     pool: &sqlx::PgPool,
     owner_id: Uuid,
     worker_job_id: Uuid,
+    worker_lease_token: Uuid,
     closure_check_id: Uuid,
 ) {
     sqlx::query(
@@ -221,15 +262,18 @@ async fn seed_crash_closure(
         r"
         INSERT INTO public.worker_jobs (
           id, job_kind, worker_runtime, worker_queue, requester_type,
-          requested_by, visibility, payload_schema_version, payload_json, status
+          requested_by, visibility, payload_schema_version, payload_json, status,
+          lease_token, lease_expires_at
         ) VALUES (
           $1, 'lcia.scope_closure_check', 'calculator', 'solver', 'operator',
-          $2, 'operator', 'lcia.scope_closure_check.request.v1', '{}', 'running'
+          $2, 'operator', 'lcia.scope_closure_check.request.v1', '{}', 'running',
+          $3, now() + interval '15 minutes'
         )
         ",
     )
     .bind(worker_job_id)
     .bind(owner_id)
+    .bind(worker_lease_token)
     .execute(pool)
     .await
     .expect("seed crash-test worker job");
@@ -259,67 +303,79 @@ async fn seed_crash_closure(
 }
 
 #[test]
-#[ignore = "requires DATABASE_ENGINE_ROOT with Database #309 exact commit"]
+#[ignore = "requires DATABASE_ENGINE_ROOT with Database #316 exact commit"]
 fn consumes_authoritative_database_fixture_at_pinned_commit() {
-    let fixture = authoritative_database_fixture();
+    let (fixture, fixture_bytes) = authoritative_database_fixture();
     assert_eq!(
-        fixture["download"]["descriptorFields"],
+        format!("{:x}", Sha256::digest(&fixture_bytes)),
+        DATABASE_CONTRACT_FIXTURE_SHA256
+    );
+    assert_eq!(
+        fixture["schemaVersion"],
+        "lcia.scope-closure-staged-write-set-fixture.v2"
+    );
+    assert_eq!(
+        fixture["contractVersion"],
+        "lcia.scope-closure-artifact-write-set.v2"
+    );
+    assert_eq!(fixture["limits"]["ordinalBase"], 1);
+    assert_eq!(fixture["limits"]["maximumBatchDescriptorCount"], 500);
+    assert_eq!(
+        fixture["canonicalization"]["descriptorSetSha256"],
+        "11723d5becbb3c1c3a9a3c6d7d23f021044f260857558c4520c40614fd14e27f"
+    );
+    assert_eq!(
+        fixture["canonicalization"]["descriptorFields"],
         serde_json::json!([
-            "artifactId",
+            "ordinal",
+            "clientKey",
+            "artifactType",
             "artifactRole",
-            "artifactState",
-            "filename",
-            "format",
+            "bucket",
+            "objectPath",
             "mediaType",
             "size",
             "checksumSha256",
-            "artifactExpiresAt",
-            "bucket",
-            "objectPath"
+            "metadata"
         ])
     );
     assert_eq!(
-        fixture["workerGc"]["claimItemFields"],
-        serde_json::json!([
-            "artifactId",
-            "artifactRole",
-            "lifecycleState",
-            "gcPhase",
-            "objectDeleteRequired",
-            "bucket",
-            "objectPath",
-            "checksumSha256",
-            "artifactExpiresAt"
-        ])
+        fixture["rpc"]["create"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_create_v2(uuid,uuid,uuid,uuid,text,integer,text,jsonb,integer,uuid)"
     );
     assert_eq!(
-        fixture["workerGc"]["freshProcessDetailCleanup"],
-        serde_json::json!({
-            "objectDeleteRequired": false,
-            "bucket": null,
-            "objectPath": null,
-            "requiresNewFencedToken": true
-        })
+        fixture["rpc"]["registerBatch"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_register_batch_v2(uuid,uuid,uuid,uuid,uuid,jsonb)"
     );
     assert_eq!(
-        fixture["publicationStaging"]["createSignature"],
-        "svc_lcia_scope_closure_artifact_write_set_create(uuid,text,jsonb,integer,uuid)"
+        fixture["rpc"]["status"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_status_v2(uuid,uuid,uuid,uuid)"
     );
     assert_eq!(
-        fixture["publicationStaging"]["bundleMetadata"]["completeMachineResultClientKey"],
-        "manifest.json"
+        fixture["rpc"]["seal"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_seal_v2(uuid,uuid,uuid,uuid)"
     );
     assert_eq!(
-        fixture["publicationStaging"]["publicationModes"]["reused"]["shape"],
-        "exactly one closure_report_xlsx"
+        fixture["rpc"]["finalize"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_finalize_v2(uuid,uuid,uuid,uuid)"
     );
     assert_eq!(
-        fixture["publicationStaging"]["reconcileSignature"],
-        "svc_lcia_scope_closure_artifact_write_set_reconcile(integer,integer)"
+        fixture["rpc"]["fail"]["signature"],
+        "svc_lcia_scope_closure_artifact_write_set_fail_v2(uuid,uuid,uuid,uuid,text)"
+    );
+    assert_eq!(fixture["rpc"]["create"]["uploadEligible"], false);
+    assert_eq!(
+        fixture["rpc"]["seal"]["success"],
+        "uploadEligible=true and artifactMap becomes visible"
     );
     assert_eq!(
-        fixture["workerGc"]["previewIsNonMutating"],
-        serde_json::Value::Bool(true)
+        fixture["states"]["registration_open"]["readyArtifactRows"],
+        0
+    );
+    assert_eq!(fixture["states"]["staging"]["readyArtifactRows"], 0);
+    assert_eq!(
+        fixture["states"]["ready"]["readyArtifactRows"],
+        "expectedDescriptorCount"
     );
 }
 
@@ -335,50 +391,77 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
         .expect("CLOSURE_CHECK_ID")
         .parse()
         .expect("valid closure check ID");
+    let worker_job_id: Uuid = std::env::var("WORKER_JOB_ID")
+        .expect("WORKER_JOB_ID")
+        .parse()
+        .expect("valid Worker job ID");
+    let worker_lease_token: Uuid = std::env::var("WORKER_LEASE_TOKEN")
+        .expect("WORKER_LEASE_TOKEN")
+        .parse()
+        .expect("valid Worker lease token");
+    let request_id: Uuid = std::env::var("REQUEST_ID")
+        .expect("REQUEST_ID")
+        .parse()
+        .expect("valid request ID");
     let endpoint = std::env::var("S3_ENDPOINT").expect("S3_ENDPOINT");
     let object_prefix = std::env::var("OBJECT_PREFIX").expect("OBJECT_PREFIX");
     let pool = sqlx::PgPool::connect(&database_url)
         .await
-        .expect("connect child to Database #309");
+        .expect("connect child to Database #316");
     let payloads = [
         (
-            "report.xlsx",
+            "closure-bundle-v3.json",
+            "closure_bundle",
+            "closure_bundle",
+            "application/json",
+        ),
+        (
+            "closure-report-v3.xlsx",
             "closure_report_xlsx",
             "closure_report",
-            "report",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ),
         (
             "manifest.json",
             "closure_complete_machine_result",
             "complete_machine_result",
-            "manifest",
+            "application/vnd.tiangong.scope-closure-manifest+json",
         ),
-        ("bundle.json", "closure_bundle", "closure_bundle", "bundle"),
     ];
     let items = payloads
         .iter()
         .enumerate()
         .map(
-            |(index, (name, artifact_type, artifact_role, client_key))| {
+            |(index, (name, artifact_type, artifact_role, media_type))| {
                 let bytes = format!("crash-fixture-{index}");
                 let metadata = if *artifact_role == "closure_bundle" {
-                    serde_json::json!({"completeMachineResultClientKey": "manifest"})
+                    serde_json::json!({
+                        "schemaVersion": "lcia.scope-closure-artifact.v2",
+                        "closureCheckId": closure_check_id,
+                        "fileName": name,
+                        "artifactRole": artifact_role,
+                        "retentionSeconds": 604_800,
+                        "contentArtifactManifestHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "completeMachineResultClientKey": "manifest.json",
+                    })
                 } else {
-                    serde_json::json!({})
+                    serde_json::json!({
+                        "schemaVersion": "lcia.scope-closure-artifact.v2",
+                        "closureCheckId": closure_check_id,
+                        "fileName": name,
+                        "artifactRole": artifact_role,
+                        "retentionSeconds": 604_800,
+                        "contentArtifactManifestHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    })
                 };
                 serde_json::json!({
-                    "clientKey": client_key,
+                    "ordinal": index + 1,
+                    "clientKey": name,
                     "artifactType": artifact_type,
                     "artifactRole": artifact_role,
                     "bucket": "closure-private",
                     "objectPath": format!("{object_prefix}/{name}"),
-                    "mediaType": if *name == "report.xlsx" {
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    } else if *name == "manifest.json" {
-                        "application/vnd.tiangong.scope-closure-manifest+json"
-                    } else {
-                        "application/json"
-                    },
+                    "mediaType": media_type,
                     "size": bytes.len(),
                     "checksumSha256": format!("{:x}", Sha256::digest(bytes.as_bytes())),
                     "metadata": metadata
@@ -386,27 +469,121 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
             },
         )
         .collect::<Vec<_>>();
+    let descriptor_set_sha256 = canonical_json_sha256(&serde_json::json!({
+        "contractVersion": "lcia.scope-closure-artifact-write-set.v2",
+        "descriptors": &items,
+    }));
+    let required_primary_roles = serde_json::json!([
+        {
+            "artifactRole": "closure_report",
+            "artifactType": "closure_report_xlsx",
+            "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "exactCount": 1
+        },
+        {
+            "artifactRole": "complete_machine_result",
+            "artifactType": "closure_complete_machine_result",
+            "mediaType": "application/vnd.tiangong.scope-closure-manifest+json",
+            "exactCount": 1
+        },
+        {
+            "artifactRole": "closure_bundle",
+            "artifactType": "closure_bundle",
+            "mediaType": "application/json",
+            "exactCount": 1
+        }
+    ]);
     let created = sqlx::query(
         r"
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_create(
-          $1, 'subprocess-crash-after-two-uploads', $2::jsonb, 1, null
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_create_v2(
+          $1, $2, $3, $4, 'lcia.scope-closure-artifact-write-set.v2',
+          $5, $6, $7::jsonb, 2, null
         ) AS result
         FROM _service_role
         ",
     )
     .bind(closure_check_id)
-    .bind(serde_json::Value::Array(items))
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .bind(request_id)
+    .bind(i32::try_from(items.len()).unwrap())
+    .bind(&descriptor_set_sha256)
+    .bind(&required_primary_roles)
     .fetch_one(&pool)
     .await
-    .expect("register complete DB-first write set")
+    .expect("create DB-first staged write set")
     .try_get::<serde_json::Value, _>("result")
     .expect("read write-set create result");
     assert_eq!(created["ok"], true);
+    assert_eq!(created["data"]["status"], "registration_open");
+    assert_eq!(created["data"]["uploadEligible"], false);
+    let write_set_id: Uuid = created["data"]["writeSetId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let write_token: Uuid = created["data"]["writeToken"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    for (batch_index, batch) in items.chunks(2).enumerate() {
+        let batch_id = Uuid::from_u128(177_000 + u128::try_from(batch_index).unwrap());
+        let registered = sqlx::query(
+            r"
+            WITH _service_role AS (
+              SELECT set_config('request.jwt.claim.role', 'service_role', true)
+            )
+            SELECT public.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
+              $1, $2, $3, $4, $5, $6::jsonb
+            ) AS result
+            FROM _service_role
+            ",
+        )
+        .bind(write_set_id)
+        .bind(write_token)
+        .bind(worker_job_id)
+        .bind(worker_lease_token)
+        .bind(batch_id)
+        .bind(serde_json::Value::Array(batch.to_vec()))
+        .fetch_one(&pool)
+        .await
+        .expect("register bounded descriptor batch")
+        .try_get::<serde_json::Value, _>("result")
+        .expect("read batch result");
+        assert_eq!(registered["ok"], true);
+        assert_eq!(registered["data"]["uploadEligible"], false);
+    }
+    let sealed = sqlx::query(
+        r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_scope_closure_artifact_write_set_seal_v2(
+          $1, $2, $3, $4
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(write_set_id)
+    .bind(write_token)
+    .bind(worker_job_id)
+    .bind(worker_lease_token)
+    .fetch_one(&pool)
+    .await
+    .expect("atomically seal complete descriptor set")
+    .try_get::<serde_json::Value, _>("result")
+    .expect("read seal result");
+    assert_eq!(sealed["ok"], true);
+    assert_eq!(sealed["data"]["status"], "staging");
+    assert_eq!(sealed["data"]["uploadEligible"], true);
     assert_eq!(
-        created["data"]["items"].as_array().map(Vec::len),
+        sealed["data"]["artifactMap"]
+            .as_object()
+            .map(serde_json::Map::len),
         Some(payloads.len())
     );
 
@@ -441,18 +618,27 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Database #309 schema at DATABASE_URL"]
+#[ignore = "requires a disposable local Database #316 schema at DATABASE_URL"]
 #[allow(clippy::too_many_lines)]
 async fn db_first_crash_is_fully_reconciled_after_restart() {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
     let pool = sqlx::PgPool::connect(&database_url)
         .await
-        .expect("connect local Database #309");
+        .expect("connect local Database #316");
     let owner_id = Uuid::new_v4();
     let worker_job_id = Uuid::new_v4();
+    let worker_lease_token = Uuid::new_v4();
     let closure_check_id = Uuid::new_v4();
-    seed_crash_closure(&pool, owner_id, worker_job_id, closure_check_id).await;
-    let object_prefix = format!("gc-crash/{closure_check_id}");
+    let request_id = Uuid::new_v4();
+    seed_crash_closure(
+        &pool,
+        owner_id,
+        worker_job_id,
+        worker_lease_token,
+        closure_check_id,
+    )
+    .await;
+    let object_prefix = format!("scope-closure/{closure_check_id}/{request_id}");
     let object_store = FakeObjectStore::start();
 
     let current_test = std::env::current_exe().expect("current integration-test executable");
@@ -461,6 +647,9 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
             .env("WORKER_ARTIFACT_CRASH_CHILD", "1")
             .env("DATABASE_URL", &database_url)
             .env("CLOSURE_CHECK_ID", closure_check_id.to_string())
+            .env("WORKER_JOB_ID", worker_job_id.to_string())
+            .env("WORKER_LEASE_TOKEN", worker_lease_token.to_string())
+            .env("REQUEST_ID", request_id.to_string())
             .env("S3_ENDPOINT", &object_store.endpoint)
             .env("OBJECT_PREFIX", &object_prefix)
             .args([
@@ -479,12 +668,12 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
     assert_eq!(
         uploaded_paths,
         BTreeSet::from([
-            format!("/closure-private/{object_prefix}/manifest.json"),
-            format!("/closure-private/{object_prefix}/report.xlsx"),
+            format!("/closure-private/{object_prefix}/closure-bundle-v3.json"),
+            format!("/closure-private/{object_prefix}/closure-report-v3.xlsx"),
         ]),
         "failpoint must abort after exactly two registered uploads"
     );
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
 
     let mut gc_command = Command::new(env!("CARGO_BIN_EXE_artifact_gc"));
     gc_command
@@ -547,39 +736,23 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
     .try_get::<i64, _>("count")
     .unwrap();
     assert_eq!(ready_count, 0, "crash exposed a partial ready write set");
-
-    sqlx::query(
-        "DELETE FROM public.lcia_scope_closure_artifact_write_set_items WHERE write_set_id = $1",
+    let retained_item_count = sqlx::query(
+        r"
+        SELECT count(*) AS count
+        FROM public.lcia_scope_closure_artifact_write_set_items
+        WHERE write_set_id = $1
+        ",
     )
     .bind(write_set_id)
-    .execute(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("clean crash-test write-set items");
-    sqlx::query("DELETE FROM public.lcia_scope_closure_artifact_write_sets WHERE id = $1")
-        .bind(write_set_id)
-        .execute(&pool)
-        .await
-        .expect("clean crash-test write set");
-    sqlx::query("DELETE FROM public.lcia_scope_closure_checks WHERE id = $1")
-        .bind(closure_check_id)
-        .execute(&pool)
-        .await
-        .expect("clean crash-test closure check");
-    sqlx::query("DELETE FROM public.worker_jobs WHERE id = $1")
-        .bind(worker_job_id)
-        .execute(&pool)
-        .await
-        .expect("clean crash-test worker job");
-    sqlx::query("DELETE FROM public.users WHERE id = $1")
-        .bind(owner_id)
-        .execute(&pool)
-        .await
-        .expect("clean crash-test public user");
-    sqlx::query("DELETE FROM auth.users WHERE id = $1")
-        .bind(owner_id)
-        .execute(&pool)
-        .await
-        .expect("clean crash-test auth user");
+    .expect("count retained immutable write-set items")
+    .try_get::<i64, _>("count")
+    .unwrap();
+    assert_eq!(
+        retained_item_count, 3,
+        "one bounded detail-cleanup slot must be reclaimed without touching other audit items"
+    );
 }
 
 #[tokio::test]

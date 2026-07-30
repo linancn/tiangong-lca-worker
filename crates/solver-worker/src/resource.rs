@@ -9,6 +9,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -196,6 +199,8 @@ impl ResourceError {
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_cancel_stage: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl CancellationToken {
@@ -208,7 +213,24 @@ impl CancellationToken {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub fn cancel_at_stage(&self, stage: &'static str) {
+        *self
+            .test_cancel_stage
+            .lock()
+            .expect("cancellation stage lock poisoned") = Some(stage);
+    }
+
     pub fn check(&self, stage: &'static str) -> Result<(), ResourceError> {
+        #[cfg(test)]
+        if self
+            .test_cancel_stage
+            .lock()
+            .expect("cancellation stage lock poisoned")
+            .is_some_and(|target| target == stage)
+        {
+            self.cancel();
+        }
         if self.is_cancelled() {
             Err(ResourceError::Cancelled { stage })
         } else {

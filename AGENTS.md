@@ -41,13 +41,14 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-29
-lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: topology-measured admission, bounded complete-result reconstruction, role-tagged publication, and retry-safe application-level artifact GC remain Worker-owned while durable lifecycle schema and RPC governance remain database-engine-owned."
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 issue/result representation and staged publication remain Worker runtime concerns while durable registration, seal, and visibility remain database-engine-owned."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
@@ -71,6 +72,7 @@ Start here when the task may change what the compute stack does.
 | `.docpact/config.yaml` | machine-readable repo facts, routing intents, governed-doc rules, ownership, coverage, and freshness | explanatory prose or long-form walkthroughs |
 | `docs/agents/repo-validation.md` | minimum proof by change type, manual validation helpers, PR validation note shape | repo contract, branch policy truth, or long setup notes |
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
+| `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v3 issue/result, compact root-impact/witness, memory/cancellation, migration, and staged-publication invariants | general repo routing or durable database schema |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
 | `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
@@ -92,6 +94,7 @@ Read in this order:
 4. load only the narrow contract doc that matches the task:
    - `docs/lca-api-contract.md`
    - `docs/scope-closure-contract.md`
+   - `docs/agents/contracts/scope-closure-memory-and-result-contract.md`
    - `docs/matrix-readiness-report-contract.md`
    - `docs/review-submit-fast-gate-contract.md`
    - `docs/edge-function-integration.md`
@@ -172,7 +175,7 @@ Route those tasks to:
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
-- package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION`, verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
+- package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION` (active governed default `0.1.2`), verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 - scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, with manifest-driven streaming reconstruction of exact membership/counts/hashes, not a duplicate monolithic JSONL artifact; this delivery directly downloads only XLSX and the manifest, and direct partition retrieval remains a separately tracked cross-repository contract
 - generic artifact GC is a lease-fenced `worker.artifact_gc` maintenance job: Database Engine #309 claims bounded rows under a shared token, `object_delete` candidates require one exact object deletion before bounded completion, and fresh-process `detail_cleanup` recovery candidates carry a new fenced token, `objectDeleteRequired=false`, and no locator; a missing object is idempotent success and object-delete failures release the claim without premature tombstoning

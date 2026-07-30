@@ -2732,11 +2732,14 @@ async fn verify_certified_closure_bundle_artifact(
     let checksum_sha256 = row.try_get::<String, _>("checksum_sha256")?;
     let metadata = row.try_get::<Value, _>("metadata")?;
     let expected_closure_check_id = expected_closure_check_id.to_string();
+    let artifact_schema = metadata.get("schemaVersion").and_then(Value::as_str);
     if artifact_type != "closure_bundle"
         || content_type != "application/json"
         || checksum_sha256 != expected_bundle_hash
-        || metadata.get("schemaVersion").and_then(Value::as_str)
-            != Some("lcia.scope-closure-artifact.v1")
+        || !matches!(
+            artifact_schema,
+            Some("lcia.scope-closure-artifact.v1" | "lcia.scope-closure-artifact.v2")
+        )
         || metadata.get("closureCheckId").and_then(Value::as_str)
             != Some(expected_closure_check_id.as_str())
     {
@@ -2757,9 +2760,11 @@ async fn verify_certified_closure_bundle_artifact(
         ));
     }
     let bundle = serde_json::from_slice::<Value>(bytes.as_slice())?;
-    if bundle.get("schemaVersion").and_then(Value::as_str) != Some("lcia.scope-closure-bundle.v1")
-        || bundle.get("dataSnapshotToken").and_then(Value::as_str)
-            != Some(expected_data_snapshot_token)
+    if !matches!(
+        bundle.get("schemaVersion").and_then(Value::as_str),
+        Some("lcia.scope-closure-bundle.v1" | "lcia.scope-closure-bundle.v3")
+    ) || bundle.get("dataSnapshotToken").and_then(Value::as_str)
+        != Some(expected_data_snapshot_token)
     {
         return Err(anyhow::anyhow!(
             "certified_closure_bundle_artifact_binding_mismatch"
