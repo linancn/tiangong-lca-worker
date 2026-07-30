@@ -37,7 +37,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 issue partitions, compact source impact/frozen graph evidence, and staged seal-before-upload publication stay within Worker ownership."
+lastReviewedNote: "Reviewed for Worker Issue #177 production qualification: the active governed TIDAS default is v0.1.2; canonical v3 partitions, compact evidence, and staged publication ownership remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

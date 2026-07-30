@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: public XLSX/manifest DTOs remain unchanged while the manifest-addressed complete result moves to canonical v3 and staged seal-before-upload publication."
+lastReviewedNote: "Reviewed for Worker Issue #177 TIDAS v0.1.2 qualification: public XLSX/manifest DTOs remain unchanged while canonical v3 and staged seal-before-upload publication remain the machine-result contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml

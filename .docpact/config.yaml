@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedAt: "2026-07-30"
 lastReviewedCommit: "936b0db78e5241ac81fd3cc72a95c8dd3fcfe959"
-lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 uses one unified issue record, compact source root-impact and frozen-graph evidence, and staged seal-before-upload publication."
+lastReviewedNote: "Reviewed for Worker Issue #177 production qualification: active TIDAS defaults move to governed v0.1.2 while canonical v3 routing, ownership, and staged seal-before-upload publication remain unchanged."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

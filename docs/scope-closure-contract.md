@@ -95,7 +95,7 @@ Reference extraction in `scope_closure.rs` mirrors the public `tidas.reference-e
 
 Document validation uses only the published unified Rust `tidas` CLI selected by `TIDAS_BIN` (default `tidas`). No Python entrypoint, legacy binary name, or ordered command-candidate fallback is permitted:
 
-1. `version --format json --progress never` must equal `TIDAS_EXPECTED_VERSION` (default `0.1.1`).
+1. `version --format json --progress never` must equal `TIDAS_EXPECTED_VERSION` (active governed default `0.1.2`).
 2. `validate --describe --format json --progress never` must advertise `document-validation-batch.v1`, `tidas-document-conformance.v1`, the validation report schema, and an immutable asset fingerprint.
 3. Uncached documents are spooled as canonical JSON plus an exact JSONL input manifest.
 4. The Worker invokes profile `tidas-document-conformance.v1` with bounded memory/queue configuration inherited by the binary.

@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/tests/artifact_gc_database_contract.rs
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Created for Worker Issue #177 and the Database #316 staged-write handshake: canonical v3 stores one coalesced issue record, compact source impact and frozen-graph evidence, and no expanded issue×root×witness relation."
+lastReviewedNote: "Reviewed for Worker Issue #177 TIDAS v0.1.2 production qualification: canonical v3 keeps one coalesced issue record, compact source impact and frozen-graph evidence, and no expanded issue×root×witness relation."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
