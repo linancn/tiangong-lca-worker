@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 issue/result representation and staged publication remain Worker runtime concerns while durable registration, seal, and visibility remain database-engine-owned."
+lastReviewedNote: "Reviewed for Worker Issue #179: bounded v4 bundle/administrative partitioning remains Worker-owned; Database continues to own descriptor registration, atomic seal, visibility, and cleanup state."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

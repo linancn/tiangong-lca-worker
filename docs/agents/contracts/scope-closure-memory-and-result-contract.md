@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/tests/artifact_gc_database_contract.rs
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177 TIDAS v0.1.2 production qualification: canonical v3 keeps one coalesced issue record, compact source impact and frozen-graph evidence, and no expanded issue×root×witness relation."
+lastReviewedNote: "Updated for Worker Issue #179: canonical v4 preserves v3 unified issue/root/witness semantics while partitioning administrative evidence and bounding every object before staged publication."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -36,7 +36,7 @@ related:
 
 ## Canonical semantic result
 
-`lcia.scope-closure-issue-manifest.v3` is the canonical complete machine-result contract for a fresh scope-closure scan. It represents one unified issue set, not a TIDAS-only validation result. The set includes:
+`lcia.scope-closure-issue-manifest.v4` is the canonical complete machine-result contract for a fresh scope-closure scan. V4 preserves the unified v3 issue/root-impact/witness semantics and adds bounded administrative evidence membership. It represents one unified issue set, not a TIDAS-only validation result. The set includes:
 
 - TIDAS document-conformance issues;
 - exact-reference, missing-reference, frozen-release, and source-drift issues;
@@ -72,21 +72,22 @@ Root impact uses stable zero-based root ordinals and `lcia.scope-closure-root-im
 
 ## Files and manifest
 
-A fresh v3 result contains:
+A fresh v4 result contains:
 
-- `closure-bundle-v3.json`, retaining the existing certificate and reuse boundary without copying issue rows or raw TIDAS events; historical v1 bundles remain readable;
+- `closure-bundle-v4.json`, a small certificate/snapshot/package binding manifest containing stable request, policy, validator, TIDAS, scan-count, and administrative relation logical hashes/counts; it never copies growing scan arrays, issue rows, or raw TIDAS events, and historical v1/v3 bundles remain readable through a bounded file reader;
 - `closure-report-v1.xlsx`, retained for the existing public operator transport;
-- `manifest.json` with schema `lcia.scope-closure-issue-manifest.v3`;
+- `manifest.json` with schema `lcia.scope-closure-issue-manifest.v4`;
 - `issues/part-NNNNNN.ndjson.zst`, containing the globally ordered coalesced v3 issue records;
 - `tidas/issues.ndjson.zst`, containing the byte-exact logical TIDAS event stream once;
 - `evidence/root-impact-index-v1.bin.zst`;
-- `evidence/frozen-reference-graph-v1.bin.zst`.
+- `evidence/frozen-reference-graph-v1.bin.zst`;
+- `administrative/<relation>/part-NNNNNN.ndjson.zst` for documents, edges, resolved references, resolution map, roots, frontier, provider universe, and omitted-version resolutions.
 
-There are no production `occurrences/*` or `affected-roots/*` partitions in v3, and `expandedAffectedRootRecordCount` is exactly zero. Issue partitions close at the first configured record or canonical uncompressed-byte limit. The manifest binds every artifact path, media type, compressed and uncompressed byte size and SHA-256, record count, first/last key, global relation hashes, root count, graph node/edge count, partition limits, sample limits, and ordering rules.
+There are no production `occurrences/*` or `affected-roots/*` partitions in v4, and `expandedAffectedRootRecordCount` is exactly zero. Issue and administrative partitions close at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON. Every physical scope-closure object must be at most 256 MiB; a larger object or single record fails before write-set creation, registration, seal, or upload. The manifest binds every artifact path, media type, compressed and uncompressed byte size and SHA-256, record count, first/last key, global relation hashes, root count, graph node/edge count, partition limits, sample limits, and ordering rules.
 
-The version-dispatch reader accepts v2 and v3 manifests. V2 remains readable through its original issue/occurrence/affected-root partitions. V3 can project the legacy affected-root view on demand from issue records, the compact root-impact index, and the frozen graph. The reader rejects missing, extra, duplicate, reordered, truncated, hash-mismatched, boundary-inconsistent, or cardinality-inconsistent files. Writers always emit v3; they never silently downgrade.
+The version-dispatch reader accepts v2, v3, and v4 manifests. V2 remains readable through its original issue/occurrence/affected-root partitions. V3 and V4 can project the legacy affected-root view on demand from issue records, the compact root-impact index, and the frozen graph. V4 additionally verifies every administrative partition and its relation-level logical hash/count. The reader rejects missing, extra, duplicate, reordered, truncated, hash-mismatched, boundary-inconsistent, oversized, or cardinality-inconsistent files. Writers always emit v4; they never silently downgrade.
 
-Next and Edge continue to expose the existing XLSX and manifest download selectors and descriptors. V3 does not change their public DTO. Access to subordinate manifest members remains governed by the existing authorized artifact boundary; Worker does not create a new cross-repo public API.
+Next and Edge continue to expose the existing XLSX and manifest download selectors and descriptors. V4 does not change their public DTO. Access to subordinate manifest members remains governed by the existing authorized artifact boundary; Worker does not create a new cross-repo public API.
 
 ## Bounded execution and cleanup
 

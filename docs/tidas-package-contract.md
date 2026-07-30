@@ -21,7 +21,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-30
 lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177: scope-closure v3 still preserves the verified raw TIDAS issue stream once and does not change package import/export validation, reports, or retention."
+lastReviewedNote: "Reviewed for Worker Issue #179: package binding reads current bounded scope-closure v4 and historical v1/v3 bundles through file-backed streaming without changing import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -243,6 +243,8 @@ cargo run -p solver-worker --bin package_gc -- --execute
 ### 7.3 与 certificate-bound LCIA result package 的边界
 
 `lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。
+
+Fresh scope closure uses the bounded `lcia.scope-closure-bundle.v4` binding manifest. Package verification downloads that JSON through the bounded file API, recomputes its exact hash, and streams only the schema/token binding fields; historical v1/v3 bundle files remain readable without materializing the complete object in memory. The growing administrative evidence is partitioned under the closure manifest and does not change TIDAS import/export ZIP semantics.
 
 这项绑定不会改变 TIDAS import/export ZIP、report、retention 或 `worker_queue=package` 状态机。完整契约见 `docs/scope-closure-contract.md` 与 `docs/lca-api-contract.md`。
 
