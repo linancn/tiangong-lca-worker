@@ -30,13 +30,14 @@ checkPaths:
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
   - .githooks/pre-push
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-29
-lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: measured-topology admission, bounded complete-result reconstruction, role-tagged publication, and generic application-level artifact GC fit the existing Worker, storage, and maintenance boundaries."
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 issue partitions, compact source impact/frozen graph evidence, and staged seal-before-upload publication stay within Worker ownership."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -45,6 +46,7 @@ related:
   - ../../docs/scope-closure-contract.md
   - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/review-submit-fast-gate-contract.md
+  - ./contracts/scope-closure-memory-and-result-contract.md
 ---
 
 ## Repo Shape
@@ -78,7 +80,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/resource.rs` | shared `worker.resource-profile.v1` admission, cancellation, Linux RSS/cgroup telemetry, and owned/temp/object/cache counters |
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
-| `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, bounded issue-relation partitions/reports, scan reuse, and package certificate verification |
+| `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
 | `crates/solver-worker/src/tidas_cli.rs` | single-binary Rust tidas version/protocol handshake, bounded command execution, report validation, and spool hash/count verification |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
@@ -86,6 +88,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `supabase/migrations/**` | local runtime-facing SQL expectations referenced by the worker runtime |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
 | `docs/scope-closure-contract.md` | closure traversal, immutable source, validation, artifact, reuse, and build-binding contract |
+| `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v3 issue/result shape, compact root-impact/witness representation, memory/cancellation invariants, and Database #316 staged-publication handshake |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
 | `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, blocker codes, and targeted probe contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
@@ -119,7 +122,7 @@ The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND
 
 `crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope.
 
-The same module invokes TIDAS `document-validation-batch.v1` through `tidas_cli.rs`. The adapter accepts one `TIDAS_BIN`, requires the exact expected Rust release version, verifies `validate --describe`, hashes issue events from their original NDJSON lines before parsing, and rejects any SHA-256/byte/count or asset-fingerprint drift. Validation evidence lookup is capped at 256 keys, uncached execution at 64 documents, and cache writes at 8 MiB. Traversal writes canonical document payloads and full reference evidence to temporary random-access/sorted spools, retains only document metadata plus a numeric-ID graph, and reloads payloads only for uncached validation windows. Issue and resolution-map events are canonicalized through 32 MiB external-sort runs. Derived issues, occurrences, and affected-root/witness relations use independent bounded runs and bounded-fan-in merges that feed one active deterministic zstd partition writer per relation. Initial temporary-disk admission covers only stages derivable from the observed raw stream; topology-dependent fan-out is admitted from actual bytes at every bounded run and merge boundary, so the global requested-root count is never treated as the per-event fan-out and complete output still has no arbitrary total cap. Closure bundle, bounded XLSX, deterministic compressed machine-result partitions and manifest, and object-store uploads remain file-backed, with temporary-space reserve and safety margin, sequential cache-release hints, automatic temporary cleanup, phase RSS/cgroup telemetry, and lease heartbeats while blocking graph or artifact phases run. Published report artifacts carry an explicit role, the configured bucket and object path, SHA-256, byte size, content type, and database-time seven-day expiry. It uses the snapshot builder first for non-persisting signed-flow discovery and only after the discovered Process axis is administratively rescanned and blocker-free does it persist a bound HDF5 numerical snapshot. Blocked or incomplete checks produce no numerical snapshot or certificate. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/HDF5/index/build-contract/bundle/report binding against the database. The package numerical path is otherwise unchanged. See `docs/scope-closure-contract.md` for the exact contract.
+The same module invokes TIDAS `document-validation-batch.v1` through `tidas_cli.rs`. The adapter accepts one `TIDAS_BIN`, requires the exact expected Rust release version, verifies `validate --describe`, hashes issue events from their original NDJSON lines before parsing, and rejects any SHA-256/byte/count or asset-fingerprint drift. Validation evidence lookup is capped at 256 keys, uncached execution at 64 documents, and cache writes at 8 MiB. Traversal writes canonical document payloads and full reference evidence to temporary random-access/sorted spools, retains only document metadata plus a numeric-ID graph, and reloads payloads only for uncached validation windows. Canonical v3 coalescing uses bounded external sort, one source reachability state, source-level compact root ordinals, and one frozen reverse graph; it never emits issue×root×full-witness partitions. The exact TIDAS event stream is compressed once, coalesced issue records are globally ordered once into final zstd partitions, and v2 remains readable through version-dispatch migration logic. Closure bundle, bounded XLSX, deterministic manifest members, and object-store uploads remain file-backed, with temporary-space reserve, automatic cleanup, RSS/cgroup telemetry, and lease-driven cancellation. Database #316 pre-registers descriptors in bounded batches and atomically seals an exact artifact map before Worker uploads any object; finalization is the only transition to `ready`. The snapshot builder still runs first for non-persisting signed-flow discovery and persists a bound HDF5 numerical snapshot only after the discovered Process axis is rescanned and blocker-free. Blocked or incomplete checks produce no numerical snapshot or certificate. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/HDF5/index/build-contract/bundle/report binding against the database. See `docs/scope-closure-contract.md` and the narrow memory/result contract for exact behavior.
 
 Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limited to process/flow rows and load LCIA methods from the reviewed, release-pinned static cache through `crates/solver-worker/src/static_lcia_cache.rs`. That module owns trusted-base retrieval, byte/decompression limits, raw and canonical hash verification, method/locator alias validation, and streaming factor normalization. `calculation_evidence.rs` owns the v2 source/bundle/25-method coverage binding. Gap evidence is deterministically spooled as JSONL rather than retained as an exchange-by-method object graph. Build-snapshot terminal projection comes from canonical `worker_jobs` diagnostics, including reuse-resolved snapshot ID and evidence, so optional `lca_jobs` is never required. Singular/factorization diagnostics use only the exact process/version pairs in the snapshot index.
 

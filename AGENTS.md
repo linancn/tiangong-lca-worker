@@ -41,13 +41,14 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-29
-lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: topology-measured admission, bounded complete-result reconstruction, role-tagged publication, and retry-safe application-level artifact GC remain Worker-owned while durable lifecycle schema and RPC governance remain database-engine-owned."
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177 and Database #316: canonical v3 issue/result representation and staged publication remain Worker runtime concerns while durable registration, seal, and visibility remain database-engine-owned."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
@@ -71,6 +72,7 @@ Start here when the task may change what the compute stack does.
 | `.docpact/config.yaml` | machine-readable repo facts, routing intents, governed-doc rules, ownership, coverage, and freshness | explanatory prose or long-form walkthroughs |
 | `docs/agents/repo-validation.md` | minimum proof by change type, manual validation helpers, PR validation note shape | repo contract, branch policy truth, or long setup notes |
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
+| `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v3 issue/result, compact root-impact/witness, memory/cancellation, migration, and staged-publication invariants | general repo routing or durable database schema |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
 | `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
@@ -92,6 +94,7 @@ Read in this order:
 4. load only the narrow contract doc that matches the task:
    - `docs/lca-api-contract.md`
    - `docs/scope-closure-contract.md`
+   - `docs/agents/contracts/scope-closure-memory-and-result-contract.md`
    - `docs/matrix-readiness-report-contract.md`
    - `docs/review-submit-fast-gate-contract.md`
    - `docs/edge-function-integration.md`

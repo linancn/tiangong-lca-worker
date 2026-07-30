@@ -18,15 +18,17 @@ checkPaths:
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
-lastReviewedAt: 2026-07-29
-lastReviewedCommit: fb8293f5d2c83dfe845dd4149de5b5bfed5e7076
-lastReviewedNote: "Reviewed for Issue #172 on the merged #174 baseline and Database #309 final contract commit 837948a: bounded reconstruction of role-tagged temporary scope-closure artifacts and phase-aware lifecycle GC remain separate from the raw TIDAS issue-stream hash and package-specific retention."
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177: scope-closure v3 still preserves the verified raw TIDAS issue stream once and does not change package import/export validation, reports, or retention."
 related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
   - docs/scope-closure-contract.md
+  - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 ---
 
 # TIDAS Package Async Contract

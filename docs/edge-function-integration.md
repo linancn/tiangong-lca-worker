@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-07-12
-lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
-lastReviewedNote: "Reviewed for the Edge/Next/Worker static-bundle and 25-method matrix v2 handoff in Issue #116."
+lastReviewedAt: 2026-07-30
+lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedNote: "Reviewed for Worker Issue #177: canonical scope-closure v3 and Database #316 staged publication remain behind the existing Edge-owned XLSX plus manifest projection; no Edge request or response DTO change is required."
 related:
   - AGENTS.md
   - .docpact/config.yaml
