@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Updated for Worker Issue #186: git-tracked external and isolated-provider executables emit the exact root qualification child contracts and fail closed on identity, payload, target, or cleanup drift."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane access preserves the scope-closure package and qualification contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 runtime default changes without altering Worker orchestration or provider ownership."
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issues #190 and #193: private control-plane access and the exact tidas v0.1.3 default preserve Worker orchestration, ownership, and the Database-owned schema boundary."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
