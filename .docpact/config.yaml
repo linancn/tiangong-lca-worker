@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-07-30"
-lastReviewedCommit: "936b0db78e5241ac81fd3cc72a95c8dd3fcfe959"
-lastReviewedNote: "Reviewed for Worker Issue #179: scope-closure routing and ownership remain Worker-local while canonical v4 bounds administrative evidence and every object before staged seal-before-upload publication."
+lastReviewedAt: "2026-07-31"
+lastReviewedCommit: "5edde096148b1113d5d605d239cfe34d16308837"
+lastReviewedNote: "Reviewed for Worker Issue #181: scope-closure routing and ownership remain Worker-local while oversized administrative records gain deterministic bounded physical segmentation."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

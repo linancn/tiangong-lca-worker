@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Updated for Worker Issue #179: public XLSX/manifest DTOs remain unchanged while canonical v4 partitions administrative evidence and keeps the closure bundle as a bounded internal binding."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
+lastReviewedNote: "Updated for Worker Issue #181: public XLSX/manifest DTOs remain unchanged while an oversized internal administrative record uses a deterministic index and bounded canonical-byte chunks."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -449,6 +449,8 @@ Worker 重任务可使用共享 `worker.resource-profile.v1` primitive 声明并
 - `upload_object_key_file_bounded`：在网络传输前按文件 metadata 拒绝超限、流式计算/校验 SHA-256，并在每个 multipart boundary 检查 cancellation；失败或取消会 abort 已创建的 multipart upload。
 
 旧 `download_object_url -> Vec<u8>`、`download_object_key -> Vec<u8>` 与现有 file-upload 方法保留作兼容面；新迁移的 snapshot、package、graph-cache 或 solve 路径不得继续采用完整对象内存物化。具体算法迁移由 #162 的后续独立交付完成，不改变本节现有 jobs/results consumer schema。
+
+`lcia.scope_closure_check` 的公开 XLSX/manifest selector 与 result DTO 不因单条超大 administrative record 改变。canonical v4 内部保持普通 NDJSON partition 原样；若一条逻辑记录连同 NDJSON 换行超过 32 MiB，则以小型 index 和固定 8 MiB canonical-byte chunks 表示。index、top-level manifest 与 relation-local layout 共同绑定逻辑长度、完整 record SHA-256 以及 chunk 顺序/长度/hash；读端流式重建并以原 canonical record 加单个换行计算 relation hash，对缺失、重复、乱序或篡改 fail closed。该内部物理分段不扩大公开下载 selector，也不改变 Database #316 的 descriptor ordinal/digest、seal 或 finalize 契约。
 
 ## 6. 幂等与请求缓存（建议约束）
 

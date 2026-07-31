@@ -25,9 +25,9 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Updated for Worker Issue #179: canonical v4 preserves unified v3 issue semantics, replaces the monolithic bundle with bounded administrative partitions, and rejects oversized objects before write-set creation."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
+lastReviewedNote: "Updated for Worker Issue #181: canonical v4 keeps ordinary administrative NDJSON unchanged and deterministically segments a single oversized logical record into an index plus bounded canonical-byte chunks."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -149,14 +149,17 @@ traversal and issue aggregation under this document's frozen-release rules.
 Each fresh scan produces deterministic administrative artifacts:
 
 - `closure-bundle-v4.json`: a small certificate/snapshot/package binding manifest containing requested bindings, scan counts, relation-level logical hashes/counts, and the logical hash/count/path reference to the single compressed TIDAS stream; it contains no growing scan arrays, and the package verifier reads it through bounded file I/O while historical v1/v3 bundles remain readable;
-- `manifest.json`: `lcia.scope-closure-issue-manifest.v4`, preserving canonical v3 unified issue/root-impact/witness semantics while additionally binding bounded administrative evidence partitions;
+- `manifest.json`: `lcia.scope-closure-issue-manifest.v4`, preserving canonical v3 unified issue/root-impact/witness semantics while additionally binding bounded administrative evidence partitions, oversized-record indexes/chunks, and their relation-local logical layout;
 - `issues/part-NNNNNN.ndjson.zst`: globally `issueKey`-ordered `lcia.scope-closure-issue.v3` main records, each streamed through one active zstd writer and sealed at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON;
 - `tidas/issues.ndjson.zst`: the exact verified TIDAS logical event stream, compressed once;
 - `evidence/root-impact-index-v1.bin.zst` and `evidence/frozen-reference-graph-v1.bin.zst`: compact root membership and deterministic witness-reconstruction evidence;
 - `administrative/<relation>/part-NNNNNN.ndjson.zst`: documents, edges, resolved references, resolution map, roots, frontier, provider universe, and omitted-version resolutions, each sealed at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON;
+- `administrative/<relation>/oversized/record-<logical-ordinal>/index.json` plus `chunk-NNNNNN.bin`: the representation for one administrative record whose canonical record plus newline exceeds 32 MiB; the small index binds the relation, logical ordinal/key, total canonical byte length/hash, and every fixed 8 MiB canonical-byte chunk ordinal/path/length/hash;
 - `closure-report-v1.xlsx`: a valid workbook tagged with the current `closureCheckId`, containing exact summary counts, a complete-artifact index, at most 5,000 issue rows, 10,000 occurrence rows, and 10,000 affected-root rows.
 
-Partition ordering, binary encoding, and zstd level are deterministic for identical inputs. The logical issue hash remains the exact TIDAS issue-event NDJSON bytes; repartitioning does not redefine it. Every prepared scope-closure object is checked against a 256 MiB hard ceiling before a write-set header is created, so an oversized object cannot be registered, sealed, or uploaded. A single administrative record above the 32 MiB logical partition window fails with `artifact_limit_exceeded`. Before opening the XLSX ZIP, Worker rejects any worksheet over 1,048,576 rows or 64 MiB estimated uncompressed XML and any workbook over 128 MiB estimated worksheet XML. It also rejects the finished archive above 64 MiB.
+Partition ordering, binary encoding, and zstd level are deterministic for identical inputs. Ordinary records keep the historical NDJSON representation. For an individually oversized administrative record, Worker first closes the active ordinary partition, writes the canonical JSON bytes without their framing newline into contiguous fixed-size chunks, and records one layout entry for the index. A reader must stream chunks in layout order, verify every binding, and append exactly one logical newline while updating the relation hash/count; missing, extra, duplicate, reordered, truncated, or corrupted index/chunk material fails closed. The logical issue hash remains the exact TIDAS issue-event NDJSON bytes, and every administrative relation hash remains the original canonical record-plus-newline stream; physical segmentation does not redefine either identity. Historical v4 manifests without oversized-record fields remain readable as partition-only layouts.
+
+Every prepared scope-closure object is checked against a 256 MiB hard ceiling before a write-set header is created, so an oversized physical object cannot be registered, sealed, or uploaded. A logical administrative record may exceed that ceiling only because its physical representation is bounded to one small index and 8 MiB chunks. Before opening the XLSX ZIP, Worker rejects any worksheet over 1,048,576 rows or 64 MiB estimated uncompressed XML and any workbook over 128 MiB estimated worksheet XML. It also rejects the finished archive above 64 MiB.
 
 The manifest plus its listed members is the only complete machine-result representation. A bounded version-dispatch reader retains v2/v3 migration support and verifies v4 exact membership, ordering, compressed/uncompressed hashes and sizes, administrative relation hashes/counts, unified issue counts, root-impact references, graph boundaries, and reconstructed sample witnesses. Publication follows Database #316's `lcia.scope-closure-artifact-write-set.v2`: deterministic one-based descriptors and digest, header creation, batches of at most 500, status readback, atomic seal into `staging`, exact `clientKey -> artifactId` readback, and only then object upload. Finalization atomically exposes `ready`. Worker uploads no object before successful seal/readback and preserves Database #309's role, trusted expiry, download, and GC semantics.
 

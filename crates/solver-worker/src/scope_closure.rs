@@ -68,6 +68,7 @@ const ISSUE_PARTITION_MAX_RECORDS: u64 = 25_000;
 const ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 const ADMINISTRATIVE_PARTITION_MAX_RECORDS: u64 = 25_000;
 const ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 const ARTIFACT_REGISTRATION_BATCH_SIZE: usize = 500;
 const ROOT_IMPACT_INDEX_MAGIC: &[u8] = b"TGLCA-RI-V1\0";
@@ -3143,6 +3144,51 @@ struct AdministrativeEvidenceSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AdministrativeLayoutEntry {
+    relation: String,
+    sequence_ordinal: u64,
+    kind: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdministrativeOversizedRecordManifestEntry {
+    relation: String,
+    record_ordinal: u64,
+    record_key: String,
+    logical_byte_size: u64,
+    logical_sha256: String,
+    index_path: String,
+    index_byte_size: u64,
+    index_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdministrativeOversizedRecordChunk {
+    ordinal: u64,
+    path: String,
+    byte_size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdministrativeOversizedRecordIndex {
+    schema_version: String,
+    relation: String,
+    record_ordinal: u64,
+    record_key: String,
+    logical_byte_size: u64,
+    logical_sha256: String,
+    chunk_byte_size: u64,
+    chunk_count: u64,
+    chunks: Vec<AdministrativeOversizedRecordChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IssueRelationStreamHashesV3 {
     issues: String,
     tidas_issue_stream: String,
@@ -3205,8 +3251,14 @@ struct ScopeClosureManifestV4 {
     issue_manifest: IssuePartitionManifestV3,
     administrative_evidence: Vec<AdministrativeEvidenceSummary>,
     administrative_partitions: Vec<IssuePartitionManifestEntry>,
+    #[serde(default)]
+    administrative_layout: Vec<AdministrativeLayoutEntry>,
+    #[serde(default)]
+    administrative_oversized_records: Vec<AdministrativeOversizedRecordManifestEntry>,
     administrative_partition_max_records: u64,
     administrative_partition_max_uncompressed_bytes: u64,
+    #[serde(default)]
+    administrative_oversized_record_chunk_bytes: u64,
     per_object_max_bytes: u64,
 }
 
@@ -3219,7 +3271,29 @@ struct IssuePartitionAccumulator {
     entries: Vec<IssuePartitionManifestEntry>,
     artifacts: Vec<PreparedArtifact>,
     relation_uncompressed_digest: Sha256,
+    logical_record_count: u64,
+    logical_byte_size: u64,
+    layout: Vec<AdministrativeLayoutEntry>,
+    oversized_records: Vec<AdministrativeOversizedRecordManifestEntry>,
 }
+
+type IssuePartitionFinish = (
+    Vec<IssuePartitionManifestEntry>,
+    Vec<PreparedArtifact>,
+    String,
+    u64,
+    u64,
+    Vec<AdministrativeLayoutEntry>,
+    Vec<AdministrativeOversizedRecordManifestEntry>,
+);
+
+type PreparedAdministrativePartitions = (
+    Vec<AdministrativeEvidenceSummary>,
+    Vec<IssuePartitionManifestEntry>,
+    Vec<AdministrativeLayoutEntry>,
+    Vec<AdministrativeOversizedRecordManifestEntry>,
+    Vec<PreparedArtifact>,
+);
 
 struct ActiveIssuePartition {
     relative_path: String,
@@ -5573,6 +5647,10 @@ impl IssuePartitionAccumulator {
             entries: Vec::new(),
             artifacts: Vec::new(),
             relation_uncompressed_digest: Sha256::new(),
+            logical_record_count: 0,
+            logical_byte_size: 0,
+            layout: Vec::new(),
+            oversized_records: Vec::new(),
         }
     }
 
@@ -5594,6 +5672,10 @@ impl IssuePartitionAccumulator {
             entries: Vec::new(),
             artifacts: Vec::new(),
             relation_uncompressed_digest: Sha256::new(),
+            logical_record_count: 0,
+            logical_byte_size: 0,
+            layout: Vec::new(),
+            oversized_records: Vec::new(),
         }
     }
 
@@ -5604,15 +5686,27 @@ impl IssuePartitionAccumulator {
     }
 
     fn push_bytes(&mut self, issue_key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.push_bytes_with_cancellation(issue_key, bytes, None)
+    }
+
+    fn push_bytes_cancellable(
+        &mut self,
+        issue_key: &str,
+        bytes: &[u8],
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.push_bytes_with_cancellation(issue_key, bytes, Some(cancellation))
+    }
+
+    fn push_bytes_with_cancellation(
+        &mut self,
+        issue_key: &str,
+        bytes: &[u8],
+        cancellation: Option<&CancellationToken>,
+    ) -> anyhow::Result<()> {
         let record_bytes = u64::try_from(bytes.len())?;
         if record_bytes > self.max_uncompressed_bytes {
-            return Err(anyhow::anyhow!(
-                "artifact_limit_exceeded: relation={}, issue_key={}, record_bytes={}, max_partition_bytes={}",
-                self.relation,
-                issue_key,
-                record_bytes,
-                self.max_uncompressed_bytes
-            ));
+            return self.push_oversized_record(issue_key, bytes, cancellation);
         }
         let record_limit_reached = self
             .active
@@ -5631,6 +5725,14 @@ impl IssuePartitionAccumulator {
         active.encoder.write_all(bytes)?;
         active.uncompressed_digest.update(bytes);
         self.relation_uncompressed_digest.update(bytes);
+        self.logical_record_count = self
+            .logical_record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("partition logical record count overflow"))?;
+        self.logical_byte_size = self
+            .logical_byte_size
+            .checked_add(record_bytes)
+            .ok_or_else(|| anyhow::anyhow!("partition logical byte size overflow"))?;
         active.record_count = active
             .record_count
             .checked_add(1)
@@ -5640,6 +5742,127 @@ impl IssuePartitionAccumulator {
             .checked_add(record_bytes)
             .ok_or_else(|| anyhow::anyhow!("partition uncompressed byte size overflow"))?;
         issue_key.clone_into(&mut active.last_issue_key);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn push_oversized_record(
+        &mut self,
+        issue_key: &str,
+        bytes: &[u8],
+        cancellation: Option<&CancellationToken>,
+    ) -> anyhow::Result<()> {
+        if bytes.last() != Some(&b'\n') {
+            return Err(anyhow::anyhow!(
+                "oversized administrative record must retain canonical NDJSON newline framing"
+            ));
+        }
+        self.flush()?;
+        let logical_bytes = &bytes[..bytes.len() - 1];
+        let record_ordinal = self.logical_record_count;
+        let record_directory = format!("{}/oversized/record-{record_ordinal:020}", self.relation);
+        let mut chunks = Vec::new();
+        for (ordinal, chunk) in logical_bytes
+            .chunks(usize::try_from(
+                ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES,
+            )?)
+            .enumerate()
+        {
+            if let Some(cancellation) = cancellation {
+                cancellation.check("scope_closure_administrative_oversized_record_chunk")?;
+            }
+            let ordinal = u64::try_from(ordinal)?;
+            let relative_path = format!("{record_directory}/chunk-{ordinal:06}.bin");
+            let path = self.temp.path().join(&relative_path);
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("oversized chunk path omitted parent"))?,
+            )?;
+            fs::write(&path, chunk)?;
+            let byte_size = u64::try_from(chunk.len())?;
+            let sha256 = sha256_hex(chunk);
+            chunks.push(AdministrativeOversizedRecordChunk {
+                ordinal,
+                path: relative_path.clone(),
+                byte_size,
+                sha256: sha256.clone(),
+            });
+            self.artifacts.push(PreparedArtifact {
+                descriptor: ArtifactManifestEntry {
+                    artifact_type: "closure_complete_machine_result".to_owned(),
+                    artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
+                    file_name: relative_path,
+                    content_type: "application/vnd.tiangong.scope-closure-canonical-json-chunk"
+                        .to_owned(),
+                    byte_size: usize::try_from(byte_size)?,
+                    checksum_sha256: sha256,
+                },
+                path,
+                _temp: Arc::clone(&self.temp),
+            });
+        }
+        let logical_byte_size = u64::try_from(logical_bytes.len())?;
+        let logical_sha256 = sha256_hex(logical_bytes);
+        let index = AdministrativeOversizedRecordIndex {
+            schema_version: "lcia.scope-closure-administrative-oversized-record.v1".to_owned(),
+            relation: self
+                .relation
+                .strip_prefix("administrative/")
+                .unwrap_or(&self.relation)
+                .to_owned(),
+            record_ordinal,
+            record_key: issue_key.to_owned(),
+            logical_byte_size,
+            logical_sha256: logical_sha256.clone(),
+            chunk_byte_size: ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES,
+            chunk_count: u64::try_from(chunks.len())?,
+            chunks,
+        };
+        let index_path = format!("{record_directory}/index.json");
+        let index_file = self.temp.path().join(&index_path);
+        let index_bytes = canonical_json_bytes(&index)?;
+        fs::write(&index_file, &index_bytes)?;
+        let index_byte_size = u64::try_from(index_bytes.len())?;
+        let index_sha256 = sha256_hex(&index_bytes);
+        self.artifacts.push(PreparedArtifact {
+            descriptor: ArtifactManifestEntry {
+                artifact_type: "closure_complete_machine_result".to_owned(),
+                artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
+                file_name: index_path.clone(),
+                content_type: "application/vnd.tiangong.scope-closure-oversized-record-index+json"
+                    .to_owned(),
+                byte_size: usize::try_from(index_byte_size)?,
+                checksum_sha256: index_sha256.clone(),
+            },
+            path: index_file,
+            _temp: Arc::clone(&self.temp),
+        });
+        self.layout.push(AdministrativeLayoutEntry {
+            relation: self.relation.clone(),
+            sequence_ordinal: u64::try_from(self.layout.len())?,
+            kind: "oversized_record".to_owned(),
+            path: index_path.clone(),
+        });
+        self.oversized_records
+            .push(AdministrativeOversizedRecordManifestEntry {
+                relation: self.relation.clone(),
+                record_ordinal,
+                record_key: issue_key.to_owned(),
+                logical_byte_size,
+                logical_sha256,
+                index_path,
+                index_byte_size,
+                index_sha256,
+            });
+        self.relation_uncompressed_digest.update(bytes);
+        self.logical_record_count = self
+            .logical_record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("partition logical record count overflow"))?;
+        self.logical_byte_size = self
+            .logical_byte_size
+            .checked_add(u64::try_from(bytes.len())?)
+            .ok_or_else(|| anyhow::anyhow!("partition logical byte size overflow"))?;
         Ok(())
     }
 
@@ -5689,6 +5912,12 @@ impl IssuePartitionAccumulator {
             first_issue_key: active.first_issue_key,
             last_issue_key: active.last_issue_key,
         };
+        self.layout.push(AdministrativeLayoutEntry {
+            relation: self.relation.clone(),
+            sequence_ordinal: u64::try_from(self.layout.len())?,
+            kind: "ndjson_partition".to_owned(),
+            path: active.relative_path.clone(),
+        });
         self.artifacts.push(PreparedArtifact {
             descriptor: ArtifactManifestEntry {
                 artifact_type: "closure_complete_machine_result".to_owned(),
@@ -5705,18 +5934,16 @@ impl IssuePartitionAccumulator {
         Ok(())
     }
 
-    fn finish(
-        mut self,
-    ) -> anyhow::Result<(
-        Vec<IssuePartitionManifestEntry>,
-        Vec<PreparedArtifact>,
-        String,
-    )> {
+    fn finish(mut self) -> anyhow::Result<IssuePartitionFinish> {
         self.flush()?;
         Ok((
             self.entries,
             self.artifacts,
             hex::encode(self.relation_uncompressed_digest.finalize()),
+            self.logical_record_count,
+            self.logical_byte_size,
+            self.layout,
+            self.oversized_records,
         ))
     }
 }
@@ -5845,13 +6072,18 @@ fn prepare_issue_partition_artifacts_with_cancellation(
     artifacts.push(relations.root_impact_index.prepared_artifact()?);
     artifacts.push(frozen_reference_graph.prepared_artifact()?);
     artifacts.push(tidas_issue_stream.prepared_artifact()?);
-    let (administrative_evidence, administrative_partitions, administrative_artifacts) =
-        prepare_administrative_partition_artifacts(
-            scan,
-            resolution_map,
-            Arc::clone(&temp),
-            cancellation,
-        )?;
+    let (
+        administrative_evidence,
+        administrative_partitions,
+        administrative_layout,
+        administrative_oversized_records,
+        administrative_artifacts,
+    ) = prepare_administrative_partition_artifacts(
+        scan,
+        resolution_map,
+        Arc::clone(&temp),
+        cancellation,
+    )?;
     artifacts.extend(administrative_artifacts);
     let partition_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
         total.saturating_add(u64::try_from(artifact.descriptor.byte_size).unwrap_or(u64::MAX))
@@ -5934,9 +6166,12 @@ fn prepare_issue_partition_artifacts_with_cancellation(
         issue_manifest,
         administrative_evidence,
         administrative_partitions,
+        administrative_layout,
+        administrative_oversized_records,
         administrative_partition_max_records: ADMINISTRATIVE_PARTITION_MAX_RECORDS,
         administrative_partition_max_uncompressed_bytes:
             ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+        administrative_oversized_record_chunk_bytes: ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES,
         per_object_max_bytes: SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES,
     };
     let manifest_path = temp.path().join("manifest.json");
@@ -5952,18 +6187,17 @@ fn prepare_issue_partition_artifacts_with_cancellation(
     Ok(artifacts)
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_administrative_partition_artifacts(
     scan: &ScopeClosureScan,
     resolution_map: &JsonlValueSpool,
     temp: Arc<TempDir>,
     cancellation: &CancellationToken,
-) -> anyhow::Result<(
-    Vec<AdministrativeEvidenceSummary>,
-    Vec<IssuePartitionManifestEntry>,
-    Vec<PreparedArtifact>,
-)> {
+) -> anyhow::Result<PreparedAdministrativePartitions> {
     let mut summaries = Vec::new();
     let mut entries = Vec::new();
+    let mut layout = Vec::new();
+    let mut oversized_records = Vec::new();
     let mut artifacts = Vec::new();
 
     let mut documents =
@@ -5974,13 +6208,15 @@ fn prepare_administrative_partition_artifacts(
         cancellation.check("scope_closure_administrative_documents")?;
         let mut record = bytes.to_vec();
         record.push(b'\n');
-        documents.push_bytes(&identity.document_key(), &record)
+        documents.push_bytes_cancellable(&identity.document_key(), &record, cancellation)
     })?;
     finish_administrative_relation(
         "documents",
         documents,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
 
@@ -5991,6 +6227,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_values_administrative_relation(
@@ -6000,6 +6238,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_values_administrative_relation(
@@ -6009,6 +6249,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_values_administrative_relation(
@@ -6018,6 +6260,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_spooled_administrative_relation(
@@ -6027,6 +6271,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_spooled_administrative_relation(
@@ -6036,6 +6282,8 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
     prepare_values_administrative_relation(
@@ -6045,15 +6293,24 @@ fn prepare_administrative_partition_artifacts(
         cancellation,
         &mut summaries,
         &mut entries,
+        &mut layout,
+        &mut oversized_records,
         &mut artifacts,
     )?;
 
     summaries.sort_by(|left, right| left.relation.cmp(&right.relation));
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    layout.sort_by(|left, right| {
+        (&left.relation, left.sequence_ordinal).cmp(&(&right.relation, right.sequence_ordinal))
+    });
+    oversized_records.sort_by(|left, right| {
+        (&left.relation, left.record_ordinal).cmp(&(&right.relation, right.record_ordinal))
+    });
     artifacts.sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
-    Ok((summaries, entries, artifacts))
+    Ok((summaries, entries, layout, oversized_records, artifacts))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_spooled_administrative_relation(
     relation: &'static str,
     spool: &JsonlValueSpool,
@@ -6061,6 +6318,8 @@ fn prepare_spooled_administrative_relation(
     cancellation: &CancellationToken,
     summaries: &mut Vec<AdministrativeEvidenceSummary>,
     entries: &mut Vec<IssuePartitionManifestEntry>,
+    layout: &mut Vec<AdministrativeLayoutEntry>,
+    oversized_records: &mut Vec<AdministrativeOversizedRecordManifestEntry>,
     artifacts: &mut Vec<PreparedArtifact>,
 ) -> anyhow::Result<()> {
     let mut accumulator =
@@ -6070,15 +6329,26 @@ fn prepare_spooled_administrative_relation(
     let mut ordinal = 0_u64;
     spool.visit(|value| {
         cancellation.check("scope_closure_administrative_spool")?;
-        accumulator.push(&format!("{ordinal:020}"), &value)?;
+        let mut bytes = canonical_json_bytes(&value)?;
+        bytes.push(b'\n');
+        accumulator.push_bytes_cancellable(&format!("{ordinal:020}"), &bytes, cancellation)?;
         ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("administrative record ordinal overflow"))?;
         Ok(())
     })?;
-    finish_administrative_relation(relation, accumulator, summaries, entries, artifacts)
+    finish_administrative_relation(
+        relation,
+        accumulator,
+        summaries,
+        entries,
+        layout,
+        oversized_records,
+        artifacts,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_values_administrative_relation<T: Serialize>(
     relation: &'static str,
     values: &[T],
@@ -6086,6 +6356,8 @@ fn prepare_values_administrative_relation<T: Serialize>(
     cancellation: &CancellationToken,
     summaries: &mut Vec<AdministrativeEvidenceSummary>,
     entries: &mut Vec<IssuePartitionManifestEntry>,
+    layout: &mut Vec<AdministrativeLayoutEntry>,
+    oversized_records: &mut Vec<AdministrativeOversizedRecordManifestEntry>,
     artifacts: &mut Vec<PreparedArtifact>,
 ) -> anyhow::Result<()> {
     let mut accumulator =
@@ -6095,9 +6367,19 @@ fn prepare_values_administrative_relation<T: Serialize>(
     for (ordinal, value) in values.iter().enumerate() {
         cancellation.check("scope_closure_administrative_values")?;
         let value = serde_json::to_value(value)?;
-        accumulator.push(&format!("{ordinal:020}"), &value)?;
+        let mut bytes = canonical_json_bytes(&value)?;
+        bytes.push(b'\n');
+        accumulator.push_bytes_cancellable(&format!("{ordinal:020}"), &bytes, cancellation)?;
     }
-    finish_administrative_relation(relation, accumulator, summaries, entries, artifacts)
+    finish_administrative_relation(
+        relation,
+        accumulator,
+        summaries,
+        entries,
+        layout,
+        oversized_records,
+        artifacts,
+    )
 }
 
 fn finish_administrative_relation(
@@ -6105,19 +6387,19 @@ fn finish_administrative_relation(
     accumulator: IssuePartitionAccumulator,
     summaries: &mut Vec<AdministrativeEvidenceSummary>,
     entries: &mut Vec<IssuePartitionManifestEntry>,
+    layout: &mut Vec<AdministrativeLayoutEntry>,
+    oversized_records: &mut Vec<AdministrativeOversizedRecordManifestEntry>,
     artifacts: &mut Vec<PreparedArtifact>,
 ) -> anyhow::Result<()> {
-    let (relation_entries, relation_artifacts, logical_sha256) = accumulator.finish()?;
-    let record_count = relation_entries.iter().try_fold(0_u64, |total, entry| {
-        total
-            .checked_add(entry.record_count)
-            .ok_or_else(|| anyhow::anyhow!("administrative record count overflow"))
-    })?;
-    let logical_byte_size = relation_entries.iter().try_fold(0_u64, |total, entry| {
-        total
-            .checked_add(entry.uncompressed_byte_size)
-            .ok_or_else(|| anyhow::anyhow!("administrative byte count overflow"))
-    })?;
+    let (
+        relation_entries,
+        relation_artifacts,
+        logical_sha256,
+        record_count,
+        logical_byte_size,
+        relation_layout,
+        relation_oversized_records,
+    ) = accumulator.finish()?;
     summaries.push(AdministrativeEvidenceSummary {
         relation: relation.to_owned(),
         record_count,
@@ -6126,6 +6408,14 @@ fn finish_administrative_relation(
         partition_prefix: administrative_partition_prefix(relation),
     });
     entries.extend(relation_entries);
+    layout.extend(relation_layout.into_iter().map(|mut item| {
+        relation.clone_into(&mut item.relation);
+        item
+    }));
+    oversized_records.extend(relation_oversized_records.into_iter().map(|mut item| {
+        relation.clone_into(&mut item.relation);
+        item
+    }));
     artifacts.extend(relation_artifacts);
     Ok(())
 }
@@ -8299,7 +8589,7 @@ fn build_issue_relation_spools_with_cancellation_and_progress(
         issue_partition_writer.push(issue_key, partition_record)
     })?;
     let issues = issue_spool_writer.finish()?;
-    let (issue_partition_entries, issue_partition_artifacts, issue_relation_sha256) =
+    let (issue_partition_entries, issue_partition_artifacts, issue_relation_sha256, ..) =
         issue_partition_writer.finish()?;
     let root_impact_index = root_impact_writer.finish()?;
     if issues.event_count != stats.issue_count
@@ -9487,67 +9777,301 @@ mod tests {
         legacy_relation_stream_sha256: Option<IssueRelationStreamHashesV2>,
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_administrative_manifest_v4(
         manifest: &ScopeClosureManifestV4,
         artifacts: &BTreeMap<&str, &PreparedArtifact>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<BTreeSet<String>> {
         if manifest.administrative_partition_max_records != ADMINISTRATIVE_PARTITION_MAX_RECORDS
             || manifest.administrative_partition_max_uncompressed_bytes
                 != ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES
+            || (!manifest.administrative_oversized_records.is_empty()
+                && manifest.administrative_oversized_record_chunk_bytes
+                    != ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES)
             || manifest.per_object_max_bytes != SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES
         {
             return Err(anyhow::anyhow!(
                 "v4 administrative partition limits differ from the reader contract"
             ));
         }
+        let partitions = manifest
+            .administrative_partitions
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        if partitions.len() != manifest.administrative_partitions.len() {
+            return Err(anyhow::anyhow!(
+                "v4 administrative partition identity is duplicated"
+            ));
+        }
+        let oversized = manifest
+            .administrative_oversized_records
+            .iter()
+            .map(|entry| (entry.index_path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        if oversized.len() != manifest.administrative_oversized_records.len() {
+            return Err(anyhow::anyhow!(
+                "v4 oversized administrative record identity is duplicated"
+            ));
+        }
         let mut summaries = BTreeMap::<String, (u64, u64, Sha256)>::new();
-        for entry in &manifest.administrative_partitions {
-            let artifact = artifacts
-                .get(entry.path.as_str())
-                .ok_or_else(|| anyhow::anyhow!("v4 administrative partition is missing"))?;
-            if u64::try_from(artifact.descriptor.byte_size)?
-                > SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES
-            {
+        let mut bound_paths = BTreeSet::new();
+        let mut expected_sequence = BTreeMap::<String, u64>::new();
+        let mut used_partitions = BTreeSet::new();
+        let mut used_oversized = BTreeSet::new();
+        let legacy_layout;
+        let layout_entries = if manifest.administrative_layout.is_empty()
+            && manifest.administrative_oversized_records.is_empty()
+        {
+            let mut next = BTreeMap::<String, u64>::new();
+            legacy_layout = manifest
+                .administrative_partitions
+                .iter()
+                .map(|entry| {
+                    let relation = entry
+                        .relation
+                        .strip_prefix("administrative/")
+                        .unwrap_or(&entry.relation)
+                        .to_owned();
+                    let sequence_ordinal = *next.entry(relation.clone()).or_default();
+                    *next.get_mut(&relation).expect("relation sequence inserted") += 1;
+                    AdministrativeLayoutEntry {
+                        relation,
+                        sequence_ordinal,
+                        kind: "ndjson_partition".to_owned(),
+                        path: entry.path.clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            &legacy_layout
+        } else {
+            &manifest.administrative_layout
+        };
+        for layout in layout_entries {
+            let sequence = expected_sequence
+                .entry(layout.relation.clone())
+                .or_default();
+            if layout.sequence_ordinal != *sequence {
                 return Err(anyhow::anyhow!(
-                    "v4 administrative partition exceeds the object ceiling"
+                    "v4 administrative layout sequence is missing, duplicated, or reordered"
                 ));
             }
-            let (compressed_bytes, compressed_sha256) = file_size_and_sha256(&artifact.path)?;
-            if compressed_bytes != entry.compressed_byte_size
-                || compressed_sha256 != entry.compressed_sha256
-            {
-                return Err(anyhow::anyhow!(
-                    "v4 administrative compressed descriptor mismatch"
-                ));
-            }
-            let mut decoder =
-                zstd::stream::read::Decoder::new(BufReader::new(File::open(&artifact.path)?))?;
-            let mut bytes = Vec::new();
-            decoder.read_to_end(&mut bytes)?;
-            if u64::try_from(bytes.len())? != entry.uncompressed_byte_size
-                || sha256_hex(&bytes) != entry.uncompressed_sha256
-            {
-                return Err(anyhow::anyhow!(
-                    "v4 administrative uncompressed descriptor mismatch"
-                ));
-            }
-            let relation = entry
-                .relation
-                .strip_prefix("administrative/")
-                .ok_or_else(|| anyhow::anyhow!("v4 administrative relation prefix is invalid"))?
-                .to_owned();
+            *sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("v4 administrative layout sequence overflow"))?;
             let summary = summaries
-                .entry(relation)
+                .entry(layout.relation.clone())
                 .or_insert_with(|| (0, 0, Sha256::new()));
-            summary.0 = summary
-                .0
-                .checked_add(entry.record_count)
-                .ok_or_else(|| anyhow::anyhow!("v4 administrative record count overflow"))?;
-            summary.1 = summary
-                .1
-                .checked_add(entry.uncompressed_byte_size)
-                .ok_or_else(|| anyhow::anyhow!("v4 administrative byte count overflow"))?;
-            summary.2.update(&bytes);
+            match layout.kind.as_str() {
+                "ndjson_partition" => {
+                    let entry = partitions.get(layout.path.as_str()).ok_or_else(|| {
+                        anyhow::anyhow!("v4 administrative layout references a missing partition")
+                    })?;
+                    if entry.relation != administrative_partition_prefix(&layout.relation)
+                        || !used_partitions.insert(layout.path.clone())
+                        || !bound_paths.insert(layout.path.clone())
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 administrative partition relation or membership is invalid"
+                        ));
+                    }
+                    let artifact = artifacts
+                        .get(entry.path.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("v4 administrative partition is missing"))?;
+                    if u64::try_from(artifact.descriptor.byte_size)?
+                        > SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 administrative partition exceeds the object ceiling"
+                        ));
+                    }
+                    let (compressed_bytes, compressed_sha256) =
+                        file_size_and_sha256(&artifact.path)?;
+                    if compressed_bytes != entry.compressed_byte_size
+                        || compressed_sha256 != entry.compressed_sha256
+                        || artifact.descriptor.checksum_sha256 != entry.compressed_sha256
+                        || artifact.descriptor.content_type != entry.media_type
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 administrative compressed descriptor mismatch"
+                        ));
+                    }
+                    let decoder = zstd::stream::read::Decoder::new(BufReader::new(File::open(
+                        &artifact.path,
+                    )?))?;
+                    let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+                    let mut digest = Sha256::new();
+                    let mut byte_size = 0_u64;
+                    let mut record_count = 0_u64;
+                    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+                    loop {
+                        let read = reader.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        let bytes = &buffer[..read];
+                        digest.update(bytes);
+                        summary.2.update(bytes);
+                        byte_size =
+                            byte_size.checked_add(u64::try_from(read)?).ok_or_else(|| {
+                                anyhow::anyhow!("v4 administrative partition byte count overflow")
+                            })?;
+                        record_count = bytes.iter().try_fold(record_count, |count, byte| {
+                            count.checked_add(u64::from(*byte == b'\n')).ok_or_else(|| {
+                                anyhow::anyhow!("v4 administrative partition record count overflow")
+                            })
+                        })?;
+                    }
+                    if byte_size != entry.uncompressed_byte_size
+                        || record_count != entry.record_count
+                        || hex::encode(digest.finalize()) != entry.uncompressed_sha256
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 administrative uncompressed descriptor mismatch"
+                        ));
+                    }
+                    summary.0 = summary.0.checked_add(record_count).ok_or_else(|| {
+                        anyhow::anyhow!("v4 administrative record count overflow")
+                    })?;
+                    summary.1 = summary
+                        .1
+                        .checked_add(byte_size)
+                        .ok_or_else(|| anyhow::anyhow!("v4 administrative byte count overflow"))?;
+                }
+                "oversized_record" => {
+                    let expected = oversized.get(layout.path.as_str()).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "v4 administrative layout references a missing oversized index"
+                        )
+                    })?;
+                    if expected.relation != layout.relation
+                        || expected.record_ordinal != summary.0
+                        || !used_oversized.insert(layout.path.clone())
+                        || !bound_paths.insert(layout.path.clone())
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 oversized administrative membership is invalid"
+                        ));
+                    }
+                    let index_artifact =
+                        artifacts.get(expected.index_path.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("v4 oversized administrative index is missing")
+                        })?;
+                    let (index_byte_size, index_sha256) =
+                        file_size_and_sha256(&index_artifact.path)?;
+                    if index_byte_size != expected.index_byte_size
+                        || index_sha256 != expected.index_sha256
+                        || index_artifact.descriptor.checksum_sha256 != expected.index_sha256
+                        || u64::try_from(index_artifact.descriptor.byte_size)? != index_byte_size
+                        || index_artifact.descriptor.content_type
+                            != "application/vnd.tiangong.scope-closure-oversized-record-index+json"
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 oversized administrative index descriptor mismatch"
+                        ));
+                    }
+                    let index: AdministrativeOversizedRecordIndex =
+                        serde_json::from_reader(BufReader::new(File::open(&index_artifact.path)?))?;
+                    if index.schema_version
+                        != "lcia.scope-closure-administrative-oversized-record.v1"
+                        || index.relation != expected.relation
+                        || index.record_ordinal != expected.record_ordinal
+                        || index.record_key != expected.record_key
+                        || index.logical_byte_size != expected.logical_byte_size
+                        || index.logical_sha256 != expected.logical_sha256
+                        || index.chunk_byte_size != ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES
+                        || index.chunk_count != u64::try_from(index.chunks.len())?
+                        || index.chunks.is_empty()
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 oversized administrative index binding mismatch"
+                        ));
+                    }
+                    let chunk_directory =
+                        Path::new(&expected.index_path).parent().ok_or_else(|| {
+                            anyhow::anyhow!("v4 oversized administrative index omitted parent")
+                        })?;
+                    let mut record_digest = Sha256::new();
+                    let mut record_bytes = 0_u64;
+                    for (ordinal, chunk) in index.chunks.iter().enumerate() {
+                        let ordinal = u64::try_from(ordinal)?;
+                        let expected_path = chunk_directory.join(format!("chunk-{ordinal:06}.bin"));
+                        if chunk.ordinal != ordinal
+                            || Path::new(&chunk.path) != expected_path
+                            || chunk.byte_size == 0
+                            || chunk.byte_size > ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES
+                            || (ordinal + 1 < index.chunk_count
+                                && chunk.byte_size != ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES)
+                            || !bound_paths.insert(chunk.path.clone())
+                        {
+                            return Err(anyhow::anyhow!(
+                                "v4 oversized administrative chunk order or size is invalid"
+                            ));
+                        }
+                        let artifact = artifacts.get(chunk.path.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("v4 oversized administrative chunk is missing")
+                        })?;
+                        let (physical_size, physical_sha256) =
+                            file_size_and_sha256(&artifact.path)?;
+                        if physical_size != chunk.byte_size
+                            || physical_sha256 != chunk.sha256
+                            || u64::try_from(artifact.descriptor.byte_size)? != chunk.byte_size
+                            || artifact.descriptor.checksum_sha256 != chunk.sha256
+                            || artifact.descriptor.content_type
+                                != "application/vnd.tiangong.scope-closure-canonical-json-chunk"
+                        {
+                            return Err(anyhow::anyhow!(
+                                "v4 oversized administrative chunk descriptor mismatch"
+                            ));
+                        }
+                        let mut reader =
+                            BufReader::with_capacity(64 * 1024, File::open(&artifact.path)?);
+                        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+                        loop {
+                            let read = reader.read(&mut buffer)?;
+                            if read == 0 {
+                                break;
+                            }
+                            let bytes = &buffer[..read];
+                            record_digest.update(bytes);
+                            summary.2.update(bytes);
+                            record_bytes = record_bytes
+                                .checked_add(u64::try_from(read)?)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "v4 oversized administrative byte count overflow"
+                                    )
+                                })?;
+                        }
+                    }
+                    if record_bytes != index.logical_byte_size
+                        || hex::encode(record_digest.finalize()) != index.logical_sha256
+                    {
+                        return Err(anyhow::anyhow!(
+                            "v4 oversized administrative logical record mismatch"
+                        ));
+                    }
+                    summary.2.update(b"\n");
+                    summary.0 = summary.0.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("v4 administrative record count overflow")
+                    })?;
+                    summary.1 = summary
+                        .1
+                        .checked_add(record_bytes)
+                        .and_then(|bytes| bytes.checked_add(1))
+                        .ok_or_else(|| anyhow::anyhow!("v4 administrative byte count overflow"))?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "v4 administrative layout kind is unsupported"
+                    ));
+                }
+            }
+        }
+        if used_partitions.len() != partitions.len() || used_oversized.len() != oversized.len() {
+            return Err(anyhow::anyhow!(
+                "v4 administrative layout does not bind exact segment membership"
+            ));
         }
         for expected in &manifest.administrative_evidence {
             let (record_count, logical_byte_size, digest) = summaries
@@ -9568,7 +10092,7 @@ mod tests {
                 "v4 manifest contains an unbound administrative relation"
             ));
         }
-        Ok(())
+        Ok(bound_paths)
     }
 
     fn reconstruct_complete_machine_result(
@@ -9685,28 +10209,23 @@ mod tests {
                 ));
             }
         }
-        let administrative_partitions =
+        let administrative_paths =
             if manifest.schema_version == "lcia.scope-closure-issue-manifest.v4" {
                 let v4: ScopeClosureManifestV4 =
                     serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
-                validate_administrative_manifest_v4(&v4, &machine_artifacts)?;
-                v4.administrative_partitions
+                validate_administrative_manifest_v4(&v4, &machine_artifacts)?
             } else {
-                Vec::new()
+                BTreeSet::new()
             };
         let expected_paths = manifest
             .partitions
             .iter()
             .map(|entry| entry.path.as_str())
             .chain(manifest.evidence.iter().map(|entry| entry.path.as_str()))
-            .chain(
-                administrative_partitions
-                    .iter()
-                    .map(|entry| entry.path.as_str()),
-            )
+            .chain(administrative_paths.iter().map(String::as_str))
             .collect::<BTreeSet<_>>();
         if expected_paths.len()
-            != manifest.partitions.len() + manifest.evidence.len() + administrative_partitions.len()
+            != manifest.partitions.len() + manifest.evidence.len() + administrative_paths.len()
             || expected_paths != machine_artifacts.keys().copied().collect::<BTreeSet<_>>()
         {
             return Err(anyhow::anyhow!(
@@ -10407,7 +10926,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            let (entries, artifacts, _) = writer.finish().unwrap();
+            let (entries, artifacts, ..) = writer.finish().unwrap();
             let compressed = artifacts
                 .iter()
                 .map(|artifact| fs::read(&artifact.path).unwrap())
@@ -11212,7 +11731,7 @@ mod tests {
                 enforce_scope_closure_memory_budget("qualified_relation_partition_scale").unwrap();
             }
         }
-        let (entries, artifacts, _) = writer.finish().unwrap();
+        let (entries, artifacts, ..) = writer.finish().unwrap();
         let recovered_records = entries.iter().map(|entry| entry.record_count).sum::<u64>();
         let uncompressed_bytes = entries
             .iter()
@@ -11986,6 +12505,436 @@ mod tests {
         assert!(error.to_string().contains("max_bytes=1024"));
     }
 
+    fn exact_canonical_record_bytes(total_ndjson_bytes: usize, seed: u64) -> Vec<u8> {
+        const PREFIX: &[u8] = br#"{"payload":""#;
+        const SUFFIX: &[u8] = b"\"}\n";
+        assert!(total_ndjson_bytes >= PREFIX.len() + SUFFIX.len());
+        let payload_bytes = total_ndjson_bytes - PREFIX.len() - SUFFIX.len();
+        let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        let mut state = seed.max(1);
+        let mut bytes = Vec::with_capacity(total_ndjson_bytes);
+        bytes.extend_from_slice(PREFIX);
+        if seed == 0 {
+            bytes.resize(PREFIX.len() + payload_bytes, b'x');
+        } else {
+            for _ in 0..payload_bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(alphabet[usize::try_from(state & 63).unwrap()]);
+            }
+        }
+        bytes.extend_from_slice(SUFFIX);
+        assert_eq!(bytes.len(), total_ndjson_bytes);
+        let value: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            canonical_json_bytes(&value).unwrap(),
+            &bytes[..bytes.len() - 1]
+        );
+        bytes
+    }
+
+    fn administrative_manifest_fixture(
+        relation: &str,
+        accumulator: IssuePartitionAccumulator,
+    ) -> (ScopeClosureManifestV4, Vec<PreparedArtifact>) {
+        let (
+            administrative_partitions,
+            artifacts,
+            logical_sha256,
+            record_count,
+            logical_byte_size,
+            mut administrative_layout,
+            mut administrative_oversized_records,
+        ) = accumulator.finish().unwrap();
+        for entry in &mut administrative_layout {
+            entry.relation = relation.to_owned();
+        }
+        for entry in &mut administrative_oversized_records {
+            entry.relation = relation.to_owned();
+        }
+        let issue_manifest = IssuePartitionManifestV3 {
+            schema_version: "lcia.scope-closure-issue-manifest.v4".to_owned(),
+            closure_check_id: Uuid::nil(),
+            logical_issue_stream_sha256: sha256_hex(&[]),
+            logical_issue_event_count: 0,
+            logical_issue_stream_byte_size: 0,
+            partition_max_records: ISSUE_PARTITION_MAX_RECORDS,
+            partition_max_uncompressed_bytes: ISSUE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            issue_count: 0,
+            occurrence_count: 0,
+            affected_root_count: 0,
+            expanded_affected_root_record_count: 0,
+            root_impact_record_count: 0,
+            root_count: 0,
+            graph_node_count: 0,
+            graph_edge_count: 0,
+            relation_stream_sha256: IssueRelationStreamHashesV3 {
+                issues: sha256_hex(&[]),
+                tidas_issue_stream: sha256_hex(&[]),
+                root_impact_index: sha256_hex(&[]),
+                frozen_reference_graph: sha256_hex(&[]),
+            },
+            ordering: IssueManifestOrdering {
+                issue_key: "UTF-8 ascending".to_owned(),
+                root_ordinal: "exact dataset identity ascending".to_owned(),
+                graph_node_ordinal: "exact dataset identity ascending".to_owned(),
+                root_impact_key: "UTF-8 ascending".to_owned(),
+            },
+            rpc_issue_sample_limit: ISSUE_INLINE_ISSUE_SAMPLE_LIMIT,
+            rpc_occurrence_sample_limit_per_issue: ISSUE_INLINE_OCCURRENCE_SAMPLE_LIMIT,
+            rpc_affected_root_sample_limit_per_issue: ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT,
+            xlsx_issue_sample_limit: XLSX_ISSUE_SAMPLE_LIMIT,
+            xlsx_occurrence_sample_limit: XLSX_OCCURRENCE_SAMPLE_LIMIT,
+            xlsx_affected_root_sample_limit: XLSX_AFFECTED_ROOT_SAMPLE_LIMIT,
+            compatibility: IssueManifestCompatibility {
+                readable_schema_versions: vec![
+                    "lcia.scope-closure-issue-manifest.v2".to_owned(),
+                    "lcia.scope-closure-issue-manifest.v3".to_owned(),
+                    "lcia.scope-closure-issue-manifest.v4".to_owned(),
+                ],
+                v2_affected_root_projection: "fixture".to_owned(),
+                public_transport: Vec::new(),
+            },
+            evidence: Vec::new(),
+            partitions: Vec::new(),
+        };
+        (
+            ScopeClosureManifestV4 {
+                issue_manifest,
+                administrative_evidence: vec![AdministrativeEvidenceSummary {
+                    relation: relation.to_owned(),
+                    record_count,
+                    logical_byte_size,
+                    logical_sha256,
+                    partition_prefix: administrative_partition_prefix(relation),
+                }],
+                administrative_partitions,
+                administrative_layout,
+                administrative_oversized_records,
+                administrative_partition_max_records: ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+                administrative_partition_max_uncompressed_bytes:
+                    ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+                administrative_oversized_record_chunk_bytes:
+                    ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES,
+                per_object_max_bytes: SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES,
+            },
+            artifacts,
+        )
+    }
+
+    fn validate_administrative_fixture(
+        manifest: &ScopeClosureManifestV4,
+        artifacts: &[PreparedArtifact],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        let artifact_map = artifacts
+            .iter()
+            .map(|artifact| (artifact.descriptor.file_name.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        validate_administrative_manifest_v4(manifest, &artifact_map)
+    }
+
+    #[test]
+    fn administrative_oversized_record_boundaries_preserve_normal_ndjson_and_logical_hash() {
+        for (case, total_bytes) in [
+            ("minus-one", 32 * 1024 * 1024 - 1),
+            ("equal", 32 * 1024 * 1024),
+            ("plus-one", 32 * 1024 * 1024 + 1),
+            ("production", 36_105_476),
+            ("sixty-four-mib", 64 * 1024 * 1024),
+        ] {
+            let record = exact_canonical_record_bytes(total_bytes, 0);
+            let temp = Arc::new(TempDir::new().unwrap());
+            let mut accumulator = IssuePartitionAccumulator::with_limits(
+                temp,
+                "administrative/documents",
+                ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+                ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            );
+            accumulator
+                .push_bytes(&format!("record-{case}"), &record)
+                .unwrap();
+            let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+            validate_administrative_fixture(&manifest, &artifacts).unwrap();
+            let summary = &manifest.administrative_evidence[0];
+            assert_eq!(summary.record_count, 1);
+            assert_eq!(summary.logical_byte_size, total_bytes as u64);
+            assert_eq!(summary.logical_sha256, sha256_hex(&record));
+            if total_bytes <= 32 * 1024 * 1024 {
+                assert_eq!(manifest.administrative_partitions.len(), 1);
+                assert!(manifest.administrative_oversized_records.is_empty());
+                let partition = &manifest.administrative_partitions[0];
+                let artifact = artifacts
+                    .iter()
+                    .find(|artifact| artifact.descriptor.file_name == partition.path)
+                    .unwrap();
+                assert_eq!(
+                    zstd::stream::decode_all(File::open(&artifact.path).unwrap()).unwrap(),
+                    record
+                );
+            } else {
+                assert!(manifest.administrative_partitions.is_empty());
+                assert_eq!(manifest.administrative_oversized_records.len(), 1);
+                let oversized = &manifest.administrative_oversized_records[0];
+                assert_eq!(oversized.logical_byte_size, total_bytes as u64 - 1);
+                assert_eq!(
+                    oversized.logical_sha256,
+                    sha256_hex(&record[..record.len() - 1])
+                );
+                assert!(artifacts.iter().all(|artifact| {
+                    u64::try_from(artifact.descriptor.byte_size).unwrap()
+                        <= ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_record_unicode_newline_and_incompressible_content_is_byte_exact() {
+        let mut text = String::with_capacity(40 * 1024 * 1024);
+        while text.len() < 36 * 1024 * 1024 {
+            text.push_str("生命周期🌏\n");
+        }
+        let value = json!({
+            "incompressible": String::from_utf8(
+                exact_canonical_record_bytes(33 * 1024 * 1024, 0x181)
+            ).unwrap(),
+            "unicodeAndNewlines": text,
+        });
+        let mut record = canonical_json_bytes(&value).unwrap();
+        record.push(b'\n');
+        assert!(record.len() > 32 * 1024 * 1024);
+        let mut accumulator = IssuePartitionAccumulator::with_limits(
+            Arc::new(TempDir::new().unwrap()),
+            "administrative/documents",
+            ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+            ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+        );
+        accumulator.push_bytes("unicode-newline", &record).unwrap();
+        let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+        validate_administrative_fixture(&manifest, &artifacts).unwrap();
+        assert_eq!(
+            manifest.administrative_evidence[0].logical_sha256,
+            sha256_hex(&record)
+        );
+    }
+
+    #[test]
+    fn oversized_record_reader_rejects_missing_duplicate_reordered_and_tampered_chunks() {
+        let record = exact_canonical_record_bytes(36_105_476, 0x181);
+        let build = || {
+            let mut accumulator = IssuePartitionAccumulator::with_limits(
+                Arc::new(TempDir::new().unwrap()),
+                "administrative/documents",
+                ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+                ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            );
+            accumulator.push_bytes("production-tail", &record).unwrap();
+            administrative_manifest_fixture("documents", accumulator)
+        };
+
+        let (manifest, mut missing) = build();
+        let chunk_path = missing
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name.ends_with("chunk-000000.bin"))
+            .unwrap()
+            .descriptor
+            .file_name
+            .clone();
+        missing.retain(|artifact| artifact.descriptor.file_name != chunk_path);
+        assert!(validate_administrative_fixture(&manifest, &missing).is_err());
+
+        let (manifest, mut tampered) = build();
+        let chunk = tampered
+            .iter_mut()
+            .find(|artifact| artifact.descriptor.file_name.ends_with("chunk-000000.bin"))
+            .unwrap();
+        let mut bytes = fs::read(&chunk.path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&chunk.path, bytes).unwrap();
+        assert!(validate_administrative_fixture(&manifest, &tampered).is_err());
+
+        for mutation in ["duplicate", "reordered", "record-ordinal"] {
+            let (mut manifest, mut artifacts) = build();
+            let expected = &mut manifest.administrative_oversized_records[0];
+            let index_artifact = artifacts
+                .iter_mut()
+                .find(|artifact| artifact.descriptor.file_name == expected.index_path)
+                .unwrap();
+            let mut index: AdministrativeOversizedRecordIndex =
+                serde_json::from_reader(BufReader::new(File::open(&index_artifact.path).unwrap()))
+                    .unwrap();
+            match mutation {
+                "duplicate" => {
+                    index.chunks.insert(1, index.chunks[0].clone());
+                    index.chunk_count += 1;
+                }
+                "reordered" => index.chunks.swap(0, 1),
+                "record-ordinal" => {
+                    index.record_ordinal += 1;
+                    expected.record_ordinal += 1;
+                }
+                _ => unreachable!(),
+            }
+            let bytes = canonical_json_bytes(&index).unwrap();
+            fs::write(&index_artifact.path, &bytes).unwrap();
+            expected.index_byte_size = bytes.len() as u64;
+            expected.index_sha256 = sha256_hex(&bytes);
+            index_artifact.descriptor.byte_size = bytes.len();
+            index_artifact.descriptor.checksum_sha256 = expected.index_sha256.clone();
+            assert!(
+                validate_administrative_fixture(&manifest, &artifacts).is_err(),
+                "{mutation} chunk index must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_record_layout_interleaves_normal_records_without_changing_relation_bytes() {
+        let first = b"{\"ordinal\":0}\n".to_vec();
+        let oversized = exact_canonical_record_bytes(1024, 0x181);
+        let last = b"{\"ordinal\":2}\n".to_vec();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&oversized);
+        expected.extend_from_slice(&last);
+        let mut accumulator = IssuePartitionAccumulator::with_limits(
+            Arc::new(TempDir::new().unwrap()),
+            "administrative/documents",
+            25_000,
+            128,
+        );
+        accumulator.push_bytes("000", &first).unwrap();
+        accumulator.push_bytes("001", &oversized).unwrap();
+        accumulator.push_bytes("002", &last).unwrap();
+        let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+        validate_administrative_fixture(&manifest, &artifacts).unwrap();
+        assert_eq!(
+            manifest
+                .administrative_layout
+                .iter()
+                .map(|entry| (entry.sequence_ordinal, entry.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "ndjson_partition"),
+                (1, "oversized_record"),
+                (2, "ndjson_partition"),
+            ]
+        );
+        assert_eq!(manifest.administrative_evidence[0].record_count, 3);
+        assert_eq!(
+            manifest.administrative_evidence[0].logical_byte_size,
+            expected.len() as u64
+        );
+        assert_eq!(
+            manifest.administrative_evidence[0].logical_sha256,
+            sha256_hex(&expected)
+        );
+    }
+
+    #[test]
+    fn oversized_record_output_is_retry_deterministic_and_cancellation_cleans_temp() {
+        let record = exact_canonical_record_bytes(36_105_476, 0x181);
+        let build = || {
+            let mut accumulator = IssuePartitionAccumulator::with_limits(
+                Arc::new(TempDir::new().unwrap()),
+                "administrative/documents",
+                ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+                ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+            );
+            accumulator.push_bytes("production-tail", &record).unwrap();
+            let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+            let identity = artifacts
+                .iter()
+                .map(|artifact| {
+                    (
+                        artifact.descriptor.file_name.clone(),
+                        artifact.descriptor.byte_size,
+                        artifact.descriptor.checksum_sha256.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (manifest, identity)
+        };
+        assert_eq!(build(), build());
+
+        let temp = Arc::new(TempDir::new().unwrap());
+        let temp_path = temp.path().to_owned();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut accumulator = IssuePartitionAccumulator::with_limits(
+            temp,
+            "administrative/documents",
+            ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+            ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+        );
+        assert!(
+            accumulator
+                .push_bytes_cancellable("cancelled", &record, &cancellation)
+                .is_err()
+        );
+        drop(accumulator);
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    #[ignore = "qualification gate: materializes a logical record above the 256 MiB object ceiling"]
+    fn oversized_record_above_physical_object_ceiling_is_segmented_into_bounded_objects() {
+        let started = Instant::now();
+        let total_bytes = 256 * 1024 * 1024 + 1;
+        let record = exact_canonical_record_bytes(total_bytes, 0x181);
+        let temp = Arc::new(TempDir::new().unwrap());
+        let mut accumulator = IssuePartitionAccumulator::with_limits(
+            Arc::clone(&temp),
+            "administrative/documents",
+            ADMINISTRATIVE_PARTITION_MAX_RECORDS,
+            ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES,
+        );
+        accumulator
+            .push_bytes("above-object-ceiling", &record)
+            .unwrap();
+        let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+        validate_administrative_fixture(&manifest, &artifacts).unwrap();
+        assert!(artifacts.len() > 32);
+        assert!(artifacts.iter().all(|artifact| {
+            u64::try_from(artifact.descriptor.byte_size).unwrap()
+                <= ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES
+        }));
+        enforce_scope_closure_object_ceiling(&artifacts).unwrap();
+        let total_object_bytes = artifacts.iter().fold(0_u64, |total, artifact| {
+            total.saturating_add(artifact.descriptor.byte_size as u64)
+        });
+        let maximum_object_bytes = artifacts
+            .iter()
+            .map(|artifact| artifact.descriptor.byte_size as u64)
+            .max()
+            .unwrap_or_default();
+        let temp_bytes = directory_bytes(temp.path()).unwrap_or_default();
+        println!(
+            "{}",
+            canonical_value(&json!({
+                "schemaVersion": "lcia.scope-closure-oversized-record-qualification.v1",
+                "logicalRecordBytes": total_bytes,
+                "logicalRelationSha256": manifest.administrative_evidence[0].logical_sha256,
+                "oversizedRecordCount": manifest.administrative_oversized_records.len(),
+                "descriptorCount": artifacts.len(),
+                "objectBytes": total_object_bytes,
+                "maximumObjectBytes": maximum_object_bytes,
+                "tempBytes": temp_bytes,
+                "wallMilliseconds": started.elapsed().as_millis(),
+                "resources": ResourceMeasurement::capture(
+                    "oversized_record_qualification",
+                    ResourceCounters {
+                        temp_bytes: Some(temp_bytes),
+                        object_bytes: Some(total_object_bytes),
+                        rows: Some(1),
+                        ..ResourceCounters::default()
+                    },
+                ),
+            }))
+        );
+    }
+
     #[test]
     fn simulated_storage_limit_rejects_legacy_monolith_but_accepts_bounded_partitions() {
         const SIMULATED_OBJECT_LIMIT: u64 = 1024 * 1024;
@@ -12009,7 +12958,7 @@ mod tests {
             partitions.push(&format!("{ordinal:020}"), &value).unwrap();
         }
         assert!(legacy_monolith_bytes > SIMULATED_OBJECT_LIMIT);
-        let (entries, artifacts, _) = partitions.finish().unwrap();
+        let (entries, artifacts, ..) = partitions.finish().unwrap();
         assert!(entries.len() > 1);
         assert!(
             entries
@@ -12807,7 +13756,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let (issue_entries, issue_artifacts, issue_hash) = issues.finish().unwrap();
+        let (issue_entries, issue_artifacts, issue_hash, ..) = issues.finish().unwrap();
 
         let mut occurrences = IssuePartitionAccumulator::new(Arc::clone(&temp), "occurrences");
         occurrences
@@ -12820,7 +13769,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let (occurrence_entries, occurrence_artifacts, occurrence_hash) =
+        let (occurrence_entries, occurrence_artifacts, occurrence_hash, ..) =
             occurrences.finish().unwrap();
 
         let mut affected_roots =
@@ -12831,7 +13780,7 @@ mod tests {
                 &affected_root_partition_record(issue_key, &root, std::slice::from_ref(&root)),
             )
             .unwrap();
-        let (affected_entries, affected_artifacts, affected_hash) =
+        let (affected_entries, affected_artifacts, affected_hash, ..) =
             affected_roots.finish().unwrap();
 
         let mut entries = issue_entries
