@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/linancn/tiangong-lca-worker/blob/main/docs/agents/contracts/scope-closure-external-result.v1.schema.json",
+  "$comment": "Worker compatibility snapshot of lca-workspace #518 child input contract.",
+  "title": "Child-owned scope-closure external qualification result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "components", "source", "tidas", "resources", "traversal"],
+  "properties": {
+    "schemaVersion": {"const": "lcia.scope-closure-external-result.v1"},
+    "components": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureSha256", "includedRecords", "excludedRecords", "malformedRecords", "recordSizeDistribution"],
+      "properties": {
+        "fixtureSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "includedRecords": {"type": "integer", "minimum": 1},
+        "excludedRecords": {"type": "integer", "minimum": 0},
+        "malformedRecords": {"const": 0},
+        "recordSizeDistribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["p50", "p95", "p99", "max"],
+          "properties": {
+            "p50": {"type": "integer", "minimum": 0},
+            "p95": {"type": "integer", "minimum": 0},
+            "p99": {"type": "integer", "minimum": 0},
+            "max": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "tidas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "protocol", "events", "spoolBytes", "spoolSha256", "wallTimeSeconds", "processPeakRssBytes"],
+      "properties": {
+        "version": {"const": "0.1.2"},
+        "protocol": {"const": "document-validation-batch.v1"},
+        "events": {"type": "integer", "minimum": 1},
+        "spoolBytes": {"type": "integer", "minimum": 1},
+        "spoolSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "wallTimeSeconds": {"type": "number", "minimum": 0},
+        "processPeakRssBytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "traversal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documents", "edges", "roots"],
+      "properties": {
+        "documents": {"type": "integer", "minimum": 1},
+        "edges": {"type": "integer", "minimum": 0},
+        "roots": {"type": "integer", "minimum": 0}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wallTimeSeconds", "processPeakRssBytes", "cgroupAnonBytes", "cgroupFileBytes", "cgroupCurrentBytes", "cgroupPeakBytes", "tempPeakBytes", "tempFinalBytes", "budgetsPassed"],
+      "properties": {
+        "wallTimeSeconds": {"type": "number", "minimum": 0},
+        "processPeakRssBytes": {"type": "integer", "minimum": 0},
+        "cgroupAnonBytes": {"type": "integer", "minimum": 0},
+        "cgroupFileBytes": {"type": "integer", "minimum": 0},
+        "cgroupCurrentBytes": {"type": "integer", "minimum": 0},
+        "cgroupPeakBytes": {"type": "integer", "minimum": 0},
+        "tempPeakBytes": {"type": "integer", "minimum": 0},
+        "tempFinalBytes": {"const": 0},
+        "budgetsPassed": {"const": true}
+      }
+    }
+  }
+}

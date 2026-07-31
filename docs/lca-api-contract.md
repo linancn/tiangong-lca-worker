@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-31
-lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: public XLSX/manifest DTOs remain unchanged while real-payload qualification covers internal bounded partitions and oversized-record chunks."
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Reviewed for Worker Issue #186: qualification child-result envelopes and owning-repo provider fragments do not change public Worker, Edge, or Next DTOs."
 related:
   - AGENTS.md
   - .docpact/config.yaml

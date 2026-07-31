@@ -20,8 +20,8 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-31
-lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: package binding reads real-payload v4 evidence and oversized-record indexes/chunks through verified streaming without changing import/export semantics."
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Reviewed for Worker Issue #186: the external qualification harness streams a local ZIP and exact TIDAS validation without changing asynchronous package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

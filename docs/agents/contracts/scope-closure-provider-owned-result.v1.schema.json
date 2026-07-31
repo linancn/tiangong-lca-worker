@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/linancn/tiangong-lca-worker/blob/main/docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json",
+  "title": "Owning-repository provider qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "owner", "component", "componentSha", "targetClass", "productionMutation", "assertions", "evidence"],
+  "properties": {
+    "schemaVersion": {"const": "lcia.scope-closure-provider-owned-result.v1"},
+    "runId": {"type": "string", "format": "uuid"},
+    "owner": {"enum": ["database", "storage", "edge", "next"]},
+    "component": {"enum": ["database", "edge", "next"]},
+    "componentSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "targetClass": {"const": "isolated-production-equivalent"},
+    "productionMutation": {"const": false},
+    "assertions": {"type": "integer", "minimum": 1},
+    "evidence": {"type": "object", "minProperties": 1}
+  }
+}

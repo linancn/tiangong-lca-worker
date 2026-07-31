@@ -25,9 +25,15 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+  - docs/agents/contracts/scope-closure-external-result.v1.schema.json
+  - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
+  - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
+  - scripts/scope_closure_qualification.py
+  - scripts/run_scope_closure_external_qualification.sh
+  - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-07-31
-lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #182 on top of #181: local qualification preserves actual package payloads, separates real evidence from synthetic scale, and exercises deterministic oversized-record segmentation."
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Updated for Worker Issue #186: git-tracked external and isolated-provider executables emit the exact root qualification child contracts and fail closed on identity, payload, target, or cleanup drift."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -110,6 +116,33 @@ The Worker consumes validation evidence under fixed resource windows: at most 25
 Before coalescing begins, temporary-disk admission projects only stages derivable from observed raw bytes and bounded active windows. It adds a 25% safety margin plus the fixed 512 MiB reserve. The global requested-root count is never multiplied by issue count for admission. Source impact is encoded once as compact ordinals, and witness evidence is stored once as the frozen reference graph, so physical temporary and artifact bytes do not scale with `issue × root × witness length`. Initial or incremental shortage returns the stable `scope_closure_relation_temp_space_low` error with its stage, available, planned, required, and reserve bytes. Run creation, merge consumption, and partition completion use best-effort sequential-access/cache-release hints, while Linux phase telemetry records process RSS and cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`. Cancellation, lease loss, or any admission failure cleans every owned temporary directory.
 
 Local capacity qualification has two non-interchangeable modes. `real-payload` bounded-reads and preserves each actual package document JSON value, validates and accounts for every package member, and fails closed on malformed, oversized, or unexpectedly shaped input. `synthetic-cardinality` generates deterministic scale and distribution evidence only; it cannot substantiate real-package behavior. A real-payload result reports per-administrative-relation p50/p95/p99/max logical and standalone-zstd record bytes plus the maximum exact identity, and labels any synthetic topology scaffold separately from package payload evidence.
+
+The git-tracked external qualification entrypoint is
+`scripts/run_scope_closure_external_qualification.sh --fixture <zip> --output <dir>`.
+It runs only on Linux, requires an exact executable `TIDAS_BIN=0.1.2`, streams a
+bounded safe extraction without logging payloads, validates the native TIDAS
+protocol and spool identity, and runs the same real package/spool through exact
+`cold`, `warm`, `mixed`, and `stale` capacity modes. The four logical and artifact
+identities and stable counts must agree before
+`lcia.scope-closure-external-result.v1` is written atomically. The child result
+contains only aggregate source accounting/distribution, authoritative
+document/edge/root counts, TIDAS version/protocol/spool evidence, process RSS,
+cgroup v2 memory, temporary-space, and wall-time evidence. Package paths,
+payloads, private fixture content, logs, credentials, and locators are never
+result fields.
+
+The git-tracked provider entrypoint is
+`scripts/run_scope_closure_provider_qualification.sh --output <file>`. It accepts
+only explicitly confirmed loopback `QUALIFICATION_*` targets and invokes
+git-tracked, exact-SHA adapters in Database, Edge, and Next. Those owning
+repositories produce `lcia.scope-closure-provider-owned-result.v1` fragments for
+their own database/storage/publication/download/lifecycle/consumer assertions.
+Worker only verifies identity, positive evidence, scale and cleanup invariants,
+merges disjoint fragments, and emits
+`lcia.scope-closure-provider-result.v1`. It does not reproduce another
+repository's business assertion. Missing adapters or credentials, a production
+fingerprint, descriptor-scale/batch drift, retry/fence/seal/finalize/download/GC
+failure, secret or locator material, or cleanup residue fails before output.
 
 On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 

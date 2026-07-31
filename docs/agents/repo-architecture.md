@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-31
-lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: real package payloads exercise the existing bounded administrative partitions and deterministic indexed canonical-byte chunks without changing architecture ownership."
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Updated for Worker Issue #186: Worker owns external/provider orchestration and envelope validation while provider assertions remain in their owning repositories."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -81,6 +81,8 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
+| `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
+| `docs/agents/contracts/scope-closure-*-result.v1.schema.json` | compatibility snapshots for the root child-result envelopes and the owning-repository provider fragment boundary |
 | `crates/solver-worker/src/tidas_cli.rs` | single-binary Rust tidas version/protocol handshake, bounded command execution, report validation, and spool hash/count verification |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
@@ -121,6 +123,14 @@ The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND
 ### Scope closure and certificate-bound build
 
 `crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope.
+
+Qualification preserves the same ownership boundary. Worker owns real payload
+collection, TIDAS/spool verification, four-mode capacity replay, resource
+sampling, and child-envelope validation. Database, Storage, Edge, and Next own
+their provider-facing assertions and expose only aggregate, locator-free
+fragments through git-tracked exact-checkout adapters. The Worker aggregator
+cannot turn a missing owner fragment into passed evidence and cannot infer a
+foreign business assertion from its own mocks.
 
 The same module invokes TIDAS `document-validation-batch.v1` through `tidas_cli.rs`. The adapter accepts one `TIDAS_BIN`, requires the exact expected Rust release version, verifies `validate --describe`, hashes issue events from their original NDJSON lines before parsing, and rejects any SHA-256/byte/count or asset-fingerprint drift. Validation evidence lookup is capped at 256 keys, uncached execution at 64 documents, and cache writes at 8 MiB. Traversal writes canonical document payloads and full reference evidence to temporary random-access/sorted spools, retains only document metadata plus a numeric-ID graph, and reloads payloads only for uncached validation windows. Canonical v3 issue coalescing uses bounded external sort, one source reachability state, source-level compact root ordinals, and one frozen reverse graph; it never emits issue×root×full-witness partitions. Fresh v4 publication preserves those semantics, compresses ordinary administrative scan/resolution records into deterministic 25,000-record/32 MiB partitions, and replaces the monolithic closure bundle with a small relation-hash binding manifest. A single record above that window is represented by one canonical index and contiguous fixed 8 MiB canonical-byte chunks; the layout stream interleaves that logical record with ordinary partitions, so reconstruction hashes the original record bytes plus newline without redefining relation identity. The exact TIDAS event stream is compressed once, coalesced issue records are globally ordered once into final zstd partitions, and historical readers remain version-dispatched. Every object is file-backed and admitted below a 256 MiB ceiling before Database #316 write-set creation; bounded XLSX, temporary-space reserve, automatic cleanup, RSS/cgroup telemetry, and lease-driven cancellation remain in force. Database #316 pre-registers descriptors in bounded batches and atomically seals an exact artifact map before Worker uploads any object; finalization is the only transition to `ready`. The snapshot builder still runs first for non-persisting signed-flow discovery and persists a bound HDF5 numerical snapshot only after the discovered Process axis is rescanned and blocker-free. Blocked or incomplete checks produce no numerical snapshot or certificate. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/HDF5/index/build-contract/bundle/report binding against the database and reads bundle binding fields from a bounded local file. See `docs/scope-closure-contract.md` and the narrow memory/result contract for exact behavior.
 
