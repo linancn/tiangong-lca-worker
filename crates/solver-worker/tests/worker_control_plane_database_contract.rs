@@ -2,7 +2,6 @@ use std::env;
 
 use serde_json::{Value, json};
 use solver_worker::{
-    artifact_gc::{ARTIFACT_GC_JOB_KIND, ARTIFACT_GC_REQUEST_SCHEMA_VERSION},
     pgbouncer_sqlx::{self as sqlx, Executor, PgPool, Row},
     worker_control_plane::{
         INSERT_MAINTENANCE_ARTIFACT_SQL, WORKER_JOB_ARTIFACTS_TABLE, WORKER_JOB_DOMAIN_REFS_TABLE,
@@ -17,6 +16,8 @@ use uuid::Uuid;
 
 const DATABASE_URL_ENV: &str = "WORKER_CONTROL_PLANE_DATABASE_URL";
 const MIGRATION_VERSION_ENV: &str = "WORKER_CONTROL_PLANE_MIGRATION_VERSION";
+const CONTRACT_JOB_KIND: &str = "lca.result_gc";
+const CONTRACT_PAYLOAD_SCHEMA_VERSION: &str = "lca.result_gc.request.v1";
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} is required by the isolated DB harness"))
@@ -74,7 +75,10 @@ async fn enqueue(
         concurrency_key,
     )
     .await?;
-    anyhow::ensure!(result.get("ok").and_then(Value::as_bool) == Some(true));
+    anyhow::ensure!(
+        result.get("ok").and_then(Value::as_bool) == Some(true),
+        "worker_enqueue_job returned non-ok result: {result}"
+    );
     Ok(result)
 }
 
@@ -101,6 +105,28 @@ async fn cancel(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Value> {
     .fetch_one(pool)
     .await?;
     Ok(row.try_get("result")?)
+}
+
+async fn cancel_prior_harness_jobs(pool: &PgPool) -> anyhow::Result<()> {
+    let job_ids: Vec<Uuid> = sqlx::query_scalar(
+        r"
+        SELECT id
+        FROM private.worker_jobs
+        WHERE idempotency_key LIKE 'worker-private-contract:%'
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+        ORDER BY created_at, id
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+    for job_id in job_ids {
+        let result = cancel(pool, job_id).await?;
+        anyhow::ensure!(
+            result["ok"] == true,
+            "prior harness job cleanup failed: {result}"
+        );
+    }
+    Ok(())
 }
 
 async fn complete(pool: &PgPool, job: &WorkerJob) -> anyhow::Result<()> {
@@ -201,9 +227,10 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
             .await?;
         anyhow::ensure!(exists, "required relation is absent: {relation}");
     }
+    cancel_prior_harness_jobs(&pool).await?;
 
-    let job_kind = ARTIFACT_GC_JOB_KIND;
-    let payload_schema_version = ARTIFACT_GC_REQUEST_SCHEMA_VERSION;
+    let job_kind = CONTRACT_JOB_KIND;
+    let payload_schema_version = CONTRACT_PAYLOAD_SCHEMA_VERSION;
     let run = Uuid::new_v4();
 
     // Lost enqueue response and duplicate enqueue converge on one logical job.
@@ -239,7 +266,8 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
     .await?;
     anyhow::ensure!(conflict["ok"] == false);
     anyhow::ensure!(
-        conflict.pointer("/error/code") == Some(&json!("WORKER_JOB_CONCURRENCY_CONFLICT"))
+        conflict.get("code") == Some(&json!("WORKER_JOB_CONCURRENCY_CONFLICT")),
+        "concurrency conflict changed public error semantics: {conflict}"
     );
     anyhow::ensure!(cancel(&pool, duplicate_job_id).await?["ok"] == true);
 
@@ -269,7 +297,11 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
     claims.sort_by_key(|job| job.id);
     queued_ids.sort_unstable();
     anyhow::ensure!(claims.len() == 2);
-    anyhow::ensure!(claims.iter().map(|job| job.id).collect::<Vec<_>>() == queued_ids);
+    let claimed_ids = claims.iter().map(|job| job.id).collect::<Vec<_>>();
+    anyhow::ensure!(
+        claimed_ids == queued_ids,
+        "concurrent claim mismatch: expected {queued_ids:?}, got {claimed_ids:?}"
+    );
     anyhow::ensure!(claims[0].lease_token != claims[1].lease_token);
 
     complete(&pool, &claims[0]).await?;
