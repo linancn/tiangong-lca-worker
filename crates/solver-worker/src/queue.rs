@@ -23,6 +23,7 @@ use crate::{
         record_scope_closure_failure,
     },
     types::JobPayload,
+    worker_control_plane::worker_jobs_table,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
 
@@ -962,11 +963,15 @@ async fn fetch_worker_job_diagnostics(
     pool: &sqlx::PgPool,
     worker_job_id: Uuid,
 ) -> anyhow::Result<Value> {
-    let row = sqlx::query("SELECT diagnostics FROM public.worker_jobs WHERE id = $1")
-        .bind(worker_job_id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("worker_jobs row disappeared before result projection"))?;
+    let row = sqlx::query(concat!(
+        "SELECT diagnostics FROM ",
+        worker_jobs_table!(),
+        " WHERE id = $1"
+    ))
+    .bind(worker_job_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("worker_jobs row disappeared before result projection"))?;
     Ok(row
         .try_get::<Option<Value>, _>("diagnostics")?
         .unwrap_or_else(|| json!({})))

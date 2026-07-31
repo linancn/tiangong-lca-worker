@@ -23,8 +23,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Issue #193: the active governed Rust tidas baseline is v0.1.3 while scope-closure v3 retains the 2048 MiB Linux RSS guard."
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issues #190 and #193: private control-plane access leaves operator entry points unchanged; the governed Rust tidas baseline is v0.1.3 and scope-closure v3 retains the 2048 MiB Linux RSS guard."
 related:
   - AGENTS.md
   - .docpact/config.yaml

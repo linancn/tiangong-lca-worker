@@ -8,6 +8,7 @@ use solver_worker::{
     },
     db_pool::{APP_MAINTENANCE_WORKER, WorkerDbPoolOptions},
     pgbouncer_sqlx::{self as sqlx, Row},
+    worker_control_plane::INSERT_MAINTENANCE_ARTIFACT_SQL,
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
         record_worker_job_result,
@@ -574,23 +575,11 @@ async fn insert_maintenance_report_artifact(
         },
     });
 
-    let row = sqlx::query(
-        r"
-        INSERT INTO public.worker_job_artifacts (
-            job_id,
-            artifact_type,
-            content_type,
-            metadata,
-            visibility
-        )
-        VALUES ($1, 'maintenance_gc_report', 'application/json', $2::jsonb, 'operator')
-        RETURNING id
-        ",
-    )
-    .bind(job.id)
-    .bind(metadata)
-    .fetch_one(pool)
-    .await?;
+    let row = sqlx::query(INSERT_MAINTENANCE_ARTIFACT_SQL)
+        .bind(job.id)
+        .bind(metadata)
+        .fetch_one(pool)
+        .await?;
 
     let artifact_id = row.try_get::<Uuid, _>("id")?;
     Ok(json!({
