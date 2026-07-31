@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #179: package binding reads current bounded scope-closure v4 and historical v1/v3 bundles through file-backed streaming without changing import/export semantics."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
+lastReviewedNote: "Reviewed for Worker Issue #181: package binding accepts current v4 oversized administrative-record indexes/chunks through the verified streaming reader without changing import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

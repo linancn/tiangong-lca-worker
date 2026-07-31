@@ -24,7 +24,7 @@ const MULTIPART_UPLOAD_PART_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const XML_CONTENT_TYPE: &str = "application/xml";
 const DEFAULT_OBJECT_TRANSFER_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
-const DEFAULT_OBJECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_OBJECT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 type HmacSha256 = Hmac<Sha256>;

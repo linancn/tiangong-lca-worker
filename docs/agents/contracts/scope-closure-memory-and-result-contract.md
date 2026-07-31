@@ -21,9 +21,9 @@ checkPaths:
   - crates/solver-worker/src/scope_closure.rs
   - crates/solver-worker/src/worker_jobs.rs
   - crates/solver-worker/tests/artifact_gc_database_contract.rs
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Updated for Worker Issue #179: canonical v4 preserves v3 unified issue/root/witness semantics while partitioning administrative evidence and bounding every object before staged publication."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
+lastReviewedNote: "Updated for Worker Issue #181: canonical v4 preserves ordinary NDJSON and logical relation hashes while segmenting individually oversized administrative records into deterministic bounded objects."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -83,9 +83,13 @@ A fresh v4 result contains:
 - `evidence/frozen-reference-graph-v1.bin.zst`;
 - `administrative/<relation>/part-NNNNNN.ndjson.zst` for documents, edges, resolved references, resolution map, roots, frontier, provider universe, and omitted-version resolutions.
 
-There are no production `occurrences/*` or `affected-roots/*` partitions in v4, and `expandedAffectedRootRecordCount` is exactly zero. Issue and administrative partitions close at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON. Every physical scope-closure object must be at most 256 MiB; a larger object or single record fails before write-set creation, registration, seal, or upload. The manifest binds every artifact path, media type, compressed and uncompressed byte size and SHA-256, record count, first/last key, global relation hashes, root count, graph node/edge count, partition limits, sample limits, and ordering rules.
+There are no production `occurrences/*` or `affected-roots/*` partitions in v4, and `expandedAffectedRootRecordCount` is exactly zero. Issue partitions and ordinary administrative records close at the first of 25,000 records or 32 MiB canonical uncompressed NDJSON. An administrative record whose canonical record plus newline exceeds 32 MiB is not rejected and does not change the ordinary representation: Worker flushes the active ordinary partition, writes `administrative/<relation>/oversized/record-<logical-ordinal>/index.json`, and writes contiguous raw canonical-byte chunks named `chunk-NNNNNN.bin`. Every non-final chunk is exactly 8 MiB; the final chunk is non-empty and at most 8 MiB.
 
-The version-dispatch reader accepts v2, v3, and v4 manifests. V2 remains readable through its original issue/occurrence/affected-root partitions. V3 and V4 can project the legacy affected-root view on demand from issue records, the compact root-impact index, and the frozen graph. V4 additionally verifies every administrative partition and its relation-level logical hash/count. The reader rejects missing, extra, duplicate, reordered, truncated, hash-mismatched, boundary-inconsistent, oversized, or cardinality-inconsistent files. Writers always emit v4; they never silently downgrade.
+The oversized-record index uses `lcia.scope-closure-administrative-oversized-record.v1`. It binds the relation, logical record ordinal and stable record key, canonical record byte length and SHA-256 excluding NDJSON framing, fixed chunk size/count, and every chunk ordinal/path/length/SHA-256. The top-level manifest repeats the record/index identity and carries a relation-local layout whose contiguous sequence ordinals interleave ordinary partition paths and oversized-record index paths. A reader streams that layout in order, streams every chunk, verifies exact membership/order/length/hash, appends the one logical newline only to relation hashing/counting, and therefore reconstructs the same record count, logical byte size, and relation SHA-256 as the unsegmented canonical record plus newline. Missing, extra, duplicate, reordered, truncated, or corrupted index/chunk material fails closed.
+
+Every physical scope-closure object must remain at most 256 MiB; an oversized physical object still fails before write-set creation, registration, seal, or upload. The manifest binds every artifact path, media type, compressed and uncompressed byte size and SHA-256, record count, first/last key, global relation hashes, root count, graph node/edge count, partition/chunk limits, sample limits, and ordering rules.
+
+The version-dispatch reader accepts v2, v3, and v4 manifests. V2 remains readable through its original issue/occurrence/affected-root partitions. V3 and V4 can project the legacy affected-root view on demand from issue records, the compact root-impact index, and the frozen graph. V4 additionally verifies every administrative partition, oversized-record index/chunk set, layout sequence, and relation-level logical hash/count. Historical v4 manifests without oversized-record fields remain readable by deriving their partition-only relation layout. The reader rejects missing, extra, duplicate, reordered, truncated, hash-mismatched, boundary-inconsistent, oversized, or cardinality-inconsistent files. Writers always emit the current v4 shape; they never silently downgrade.
 
 Next and Edge continue to expose the existing XLSX and manifest download selectors and descriptors. V4 does not change their public DTO. Access to subordinate manifest members remains governed by the existing authorized artifact boundary; Worker does not create a new cross-repo public API.
 
