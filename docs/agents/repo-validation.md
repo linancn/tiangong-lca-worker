@@ -42,7 +42,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #181 with exact 32 MiB boundaries, the 36,105,476-byte production tail, 64 MiB and above-256 MiB logical records, chunk fault injection, and streamed reconstruction proof."
+lastReviewedNote: "Updated for Worker Issue #182 on top of #181 with explicit real-payload qualification, strict package and per-relation size evidence, cache scenarios, exact boundaries, and segmented-record reconstruction proof."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -88,6 +88,12 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations | record separately when durable schema proof is required in `database-engine` | Local migration files here are not the workspace-wide source of truth. |
 | manual debug, parity, or target-validation scripts | run the touched script with safe args or `--help` when available, plus baseline gates if code changed nearby | `./scripts/run_full_compute_debug.sh`, `./scripts/run_bw25_validation.sh`, or `./scripts/validate_lcia_targets.sh` as applicable | `bw25-validator` is manual-only and out-of-band. |
 | repo docs, `.env.example`, or docpact config only | `scripts/docpact validate-config --root . --strict`; `scripts/docpact lint --root . --worktree --mode enforce` | perform route checks for affected intent surfaces such as `solver-runtime`, `package-worker`, or `runtime-sql-boundary` | Refresh review metadata even when prose-only docs change. Keep `.env.example` secret-free. |
+
+### Scope-closure capacity input modes
+
+Select `real-payload` or `synthetic-cardinality` explicitly. Generated cardinality is scaling evidence only and must never be cited as real-package evidence. Real-payload qualification bounded-reads and preserves every actual package document JSON value, accounts for every package member, and fails rather than silently skipping, replacing, or truncating a document.
+
+For every administrative relation, report record count and p50/p95/p99/max logical and standalone-zstd record bytes with the maximum exact identity; represent empty relations explicitly with zero count. Exercise cold, warm, mixed, and stale cache replay without changing exact event bytes. The generated non-sensitive boundary set covers 32 MiB minus/equal/plus one byte, exactly 36,105,476 bytes, 64 MiB, incompressible content, Unicode/newlines, and oversized human-report fields through the segmented-record contract.
 
 ## Isolated Review-Submit Source-Closure Benchmark
 

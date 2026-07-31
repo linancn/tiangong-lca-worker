@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Reviewed for Worker Issue #181: deterministic oversized administrative-record chunks remain Worker-owned and do not change Database staged-publication or public DTO ownership."
+lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: real-payload capacity evidence and oversized administrative-record chunks remain Worker-owned without changing Database publication or public DTO ownership."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

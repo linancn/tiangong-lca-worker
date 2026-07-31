@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedAt: "2026-07-31"
 lastReviewedCommit: "5edde096148b1113d5d605d239cfe34d16308837"
-lastReviewedNote: "Reviewed for Worker Issue #181: scope-closure routing and ownership remain Worker-local while oversized administrative records gain deterministic bounded physical segmentation."
+lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: scope-closure routing remains Worker-local while real-payload qualification exercises deterministic bounded oversized-record segmentation."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

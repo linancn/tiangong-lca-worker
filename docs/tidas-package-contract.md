@@ -21,7 +21,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Reviewed for Worker Issue #181: package binding accepts current v4 oversized administrative-record indexes/chunks through the verified streaming reader without changing import/export semantics."
+lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: package binding reads real-payload v4 evidence and oversized-record indexes/chunks through verified streaming without changing import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/tests/artifact_gc_database_contract.rs
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #181: canonical v4 preserves ordinary NDJSON and logical relation hashes while segmenting individually oversized administrative records into deterministic bounded objects."
+lastReviewedNote: "Updated for Worker Issue #182 on top of #181: qualification distinguishes real payload from synthetic cardinality and proves bounded oversized-record segmentation with strict package, size, cache, cleanup, and cgroup evidence."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -128,11 +128,17 @@ The shared fixture, digest, ordinals, states, and stable v2 error codes are reco
 
 Before merge, the v3 implementation must pass the Worker baseline gates and the scope-closure qualification in `docs/agents/repo-validation.md`. At minimum:
 
+- qualification selects `real-payload` or `synthetic-cardinality` explicitly; generated cardinality is never real-package evidence;
+- real-payload qualification bounded-reads every package document as its actual JSON value, accounts for every package file, and fails rather than silently skipping, replacing, or truncating a document;
+- each administrative relation reports record count and p50/p95/p99/max logical and standalone-zstd record bytes, including the maximum exact identity; empty relations are explicit zero-count entries;
+- generated, non-sensitive fixtures cover 32 MiB minus/equal/plus one byte, exactly 36,105,476 bytes, 64 MiB, incompressible content, Unicode/newlines, and oversized human-report fields;
 - two complete runs over the external open-data package produce byte-identical non-summary artifacts, manifests, order, and logical hashes;
 - native TIDAS completes within 60 seconds and 512 MiB peak RSS;
 - the production-shaped closure completes within 10 minutes and 4 GiB process-tree peak RSS;
 - 1×, 2×, 5×, and 10× production-distribution runs record wall time, RSS/cgroup breakdown, temporary bytes, artifact/partition bytes and counts, descriptor count, and cache reclaim;
 - the unified issue set, blockers, verdict/certificate inputs, counts, root membership, and reconstructed witnesses are semantically equivalent to the pre-v3 result while physical expanded relations remain zero;
 - cancellation, crash, and retry are exercised at coalesce, partition write, batch registration, seal, upload, and finalization boundaries, with no visible partial set, orphan, or local temporary leak.
+
+The boundary qualification consumes the segmented-record representation owned by Worker #181 once that contract is available. The capacity harness must not duplicate or privately redefine that core chunk contract.
 
 The package fixture and generated outputs stay outside git. Qualification never deploys, restarts a server, enqueues a production task, mutates production state, or updates the root workspace submodule pointer.
