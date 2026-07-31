@@ -49,6 +49,7 @@ use crate::{
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::{ObjectStoreClient, ObjectTransferOptions},
     types::{JobPayload, SolveOptionsPayload},
+    worker_control_plane::{worker_job_artifacts_table, worker_jobs_table},
 };
 
 /// Queue message from pgmq.read.
@@ -82,7 +83,8 @@ const MAX_ALL_UNIT_BATCH_SIZE: usize = 2_048;
 const BUILD_SNAPSHOT_ADVISORY_LOCK_BASE: i64 = 0x5447_4c43_4253_4e50;
 const SNAPSHOT_BUILDER_CAPTURE_BYTES: usize = 64 * 1024;
 const DEFAULT_SNAPSHOT_BUILDER_WALL_TIMEOUT_SECONDS: u64 = 30 * 60;
-const ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL: &str = r"
+const ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL: &str = concat!(
+    r"
 WITH _service_role AS (
     SELECT set_config('request.jwt.claim.role', 'service_role', true)
 ),
@@ -93,7 +95,9 @@ _lock AS (
 active_builds AS (
     SELECT count(active.id)::integer AS active_build_count
     FROM _lock
-    LEFT JOIN public.worker_jobs AS active
+    LEFT JOIN ",
+    worker_jobs_table!(),
+    r" AS active
       ON active.worker_runtime = 'calculator'
      AND active.worker_queue = 'solver'
      AND active.job_kind = 'lca.build_snapshot'
@@ -103,7 +107,9 @@ active_builds AS (
      AND active.id <> $1
 ),
 updated AS (
-    UPDATE public.worker_jobs AS job
+    UPDATE ",
+    worker_jobs_table!(),
+    r" AS job
        SET phase = 'build_snapshot',
            progress = GREATEST(COALESCE(job.progress, 0), 0.10),
            diagnostics = COALESCE(job.diagnostics, '{}'::jsonb) || $6::jsonb,
@@ -120,7 +126,8 @@ updated AS (
 )
 SELECT active_build_count
 FROM updated
-";
+"
+);
 const REVIEW_SUBMIT_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_submit_overlay";
 const REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS: i64 = 14 * 24 * 60 * 60;
 
@@ -2713,14 +2720,16 @@ async fn verify_certified_closure_bundle_artifact(
     expected_bundle_hash: &str,
     expected_data_snapshot_token: &str,
 ) -> anyhow::Result<()> {
-    let row = sqlx::query(
+    let row = sqlx::query(concat!(
         r"
         SELECT artifact_type, storage_path, content_type, byte_size,
                checksum_sha256, metadata
-        FROM public.worker_job_artifacts
+        FROM ",
+        worker_job_artifacts_table!(),
+        r"
         WHERE id = $1
-        ",
-    )
+        "
+    ))
     .bind(expected_artifact_id)
     .fetch_optional(&state.pool)
     .await?

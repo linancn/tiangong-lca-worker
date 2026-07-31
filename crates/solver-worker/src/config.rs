@@ -18,7 +18,7 @@ pub enum RunMode {
 pub enum QueueBackend {
     /// Legacy pgmq queue payloads.
     Pgmq,
-    /// Unified `public.worker_jobs` queue payloads.
+    /// Unified logical `worker_jobs` payloads through the private Expand contract.
     WorkerJobs,
 }
 

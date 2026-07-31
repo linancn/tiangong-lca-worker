@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Reviewed for Worker Issue #186: the external qualification harness streams a local ZIP and exact TIDAS validation without changing asynchronous package import/export semantics."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #190: schema-qualified worker job access preserves asynchronous TIDAS package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

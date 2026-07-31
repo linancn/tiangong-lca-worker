@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Reviewed for Worker Issue #186: tracked qualification child executables remain Worker orchestration while Database/Storage/Edge/Next retain their provider assertion ownership."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane access remains Worker-owned implementation under the existing Database-owned schema contract."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

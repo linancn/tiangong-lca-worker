@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-07-31"
-lastReviewedCommit: "e67971ff8624fe543f10d93abe88c11bf5e1a396"
-lastReviewedNote: "Updated for Worker Issue #186: route the tracked external/provider qualification executables and child-result compatibility schemas through the Worker scope-closure contract."
+lastReviewedAt: "2026-08-01"
+lastReviewedCommit: "e5a7f769f4716266271eea53cb5233781635174f"
+lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane qualification preserves current workspace ownership and docpact routing."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

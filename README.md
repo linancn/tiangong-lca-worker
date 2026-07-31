@@ -22,9 +22,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 740c113b1ee50227af765935b1e263916a1a8f6e
-lastReviewedNote: "Reviewed for Issue #177: the active governed Rust tidas baseline is v0.1.2 while scope-closure v3 retains the 2048 MiB Linux RSS guard."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane access does not change the repository overview or operator entry points."
 related:
   - AGENTS.md
   - .docpact/config.yaml

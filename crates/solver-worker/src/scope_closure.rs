@@ -38,6 +38,7 @@ use crate::{
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
     tidas_cli,
+    worker_control_plane::worker_job_artifacts_table,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
 
@@ -7521,7 +7522,7 @@ async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
 }
 
 async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyhow::Result<String> {
-    let row = sqlx::query(
+    let row = sqlx::query(concat!(
         r"
         SELECT public.lcia_scope_closure_sha256(jsonb_build_object(
             'artifactId', id,
@@ -7531,10 +7532,12 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
             'byteSize', byte_size,
             'checksumSha256', checksum_sha256
         )) AS manifest_hash
-        FROM public.worker_job_artifacts
+        FROM ",
+        worker_job_artifacts_table!(),
+        r"
         WHERE id = $1
-        ",
-    )
+        "
+    ))
     .bind(artifact_id)
     .fetch_one(pool)
     .await?;
