@@ -4505,7 +4505,7 @@ pub async fn execute_scope_closure_job(
                 .await;
             }
             ScanExecutionClaim::Busy => {
-                if wait_started.elapsed() >= std::time::Duration::from_secs(3_600) {
+                if wait_started.elapsed() >= std::time::Duration::from_hours(1) {
                     return Err(anyhow::anyhow!("shared_scan_wait_timeout"));
                 }
                 progress
