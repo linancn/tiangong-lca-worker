@@ -83,6 +83,10 @@ const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
 
+fn artifact_registration_batches(items: &[Value]) -> std::slice::Chunks<'_, Value> {
+    items.chunks(ARTIFACT_REGISTRATION_BATCH_SIZE)
+}
+
 fn scope_closure_memory_budget_bytes() -> u64 {
     std::env::var("SCOPE_CLOSURE_MEMORY_BUDGET_MIB")
         .ok()
@@ -6667,10 +6671,7 @@ async fn persist_closure_artifacts(
                 "registration_open",
                 false,
             )?;
-            for (batch_index, batch) in request_items
-                .chunks(ARTIFACT_REGISTRATION_BATCH_SIZE)
-                .enumerate()
-            {
+            for (batch_index, batch) in artifact_registration_batches(&request_items).enumerate() {
                 let batch_digest = canonical_json_sha256(&Value::Array(batch.to_vec()))?;
                 let batch_id = deterministic_contract_uuid(&format!(
                     "scope-closure-write-set-v2:{request_id}:batch-{batch_index:06}:{batch_digest}"
@@ -11016,45 +11017,685 @@ mod tests {
         );
     }
 
-    fn collect_real_package_documents(
-        directory: &Path,
-        writer: &mut ClosureDocumentSpoolWriter,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CapacityInputMode {
+        RealPayload,
+        SyntheticCardinality,
+    }
+
+    impl CapacityInputMode {
+        fn from_environment() -> anyhow::Result<Self> {
+            match std::env::var("SCOPE_CLOSURE_CAPACITY_MODE").as_deref() {
+                Ok("real-payload") => Ok(Self::RealPayload),
+                Ok("synthetic-cardinality") => Ok(Self::SyntheticCardinality),
+                Ok(value) => Err(anyhow::anyhow!(
+                    "unsupported SCOPE_CLOSURE_CAPACITY_MODE={value}; expected real-payload or synthetic-cardinality"
+                )),
+                Err(_) => Err(anyhow::anyhow!(
+                    "SCOPE_CLOSURE_CAPACITY_MODE is required; choose real-payload or synthetic-cardinality explicitly"
+                )),
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::RealPayload => "real-payload",
+                Self::SyntheticCardinality => "synthetic-cardinality",
+            }
+        }
+
+        const fn is_real_evidence(self) -> bool {
+            matches!(self, Self::RealPayload)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum CapacityCacheMode {
+        Cold,
+        Warm,
+        Mixed,
+        Stale,
+    }
+
+    impl CapacityCacheMode {
+        fn from_environment() -> anyhow::Result<Self> {
+            match std::env::var("SCOPE_CLOSURE_CAPACITY_CACHE_MODE")
+                .unwrap_or_else(|_| "cold".to_owned())
+                .as_str()
+            {
+                "cold" => Ok(Self::Cold),
+                "warm" => Ok(Self::Warm),
+                "mixed" => Ok(Self::Mixed),
+                "stale" => Ok(Self::Stale),
+                value => Err(anyhow::anyhow!(
+                    "unsupported SCOPE_CLOSURE_CAPACITY_CACHE_MODE={value}; expected cold, warm, mixed, or stale"
+                )),
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CapacityCacheReport {
+        mode: Option<CapacityCacheMode>,
+        cold_misses: u64,
+        warm_hits: u64,
+        stale_misses: u64,
+        replayed_events: u64,
+    }
+
+    impl CapacityCacheReport {
+        fn new(mode: CapacityCacheMode) -> Self {
+            Self {
+                mode: Some(mode),
+                ..Self::default()
+            }
+        }
+
+        fn record_replay(&mut self, ordinal: u64) {
+            match self.mode.expect("capacity cache mode") {
+                CapacityCacheMode::Mixed if ordinal.is_multiple_of(2) => {
+                    self.warm_hits = self.warm_hits.saturating_add(1);
+                }
+                CapacityCacheMode::Stale if ordinal.is_multiple_of(5) => {
+                    self.stale_misses = self.stale_misses.saturating_add(1);
+                }
+                CapacityCacheMode::Cold | CapacityCacheMode::Mixed => {
+                    self.cold_misses = self.cold_misses.saturating_add(1);
+                }
+                CapacityCacheMode::Warm | CapacityCacheMode::Stale => {
+                    self.warm_hits = self.warm_hits.saturating_add(1);
+                }
+            }
+            // Cache state changes where the event came from, never which exact event is replayed.
+            self.replayed_events = self.replayed_events.saturating_add(1);
+        }
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RealPackageCollectionReport {
+        files_seen: u64,
+        included_documents: u64,
+        excluded_package_manifests: u64,
+        excluded_non_json_files: u64,
+        source_json_bytes: u64,
+        canonical_payload_bytes: u64,
+        largest_document_identity: Option<String>,
+        largest_document_jsonl_bytes: u64,
+        max_input_document_bytes: u64,
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CapacityRecordSizeDistribution {
+        p50: u64,
+        p95: u64,
+        p99: u64,
+        max: u64,
+        max_identity: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AdministrativeRelationCapacityEvidence {
+        relation: String,
+        record_count: u64,
+        logical_bytes: Option<CapacityRecordSizeDistribution>,
+        standalone_zstd_bytes: Option<CapacityRecordSizeDistribution>,
+    }
+
+    fn nearest_rank(samples: &[(u64, String)], percentile: u64) -> u64 {
+        let rank = samples
+            .len()
+            .saturating_mul(usize::try_from(percentile).expect("percentile"))
+            .saturating_add(99)
+            / 100;
+        samples[rank.saturating_sub(1).min(samples.len() - 1)].0
+    }
+
+    fn capacity_size_distribution(
+        mut samples: Vec<(u64, String)>,
+    ) -> anyhow::Result<CapacityRecordSizeDistribution> {
+        if samples.is_empty() {
+            return Err(anyhow::anyhow!(
+                "capacity size distribution requires at least one record"
+            ));
+        }
+        samples.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let (max, max_identity) = samples.last().cloned().expect("nonempty samples");
+        Ok(CapacityRecordSizeDistribution {
+            p50: nearest_rank(&samples, 50),
+            p95: nearest_rank(&samples, 95),
+            p99: nearest_rank(&samples, 99),
+            max,
+            max_identity,
+        })
+    }
+
+    fn administrative_record_identity(
+        relation: &str,
+        record: &[u8],
+        ordinal: u64,
+    ) -> anyhow::Result<String> {
+        if relation == "documents" {
+            let document: ClosureDocument = serde_json::from_slice(record)?;
+            return Ok(document.identity.document_key());
+        }
+        if relation == "roots" {
+            let identity: ExactDatasetIdentity = serde_json::from_slice(record)?;
+            return Ok(identity.document_key());
+        }
+        let digest = Sha256::digest(record);
+        Ok(format!(
+            "{relation}#{ordinal:020}:{}",
+            hex::encode(&digest[..8])
+        ))
+    }
+
+    fn sample_administrative_partitions(
+        relation: &str,
+        partitions: &[&PreparedArtifact],
+        logical_samples: &mut Vec<(u64, String)>,
+        compressed_samples: &mut Vec<(u64, String)>,
+        ordinal: &mut u64,
     ) -> anyhow::Result<()> {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                collect_real_package_documents(&path, writer)?;
-                continue;
+        for partition in partitions {
+            let decoder =
+                zstd::stream::read::Decoder::new(BufReader::new(File::open(&partition.path)?))?;
+            let mut reader = BufReader::new(decoder);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line)? == 0 {
+                    break;
+                }
+                let identity = administrative_record_identity(relation, &line, *ordinal)?;
+                logical_samples.push((u64::try_from(line.len())?, identity.clone()));
+                compressed_samples.push((
+                    u64::try_from(zstd::bulk::compress(&line, 6)?.len())?,
+                    identity,
+                ));
+                *ordinal = ordinal.saturating_add(1);
             }
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
+        }
+        Ok(())
+    }
+
+    fn sample_administrative_oversized_records(
+        relation: &str,
+        manifest: &ScopeClosureManifestV4,
+        artifact_by_path: &BTreeMap<&str, &PreparedArtifact>,
+        logical_samples: &mut Vec<(u64, String)>,
+        compressed_samples: &mut Vec<(u64, String)>,
+        ordinal: &mut u64,
+    ) -> anyhow::Result<()> {
+        for oversized in manifest
+            .administrative_oversized_records
+            .iter()
+            .filter(|entry| entry.relation == relation)
+        {
+            let index_artifact = artifact_by_path
+                .get(oversized.index_path.as_str())
+                .ok_or_else(|| anyhow::anyhow!("capacity evidence omitted oversized index"))?;
+            let index: AdministrativeOversizedRecordIndex =
+                serde_json::from_reader(BufReader::new(File::open(&index_artifact.path)?))?;
+            let mut line =
+                Vec::with_capacity(usize::try_from(index.logical_byte_size)?.saturating_add(1));
+            for chunk in &index.chunks {
+                let artifact = artifact_by_path
+                    .get(chunk.path.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("capacity evidence omitted chunk"))?;
+                File::open(&artifact.path)?.read_to_end(&mut line)?;
+                if u64::try_from(line.len())? > index.logical_byte_size {
+                    return Err(anyhow::anyhow!(
+                        "capacity evidence oversized record exceeded declared bytes"
+                    ));
+                }
             }
-            let category = path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(std::ffi::OsStr::to_str)
-                .ok_or_else(|| anyhow::anyhow!("package document omitted category"))?;
-            let Some((id, version)) = path
-                .file_stem()
-                .and_then(std::ffi::OsStr::to_str)
-                .and_then(|name| name.rsplit_once('_'))
+            line.push(b'\n');
+            let identity = oversized.record_key.clone();
+            logical_samples.push((u64::try_from(line.len())?, identity.clone()));
+            compressed_samples.push((
+                u64::try_from(zstd::bulk::compress(&line, 6)?.len())?,
+                identity,
+            ));
+            *ordinal = ordinal.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn administrative_relation_capacity_evidence(
+        artifacts: &[PreparedArtifact],
+    ) -> anyhow::Result<Vec<AdministrativeRelationCapacityEvidence>> {
+        let manifest_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor.file_name == "manifest.json")
+            .ok_or_else(|| anyhow::anyhow!("capacity evidence omitted v4 manifest"))?;
+        let manifest: ScopeClosureManifestV4 =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_artifact.path)?))?;
+        let artifact_by_path = artifacts
+            .iter()
+            .map(|artifact| (artifact.descriptor.file_name.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let mut grouped = BTreeMap::<String, Vec<&PreparedArtifact>>::new();
+        for artifact in artifacts {
+            let Some(remainder) = artifact
+                .descriptor
+                .file_name
+                .strip_prefix("administrative/")
             else {
                 continue;
             };
-            let Ok(id) = Uuid::parse_str(id) else {
+            let Some((relation, _)) = remainder.split_once('/') else {
                 continue;
             };
-            writer.append(&ClosureDocument {
+            if !artifact.descriptor.file_name.ends_with(".ndjson.zst") {
+                continue;
+            }
+            grouped
+                .entry(relation.to_owned())
+                .or_default()
+                .push(artifact);
+        }
+        let mut evidence = Vec::new();
+        for relation in [
+            "documents",
+            "edges",
+            "frontier",
+            "omitted-version-resolutions",
+            "provider-universe",
+            "resolution-map",
+            "resolved-references",
+            "roots",
+        ] {
+            let mut partitions = grouped.remove(relation).unwrap_or_default();
+            partitions
+                .sort_by(|left, right| left.descriptor.file_name.cmp(&right.descriptor.file_name));
+            let mut logical_samples = Vec::new();
+            let mut compressed_samples = Vec::new();
+            let mut ordinal = 0_u64;
+            sample_administrative_partitions(
+                relation,
+                &partitions,
+                &mut logical_samples,
+                &mut compressed_samples,
+                &mut ordinal,
+            )?;
+            sample_administrative_oversized_records(
+                relation,
+                &manifest,
+                &artifact_by_path,
+                &mut logical_samples,
+                &mut compressed_samples,
+                &mut ordinal,
+            )?;
+            evidence.push(AdministrativeRelationCapacityEvidence {
+                relation: relation.to_owned(),
+                record_count: ordinal,
+                logical_bytes: (!logical_samples.is_empty())
+                    .then(|| capacity_size_distribution(logical_samples))
+                    .transpose()?,
+                standalone_zstd_bytes: (!compressed_samples.is_empty())
+                    .then(|| capacity_size_distribution(compressed_samples))
+                    .transpose()?,
+            });
+        }
+        if !grouped.is_empty() {
+            return Err(anyhow::anyhow!(
+                "capacity report found unexpected administrative relations: {:?}",
+                grouped.keys().collect::<Vec<_>>()
+            ));
+        }
+        Ok(evidence)
+    }
+
+    fn capacity_real_document_max_bytes() -> u64 {
+        std::env::var("SCOPE_CLOSURE_REAL_DOCUMENT_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(SCOPE_CLOSURE_ARTIFACT_MAX_OBJECT_BYTES)
+    }
+
+    fn collect_package_files(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "real package collector rejects symlink entry {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                collect_package_files(&path, files)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            } else {
+                return Err(anyhow::anyhow!(
+                    "real package collector found unsupported entry {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_streaming_json(path: &Path) -> anyhow::Result<()> {
+        let file = File::open(path)?;
+        let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
+        serde::de::IgnoredAny::deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        Ok(())
+    }
+
+    fn read_bounded_json_payload(path: &Path, max_bytes: u64) -> anyhow::Result<Value> {
+        let source_bytes = fs::metadata(path)?.len();
+        if source_bytes > max_bytes {
+            return Err(anyhow::anyhow!(
+                "real package document exceeds bounded input limit: path={}, bytes={}, max={max_bytes}",
+                path.display(),
+                source_bytes
+            ));
+        }
+        let file = File::open(path)?;
+        let reader = BufReader::with_capacity(64 * 1024, file).take(max_bytes.saturating_add(1));
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let payload = Value::deserialize(&mut deserializer).map_err(|error| {
+            anyhow::anyhow!(
+                "real package document is malformed JSON: path={}, error={error}",
+                path.display()
+            )
+        })?;
+        deserializer.end().map_err(|error| {
+            anyhow::anyhow!(
+                "real package document contains trailing JSON data: path={}, error={error}",
+                path.display()
+            )
+        })?;
+        Ok(payload)
+    }
+
+    fn collect_real_package_documents(
+        directory: &Path,
+        writer: &mut ClosureDocumentSpoolWriter,
+    ) -> anyhow::Result<RealPackageCollectionReport> {
+        let directory = directory.canonicalize()?;
+        let max_bytes = capacity_real_document_max_bytes();
+        let mut files = Vec::new();
+        collect_package_files(&directory, &mut files)?;
+        files.sort();
+        let mut report = RealPackageCollectionReport {
+            max_input_document_bytes: max_bytes,
+            ..RealPackageCollectionReport::default()
+        };
+
+        for path in files {
+            report.files_seen = report.files_seen.saturating_add(1);
+            let relative = path.strip_prefix(&directory)?;
+            if relative == Path::new("manifest.json") {
+                validate_streaming_json(&path)?;
+                report.excluded_package_manifests =
+                    report.excluded_package_manifests.saturating_add(1);
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                report.excluded_non_json_files = report.excluded_non_json_files.saturating_add(1);
+                continue;
+            }
+            let category = relative
+                .parent()
+                .filter(|parent| parent.components().count() == 1)
+                .and_then(Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "real package JSON document has unexpected path shape: {}",
+                        relative.display()
+                    )
+                })?;
+            let file_stem = path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "real package JSON document omitted UTF-8 file stem: {}",
+                        relative.display()
+                    )
+                })?;
+            let (id, version) = file_stem.rsplit_once('_').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "real package JSON document omitted <uuid>_<version> identity: {}",
+                    relative.display()
+                )
+            })?;
+            let id = Uuid::parse_str(id).map_err(|error| {
+                anyhow::anyhow!(
+                    "real package JSON document has invalid UUID: path={}, error={error}",
+                    relative.display()
+                )
+            })?;
+            validate_version(version).map_err(|error| {
+                anyhow::anyhow!(
+                    "real package JSON document has invalid version: path={}, error={error:#}",
+                    relative.display()
+                )
+            })?;
+            let source_bytes = fs::metadata(&path)?.len();
+            let payload = read_bounded_json_payload(&path, max_bytes)?;
+            let document = ClosureDocument {
                 identity: ExactDatasetIdentity {
                     category: parse_category(category)?,
                     id,
                     version: version.to_owned(),
                 },
-                payload: json!({}),
-            })?;
+                payload,
+            };
+            let document_jsonl_bytes =
+                u64::try_from(canonical_json_bytes(&document)?.len())?.saturating_add(1);
+            if document_jsonl_bytes > report.largest_document_jsonl_bytes {
+                report.largest_document_jsonl_bytes = document_jsonl_bytes;
+                report.largest_document_identity = Some(document.identity.document_key());
+            }
+            report.source_json_bytes = report.source_json_bytes.saturating_add(source_bytes);
+            report.canonical_payload_bytes = report.canonical_payload_bytes.saturating_add(
+                u64::try_from(canonical_json_bytes(&document.payload)?.len())?,
+            );
+            writer.append(&document)?;
+            report.included_documents = report.included_documents.saturating_add(1);
         }
-        Ok(())
+
+        let accounted = report
+            .included_documents
+            .saturating_add(report.excluded_package_manifests)
+            .saturating_add(report.excluded_non_json_files);
+        if accounted != report.files_seen {
+            return Err(anyhow::anyhow!(
+                "real package collector accounting mismatch: seen={}, accounted={accounted}",
+                report.files_seen
+            ));
+        }
+        if report.included_documents == 0 {
+            return Err(anyhow::anyhow!(
+                "real package collector found no dataset documents"
+            ));
+        }
+        Ok(report)
+    }
+
+    #[derive(Clone, Copy)]
+    enum CapacityBoundaryContent {
+        Compressible,
+        Incompressible,
+        UnicodeNewlines,
+        HumanReport,
+    }
+
+    fn deterministic_incompressible_ascii(length: usize) -> String {
+        const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        let mut output = String::with_capacity(length);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            output.push(char::from(
+                ALPHABET[usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap()],
+            ));
+        }
+        output
+    }
+
+    fn exact_boundary_document(
+        target_jsonl_bytes: usize,
+        content: CapacityBoundaryContent,
+    ) -> ClosureDocument {
+        let field = match content {
+            CapacityBoundaryContent::HumanReport => "humanReport",
+            _ => "content",
+        };
+        let prefix = match content {
+            CapacityBoundaryContent::UnicodeNewlines => "天工生命周期\nline-2\r\n🙂",
+            _ => "",
+        };
+        let mut payload = Map::new();
+        payload.insert(field.to_owned(), Value::String(prefix.to_owned()));
+        let mut document = ClosureDocument {
+            identity: identity(
+                DatasetCategory::Lciamethods,
+                "05316e7a-b254-4bea-9cf0-6bf33eb5c630",
+            ),
+            payload: Value::Object(payload),
+        };
+        let base = canonical_json_bytes(&document).unwrap().len() + 1;
+        assert!(
+            target_jsonl_bytes >= base,
+            "target JSONL record is smaller than fixture envelope"
+        );
+        let padding_len = target_jsonl_bytes - base;
+        let padding = match content {
+            CapacityBoundaryContent::Incompressible => {
+                deterministic_incompressible_ascii(padding_len)
+            }
+            _ => "x".repeat(padding_len),
+        };
+        document.payload[field] = Value::String(format!("{prefix}{padding}"));
+        assert_eq!(
+            canonical_json_bytes(&document).unwrap().len() + 1,
+            target_jsonl_bytes
+        );
+        document
+    }
+
+    #[test]
+    fn real_package_collector_preserves_payload_and_accounts_for_every_file() {
+        let package = TempDir::new().unwrap();
+        fs::write(
+            package.path().join("manifest.json"),
+            br#"{"package":"fixture"}"#,
+        )
+        .unwrap();
+        fs::write(package.path().join("README.txt"), b"fixture").unwrap();
+        let category = package.path().join("processes");
+        fs::create_dir(&category).unwrap();
+        let document_path = category.join("f1820000-0000-4000-8000-000000000182_01.00.000.json");
+        let payload = json!({
+            "name": "真实 payload\nwith newline",
+            "report": {"human": "kept, not replaced"},
+        });
+        fs::write(&document_path, canonical_json_bytes(&payload).unwrap()).unwrap();
+
+        let mut writer = ClosureDocumentSpoolWriter::new().unwrap();
+        let report = collect_real_package_documents(package.path(), &mut writer).unwrap();
+        let documents = writer.finish().unwrap();
+        let mut recovered = Vec::new();
+        documents
+            .visit(|_, bytes| {
+                recovered.push(serde_json::from_slice::<ClosureDocument>(bytes)?);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].payload, payload);
+        assert_eq!(report.files_seen, 3);
+        assert_eq!(report.included_documents, 1);
+        assert_eq!(report.excluded_package_manifests, 1);
+        assert_eq!(report.excluded_non_json_files, 1);
+        assert_eq!(
+            report.largest_document_identity.as_deref(),
+            Some("processes:f1820000-0000-4000-8000-000000000182:01.00.000")
+        );
+    }
+
+    #[test]
+    fn capacity_cache_scenarios_replay_every_exact_event() {
+        for (mode, cold, warm, stale) in [
+            (CapacityCacheMode::Cold, 10, 0, 0),
+            (CapacityCacheMode::Warm, 0, 10, 0),
+            (CapacityCacheMode::Mixed, 5, 5, 0),
+            (CapacityCacheMode::Stale, 0, 8, 2),
+        ] {
+            let mut report = CapacityCacheReport::new(mode);
+            for ordinal in 0..10 {
+                report.record_replay(ordinal);
+            }
+            assert_eq!(report.replayed_events, 10);
+            assert_eq!(report.cold_misses, cold);
+            assert_eq!(report.warm_hits, warm);
+            assert_eq!(report.stale_misses, stale);
+        }
+    }
+
+    #[test]
+    #[ignore = "local boundary capacity fixtures allocate records through 64 MiB"]
+    fn qualified_administrative_document_boundaries_are_byte_exact_and_named() {
+        let boundary = usize::try_from(ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES).unwrap();
+        for (target, content) in [
+            (boundary - 1, CapacityBoundaryContent::UnicodeNewlines),
+            (boundary, CapacityBoundaryContent::Compressible),
+            (boundary + 1, CapacityBoundaryContent::Compressible),
+            (36_105_476, CapacityBoundaryContent::HumanReport),
+            (64 * 1024 * 1024, CapacityBoundaryContent::Incompressible),
+        ] {
+            let document = exact_boundary_document(target, content);
+            let mut record = canonical_json_bytes(&document).unwrap();
+            record.push(b'\n');
+            assert_eq!(record.len(), target);
+            let temp = Arc::new(TempDir::new().unwrap());
+            let mut accumulator = IssuePartitionAccumulator::new(temp, "administrative/documents");
+            accumulator.max_records = ADMINISTRATIVE_PARTITION_MAX_RECORDS;
+            accumulator.max_uncompressed_bytes = ADMINISTRATIVE_PARTITION_MAX_UNCOMPRESSED_BYTES;
+            accumulator
+                .push_bytes(&document.identity.document_key(), &record)
+                .unwrap();
+            let (manifest, artifacts) = administrative_manifest_fixture("documents", accumulator);
+            validate_administrative_fixture(&manifest, &artifacts).unwrap();
+            assert_eq!(manifest.administrative_evidence[0].record_count, 1);
+            assert_eq!(
+                manifest.administrative_evidence[0].logical_byte_size,
+                u64::try_from(target).unwrap()
+            );
+            if target <= boundary {
+                assert_eq!(manifest.administrative_partitions.len(), 1);
+                assert!(manifest.administrative_oversized_records.is_empty());
+            } else {
+                assert!(manifest.administrative_partitions.is_empty());
+                assert_eq!(manifest.administrative_oversized_records.len(), 1);
+                let oversized = &manifest.administrative_oversized_records[0];
+                assert_eq!(oversized.record_key, document.identity.document_key());
+                assert_eq!(
+                    oversized.logical_byte_size,
+                    u64::try_from(target - 1).unwrap()
+                );
+                assert!(artifacts.iter().all(|artifact| {
+                    u64::try_from(artifact.descriptor.byte_size).unwrap()
+                        <= ADMINISTRATIVE_OVERSIZED_RECORD_CHUNK_BYTES
+                }));
+            }
+        }
     }
 
     fn package_issue_document_key(event: &Value) -> Option<String> {
@@ -11265,6 +11906,12 @@ mod tests {
     #[ignore = "local capacity gate: real package or high-unique generated issue merge/report"]
     #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
     fn qualified_streaming_issue_merge_report_capacity() {
+        let input_mode = CapacityInputMode::from_environment().unwrap();
+        let cache_mode = CapacityCacheMode::from_environment().unwrap();
+        let mut cache_report = CapacityCacheReport::new(cache_mode);
+        let mut real_package_report = None;
+        let mut synthetic_topology_document_count = 0_u64;
+        let mut synthetic_topology_event_remaps = 0_u64;
         let output_dir = PathBuf::from(
             std::env::var("SCOPE_CLOSURE_CAPACITY_OUTPUT").unwrap_or_else(|_| {
                 TempDir::new()
@@ -11276,13 +11923,15 @@ mod tests {
         );
         fs::create_dir_all(&output_dir).unwrap();
         let mut event_writer = JsonlValueSpoolWriter::new("capacity-issue-events.jsonl").unwrap();
-        let (documents, roots, reference_graph) = if let Ok(package_dir) =
-            std::env::var("SCOPE_CLOSURE_REAL_PACKAGE_DIR")
-        {
+        let (documents, roots, reference_graph) = if input_mode.is_real_evidence() {
+            let package_dir = std::env::var("SCOPE_CLOSURE_REAL_PACKAGE_DIR")
+                .expect("real-payload mode requires SCOPE_CLOSURE_REAL_PACKAGE_DIR");
             let mut documents = ClosureDocumentSpoolWriter::new().unwrap();
-            collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap();
+            real_package_report = Some(
+                collect_real_package_documents(Path::new(&package_dir), &mut documents).unwrap(),
+            );
             let issue_spool = std::env::var("SCOPE_CLOSURE_REAL_ISSUE_SPOOL")
-                .expect("real package mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
+                .expect("real-payload mode requires SCOPE_CLOSURE_REAL_ISSUE_SPOOL");
             let target_raw_events = std::env::var("SCOPE_CLOSURE_PRODUCTION_RAW_EVENTS")
                 .ok()
                 .map_or(0, |value| {
@@ -11295,6 +11944,7 @@ mod tests {
                 });
             let production_graph = (target_raw_events > 0).then(production_capacity_graph);
             if let Some(graph) = &production_graph {
+                synthetic_topology_document_count = u64::try_from(graph.documents.len()).unwrap();
                 for document in &graph.documents {
                     documents.append(document).unwrap();
                 }
@@ -11327,8 +11977,14 @@ mod tests {
                         json!(format!("{base_location}#capacity[{observed_events:06}]"));
                     pad_capacity_event(&mut event, 1_096);
                     observed_events = observed_events.saturating_add(1);
+                    synthetic_topology_event_remaps =
+                        synthetic_topology_event_remaps.saturating_add(1);
                 } else if let Some(document_key) = package_issue_document_key(&event) {
                     event["document_key"] = json!(document_key);
+                }
+                cache_report.record_replay(observed_events);
+                if target_raw_events == 0 {
+                    observed_events = observed_events.saturating_add(1);
                 }
                 event_writer.append(&event)
             })
@@ -11347,6 +12003,11 @@ mod tests {
             );
             (documents.finish().unwrap(), roots, reference_graph)
         } else {
+            assert!(
+                std::env::var_os("SCOPE_CLOSURE_REAL_PACKAGE_DIR").is_none()
+                    && std::env::var_os("SCOPE_CLOSURE_REAL_ISSUE_SPOOL").is_none(),
+                "synthetic-cardinality mode rejects real-package inputs so it cannot be mistaken for real-package evidence"
+            );
             let multiplier = std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -11383,6 +12044,7 @@ mod tests {
                     },
                 });
                 pad_capacity_event(&mut event, 1_096);
+                cache_report.record_replay(index);
                 event_writer.append(&event).unwrap();
             }
             (documents.finish().unwrap(), graph.roots, reference_graph)
@@ -11459,6 +12121,8 @@ mod tests {
             }
             artifact_manifest.push(artifact.descriptor.clone());
         }
+        let administrative_record_sizes =
+            administrative_relation_capacity_evidence(&artifacts).unwrap();
         let mut temp_roots = BTreeSet::from([
             scan.documents._temp.path().to_path_buf(),
             scan.edges._temp.path().to_path_buf(),
@@ -11508,7 +12172,7 @@ mod tests {
         if let Ok(target) = std::env::var("SCOPE_CLOSURE_PRODUCTION_RELATIONS") {
             let target = target.parse::<u64>().unwrap();
             assert_eq!(relations.stats.affected_root_count, target);
-        } else if std::env::var_os("SCOPE_CLOSURE_REAL_PACKAGE_DIR").is_none() {
+        } else if input_mode == CapacityInputMode::SyntheticCardinality {
             let expected_relations = input_event_count
                 .saturating_mul(6)
                 .saturating_add(input_event_count.saturating_add(4) / 5);
@@ -11548,12 +12212,16 @@ mod tests {
             },
         );
         let summary = json!({
-            "schemaVersion": "lcia.scope-closure-capacity-result.v2",
-            "inputMode": if std::env::var_os("SCOPE_CLOSURE_REAL_PACKAGE_DIR").is_some() {
-                "external-open-data-package"
-            } else {
-                "production-distribution-generated"
+            "schemaVersion": "lcia.scope-closure-capacity-result.v3",
+            "inputMode": input_mode.label(),
+            "realPackageEvidence": input_mode.is_real_evidence(),
+            "realPackageCollection": real_package_report,
+            "syntheticTopology": {
+                "documentCount": synthetic_topology_document_count,
+                "eventRemaps": synthetic_topology_event_remaps,
+                "purpose": "bounded relation-density scaffold only; excluded from real-package payload evidence",
             },
+            "cacheScenario": cache_report,
             "scaleMultiplier": std::env::var("SCOPE_CLOSURE_SCALE_MULTIPLIER")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -11582,6 +12250,7 @@ mod tests {
                 "rootImpactIndexBytes": relations.root_impact_index.compressed_byte_size,
                 "rootImpactRecordCount": relations.root_impact_index.record_count,
             },
+            "administrativeRecordSizes": administrative_record_sizes,
             "tempAdmission": {
                 "strategy": "observed_raw_then_measured_topology_watermarks",
                 "initialPlannedBytes": relation_temp_admission_bytes(
@@ -11968,6 +12637,79 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_download_reader_exposes_exact_bounded_samples_and_full_counts() {
+        let root = identity(
+            DatasetCategory::Processes,
+            "f1820000-0000-4000-8000-000000001182",
+        );
+        let mut issues = (0..=XLSX_ISSUE_SAMPLE_LIMIT)
+            .map(|index| ClosureIssue {
+                issue_key: format!("issue-{index:05}"),
+                severity: "warning".to_owned(),
+                blocking: false,
+                issue_code: "xlsx_capacity_fixture".to_owned(),
+                source: Some(root.clone()),
+                json_path: Some(format!("$.fixture[{index}]")),
+                reference_role: None,
+                requested_target_type: None,
+                requested_target_id: None,
+                requested_target_version: None,
+                message: "generated XLSX truncation fixture".to_owned(),
+                suggested_action: None,
+                occurrence_count: 0,
+                occurrences: Vec::new(),
+                affected_root_count: 0,
+                affected_roots: Vec::new(),
+                affected_root_witness_paths: Vec::new(),
+                witness_path: vec![root.clone()],
+            })
+            .collect::<Vec<_>>();
+        issues[0].occurrences = (0..=XLSX_OCCURRENCE_SAMPLE_LIMIT)
+            .map(|index| ClosureIssueOccurrence {
+                occurrence_key: format!("occ-{index:05}"),
+                source: Some(root.clone()),
+                json_path: Some(format!("$.occurrence[{index}]")),
+                reference_role: None,
+                details: json!({"ordinal": index}),
+            })
+            .collect();
+        issues[0].occurrence_count = u32::try_from(issues[0].occurrences.len()).unwrap();
+        issues[0].affected_roots = vec![root.clone(); XLSX_AFFECTED_ROOT_SAMPLE_LIMIT + 1];
+        issues[0].affected_root_count = u32::try_from(issues[0].affected_roots.len()).unwrap();
+
+        let bytes = build_xlsx_report(Uuid::new_v4(), &issues).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut sheets = Vec::new();
+        for sheet_number in 1..=4 {
+            let mut xml = String::new();
+            std::io::Read::read_to_string(
+                &mut archive
+                    .by_name(format!("xl/worksheets/sheet{sheet_number}.xml").as_str())
+                    .unwrap(),
+                &mut xml,
+            )
+            .unwrap();
+            sheets.push(xml);
+        }
+
+        assert!(sheets[0].contains(&issues.len().to_string()));
+        assert_eq!(
+            sheets[1].matches("<row r=").count(),
+            XLSX_ISSUE_SAMPLE_LIMIT + 1
+        );
+        assert_eq!(
+            sheets[2].matches("<row r=").count(),
+            XLSX_OCCURRENCE_SAMPLE_LIMIT + 1
+        );
+        assert_eq!(
+            sheets[3].matches("<row r=").count(),
+            XLSX_AFFECTED_ROOT_SAMPLE_LIMIT + 1
+        );
+        assert!(sheets[2].contains("occ-09999"));
+        assert!(!sheets[2].contains("occ-10000"));
+    }
+
+    #[test]
     fn short_exact_versions_are_normalized_without_changing_omitted_semantics() {
         assert_eq!(normalize_exact_version("01.02").unwrap(), "01.02.000");
         assert_eq!(normalize_exact_version("01.02.003").unwrap(), "01.02.003");
@@ -12319,6 +13061,36 @@ mod tests {
             deterministic_contract_uuid(request_identity),
             deterministic_contract_uuid(request_identity)
         );
+    }
+
+    #[test]
+    fn artifact_registration_batches_cover_596_and_large_descriptor_sets_exactly() {
+        for (descriptor_count, expected_batch_sizes) in [
+            (596, vec![500, 96]),
+            (1_500, vec![500, 500, 500]),
+            (1_501, vec![500, 500, 500, 1]),
+        ] {
+            let descriptors = (0..descriptor_count)
+                .map(|ordinal| json!({"ordinal": ordinal + 1}))
+                .collect::<Vec<_>>();
+            let batches = artifact_registration_batches(&descriptors).collect::<Vec<_>>();
+            assert_eq!(
+                batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+                expected_batch_sizes
+            );
+            assert_eq!(
+                batches.iter().map(|batch| batch.len()).sum::<usize>(),
+                descriptor_count
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .flat_map(|batch| batch.iter())
+                    .map(|item| item["ordinal"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                (1..=u64::try_from(descriptor_count).unwrap()).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

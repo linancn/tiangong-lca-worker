@@ -27,7 +27,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #181: canonical v4 keeps ordinary administrative NDJSON unchanged and deterministically segments a single oversized logical record into an index plus bounded canonical-byte chunks."
+lastReviewedNote: "Updated for Worker Issue #182 on top of #181: local qualification preserves actual package payloads, separates real evidence from synthetic scale, and exercises deterministic oversized-record segmentation."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -108,6 +108,8 @@ Document-validation evidence is cached only under the full immutable key: exact 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Raw validator issue events are stream-verified into a spool capped at 2 GiB and 5,000,000 events. The exact verified NDJSON is compressed once into the final `tidas/issues.ndjson.zst` evidence member; its logical bytes, SHA-256, and event count remain authoritative. Unified issue coalescing uses bounded external-sort runs keyed by source and issue, keeps only one coalesced issue plus one source reachability state, and feeds globally issue-key-ordered final partitions. It does not create occurrence or affected-root/witness expansion runs.
 
 Before coalescing begins, temporary-disk admission projects only stages derivable from observed raw bytes and bounded active windows. It adds a 25% safety margin plus the fixed 512 MiB reserve. The global requested-root count is never multiplied by issue count for admission. Source impact is encoded once as compact ordinals, and witness evidence is stored once as the frozen reference graph, so physical temporary and artifact bytes do not scale with `issue × root × witness length`. Initial or incremental shortage returns the stable `scope_closure_relation_temp_space_low` error with its stage, available, planned, required, and reserve bytes. Run creation, merge consumption, and partition completion use best-effort sequential-access/cache-release hints, while Linux phase telemetry records process RSS and cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`. Cancellation, lease loss, or any admission failure cleans every owned temporary directory.
+
+Local capacity qualification has two non-interchangeable modes. `real-payload` bounded-reads and preserves each actual package document JSON value, validates and accounts for every package member, and fails closed on malformed, oversized, or unexpectedly shaped input. `synthetic-cardinality` generates deterministic scale and distribution evidence only; it cannot substantiate real-package behavior. A real-payload result reports per-administrative-relation p50/p95/p99/max logical and standalone-zstd record bytes plus the maximum exact identity, and labels any synthetic topology scaffold separately from package payload evidence.
 
 On the Linux runtime, `SCOPE_CLOSURE_MEMORY_BUDGET_MIB` defaults to 2048 MiB and applies to Worker RSS across traversal, graph finalization, validation/cache windows, and issue merging. Crossing the limit fails the run without certificate projection. The TIDAS child retains its own `TIDAS_MEMORY_BUDGET_MIB` enforcement.
 

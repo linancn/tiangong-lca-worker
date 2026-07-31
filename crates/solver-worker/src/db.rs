@@ -4292,7 +4292,8 @@ mod tests {
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use std::{
-        fs,
+        fs::{self, File},
+        io::{BufReader, BufWriter, Write},
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process::Command as StdCommand,
@@ -4931,5 +4932,34 @@ mod tests {
             assert_eq!(binding.schema_version, schema_version);
             assert_eq!(binding.data_snapshot_token, "snapshot-token");
         }
+    }
+
+    #[test]
+    #[ignore = "local capacity fixture streams a 64 MiB human report field"]
+    fn qualified_certified_bundle_reader_streams_oversized_human_report_field() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("oversized-human-report.json");
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        writer
+            .write_all(br#"{"scan":{"humanReport":"Unicode \u5929\u5de5\n"#)
+            .unwrap();
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..1024 {
+            writer.write_all(&block).unwrap();
+        }
+        writer
+            .write_all(
+                br#""},"schemaVersion":"lcia.scope-closure-bundle.v4","dataSnapshotToken":"snapshot-token"}"#,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+        let binding =
+            read_certified_closure_bundle_binding(BufReader::new(File::open(path).unwrap()))
+                .unwrap();
+        assert_eq!(binding.schema_version, "lcia.scope-closure-bundle.v4");
+        assert_eq!(binding.data_snapshot_token, "snapshot-token");
     }
 }

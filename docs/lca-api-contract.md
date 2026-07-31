@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #181: public XLSX/manifest DTOs remain unchanged while an oversized internal administrative record uses a deterministic index and bounded canonical-byte chunks."
+lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: public XLSX/manifest DTOs remain unchanged while real-payload qualification covers internal bounded partitions and oversized-record chunks."
 related:
   - AGENTS.md
   - .docpact/config.yaml

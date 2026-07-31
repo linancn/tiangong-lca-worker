@@ -37,7 +37,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-31
 lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #181: ordinary administrative NDJSON remains unchanged while individually oversized records use deterministic indexed canonical-byte chunks."
+lastReviewedNote: "Reviewed for Worker Issue #182 on top of #181: real package payloads exercise the existing bounded administrative partitions and deterministic indexed canonical-byte chunks without changing architecture ownership."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
