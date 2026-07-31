@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/linancn/tiangong-lca-worker/blob/main/docs/agents/contracts/scope-closure-provider-result.v1.schema.json",
+  "$comment": "Worker compatibility snapshot of lca-workspace #518 child input contract.",
+  "title": "Child-owned isolated provider qualification result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "components", "targetClass", "productionMutation", "assertions", "evidence"],
+  "properties": {
+    "schemaVersion": {"const": "lcia.scope-closure-provider-result.v1"},
+    "components": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+    },
+    "targetClass": {"const": "isolated-production-equivalent"},
+    "productionMutation": {"const": false},
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptor_write_set", "object_storage", "seal_and_finalize", "signed_head_and_range_download", "expiry_and_gc", "edge_and_next_contract"],
+      "properties": {
+        "descriptor_write_set": {"type": "integer", "minimum": 1},
+        "object_storage": {"type": "integer", "minimum": 1},
+        "seal_and_finalize": {"type": "integer", "minimum": 1},
+        "signed_head_and_range_download": {"type": "integer", "minimum": 1},
+        "expiry_and_gc": {"type": "integer", "minimum": 1},
+        "edge_and_next_contract": {"type": "integer", "minimum": 1}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptors", "storage", "publication", "download", "lifecycle", "consumers"],
+      "properties": {
+        "descriptors": {"type": "object", "minProperties": 1},
+        "storage": {"type": "object", "minProperties": 1},
+        "publication": {"type": "object", "minProperties": 1},
+        "download": {"type": "object", "minProperties": 1},
+        "lifecycle": {"type": "object", "minProperties": 1},
+        "consumers": {"type": "object", "minProperties": 1}
+      }
+    }
+  }
+}

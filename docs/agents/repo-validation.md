@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-31
-lastReviewedCommit: 5edde096148b1113d5d605d239cfe34d16308837
-lastReviewedNote: "Updated for Worker Issue #182 on top of #181 with explicit real-payload qualification, strict package and per-relation size evidence, cache scenarios, exact boundaries, and segmented-record reconstruction proof."
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Updated for Worker Issue #186 with tracked external/provider child executables, exact root schemas, four-mode identity gates, owner-adapter isolation, and negative leakage/cleanup tests."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -92,6 +92,38 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 ### Scope-closure capacity input modes
 
 Select `real-payload` or `synthetic-cardinality` explicitly. Generated cardinality is scaling evidence only and must never be cited as real-package evidence. Real-payload qualification bounded-reads and preserves every actual package document JSON value, accounts for every package member, and fails rather than silently skipping, replacing, or truncating a document.
+
+Run the tracked qualification layers in this order:
+
+```bash
+make qualification-test
+# Then run the generated Rust boundary tests named by the root #518 plan.
+TIDAS_BIN=/exact/linux/tidas \
+SCOPE_CLOSURE_QUALIFICATION_COMPONENTS='<exact component SHA JSON>' \
+  ./scripts/run_scope_closure_external_qualification.sh \
+  --fixture /absolute/path/to/local-open-data.zip \
+  --output /outside-git/external-result
+
+QUALIFICATION_NON_PRODUCTION_CONFIRMATION=I_CONFIRM_ISOLATED_NON_PRODUCTION_TARGETS \
+SCOPE_CLOSURE_QUALIFICATION_COMPONENTS='<exact component SHA JSON>' \
+  ./scripts/run_scope_closure_provider_qualification.sh \
+  --output /outside-git/provider-result.json
+```
+
+The external executable requires Linux cgroup v2 evidence and exact TIDAS
+`0.1.2`; it emits `cold`, `warm`, `mixed`, and `stale` real-payload capacity
+results plus `external-result.json`. The provider executable requires isolated
+loopback Database/Supabase/S3 targets and four git-tracked owning-repository
+adapters selected by `QUALIFICATION_DATABASE_HARNESS`,
+`QUALIFICATION_STORAGE_HARNESS`, `QUALIFICATION_EDGE_HARNESS`, and
+`QUALIFICATION_NEXT_HARNESS`. A missing owner adapter or non-production
+credential is an external blocker, never a skipped or synthetic pass.
+
+`make qualification-test` covers missing child fields, wrong exact SHAs, wrong
+cache modes, semantic/artifact drift, production fingerprints, secret/locator
+or payload leakage, unsafe archives, and cleanup residue. Harness stdout/stderr
+and private temporary files are not evidence and are removed before the final
+aggregate is written.
 
 For every administrative relation, report record count and p50/p95/p99/max logical and standalone-zstd record bytes with the maximum exact identity; represent empty relations explicitly with zero count. Exercise cold, warm, mixed, and stale cache replay without changing exact event bytes. The generated non-sensitive boundary set covers 32 MiB minus/equal/plus one byte, exactly 36,105,476 bytes, 64 MiB, incompressible content, Unicode/newlines, and oversized human-report fields through the segmented-record contract.
 

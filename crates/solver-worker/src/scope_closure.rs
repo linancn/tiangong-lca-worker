@@ -11120,10 +11120,12 @@ mod tests {
         included_documents: u64,
         excluded_package_manifests: u64,
         excluded_non_json_files: u64,
+        malformed_documents: u64,
         source_json_bytes: u64,
         canonical_payload_bytes: u64,
         largest_document_identity: Option<String>,
         largest_document_jsonl_bytes: u64,
+        record_size_distribution: Option<CapacityRecordSizeDistribution>,
         max_input_document_bytes: u64,
     }
 
@@ -11431,6 +11433,7 @@ mod tests {
             max_input_document_bytes: max_bytes,
             ..RealPackageCollectionReport::default()
         };
+        let mut record_size_samples = Vec::new();
 
         for path in files {
             report.files_seen = report.files_seen.saturating_add(1);
@@ -11495,10 +11498,12 @@ mod tests {
             };
             let document_jsonl_bytes =
                 u64::try_from(canonical_json_bytes(&document)?.len())?.saturating_add(1);
-            if document_jsonl_bytes > report.largest_document_jsonl_bytes {
-                report.largest_document_jsonl_bytes = document_jsonl_bytes;
-                report.largest_document_identity = Some(document.identity.document_key());
-            }
+            record_real_package_size(
+                &mut report,
+                &mut record_size_samples,
+                &document,
+                document_jsonl_bytes,
+            );
             report.source_json_bytes = report.source_json_bytes.saturating_add(source_bytes);
             report.canonical_payload_bytes = report.canonical_payload_bytes.saturating_add(
                 u64::try_from(canonical_json_bytes(&document.payload)?.len())?,
@@ -11507,6 +11512,13 @@ mod tests {
             report.included_documents = report.included_documents.saturating_add(1);
         }
 
+        finalize_real_package_report(report, record_size_samples)
+    }
+
+    fn finalize_real_package_report(
+        mut report: RealPackageCollectionReport,
+        samples: Vec<(u64, String)>,
+    ) -> anyhow::Result<RealPackageCollectionReport> {
         let accounted = report
             .included_documents
             .saturating_add(report.excluded_package_manifests)
@@ -11522,7 +11534,22 @@ mod tests {
                 "real package collector found no dataset documents"
             ));
         }
+        report.record_size_distribution = Some(capacity_size_distribution(samples)?);
         Ok(report)
+    }
+
+    fn record_real_package_size(
+        report: &mut RealPackageCollectionReport,
+        samples: &mut Vec<(u64, String)>,
+        document: &ClosureDocument,
+        jsonl_bytes: u64,
+    ) {
+        let document_key = document.identity.document_key();
+        samples.push((jsonl_bytes, document_key.clone()));
+        if jsonl_bytes > report.largest_document_jsonl_bytes {
+            report.largest_document_jsonl_bytes = jsonl_bytes;
+            report.largest_document_identity = Some(document_key);
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -11624,9 +11651,19 @@ mod tests {
         assert_eq!(report.included_documents, 1);
         assert_eq!(report.excluded_package_manifests, 1);
         assert_eq!(report.excluded_non_json_files, 1);
+        assert_eq!(report.malformed_documents, 0);
         assert_eq!(
             report.largest_document_identity.as_deref(),
             Some("processes:f1820000-0000-4000-8000-000000000182:01.00.000")
+        );
+        let distribution = report.record_size_distribution.unwrap();
+        assert_eq!(distribution.p50, report.largest_document_jsonl_bytes);
+        assert_eq!(distribution.p95, report.largest_document_jsonl_bytes);
+        assert_eq!(distribution.p99, report.largest_document_jsonl_bytes);
+        assert_eq!(distribution.max, report.largest_document_jsonl_bytes);
+        assert_eq!(
+            distribution.max_identity,
+            "processes:f1820000-0000-4000-8000-000000000182:01.00.000"
         );
     }
 
