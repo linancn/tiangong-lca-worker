@@ -280,6 +280,8 @@ rules:
         kind: validation-wrapper
       - path: scripts/test_supabase_consumer_manifest.py
         kind: validation-test
+      - path: scripts/requirements-supabase-consumer-manifest.txt
+        kind: validation-dependency
       - path: .github/workflows/supabase-consumer-manifest.yml
         kind: ci-gate
       - path: docs/supabase-consumer-manifest.md

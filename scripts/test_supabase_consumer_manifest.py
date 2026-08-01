@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from check_supabase_consumer_manifest import (
+    CANONICAL_REMOTE_URL,
+    SCHEMA_PATH,
     ManifestError,
     SourceFile,
     build_manifest,
@@ -60,6 +62,19 @@ sqlx::query(dynamic_sql.as_str());
         self.assertEqual("dynamic-sql", entries[0]["transport"])
         self.assertEqual("dynamic", entries[0]["schema"])
 
+    def test_query_with_executor_and_qualified_variants_are_dynamic_findings(self) -> None:
+        files = [SourceFile("crates/solver-worker/src/variants.rs", b'''\
+::sqlx::query_with(user_sql, args);
+sqlx::query_as_with::<_, Row, _>(qualified_sql, args);
+Executor::execute(executor_sql);
+pool.execute(pool_sql);
+''')]
+        entries = derive_occurrences(files)
+        dynamic = [item for item in entries if item["transport"] == "dynamic-sql"]
+        self.assertEqual(4, len(dynamic))
+        self.assertTrue(all(item["semantics"] == "dynamic-review-required" for item in dynamic))
+        self.assertTrue(all(item["sourceTextSha256"] for item in dynamic))
+
 
 class ManifestNegativeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -84,9 +99,13 @@ class ManifestNegativeTests(unittest.TestCase):
         fixture_git(self.root, "add", ".")
         fixture_git(self.root, "commit", "-qm", "fixture")
         self.head = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
-        self.manifest = build_manifest(self.root, self.head, self.head)
+        fixture_git(self.root, "remote", "add", "origin", CANONICAL_REMOTE_URL)
+        fixture_git(self.root, "update-ref", "refs/remotes/origin/main", self.head)
         contract = self.root / "contracts"
         contract.mkdir()
+        canonical_schema = Path(__file__).resolve().parents[1] / SCHEMA_PATH
+        (self.root / SCHEMA_PATH).write_bytes(canonical_schema.read_bytes())
+        self.manifest = build_manifest(self.root, self.head, self.head)
         self.path = contract / "supabase-consumer-manifest.v3.json"
         self.write(self.manifest)
 
@@ -111,11 +130,12 @@ class ManifestNegativeTests(unittest.TestCase):
             with self.subTest(field=field):
                 changed = copy.deepcopy(self.manifest)
                 changed["occurrences"][0][field] = value
-                self.assert_rejected(changed, "sets differ")
+                self.assert_rejected(changed, "canonical source patterns|span.start.line|semantics drift|sets differ")
 
     def test_commit_sha_and_schema_drift_rejected(self) -> None:
         changed = copy.deepcopy(self.manifest)
         changed["headCommit"] = "0" * 40
+        changed["origin"]["sourceTreeCommit"] = "0" * 40
         self.assert_rejected(changed, "ancestor|git rev-parse")
         changed = copy.deepcopy(self.manifest)
         changed["schema"] = "tiangong.supabase-consumer-manifest.v2"
@@ -126,17 +146,68 @@ class ManifestNegativeTests(unittest.TestCase):
             with self.subTest(field=field):
                 changed = copy.deepcopy(self.manifest)
                 changed["occurrences"][0][field] = value
-                self.assert_rejected(changed, "sets differ")
+                self.assert_rejected(changed, "ACL drift|upstream drift|sets differ")
+
+    def test_span_and_source_text_hash_drift_are_rejected(self) -> None:
+        changed = copy.deepcopy(self.manifest)
+        changed["occurrences"][0]["sourceTextSha256"] = "0" * 64
+        self.assert_rejected(changed, "sets differ")
+        changed = copy.deepcopy(self.manifest)
+        changed["occurrences"][0]["span"]["start"]["column"] += 1
+        self.assert_rejected(changed, "sets differ")
 
     def test_candidate_cannot_claim_authority(self) -> None:
         changed = copy.deepcopy(self.manifest)
         changed["authority"]["authorizesDatabaseFreeze"] = True
-        self.assert_rejected(changed, "candidate and non-authorizing")
+        self.assert_rejected(changed, "authority flags must remain false")
+
+    def test_canonical_schema_byte_tamper_is_rejected(self) -> None:
+        schema_path = self.root / SCHEMA_PATH
+        schema_path.write_bytes(schema_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(ManifestError, "canonical schema bytes|schema SHA-256"):
+            verify(self.root, self.path)
+
+    def test_canonical_schema_draft_drift_is_rejected(self) -> None:
+        schema_path = self.root / SCHEMA_PATH
+        schema = json.loads(schema_path.read_bytes())
+        schema["$schema"] = "http://json-schema.org/draft-07/schema#"
+        schema_path.write_bytes(canonical_bytes(schema))
+        changed = copy.deepcopy(self.manifest)
+        import hashlib
+        changed["schemaSha256"] = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+        self.write(changed)
+        with self.assertRaisesRegex(ManifestError, "Draft 2020-12"):
+            verify(self.root, self.path)
+
+    def test_noncanonical_origin_is_rejected(self) -> None:
+        fixture_git(self.root, "remote", "set-url", "origin", "https://github.com/example/fork.git")
+        with self.assertRaisesRegex(ManifestError, "origin remote is not the canonical repository"):
+            verify(self.root, self.path)
 
     def test_governed_source_tree_digest_tamper_is_rejected(self) -> None:
         changed = copy.deepcopy(self.manifest)
         changed["source"]["governedSourceTreeSha256"] = "0" * 64
         self.assert_rejected(changed, "digest does not match headCommit/sourceTreeCommit")
+
+    def test_absence_proof_distinguishes_zero_findings_from_uncovered(self) -> None:
+        proof = {item["surface"]: item for item in self.manifest["absenceProof"]}
+        self.assertEqual("covered-no-findings", proof["postgrest"]["scannerStatus"])
+        self.assertEqual("not-covered", proof["webhook"]["scannerStatus"])
+        self.assertTrue(any(item["kind"] == "scanner-coverage:webhook" for item in self.manifest["pending"]))
+
+    def test_residue_pending_and_absence_proof_tamper_are_rejected(self) -> None:
+        for field in ("residue", "pending", "absenceProof"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(self.manifest)
+                if field == "residue":
+                    changed[field] = [{
+                        "kind": "dynamic-sql-upstream",
+                        "occurrenceId": changed["occurrences"][0]["id"],
+                        "disposition": "pending-independent-review",
+                    }]
+                else:
+                    changed[field] = []
+                self.assert_rejected(changed, field)
 
     def test_symlink_manifest_rejected_without_following(self) -> None:
         target = self.root / "target.json"
@@ -159,8 +230,11 @@ class ManifestNegativeTests(unittest.TestCase):
         os.symlink("../crates/solver-worker/src/example.rs", link)
         fixture_git(self.root, "add", "scripts/linked.py")
         fixture_git(self.root, "commit", "-qm", "symlink")
+        symlink_head = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
         changed = copy.deepcopy(self.manifest)
-        changed["headCommit"] = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
+        changed["headCommit"] = symlink_head
+        changed["origin"]["sourceTreeCommit"] = symlink_head
+        fixture_git(self.root, "update-ref", "refs/remotes/origin/main", symlink_head)
         self.write(changed)
         with self.assertRaisesRegex(ManifestError, "not a regular git file"):
             verify(self.root, self.path)
@@ -218,6 +292,7 @@ class ManifestNegativeTests(unittest.TestCase):
         fixture_git(self.root, "commit", "-qm", "child snapshot")
         child = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
         changed = build_manifest(self.root, self.head, child)
+        fixture_git(self.root, "update-ref", "refs/remotes/origin/main", child)
         fixture_git(self.root, "checkout", "-q", "--detach", self.head)
         self.write(changed)
         with self.assertRaisesRegex(ManifestError, "not an ancestor of delivery HEAD"):
