@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tiangong-lca.dev/contracts/supabase-consumer-manifest.v3.schema.json",
+  "title": "TianGong Supabase consumer manifest v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "repository", "baseCommit", "headCommit", "authority", "source", "occurrences"],
+  "properties": {
+    "schema": {"const": "tiangong.supabase-consumer-manifest.v3"},
+    "version": {"const": 3},
+    "repository": {"const": "linancn/tiangong-lca-worker"},
+    "baseCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "headCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "authority": {
+      "const": {"status": "candidate", "authorizesDatabaseFreeze": false, "authorizesHostedMutation": false}
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["derivation", "pathPatterns", "symlinkPolicy", "nonRegularFilePolicy", "setEquality"],
+      "properties": {
+        "derivation": {"const": "git-tree-independent-v3"},
+        "pathPatterns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "symlinkPolicy": {"const": "reject"},
+        "nonRegularFilePolicy": {"const": "reject"},
+        "setEquality": {"const": "bidirectional-exact"}
+      }
+    },
+    "occurrences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "file", "line", "operation", "transport", "credential", "schema", "object", "signature", "sourceClass"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^occ-[0-9a-f]{20}$"},
+          "file": {"type": "string", "minLength": 1},
+          "line": {"type": "integer", "minimum": 1},
+          "operation": {"type": "string"},
+          "transport": {"type": "string"},
+          "credential": {"type": "string", "minLength": 1},
+          "schema": {"type": "string", "minLength": 1},
+          "object": {"type": "string", "minLength": 1},
+          "signature": {"type": "string", "minLength": 1},
+          "sourceClass": {"enum": ["runtime", "operator-tooling", "test"]}
+        }
+      }
+    }
+  }
+}

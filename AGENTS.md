@@ -30,6 +30,9 @@ checkPaths:
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
+  - docs/supabase-consumer-manifest.md
+  - contracts/supabase-consumer-manifest.v3.json
+  - contracts/supabase-consumer-manifest.v3.schema.json
   - Cargo.toml
   - Makefile
   - crates/**
@@ -41,9 +44,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 runtime default changes without altering Worker orchestration or provider ownership."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Added the Issue #192 exact-commit Supabase consumer manifest and its candidate-only, non-authorizing database-freeze boundary."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -83,6 +86,7 @@ Start here when the task may change what the compute stack does.
 | `docs/provider-linking.md` | current provider-link runtime decision order, default provider rule, candidate eligibility, and diagnostics contract | modeling rationale for regional supply mix |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics | implementation checklist or consumer API contract |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract | generic solver runtime or branch policy truth |
+| `docs/supabase-consumer-manifest.md` | exact-commit, source-derived Supabase consumer evidence and its non-authorizing database-freeze boundary | database object ownership, migration approval, or hosted mutation authority |
 
 ## Load Order
 
@@ -103,6 +107,7 @@ Read in this order:
    - `docs/implicit-regional-supply-mix-modeling.md`
    - `docs/implicit-regional-supply-mix-modeling.en.md`
    - `docs/tidas-package-contract.md`
+   - `docs/supabase-consumer-manifest.md`
 5. `README.md` only when you need longer setup or operator-facing context
 
 Do not start from the root workspace or the edge repo if the change is really about compute truth.
@@ -195,6 +200,7 @@ Route those tasks to:
 - if provider-link runtime decision order, default provider rule, candidate eligibility, or provider diagnostics change, update `docs/provider-linking.md`
 - if implicit regional supply mix theory, exchange-location supply-region semantics, or annual-volume provider share semantics change, update both `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`
 - if package-worker import/export contract changes, update `docs/tidas-package-contract.md`
+- if Supabase consumer inventory derivation, evidence schema, or freeze handoff changes, update `docs/supabase-consumer-manifest.md`
 - if landing context or operator setup changes, update `README.md`
 - do not copy the same rule into multiple docs just to make it easier to find
 

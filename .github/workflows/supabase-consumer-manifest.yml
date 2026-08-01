@@ -1,0 +1,28 @@
+name: supabase-consumer-manifest
+
+on:
+  pull_request:
+    paths:
+      - "contracts/supabase-consumer-manifest.v3.json"
+      - "contracts/supabase-consumer-manifest.v3.schema.json"
+      - "scripts/check_supabase_consumer_manifest.py"
+      - "scripts/test_supabase_consumer_manifest.py"
+      - "crates/**"
+      - "scripts/**"
+      - "tools/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run manifest verifier negative tests
+        run: PYTHONPATH=scripts python3 -m unittest scripts/test_supabase_consumer_manifest.py
+      - name: Verify exact source/manifest set equality
+        run: python3 scripts/check_supabase_consumer_manifest.py
