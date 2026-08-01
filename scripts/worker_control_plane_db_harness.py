@@ -686,6 +686,7 @@ def main() -> int:
     password = LOCAL_POSTGRES_PASSWORD
     jwt_secret = secrets.token_hex(32)
     resources = Resources()
+    evidence: dict[str, object] | None = None
 
     with tempfile.TemporaryDirectory(prefix="worker192-db-") as directory, \
             installed_cancellation_handlers():
@@ -696,7 +697,7 @@ def main() -> int:
             raise HarnessError("random harness project identity already exists")
 
         def qualify() -> None:
-            nonlocal worker_sha
+            nonlocal evidence, worker_sha
             validate_worker_source(worker_root, worker_sha)
             validate_source_root(source_root)
             extract_exact_database_source(source_root, database_root)
@@ -753,7 +754,7 @@ def main() -> int:
             database = TrustedDatabase(
                 database_url, container_id, system_identifier, sentinel_schema, sentinel
             )
-            print(json.dumps({
+            evidence = {
                 "databaseSha": EXPECTED_DATABASE_SHA,
                 "migrationVersion": EXPECTED_MIGRATION_VERSION,
                 "workerSha": worker_sha,
@@ -764,10 +765,14 @@ def main() -> int:
                 "dockerSocketRealpath": str(endpoint.socket_realpath),
                 "postgresImage": EXPECTED_POSTGRES_IMAGE,
                 "containerId": container_id,
+                "publishedBinding": f"127.0.0.1:{db_port}",
+                "publishedBindingCount": 1,
+                "otherSupabaseServicesStarted": 0,
+                "workerSourceCleanAtTest": True,
                 "roleProof": "SET ROLE service_role ACL matrix; deployment login external",
-            }, sort_keys=True))
+            }
             endpoint.assert_stable()
-            run(
+            completed = run(
                 [
                     "cargo", "test", "-p", "solver-worker", "--test",
                     "worker_control_plane_database_contract", "--", "--ignored",
@@ -778,9 +783,20 @@ def main() -> int:
                 check=True,
                 timeout=900,
             )
+            sys.stderr.write(completed.stdout)
+            sys.stderr.write(completed.stderr)
             endpoint.assert_stable()
 
         run_owned_action(endpoint, resources, project_id, qualify)
+        if evidence is None:
+            raise HarnessError("behavioral qualification produced no evidence")
+        residue = resources_for_project(endpoint, project_id)
+        evidence["cleanupResidueCounts"] = {
+            "containers": len(residue[0]),
+            "volumes": len(residue[1]),
+            "networks": len(residue[2]),
+        }
+        print(json.dumps(evidence, sort_keys=True))
     return 0
 
 
