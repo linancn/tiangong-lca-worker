@@ -27,6 +27,7 @@ EXPECTED_POSTGRES_IMAGE = (
     "public.ecr.aws/supabase/postgres@"
     "sha256:965e2dfb5a23a0d6541b6106541e777b303656ebabd4e878746b189d550c0a66"
 )
+LOCAL_POSTGRES_PASSWORD = "postgres"
 CALLER_DATABASE_ENV = "WORKER_CONTROL_PLANE_DATABASE_URL"
 PROJECT_LABEL = "com.supabase.cli.project"
 COMPOSE_LABEL = "com.docker.compose.project"
@@ -332,6 +333,22 @@ def extract_exact_database_source(source_root: Path, destination: Path) -> None:
         raise HarnessError("database-engine archive is not at the reviewed migration head")
 
 
+def rewrite_local_config(config_path: Path, *, project_id: str, db_port: int) -> None:
+    text = config_path.read_text(encoding="utf-8")
+    replacements = (
+        (r'(?m)^project_id = "[^"]+"$', f'project_id = "{project_id}"'),
+        (
+            r'(?m)^(\[db\]\n(?:.*\n)*?# Port to use for the local database URL\.\n)port = \d+$',
+            rf"\g<1>port = {db_port}",
+        ),
+    )
+    for pattern, replacement in replacements:
+        text, count = re.subn(pattern, replacement, text, count=1)
+        if count != 1:
+            raise HarnessError("exact-head Supabase config does not match reviewed local overrides")
+    config_path.write_text(text, encoding="utf-8")
+
+
 def validate_source_root(source_root: Path) -> None:
     if capture(["git", "rev-parse", "--show-toplevel"], cwd=source_root) != str(source_root):
         raise HarnessError("database worktree is not an exact repository root")
@@ -497,7 +514,7 @@ def inspect_exact(endpoint: DockerEndpoint, kind: str, identifier: str) -> dict[
     return payload[0]
 
 
-def apply_exact_migrations(endpoint: DockerEndpoint, root: Path, database_url: str) -> None:
+def apply_exact_migrations(endpoint: DockerEndpoint, root: Path) -> None:
     version = capture(
         ["supabase", "--version"], environment=endpoint.environment(), timeout=30
     ).splitlines()[0]
@@ -508,7 +525,7 @@ def apply_exact_migrations(endpoint: DockerEndpoint, root: Path, database_url: s
         run(
             [
                 "supabase", "migration", "up",
-                "--db-url", database_url,
+                "--local",
                 "--include-all",
                 "--workdir", str(root),
                 "--yes",
@@ -518,9 +535,7 @@ def apply_exact_migrations(endpoint: DockerEndpoint, root: Path, database_url: s
             timeout=600,
         )
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "Supabase CLI returned no diagnostic").replace(
-            database_url, "<owned-loopback-dsn>"
-        ).strip()
+        detail = (exc.stderr or "Supabase CLI returned no diagnostic").strip()
         raise HarnessError(f"exact migration application failed: {detail}") from None
     endpoint.assert_stable()
 
@@ -668,7 +683,7 @@ def main() -> int:
     project_id = f"w192-{secrets.token_hex(12)}"
     sentinel_schema = f"worker_harness_{secrets.token_hex(16)}"
     sentinel = secrets.token_hex(32)
-    password = secrets.token_hex(32)
+    password = LOCAL_POSTGRES_PASSWORD
     jwt_secret = secrets.token_hex(32)
     resources = Resources()
 
@@ -717,7 +732,12 @@ def main() -> int:
                 "?sslmode=disable",
                 expected_port=db_port,
             )
-            apply_exact_migrations(endpoint, database_root, database_url)
+            rewrite_local_config(
+                database_root / "supabase" / "config.toml",
+                project_id=project_id,
+                db_port=db_port,
+            )
+            apply_exact_migrations(endpoint, database_root)
             validate_migration_head(endpoint, container_id)
             system_identifier = create_sentinel(
                 endpoint, container_id, schema=sentinel_schema, sentinel=sentinel

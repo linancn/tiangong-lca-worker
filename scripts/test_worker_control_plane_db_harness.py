@@ -237,25 +237,40 @@ class WorkerControlPlaneHarnessTest(unittest.TestCase):
             r"^public\.ecr\.aws/supabase/postgres@sha256:[0-9a-f]{64}$",
         )
 
-    def test_migration_failure_does_not_disclose_owned_password(self) -> None:
+    def test_migration_failure_is_reported_without_caller_dsn(self) -> None:
         endpoint = mock.Mock(spec=harness.DockerEndpoint)
         endpoint.environment.return_value = {}
-        database_url = "postgresql://postgres:private-secret@127.0.0.1:55432/postgres"
         failure = subprocess.CalledProcessError(
             1,
-            ["supabase", "migration", "up", "--db-url", database_url],
-            stderr=f"failed to connect to {database_url}",
+            ["supabase", "migration", "up", "--local"],
+            stderr="failed to connect to owned local database",
         )
         with mock.patch.object(
             harness, "capture", return_value=harness.EXPECTED_SUPABASE_CLI_VERSION
         ), mock.patch.object(harness, "run", side_effect=failure), self.assertRaises(
             harness.HarnessError
         ) as raised:
-            harness.apply_exact_migrations(
-                endpoint, Path("/tmp/database-engine"), database_url
+            harness.apply_exact_migrations(endpoint, Path("/tmp/database-engine"))
+        self.assertIn("owned local database", str(raised.exception))
+
+    def test_config_override_changes_only_random_identity_and_database_port(self) -> None:
+        original = (
+            'project_id = "database-engine"\n\n[api]\nport = 55321\n\n[db]\n'
+            '# Port to use for the local database URL.\nport = 55322\n'
+            '# Port used by db diff command to initialize the shadow database.\n'
+            'shadow_port = 55320\n'
+        )
+        with mock.patch.object(Path, "read_text", return_value=original), mock.patch.object(
+            Path, "write_text"
+        ) as write:
+            harness.rewrite_local_config(
+                Path("config.toml"), project_id="worker192-test", db_port=55432
             )
-        self.assertNotIn("private-secret", str(raised.exception))
-        self.assertIn("<owned-loopback-dsn>", str(raised.exception))
+        rendered = write.call_args.args[0]
+        self.assertIn('project_id = "worker192-test"', rendered)
+        self.assertIn("[api]\nport = 55321", rendered)
+        self.assertIn("[db]\n# Port to use for the local database URL.\nport = 55432", rendered)
+        self.assertIn("shadow_port = 55320", rendered)
 
 
 if __name__ == "__main__":
