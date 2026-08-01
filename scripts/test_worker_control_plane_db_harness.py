@@ -82,6 +82,13 @@ class WorkerControlPlaneHarnessTest(unittest.TestCase):
                 )
 
     def test_rejects_localhost_nss_relay_and_rebound_status_targets(self) -> None:
+        self.assertEqual(
+            harness.validate_status_database_url(
+                "postgresql://postgres:postgres@127.0.0.1:55432/postgres?sslmode=disable",
+                expected_port=55432,
+            ),
+            "postgresql://postgres:postgres@127.0.0.1:55432/postgres?sslmode=disable",
+        )
         for value in (
             "postgresql://postgres:postgres@localhost:55432/postgres",
             "postgresql://postgres:postgres@127.0.0.1:60000/postgres",

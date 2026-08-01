@@ -305,7 +305,7 @@ def validate_status_database_url(value: str, *, expected_port: int) -> str:
         or parsed.hostname != "127.0.0.1"
         or port != expected_port
         or parsed.path != "/postgres"
-        or parsed.query
+        or parsed.query not in {"", "sslmode=disable"}
         or parsed.fragment
     ):
         raise HarnessError("Supabase control-plane DB URL does not match the owned container port")
@@ -713,7 +713,8 @@ def main() -> int:
                 inspected, project_id=project_id, expected_image_id=image_id
             )
             database_url = validate_status_database_url(
-                f"postgresql://postgres:{quote(password, safe='')}@127.0.0.1:{db_port}/postgres",
+                f"postgresql://postgres:{quote(password, safe='')}@127.0.0.1:{db_port}/postgres"
+                "?sslmode=disable",
                 expected_port=db_port,
             )
             apply_exact_migrations(endpoint, database_root, database_url)
