@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: 0de55284f3e614dcc3acfaf8f63172b9f15e40cf
 lastReviewedNote: "Updated for Worker Issue #186 with tracked external/provider child executables, exact root schemas, four-mode identity gates, owner-adapter isolation, and negative leakage/cleanup tests."
 related:
   - ../../AGENTS.md

@@ -191,6 +191,90 @@ class WorkerControlPlaneHarnessTest(unittest.TestCase):
                 self.assertRaisesRegex(harness.HarnessError, "daemon identity"):
             endpoint.assert_stable()
 
+    def test_endpoint_revalidation_rejects_socket_realpath_redirect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "docker.sock"
+            original_path = Path(directory) / "original.sock"
+            redirected_path = Path(directory) / "redirected.sock"
+            original_listener = socket.socket(socket.AF_UNIX)
+            redirected_listener = socket.socket(socket.AF_UNIX)
+            original_listener.bind(str(socket_path))
+            redirected_listener.bind(str(redirected_path))
+            original_stat = socket_path.stat()
+            endpoint = harness.DockerEndpoint(
+                f"unix://{socket_path}",
+                socket_path.resolve(strict=True),
+                original_stat.st_dev,
+                original_stat.st_ino,
+                "daemon-id",
+                "daemon-name",
+                Path(directory) / "docker-config",
+            )
+            socket_path.rename(original_path)
+            socket_path.symlink_to(redirected_path)
+            try:
+                self.assertEqual(
+                    socket_path.resolve(strict=True), redirected_path.resolve(strict=True)
+                )
+                self.assertNotEqual(socket_path.resolve(strict=True), endpoint.socket_realpath)
+                with mock.patch.object(harness, "_daemon_identity") as daemon_identity, \
+                        self.assertRaisesRegex(
+                            harness.HarnessError, "Unix socket identity changed"
+                        ):
+                    endpoint.assert_stable()
+                daemon_identity.assert_not_called()
+            finally:
+                original_listener.close()
+                redirected_listener.close()
+
+    def test_endpoint_revalidation_rejects_replaced_socket_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "docker.sock"
+            original_path = Path(directory) / "original.sock"
+            original_listener = socket.socket(socket.AF_UNIX)
+            original_listener.bind(str(socket_path))
+            original_stat = socket_path.stat()
+            endpoint = harness.DockerEndpoint(
+                f"unix://{socket_path}",
+                socket_path.resolve(strict=True),
+                original_stat.st_dev,
+                original_stat.st_ino,
+                "daemon-id",
+                "daemon-name",
+                Path(directory) / "docker-config",
+            )
+            socket_path.rename(original_path)
+            replacement_listener = socket.socket(socket.AF_UNIX)
+            replacement_listener.bind(str(socket_path))
+            try:
+                replacement_stat = socket_path.stat()
+                self.assertEqual(replacement_stat.st_dev, original_stat.st_dev)
+                self.assertNotEqual(replacement_stat.st_ino, original_stat.st_ino)
+                with mock.patch.object(harness, "_daemon_identity") as daemon_identity, \
+                        self.assertRaisesRegex(
+                            harness.HarnessError, "Unix socket identity changed"
+                        ):
+                    endpoint.assert_stable()
+                daemon_identity.assert_not_called()
+            finally:
+                original_listener.close()
+                replacement_listener.close()
+
+    def test_endpoint_revalidation_rejects_socket_device_change(self) -> None:
+        endpoint = harness.DockerEndpoint(
+            "unix:///tmp/docker.sock", Path("/tmp/docker.sock"), 1, 2,
+            "daemon-id", "daemon-name", Path("/tmp/docker-config"),
+        )
+        moved_stat = mock.Mock(st_mode=stat.S_IFSOCK, st_dev=2, st_ino=2)
+        with mock.patch.object(Path, "resolve", return_value=endpoint.socket_realpath), \
+                mock.patch.object(Path, "stat", return_value=moved_stat), \
+                mock.patch.object(harness, "_daemon_identity") as daemon_identity, \
+                self.assertRaisesRegex(
+                    harness.HarnessError, "Unix socket identity changed"
+                ):
+            endpoint.assert_stable()
+        daemon_identity.assert_not_called()
+
     def test_resource_queries_require_both_ownership_labels(self) -> None:
         endpoint = mock.Mock(spec=harness.DockerEndpoint)
         completed = mock.Mock(stdout="")

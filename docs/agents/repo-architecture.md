@@ -36,7 +36,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: 19a019b4e1b56f2106e6f74207d2ec4571357bf6
+lastReviewedCommit: 0de55284f3e614dcc3acfaf8f63172b9f15e40cf
 lastReviewedNote: "Updated for Worker Issue #186: Worker owns external/provider orchestration and envelope validation while provider assertions remain in their owning repositories."
 related:
   - ../../AGENTS.md

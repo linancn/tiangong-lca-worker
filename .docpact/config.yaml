@@ -1,7 +1,7 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-01"
-lastReviewedCommit: "79276438f58d34208b7d82f469c2c01d3a86a139"
+lastReviewedCommit: "0de55284f3e614dcc3acfaf8f63172b9f15e40cf"
 lastReviewedNote: "Reviewed for Worker Issue #192: versioned API consumer cutover and exact-head qualification preserve current workspace ownership and docpact routing."
 
 # Keep deterministic governance facts here.
