@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub const TIDAS_OPERATION_REPORT_SCHEMA: &str = "tidas.operation-report.v1";
 pub const TIDAS_BATCH_PROTOCOL: &str = "document-validation-batch.v1";
 pub const TIDAS_BATCH_PROFILE: &str = "tidas-document-conformance.v1";
-pub const DEFAULT_TIDAS_VERSION: &str = "0.1.2";
+pub const DEFAULT_TIDAS_VERSION: &str = "0.1.3";
 const DEFAULT_TIDAS_TIMEOUT_SECONDS: u64 = 1_800;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn governed_release_version_is_the_runtime_default() {
-        assert_eq!(DEFAULT_TIDAS_VERSION, "0.1.2");
+        assert_eq!(DEFAULT_TIDAS_VERSION, "0.1.3");
         if std::env::var_os("TIDAS_EXPECTED_VERSION").is_none() {
             assert_eq!(expected_version(), DEFAULT_TIDAS_VERSION);
         }
