@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
+use crate::pgbouncer_sqlx::{self as sqlx, Executor, PgPool, Postgres, Row};
 use crate::worker_control_plane::{CLAIM_JOBS_SQL, HEARTBEAT_JOB_SQL, RECORD_JOB_RESULT_SQL};
 
 pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
@@ -238,19 +238,22 @@ pub fn lease_heartbeat_period(lease_seconds: i32) -> std::time::Duration {
     std::time::Duration::from_secs((lease_seconds / 3).max(1))
 }
 
-pub async fn claim_worker_jobs(
-    pool: &PgPool,
+pub async fn claim_worker_jobs<'e, E>(
+    executor: E,
     worker_queue: &str,
     worker_id: &str,
     limit: i32,
     lease_seconds: i32,
-) -> anyhow::Result<Vec<WorkerJob>> {
+) -> anyhow::Result<Vec<WorkerJob>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query(CLAIM_JOBS_SQL)
         .bind(worker_queue)
         .bind(worker_id)
         .bind(limit)
         .bind(lease_seconds)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_claim_jobs")?;
@@ -261,15 +264,18 @@ pub async fn claim_worker_jobs(
     )
 }
 
-pub async fn heartbeat_worker_job(
-    pool: &PgPool,
+pub async fn heartbeat_worker_job<'e, E>(
+    executor: E,
     job_id: Uuid,
     lease_token: Uuid,
     phase: &str,
     progress: f64,
     diagnostics: Option<Value>,
     lease_seconds: i32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query(HEARTBEAT_JOB_SQL)
         .bind(job_id)
         .bind(lease_token)
@@ -277,19 +283,22 @@ pub async fn heartbeat_worker_job(
         .bind(progress)
         .bind(diagnostics)
         .bind(lease_seconds)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_heartbeat_job")?;
     Ok(())
 }
 
-pub async fn record_worker_job_result(
-    pool: &PgPool,
+pub async fn record_worker_job_result<'e, E>(
+    executor: E,
     job_id: Uuid,
     lease_token: Uuid,
     result: WorkerJobResult,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Value>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query(RECORD_JOB_RESULT_SQL)
         .bind(job_id)
         .bind(lease_token)
@@ -304,7 +313,7 @@ pub async fn record_worker_job_result(
         .bind(result.blocker_codes)
         .bind(result.resolution_scope)
         .bind(result.retryable)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     let rpc_result = row.try_get::<Value, _>("result")?;
     ensure_ok(&rpc_result, "worker_record_job_result")?;

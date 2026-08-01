@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when frozen Worker control-plane consumers still use public aliases."""
+"""Fail when frozen Worker consumers or contract identifiers use public aliases."""
 
 from __future__ import annotations
 
@@ -37,8 +37,9 @@ def tracked_consumer_paths(root: Path) -> list[Path]:
         relative = raw_path.decode()
         if relative == "scripts/check_worker_control_plane_api_cutover.py":
             continue
-        if relative in SCANNED_FILES or relative.startswith(SCANNED_PREFIXES):
-            paths.append(root / relative)
+        path = root / relative
+        if path.exists() and (relative in SCANNED_FILES or relative.startswith(SCANNED_PREFIXES)):
+            paths.append(path)
     return paths
 
 
@@ -59,11 +60,11 @@ def scan(paths: list[Path], root: Path) -> list[str]:
 def main() -> int:
     violations = scan(tracked_consumer_paths(ROOT), ROOT)
     if violations:
-        print("frozen Worker public consumer aliases remain:", file=sys.stderr)
+        print("frozen Worker public consumer/contract aliases remain:", file=sys.stderr)
         for violation in violations:
             print(violation, file=sys.stderr)
         return 1
-    print("PASS frozen Worker control-plane public consumer count is zero")
+    print("PASS frozen Worker control-plane public consumer/contract alias count is zero")
     return 0
 
 

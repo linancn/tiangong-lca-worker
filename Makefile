@@ -7,7 +7,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 qualification-test:
-	PYTHONPATH=scripts python3 -m unittest scripts/test_scope_closure_qualification.py scripts/test_worker_control_plane_api_cutover.py scripts/test_worker_control_plane_database_target.py
+	PYTHONPATH=scripts python3 -m unittest scripts/test_scope_closure_qualification.py scripts/test_worker_control_plane_api_cutover.py scripts/test_worker_control_plane_db_harness.py
 	python3 scripts/check_worker_control_plane_api_cutover.py
 
 clippy:

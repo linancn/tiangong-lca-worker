@@ -155,9 +155,9 @@ worker 反序列化时 `model_version` 仍可作为 `snapshot_id` 的别名（�
 
 ### 3.6 `worker_jobs` solver 队列映射
 
-Worker 的数据库适配对已冻结的 enqueue、claim、heartbeat 和 terminal result 使用版本化 `api.worker_*_v1` service RPC；尚未冻结的 cancel/read/list/retry 保留原 compatibility surface。所有 direct job/artifact SQL 使用显式 schema-qualified `private.worker_jobs` / `private.worker_job_artifacts` Expand contract，不依赖 `search_path`。Expand 阶段这些 private relations 可以是 public 物理存储上的 security-invoker compatibility views；物理存储切换属于后续 gated Contract migration。`api.worker_job_domain_refs` 继续是跨 domain table 的稳定 `UNION ALL` projection view，不迁入 private。上述物理边界不得出现在 job payload、result DTO、`domainSource` 或错误语义中。
+Worker 的数据库适配对已冻结的 enqueue、claim、heartbeat 和 terminal result 使用版本化 `api.worker_*_v1` service RPC；尚未冻结的 cancel/read/list/retry 保留原 compatibility surface。所有 direct job/artifact SQL 使用显式 schema-qualified `private.worker_jobs` / `private.worker_job_artifacts` Expand contract，不依赖 `search_path`。Expand 阶段这些 private relations 可以是 public 物理存储上的 security-invoker compatibility views；物理存储切换属于后续 gated Contract migration。`api.worker_job_domain_refs` 继续是跨 domain table 的稳定 `UNION ALL` projection view，不迁入 private；当前 Worker 没有读取该 view 的 production runtime caller，本次只切换共享 contract identifier、静态/集成测试和文档。上述物理边界不得出现在 job payload、result DTO、`domainSource` 或错误语义中。
 
-solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs`，通过稳定 public claim RPC 消费 schema-qualified private Expand contract。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
+solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs`，通过版本化 `api.worker_claim_jobs_v1` RPC 消费 schema-qualified private Expand contract。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
 
 | `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
 | --- | --- | --- | --- |

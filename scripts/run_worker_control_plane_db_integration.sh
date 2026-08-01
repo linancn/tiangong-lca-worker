@@ -1,37 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required=(
-  WORKER_CONTROL_PLANE_DATABASE_URL
-  WORKER_CONTROL_PLANE_DATABASE_WORKTREE
-  WORKER_CONTROL_PLANE_DATABASE_SHA
-  WORKER_CONTROL_PLANE_MIGRATION_VERSION
-)
-
-for name in "${required[@]}"; do
-  if [[ -z "${!name:-}" ]]; then
-    echo "missing required isolated-harness variable: ${name}" >&2
-    exit 2
-  fi
-done
-
-database_worktree="$(cd "${WORKER_CONTROL_PLANE_DATABASE_WORKTREE}" && pwd -P)"
-database_sha="$(git -C "${database_worktree}" rev-parse HEAD)"
-if [[ "${database_sha}" != "${WORKER_CONTROL_PLANE_DATABASE_SHA}" ]]; then
-  echo "database worktree HEAD does not match WORKER_CONTROL_PLANE_DATABASE_SHA" >&2
+if [[ -n "${WORKER_CONTROL_PLANE_DATABASE_URL:-}" ]]; then
+  echo "caller-supplied Worker behavioral database URLs are forbidden" >&2
   exit 2
 fi
-if [[ -n "$(git -C "${database_worktree}" status --porcelain --untracked-files=no)" ]]; then
-  echo "database worktree has tracked changes; exact-SHA evidence would be ambiguous" >&2
+if [[ -z "${WORKER_CONTROL_PLANE_DATABASE_WORKTREE:-}" ]]; then
+  echo "WORKER_CONTROL_PLANE_DATABASE_WORKTREE is required" >&2
   exit 2
 fi
 
-python3 "$(dirname "${BASH_SOURCE[0]}")/check_worker_control_plane_database_target.py"
-
-worker_sha="$(git rev-parse HEAD)"
-printf '{"databaseSha":"%s","migrationVersion":"%s","workerSha":"%s","targetKind":"%s","roleProof":"SET ROLE service_role ACL matrix; deployment login external"}\n' \
-  "${database_sha}" "${WORKER_CONTROL_PLANE_MIGRATION_VERSION}" "${worker_sha}" "loopback"
-
-cargo test -p solver-worker \
-  --test worker_control_plane_database_contract \
-  -- --ignored --exact private_worker_control_plane_preserves_lifecycle_and_compatibility
+exec python3 "$(dirname "${BASH_SOURCE[0]}")/worker_control_plane_db_harness.py"

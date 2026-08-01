@@ -91,30 +91,40 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 
 ## Isolated Worker Control-Plane Database Contract
 
-Run `scripts/run_worker_control_plane_db_integration.sh` only against a fresh
-literal-loopback Supabase/Postgres stack built from the exact accepted Database
-Engine head and migration ledger head. The parsed URL hostname must be exactly
-`localhost`, `127.0.0.1`, or `::1`; host/service query overrides are rejected.
-Hosted and production targets are unconditionally forbidden because the
-behavioral harness performs persistent job/artifact mutations. The wrapper
-verifies the clean database worktree HEAD before emitting a locator-free SHA
-manifest. The Rust harness performs
-migration metadata preflight before switching every behavioral connection with
-`SET ROLE service_role`; this proves the local ACL matrix only and must never be
-reported as proof of the deployment login role. Production `DATABASE_URL`
-`current_user`, pooler mode, and effective grants remain an external evidence
-gate.
+Run `scripts/run_worker_control_plane_db_integration.sh` with only
+`WORKER_CONTROL_PLANE_DATABASE_WORKTREE` pointing to a clean local checkout of
+the exact accepted Database Engine head. Caller-supplied behavioral database
+URLs and Docker endpoint overrides are rejected. The runner archives the fixed
+Database #365 head, creates a random one-time Supabase project with fresh local
+ports, starts only its PostgreSQL container, and derives the DSN from that
+project's Supabase control plane. It requires a local Unix-socket Docker context
+and binds the exact container ID, Supabase/Compose labels, immutable PostgreSQL
+system identifier, and published port before behavioral execution. It never
+uses `localhost`/NSS; only the derived `127.0.0.1` endpoint is accepted.
+
+The runner creates a random sentinel inside its owned container through
+`docker exec`, then every Rust write path verifies that sentinel, container ID,
+and `pg_control_system().system_identifier` as `service_role` in the same
+transaction before mutation. This closes local relay, port-rebinding, and
+preflight-to-behavior target-switch paths. Finally it removes only the exact
+container, volume, and network identities it recorded for this random project
+and verifies no labeled residue remains. Hosted and production targets remain
+unconditionally forbidden because the behavioral harness performs persistent
+job/artifact mutations. The local ACL matrix must never be reported as proof of
+the deployment login role; production `DATABASE_URL` identity, pooler mode, and
+effective grants remain an external evidence gate.
 
 The harness covers duplicate enqueue/lost response, two-worker concurrent
 claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
 terminal result, transaction rollback, and old-public/new-private parity. It
-also proves the frozen versioned API routines and canonical domain-ref view are
-available to `service_role` but denied to browser roles. Hosted Preview evidence
+also proves the frozen versioned API routines and canonical domain-ref contract
+view are available to `service_role` but denied to browser roles. The domain-ref
+view has no production Worker read caller in this scope; its change is limited
+to the contract identifier, static test, integration test, and documentation.
+Hosted Preview evidence
 must be collected separately through a read-only management-plane query that
 checks only project ref, exact migration head, object signatures, and ACLs; it
-must never invoke this behavioral runner. The runner does not create or reuse
-containers or volumes. The caller owns creation and teardown of the isolated
-exact-head stack.
+must never invoke this behavioral runner.
 
 ### Scope-closure capacity input modes
 
