@@ -95,24 +95,35 @@ Run `scripts/run_worker_control_plane_db_integration.sh` with only
 `WORKER_CONTROL_PLANE_DATABASE_WORKTREE` pointing to a clean local checkout of
 the exact accepted Database Engine head. Caller-supplied behavioral database
 URLs and Docker endpoint overrides are rejected. The runner archives the fixed
-Database #365 head, creates a random one-time Supabase project with fresh local
-ports, starts only its PostgreSQL container, and derives the DSN from that
-project's Supabase control plane. It requires a local Unix-socket Docker context
-and binds the exact container ID, Supabase/Compose labels, immutable PostgreSQL
-system identifier, and published port before behavioral execution. It never
-uses `localhost`/NSS; only the derived `127.0.0.1` endpoint is accepted.
+Database #365 head, resolves the current local Docker context once to an exact
+Unix-socket realpath/inode and daemon ID/name, then runs every Docker and
+Supabase subprocess with that pinned `DOCKER_HOST`, an isolated temporary
+`DOCKER_CONFIG`, and no mutable context override. It starts only a random
+one-time PostgreSQL container from the Supabase CLI 2.84.2 image pinned by
+registry digest. Docker allocates the host port atomically from
+`127.0.0.1::5432`; inspection must return exactly one
+`127.0.0.1:<port>` binding, so wildcard, IPv6, empty, duplicate, and changed
+publications fail before migrations or behavioral execution. No other Supabase
+service is started and the database is never wildcard-published, even during
+startup. The runner applies the exact archived migrations through its derived
+loopback DSN and binds the exact container ID, both ownership labels, immutable
+image ID, migration ledger, PostgreSQL system identifier, and published port.
+It never uses `localhost`/NSS or a reserve-then-release free-port probe.
 
 The runner creates a random sentinel inside its owned container through
 `docker exec`, then every Rust write path verifies that sentinel, container ID,
 and `pg_control_system().system_identifier` as `service_role` in the same
 transaction before mutation. This closes local relay, port-rebinding, and
 preflight-to-behavior target-switch paths. Finally it removes only the exact
-container, volume, and network identities it recorded for this random project
-and verifies no labeled residue remains. Hosted and production targets remain
-unconditionally forbidden because the behavioral harness performs persistent
-job/artifact mutations. The local ACL matrix must never be reported as proof of
-the deployment login role; production `DATABASE_URL` identity, pooler mode, and
-effective grants remain an external evidence gate.
+container ID, volume name, and network ID recorded immediately after each
+create response, after revalidating both ownership labels and the pinned daemon.
+SIGINT and SIGTERM flow through the same best-effort exact cleanup. The runner
+never discovers and deletes a newly appearing resource by label; unexpected
+labeled residue is reported and left untouched. Hosted and production targets
+remain unconditionally forbidden because the behavioral harness performs
+persistent job/artifact mutations. The local ACL matrix must never be reported
+as proof of the deployment login role; production `DATABASE_URL` identity,
+pooler mode, and effective grants remain an external evidence gate.
 
 The harness covers duplicate enqueue/lost response, two-worker concurrent
 claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
