@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Updated for Worker Issue #186: Worker owns external/provider orchestration and envelope validation while provider assertions remain in their owning repositories."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #193: the tidas v0.1.3 default does not change Worker, provider, or root-integration ownership boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

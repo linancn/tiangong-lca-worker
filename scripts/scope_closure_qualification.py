@@ -27,7 +27,7 @@ EXTERNAL_SCHEMA = "lcia.scope-closure-external-result.v1"
 PROVIDER_SCHEMA = "lcia.scope-closure-provider-result.v1"
 PROVIDER_OWNER_SCHEMA = "lcia.scope-closure-provider-owned-result.v1"
 CAPACITY_SCHEMA = "lcia.scope-closure-capacity-result.v3"
-TIDAS_VERSION = "0.1.2"
+TIDAS_VERSION = "0.1.3"
 TIDAS_PROTOCOL = "document-validation-batch.v1"
 CACHE_MODES = ("cold", "warm", "mixed", "stale")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -403,7 +403,7 @@ def _validate_tidas(binary: Path, package: Path, work: Path) -> tuple[dict[str, 
         "version",
     )
     if version.get("summary", {}).get("binary_version") != TIDAS_VERSION:
-        raise QualificationError("TIDAS_BIN is not exact version 0.1.2")
+        raise QualificationError(f"TIDAS_BIN is not exact version {TIDAS_VERSION}")
     describe = _tidas_json(
         binary,
         ("validate", "--describe", "--format", "json", "--progress", "never"),
