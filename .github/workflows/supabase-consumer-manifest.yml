@@ -1,0 +1,40 @@
+name: supabase-consumer-manifest
+
+on:
+  pull_request:
+    paths:
+      - "contracts/supabase-consumer-manifest.v3.json"
+      - "contracts/supabase-consumer-manifest.v3.schema.json"
+      - "scripts/check_supabase_consumer_manifest.py"
+      - "scripts/test_supabase_consumer_manifest.py"
+      - "scripts/requirements-supabase-consumer-manifest.txt"
+      - "crates/**"
+      - "scripts/**"
+      - "tools/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Prove checkout is the actual pull request delivery HEAD
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Install pinned manifest schema validator
+        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-supabase-consumer-manifest.txt
+      - name: Run manifest verifier negative tests
+        run: PYTHONPATH=scripts python3 -m unittest scripts/test_supabase_consumer_manifest.py
+      - name: Verify exact source/manifest set equality
+        run: python3 scripts/check_supabase_consumer_manifest.py
+      - name: Prove verification and canonical-format checks are non-mutating
+        run: git diff --exit-code

@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
 lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 default does not change public Worker, Edge, or Next DTOs."
 related:
   - AGENTS.md

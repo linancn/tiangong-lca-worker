@@ -34,15 +34,21 @@ checkPaths:
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
+  - docs/supabase-consumer-manifest.md
+  - contracts/supabase-consumer-manifest.v3.json
+  - contracts/supabase-consumer-manifest.v3.schema.json
+  - scripts/check_supabase_consumer_manifest.py
+  - scripts/test_supabase_consumer_manifest.py
+  - scripts/requirements-supabase-consumer-manifest.txt
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
   - .github/workflows/**
   - .githooks/pre-push
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: existing runtime, release-binary, scope-closure, and docpact proof requirements apply to tidas v0.1.3."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Added Issue #192 exact-tree consumer-manifest verification, negative proof, and the database-owned freeze handoff."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -52,6 +58,7 @@ related:
   - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/review-submit-fast-gate-contract.md
   - ../../docs/tidas-package-contract.md
+  - ../../docs/supabase-consumer-manifest.md
   - ./contracts/scope-closure-memory-and-result-contract.md
 ---
 
@@ -74,6 +81,7 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | Change type | Minimum local proof | Additional proof when risk is higher | Notes |
 | --- | --- | --- | --- |
 | `crates/**` solver or worker code | `make check`; hard Clippy gate; hard format gate | run the narrow manual script that matches the touched area, such as snapshot build, full compute debug, or BW25 validation | Record which job family or worker path was exercised. |
+| Supabase consumer manifest or any scanned consumer source | `python3 -m pip install -r scripts/requirements-supabase-consumer-manifest.txt`; `python3 scripts/check_supabase_consumer_manifest.py`; `PYTHONPATH=scripts python3 -m unittest scripts/test_supabase_consumer_manifest.py`; `make check` | database-engine independently reads exact bytes from the immutable Worker commit and runs the real joint Supabase contract suite | The Worker artifact is candidate/non-authorizing until the database-owned freeze receipt accepts exact bytes and joint behavior passes. |
 | shared resource admission or object file I/O | `cargo test -p solver-worker --lib resource::tests`; `cargo test -p solver-worker --lib storage::tests`; `cargo check -p solver-worker --all-targets`; hard Clippy/format gates | exercise a local no-`Content-Length` response, cancellation during streaming, hash mismatch, preflight oversize rejection, and multipart abort behavior when the object-store test environment is available | Assert stable resource error codes, fixed buffers, and absence of destination partial files. Keep legacy byte-returning APIs compatible, but use explicit-cap file APIs for newly migrated heavy paths. |
 | Calculation Bundle / all-unit directional LCI | `cargo test -p solver-worker calculation_bundle`; `cargo test -p solver-worker artifacts`; `cargo test -p solver-core cache`; `cargo test -p solver-worker --bin snapshot_builder`; `cargo check -p solver-worker --all-targets`; hard Clippy and format gates | with safe DB/S3 env, rebuild one snapshot, run `solve_all_unit`, verify manifest-last upload, all compressed/uncompressed hashes, exact 256-process boundaries, query-v2 chunk ranges/hashes without `h_matrix`, reviewed 25-method identities, recursively complete TIDAS source closure, directional LCI parity, and retry byte determinism. Exercise multiple admitted snapshots and prove resident cache bytes never exceed capacity, LRU eviction is deterministic, invalidation releases bytes, oversized workloads reject before factorization, and actual UMFPACK peak/retained estimates are reported. Include an LCIA-factor-only Elementary Flow and prove it appears as `support` with transitive Flow Property/Unit Group/Source/Contact documents while compiled Flow count, B/C axes, and provider decisions remain inventory-derived; also prove a non-Elementary factor target fails closed. | Old snapshots without `compiled_graph.release_evidence.source_datasets`, or with the legacy exchange-only source-closure policy, must fail closed and be rebuilt. Never infer exchange IDs, versions, units, directions, provider output IDs, or source documents from matrix indices or mutable solve-time database state. Sparse factorization fill-in is workload-dependent; tune admission from observed workloads and do not claim an input-independent constant bound. |
 | solver `worker_jobs` queue backend | `cargo test -p solver-worker worker_jobs`; `cargo test -p solver-worker maps_worker_jobs`; `cargo check -p solver-worker`; hard Clippy gate; hard format gate | when DB/S3 env is available, enqueue one safe `worker_queue=solver` job and run `solver-worker --queue-backend worker-jobs --mode worker` to verify claim/heartbeat/result projection; for legacy-table retirement, run against a schema where `public.lca_jobs` is absent or ignored | Keep `docs/lca-api-contract.md` and `docs/edge-function-integration.md` aligned with job kind, payload schema, worker_jobs result_ref, and optional legacy `lca_jobs` compatibility expectations. |

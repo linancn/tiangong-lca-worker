@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-01"
-lastReviewedCommit: "e5a7f769f4716266271eea53cb5233781635174f"
-lastReviewedNote: "Reviewed for Worker Issue #193: existing routing and ownership cover the exact tidas v0.1.3 runtime-default rollout."
+lastReviewedAt: "2026-08-02"
+lastReviewedCommit: "cabb2518a69272c20abe61692eadb292b95596f2"
+lastReviewedNote: "Issue #192 adds exact-tree Supabase consumer evidence without moving schema ownership or freeze authority out of database-engine."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -39,7 +39,11 @@ ownership:
           - docs/implicit-regional-supply-mix-modeling.md
           - docs/implicit-regional-supply-mix-modeling.en.md
           - docs/tidas-package-contract.md
+          - docs/supabase-consumer-manifest.md
+          - contracts/supabase-consumer-manifest.v3.json
+          - contracts/supabase-consumer-manifest.v3.schema.json
           - .github/workflows/ai-doc-lint.yml
+          - .github/workflows/supabase-consumer-manifest.yml
       ownerRepo: worker
     - id: solver-runtime-and-ci
       paths:
@@ -94,6 +98,9 @@ coverage:
     - docs/implicit-regional-supply-mix-modeling.md
     - docs/implicit-regional-supply-mix-modeling.en.md
     - docs/tidas-package-contract.md
+    - docs/supabase-consumer-manifest.md
+    - contracts/supabase-consumer-manifest.v3.json
+    - contracts/supabase-consumer-manifest.v3.schema.json
     - Cargo.toml
     - Makefile
     - crates/**
@@ -102,6 +109,7 @@ coverage:
     - supabase/migrations/**
     - .github/workflows/ai-doc-lint.yml
     - .github/workflows/ci.yml
+    - .github/workflows/supabase-consumer-manifest.yml
   exclude:
     - .git/**
     - .github/scripts/**
@@ -210,6 +218,7 @@ routing:
         - tools/bw25-validator/**
         - supabase/migrations/**
         - .github/workflows/ci.yml
+        - .github/workflows/supabase-consumer-manifest.yml
     repo-docs:
       paths:
         - AGENTS.md
@@ -227,6 +236,9 @@ routing:
         - docs/implicit-regional-supply-mix-modeling.md
         - docs/implicit-regional-supply-mix-modeling.en.md
         - docs/tidas-package-contract.md
+        - docs/supabase-consumer-manifest.md
+        - contracts/supabase-consumer-manifest.v3.json
+        - contracts/supabase-consumer-manifest.v3.schema.json
     root-integration:
       paths:
         - AGENTS.md
@@ -249,12 +261,43 @@ docInventory:
     - docs/implicit-regional-supply-mix-modeling.md
     - docs/implicit-regional-supply-mix-modeling.en.md
     - docs/tidas-package-contract.md
+    - docs/supabase-consumer-manifest.md
 
 repo:
   id: worker
   owner: worker
 
 rules:
+  - id: worker-supabase-consumer-manifest-contract
+    scope: repo
+    repo: worker
+    triggers:
+      - path: contracts/supabase-consumer-manifest.v3.json
+        kind: evidence-manifest
+      - path: contracts/supabase-consumer-manifest.v3.schema.json
+        kind: evidence-schema
+      - path: scripts/check_supabase_consumer_manifest.py
+        kind: validation-wrapper
+      - path: scripts/test_supabase_consumer_manifest.py
+        kind: validation-test
+      - path: scripts/requirements-supabase-consumer-manifest.txt
+        kind: validation-dependency
+      - path: .github/workflows/supabase-consumer-manifest.yml
+        kind: ci-gate
+      - path: docs/supabase-consumer-manifest.md
+        kind: runtime-contract
+    requiredDocs:
+      - path: AGENTS.md
+        mode: review_or_update
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/supabase-consumer-manifest.md
+        mode: body_update_required
+    reason: Exact-tree consumer evidence, its schema, negative proof, and the candidate-only database freeze boundary must change together.
   - id: worker-bootstrap-contract
     scope: repo
     repo: worker

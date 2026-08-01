@@ -30,14 +30,17 @@ checkPaths:
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
+  - docs/supabase-consumer-manifest.md
+  - contracts/supabase-consumer-manifest.v3.json
+  - scripts/check_supabase_consumer_manifest.py
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
   - .githooks/pre-push
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: the tidas v0.1.3 default does not change Worker, provider, or root-integration ownership boundaries."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Added Issue #192 consumer-evidence paths; Worker runtime, database schema ownership, and root integration boundaries are unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -46,6 +49,7 @@ related:
   - ../../docs/scope-closure-contract.md
   - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/review-submit-fast-gate-contract.md
+  - ../../docs/supabase-consumer-manifest.md
   - ./contracts/scope-closure-memory-and-result-contract.md
 ---
 
@@ -98,6 +102,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/provider-linking.md` | current provider-link runtime decision order, default rule, candidate eligibility, and diagnostics contract |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling notes for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract |
+| `contracts/supabase-consumer-manifest.v3.json` and `scripts/check_supabase_consumer_manifest.py` | exact-commit, source-derived SQL/Data API/PGMQ consumer evidence; candidate only until database-engine accepts exact bytes and joint proof |
 
 ## Current Runtime Families
 
