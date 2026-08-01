@@ -73,9 +73,9 @@ legacy 路径：
 统一任务路径：
 
 - `worker_jobs.worker_queue`: `package`
-- enqueue RPC: `public.worker_enqueue_job(...)`
-- claim RPC: `public.worker_claim_jobs('package', ...)`
-- result RPC: `public.worker_record_job_result(...)`
+- enqueue RPC: `api.worker_enqueue_job_v1(...)`
+- claim RPC: `api.worker_claim_jobs_v1('package', ...)`
+- result RPC: `api.worker_record_job_result_v1(...)`
 - 仅 `service_role` 可 enqueue / claim / heartbeat / record result
 
 ## 5. 任务类型

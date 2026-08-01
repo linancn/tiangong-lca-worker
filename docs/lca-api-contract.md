@@ -155,7 +155,7 @@ worker 反序列化时 `model_version` 仍可作为 `snapshot_id` 的别名（�
 
 ### 3.6 `worker_jobs` solver 队列映射
 
-Worker 的数据库适配使用稳定 `public.worker_*` service RPC 处理 enqueue、claim、heartbeat、cancel、read 和 terminal result；所有 direct job/artifact SQL 使用显式 schema-qualified `private.worker_jobs` / `private.worker_job_artifacts` Expand contract，不依赖 `search_path`。Expand 阶段这些 private relations 可以是 public 物理存储上的 security-invoker compatibility views；物理存储切换属于后续 gated Contract migration。`public.worker_job_domain_refs` 继续是跨 domain table 的稳定 `UNION ALL` projection view，不迁入 private。上述物理边界不得出现在 job payload、result DTO、`domainSource` 或错误语义中。
+Worker 的数据库适配对已冻结的 enqueue、claim、heartbeat 和 terminal result 使用版本化 `api.worker_*_v1` service RPC；尚未冻结的 cancel/read/list/retry 保留原 compatibility surface。所有 direct job/artifact SQL 使用显式 schema-qualified `private.worker_jobs` / `private.worker_job_artifacts` Expand contract，不依赖 `search_path`。Expand 阶段这些 private relations 可以是 public 物理存储上的 security-invoker compatibility views；物理存储切换属于后续 gated Contract migration。`api.worker_job_domain_refs` 继续是跨 domain table 的稳定 `UNION ALL` projection view，不迁入 private。上述物理边界不得出现在 job payload、result DTO、`domainSource` 或错误语义中。
 
 solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs`，通过稳定 public claim RPC 消费 schema-qualified private Expand contract。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
 
@@ -487,7 +487,7 @@ legacy pgmq 路径：
 统一 `worker_jobs` 路径：
 
 1. 先创建或复用 `lca_result_cache` domain row，并生成 `lcaJobId` compatibility UUID；不要求创建 `lca_jobs` row。
-2. 调 `public.worker_enqueue_job(...)` 创建 `job_kind=lca.*`、`worker_queue=solver` 的 job，payload 带 `lcaJobId` 和标准化求解参数。
+2. 调 `api.worker_enqueue_job_v1(...)` 创建 `job_kind=lca.*`、`worker_queue=solver` 的 job，payload 带 `lcaJobId` 和标准化求解参数。
 3. 返回 `workerJobId` 与 `lcaJobId` 给 Edge / Next projection。
 4. worker 使用 `worker_claim_jobs('solver', ...)` claim、heartbeat，并通过 `worker_record_job_result(...)` 写 canonical 终态；同时维护 `lca_results`、`lca_result_cache` domain/cache metadata，并回填 `worker_job_id`。Canonical path does not query or update optional `lca_jobs`; legacy table access is restricted to the explicitly enabled pgmq/debug backend。
 

@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane access remains Worker-owned implementation under the existing Database-owned schema contract."
+lastReviewedCommit: 7a665f9357ee05e0c745b939821e6857c93f1f9d
+lastReviewedNote: "Reviewed for Worker Issue #192: the frozen API consumer cutover remains Worker-owned implementation under the Database-owned exact contract."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

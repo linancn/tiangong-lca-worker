@@ -153,7 +153,7 @@ Header 建议：
    - 若 `pending/running` 且有 `job_id`，返回 `in_progress`
    - 否则生成 `lcaJobId` compatibility UUID，并创建或更新 `lca_result_cache(status='pending', job_id=lcaJobId)`
    - legacy pgmq 路径：调用 `public.lca_enqueue_job('lca_jobs', payload)` RPC 入队
-   - `worker_jobs` 路径：调用 `public.worker_enqueue_job(...)`，使用 `job_kind=lca.solve_one|lca.solve_batch|lca.solve_all_unit|lca.build_snapshot|lca.contribution_path`、`worker_queue=solver`，并在 payload 中携带 `lcaJobId`
+   - `worker_jobs` 路径：调用 `api.worker_enqueue_job_v1(...)`，使用 `job_kind=lca.solve_one|lca.solve_batch|lca.solve_all_unit|lca.build_snapshot|lca.contribution_path`、`worker_queue=solver`，并在 payload 中携带 `lcaJobId`
    - 回写 `lca_result_cache.worker_job_id`
 7. 返回 `queued`。`worker_jobs` 路径应额外返回 `workerJobId`，供任务中心和 operator 查询使用。
 

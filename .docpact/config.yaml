@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-01"
-lastReviewedCommit: "e5a7f769f4716266271eea53cb5233781635174f"
-lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane qualification preserves current workspace ownership and docpact routing."
+lastReviewedCommit: "7a665f9357ee05e0c745b939821e6857c93f1f9d"
+lastReviewedNote: "Reviewed for Worker Issue #192: versioned API consumer cutover and exact-head qualification preserve current workspace ownership and docpact routing."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

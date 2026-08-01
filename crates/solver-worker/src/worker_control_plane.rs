@@ -23,7 +23,7 @@ macro_rules! worker_job_artifacts_table {
 }
 macro_rules! worker_job_domain_refs_table {
     () => {
-        "public.worker_job_domain_refs"
+        "api.worker_job_domain_refs"
     };
 }
 macro_rules! worker_job_kinds_table {
@@ -45,7 +45,7 @@ pub const CLAIM_JOBS_SQL: &str = r"
     WITH _service_role AS (
         SELECT set_config('request.jwt.claim.role', 'service_role', true)
     )
-    SELECT public.worker_claim_jobs($1, $2, $3, $4) AS result
+    SELECT api.worker_claim_jobs_v1($1, $2, $3, $4) AS result
     FROM _service_role
 ";
 
@@ -53,7 +53,7 @@ pub const HEARTBEAT_JOB_SQL: &str = r"
     WITH _service_role AS (
         SELECT set_config('request.jwt.claim.role', 'service_role', true)
     )
-    SELECT public.worker_heartbeat_job(
+    SELECT api.worker_heartbeat_job_v1(
         $1, $2, $3, $4::double precision::numeric, $5::jsonb, $6
     ) AS result
     FROM _service_role
@@ -63,7 +63,7 @@ pub const RECORD_JOB_RESULT_SQL: &str = r"
     WITH _service_role AS (
         SELECT set_config('request.jwt.claim.role', 'service_role', true)
     )
-    SELECT public.worker_record_job_result(
+    SELECT api.worker_record_job_result_v1(
         $1,
         $2,
         $3,
@@ -150,17 +150,18 @@ mod tests {
             assert!(identifier.starts_with("private."));
             assert_eq!(identifier.matches('.').count(), 1);
         }
-        assert_eq!(
-            WORKER_JOB_DOMAIN_REFS_TABLE,
-            "public.worker_job_domain_refs"
-        );
+        assert_eq!(WORKER_JOB_DOMAIN_REFS_TABLE, "api.worker_job_domain_refs");
     }
 
     #[test]
-    fn stable_facade_rpcs_are_explicitly_public_qualified() {
+    fn frozen_worker_rpcs_use_versioned_api_facades() {
         for sql in [CLAIM_JOBS_SQL, HEARTBEAT_JOB_SQL, RECORD_JOB_RESULT_SQL] {
-            assert!(sql.contains("public.worker_"));
+            assert!(sql.contains("api.worker_"));
+            assert!(sql.contains("_v1"));
+            assert!(!sql.contains("public.worker_"));
             assert!(!sql.contains("search_path"));
+            assert!(sql.contains("WITH _service_role AS"));
+            assert!(sql.contains("set_config('request.jwt.claim.role', 'service_role', true)"));
         }
     }
 }

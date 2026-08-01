@@ -85,16 +85,18 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | maintenance worker_jobs / GC orchestration | `cargo check -p solver-worker --bin maintenance_worker`; `cargo check -p solver-worker --bin maintenance_enqueue`; run touched binaries such as `cargo check -p solver-worker --bin snapshot_gc --bin result_gc --bin artifact_gc --bin package_gc --bin process_flow_graph_cache_builder`; `cargo test -p solver-worker --bin maintenance_worker`; `cargo test -p solver-worker --bin maintenance_enqueue`; run the touched GC/filter/cache tests such as `cargo test -p solver-worker artifact_gc`, `cargo test -p solver-worker snapshot_gc`, `cargo test -p solver-worker result_gc`, `cargo test -p solver-worker package_gc`, or `cargo test -p solver-worker --bin process_flow_graph_cache_builder`; hard Clippy gate for all targets | run a safe dry-run `lca.snapshot_gc`, `lca.result_gc`, `worker.artifact_gc`, `tidas.package_artifact_gc`, or `national_carbon.process_flow_graph_cache_build` worker job in dev when DB and storage env are available; generic artifact GC must prove object-delete-before-complete, missing-object idempotency, bucket/path rejection, bounded claim batches, and retry without tombstoning | Keep `docs/agents/repo-architecture.md`, `README.md`, deployment units, and the package/LCA retention docs aligned with job kind, payload, summary, destructive-execute safety semantics, and fixed stdout/stderr capture limits. |
 | package worker import or export flows | baseline gates; real release-binary handshake against the active governed `0.1.2` default; active-source audit proving no Python validator or validator-command fallback remains | validate the largest available package locally with the release `tidas` binary before any server execution; verify `tidas.operation-report.v1`, exact version, `asset_fingerprint`, issue-spool SHA-256/bytes/event count, bounded memory/queue settings, and stable Worker error codes; run the closest safe package-flow helper when isolated DB/S3 is available | The large package fixture remains outside git. Package-job semantics are runtime-sensitive and may depend on storage or DB state; never make a production mutation for validation. |
 | package `worker_jobs` queue backend | `cargo test -p solver-worker --bin package_worker`; `cargo test -p solver-worker package_worker`; `cargo check -p solver-worker --bin package_worker`; hard Clippy gate; hard format gate | when DB/S3 env is available, enqueue one safe `worker_queue=package` job and run `package_worker --package-queue-backend worker-jobs` to verify claim/heartbeat/result projection; for legacy-table retirement, run against a schema where `public.lca_package_jobs` is absent or ignored | Keep `docs/tidas-package-contract.md` aligned with job kind, payload schema, continuation behavior, artifact projection, worker_jobs result_ref, and optional legacy `lca_package_jobs` compatibility expectations. |
-| runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations | record separately when durable schema proof is required in `database-engine` | Local migration files here are not the workspace-wide source of truth. |
+| runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations; `python3 scripts/check_worker_control_plane_api_cutover.py` for the frozen Worker API objects | record separately when durable schema proof is required in `database-engine`; run the ignored Worker control-plane integration test against the exact accepted Database head for API cutovers | Local migration files here are not the workspace-wide source of truth. Do not broaden the frozen consumer set without a Database-owned contract. |
 | manual debug, parity, or target-validation scripts | run the touched script with safe args or `--help` when available, plus baseline gates if code changed nearby | `./scripts/run_full_compute_debug.sh`, `./scripts/run_bw25_validation.sh`, or `./scripts/validate_lcia_targets.sh` as applicable | `bw25-validator` is manual-only and out-of-band. |
 | repo docs, `.env.example`, or docpact config only | `scripts/docpact validate-config --root . --strict`; `scripts/docpact lint --root . --worktree --mode enforce` | perform route checks for affected intent surfaces such as `solver-runtime`, `package-worker`, or `runtime-sql-boundary` | Refresh review metadata even when prose-only docs change. Keep `.env.example` secret-free. |
 
 ## Isolated Worker Control-Plane Database Contract
 
-Run `scripts/run_worker_control_plane_db_integration.sh` against a fresh,
-loopback-only Supabase/Postgres stack built from the exact Database Engine #335
-worktree and migration head. The wrapper verifies the clean database worktree
-HEAD before emitting a locator-free SHA manifest. The Rust harness performs
+Run `scripts/run_worker_control_plane_db_integration.sh` against either a fresh
+loopback Supabase/Postgres stack or an explicitly named hosted Preview built
+from the exact accepted Database Engine head and migration ledger head. Hosted
+targets must include the exact Preview ref and required TLS in the connection
+string; production targets are forbidden. The wrapper verifies the clean
+database worktree HEAD before emitting a locator-free SHA manifest. The Rust harness performs
 migration metadata preflight before switching every behavioral connection with
 `SET ROLE service_role`; this proves the local ACL matrix only and must never be
 reported as proof of the deployment login role. Production `DATABASE_URL`
@@ -104,7 +106,9 @@ gate.
 The harness covers duplicate enqueue/lost response, two-worker concurrent
 claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
 terminal result, transaction rollback, and old-public/new-private parity. It
-refuses non-loopback targets and does not create or reuse containers or volumes.
+also proves the frozen versioned API routines and canonical domain-ref view are
+available to `service_role` but denied to browser roles. It refuses an unnamed
+or non-TLS hosted target and does not create or reuse containers or volumes.
 The caller owns creation and teardown of the isolated exact-head stack.
 
 ### Scope-closure capacity input modes

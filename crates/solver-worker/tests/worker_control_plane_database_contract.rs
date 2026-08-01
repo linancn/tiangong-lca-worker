@@ -35,7 +35,7 @@ async fn enqueue_unchecked(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_enqueue_job(
+        SELECT api.worker_enqueue_job_v1(
             p_job_kind => $1,
             p_payload_json => $2::jsonb,
             p_payload_schema_version => $3,
@@ -77,7 +77,7 @@ async fn enqueue(
     .await?;
     anyhow::ensure!(
         result.get("ok").and_then(Value::as_bool) == Some(true),
-        "worker_enqueue_job returned non-ok result: {result}"
+        "worker_enqueue_job_v1 returned non-ok result: {result}"
     );
     Ok(result)
 }
@@ -162,13 +162,64 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
         .max_connections(1)
         .connect(&database_url)
         .await?;
-    let applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM supabase_migrations.schema_migrations WHERE version = $1)",
+    let applied_head: Option<String> =
+        sqlx::query_scalar("SELECT max(version) FROM supabase_migrations.schema_migrations")
+            .fetch_one(&preflight_pool)
+            .await?;
+    anyhow::ensure!(
+        applied_head.as_deref() == Some(migration_version.as_str()),
+        "database migration ledger is not at the requested exact head"
+    );
+
+    for signature in [
+        "api.worker_enqueue_job_v1(text,jsonb,text,text,uuid,text,uuid,text,uuid,text,text,text,integer,text,timestamp with time zone,text,integer,timestamp with time zone,jsonb,uuid,uuid)",
+        "api.worker_claim_jobs_v1(text,text,integer,integer)",
+        "api.worker_heartbeat_job_v1(uuid,uuid,text,numeric,jsonb,integer)",
+        "api.worker_record_job_result_v1(uuid,uuid,text,jsonb,text,jsonb,jsonb,text,text,jsonb,text[],text,boolean)",
+    ] {
+        let service_can_execute: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('service_role', $1, 'EXECUTE')")
+                .bind(signature)
+                .fetch_one(&preflight_pool)
+                .await?;
+        let anon_can_execute: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('anon', $1, 'EXECUTE')")
+                .bind(signature)
+                .fetch_one(&preflight_pool)
+                .await?;
+        let authenticated_can_execute: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('authenticated', $1, 'EXECUTE')")
+                .bind(signature)
+                .fetch_one(&preflight_pool)
+                .await?;
+        anyhow::ensure!(
+            service_can_execute,
+            "service_role cannot execute {signature}"
+        );
+        anyhow::ensure!(!anon_can_execute, "anon can execute {signature}");
+        anyhow::ensure!(
+            !authenticated_can_execute,
+            "authenticated can execute {signature}"
+        );
+    }
+    for role in ["anon", "authenticated"] {
+        let can_select: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege($1, 'api.worker_job_domain_refs', 'SELECT')",
+        )
+        .bind(role)
+        .fetch_one(&preflight_pool)
+        .await?;
+        anyhow::ensure!(!can_select, "{role} can select api.worker_job_domain_refs");
+    }
+    let service_can_select_domain_refs: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('service_role', 'api.worker_job_domain_refs', 'SELECT')",
     )
-    .bind(&migration_version)
     .fetch_one(&preflight_pool)
     .await?;
-    anyhow::ensure!(applied, "requested exact migration head is not applied");
+    anyhow::ensure!(
+        service_can_select_domain_refs,
+        "service_role cannot select api.worker_job_domain_refs"
+    );
     preflight_pool.close().await;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -227,6 +278,10 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
             .await?;
         anyhow::ensure!(exists, "required relation is absent: {relation}");
     }
+    let _domain_ref_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api.worker_job_domain_refs")
+            .fetch_one(&pool)
+            .await?;
     cancel_prior_harness_jobs(&pool).await?;
 
     let job_kind = CONTRACT_JOB_KIND;
@@ -373,7 +428,7 @@ async fn private_worker_control_plane_preserves_lifecycle_and_compatibility() ->
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_enqueue_job(
+        SELECT api.worker_enqueue_job_v1(
             p_job_kind => $1,
             p_payload_json => '{"contractTest":true}'::jsonb,
             p_payload_schema_version => $2,
