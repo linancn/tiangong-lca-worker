@@ -17,10 +17,17 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["derivation", "pathPatterns", "symlinkPolicy", "nonRegularFilePolicy", "setEquality"],
+      "required": ["derivation", "pathPatterns", "deliveryGuard", "auditToolPathAllowlist", "governedSourceTreeSha256", "symlinkPolicy", "nonRegularFilePolicy", "setEquality"],
       "properties": {
         "derivation": {"const": "git-tree-independent-v3"},
-        "pathPatterns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "pathPatterns": {
+          "const": ["crates/**/*.rs", "scripts/*.py", "scripts/*.sh", "scripts/**/*.py", "scripts/**/*.sh", "tools/**/*.py"]
+        },
+        "deliveryGuard": {"const": "exact-tree-entries-equal-except-audit-tools"},
+        "auditToolPathAllowlist": {
+          "const": ["scripts/check_supabase_consumer_manifest.py", "scripts/test_supabase_consumer_manifest.py"]
+        },
+        "governedSourceTreeSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "symlinkPolicy": {"const": "reject"},
         "nonRegularFilePolicy": {"const": "reject"},
         "setEquality": {"const": "bidirectional-exact"}

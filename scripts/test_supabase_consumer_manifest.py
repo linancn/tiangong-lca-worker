@@ -77,6 +77,10 @@ class ManifestNegativeTests(unittest.TestCase):
         source = self.root / "crates/solver-worker/src/example.rs"
         source.parent.mkdir(parents=True)
         source.write_text('sqlx::query("SELECT * FROM public.worker_jobs");\n')
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        (scripts / "existing.py").write_text("# governed Python consumer source\n")
+        (scripts / "existing.sh").write_text("# governed shell consumer source\n")
         fixture_git(self.root, "add", ".")
         fixture_git(self.root, "commit", "-qm", "fixture")
         self.head = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
@@ -129,6 +133,11 @@ class ManifestNegativeTests(unittest.TestCase):
         changed["authority"]["authorizesDatabaseFreeze"] = True
         self.assert_rejected(changed, "candidate and non-authorizing")
 
+    def test_governed_source_tree_digest_tamper_is_rejected(self) -> None:
+        changed = copy.deepcopy(self.manifest)
+        changed["source"]["governedSourceTreeSha256"] = "0" * 64
+        self.assert_rejected(changed, "digest does not match headCommit/sourceTreeCommit")
+
     def test_symlink_manifest_rejected_without_following(self) -> None:
         target = self.root / "target.json"
         target.write_bytes(canonical_bytes(self.manifest))
@@ -161,6 +170,72 @@ class ManifestNegativeTests(unittest.TestCase):
         changed["occurrenceCount"] = 1
         with self.assertRaisesRegex(ManifestError, "manifest fields differ"):
             validate_manifest_shape(changed)
+
+    def test_delivery_guard_allows_only_exact_audit_tool_paths(self) -> None:
+        checker = self.root / "scripts/check_supabase_consumer_manifest.py"
+        checker.write_text("# verifier delivery change\n")
+        test_script = self.root / "scripts/test_supabase_consumer_manifest.py"
+        test_script.write_text("# verifier test delivery change\n")
+        fixture_git(self.root, "add", checker.relative_to(self.root), test_script.relative_to(self.root))
+        fixture_git(self.root, "commit", "-qm", "deliver audit tools")
+        result = verify(self.root, self.path)
+        self.assertEqual(self.head, result["sourceTreeCommit"])
+        self.assertNotEqual(self.head, result["deliveryHead"])
+
+    def test_delivery_guard_rejects_changed_rust_python_and_shell_bytes(self) -> None:
+        (self.root / "crates/solver-worker/src/example.rs").write_text(
+            'sqlx::query("SELECT * FROM public.worker_jobs");\n// changed\n'
+        )
+        (self.root / "scripts/existing.py").write_text("# changed Python consumer source\n")
+        (self.root / "scripts/existing.sh").write_text("# changed shell consumer source\n")
+        fixture_git(self.root, "add", "crates", "scripts")
+        fixture_git(self.root, "commit", "-qm", "change governed source bytes")
+        with self.assertRaisesRegex(ManifestError, "consumer-governed source bytes drifted"):
+            verify(self.root, self.path)
+
+    def test_delivery_guard_rejects_add_delete_and_rename(self) -> None:
+        added = self.root / "crates/solver-worker/src/added.rs"
+        added.write_text('sqlx::query("SELECT * FROM public.added_consumer");\n')
+        (self.root / "scripts/existing.py").unlink()
+        (self.root / "scripts/existing.sh").rename(self.root / "scripts/renamed.sh")
+        fixture_git(self.root, "add", "-A", "crates", "scripts")
+        fixture_git(self.root, "commit", "-qm", "add delete and rename governed source")
+        with self.assertRaisesRegex(ManifestError, "consumer-governed source bytes drifted"):
+            verify(self.root, self.path)
+
+    def test_delivery_guard_rejects_new_dynamic_call(self) -> None:
+        source = self.root / "crates/solver-worker/src/example.rs"
+        source.write_text(source.read_text() + "sqlx::query(user_supplied_sql);\n")
+        fixture_git(self.root, "add", source.relative_to(self.root))
+        fixture_git(self.root, "commit", "-qm", "add dynamic SQL consumer")
+        with self.assertRaisesRegex(ManifestError, "consumer-governed source bytes drifted"):
+            verify(self.root, self.path)
+
+    def test_delivery_guard_rejects_nonancestor_source_snapshot(self) -> None:
+        audit_tool = self.root / "scripts/check_supabase_consumer_manifest.py"
+        audit_tool.write_text("# child audit tool\n")
+        fixture_git(self.root, "add", audit_tool.relative_to(self.root))
+        fixture_git(self.root, "commit", "-qm", "child snapshot")
+        child = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
+        changed = build_manifest(self.root, self.head, child)
+        fixture_git(self.root, "checkout", "-q", "--detach", self.head)
+        self.write(changed)
+        with self.assertRaisesRegex(ManifestError, "not an ancestor of delivery HEAD"):
+            verify(self.root, self.path)
+
+    def test_verify_ignores_outer_hook_repository_environment(self) -> None:
+        original = {key: os.environ.get(key) for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        try:
+            os.environ["GIT_DIR"] = "/must/not/be/used.git"
+            os.environ["GIT_WORK_TREE"] = "/must/not/be/used"
+            os.environ["GIT_COMMON_DIR"] = "/must/not/be/used-common"
+            self.assertTrue(verify(self.root, self.path)["setEquality"])
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def test_fixture_git_ignores_outer_hook_repository_environment(self) -> None:
         original = {key: os.environ.get(key) for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}

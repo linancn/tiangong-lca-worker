@@ -50,6 +50,21 @@ The source reader uses the immutable Git object database. Included symlinks,
 gitlinks, or other non-regular entries fail closed. The checked-in manifest is
 also opened only after `lstat` confirms it is a regular non-symlink file.
 
+`headCommit` is the immutable `sourceTreeCommit`, not the delivery commit. On
+every verification run, the checker resolves the current exact Git `HEAD` as
+`deliveryHead`, requires `sourceTreeCommit` to be its ancestor, and compares
+the complete path/mode/type/blob identity for every source path at both ends.
+Only `scripts/check_supabase_consumer_manifest.py` and
+`scripts/test_supabase_consumer_manifest.py` are exempt so that the audit guard
+can be delivered without self-reference. The exact allowlist and comparison
+policy are part of the manifest `source` contract and JSON Schema. No broad
+`scripts/**` exemption exists: any other matching Rust, Python, or shell source
+addition, deletion, rename, mode change, or byte change fails closed.
+The `source.governedSourceTreeSha256` binding is the SHA-256 of the canonical
+filtered projection of every governed path, mode, Git object type, and blob OID.
+The checker independently recomputes it at both `sourceTreeCommit` and
+`deliveryHead`; both ends must equal the embedded digest.
+
 Verify the checked-in candidate:
 
 ```bash

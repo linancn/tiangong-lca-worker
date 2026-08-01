@@ -33,6 +33,10 @@ SOURCE_PATTERNS = (
     "scripts/**/*.sh",
     "tools/**/*.py",
 )
+AUDIT_TOOL_PATH_ALLOWLIST = (
+    "scripts/check_supabase_consumer_manifest.py",
+    "scripts/test_supabase_consumer_manifest.py",
+)
 TRANSPORTS = {
     "direct-postgresql",
     "pgmq",
@@ -97,6 +101,13 @@ class SourceFile:
     data: bytes
 
 
+@dataclass(frozen=True)
+class TreeEntry:
+    mode: str
+    kind: str
+    object_id: str
+
+
 def run_git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     result = subprocess.run(
@@ -125,12 +136,12 @@ def source_path(path: str) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in SOURCE_PATTERNS)
 
 
-def read_commit_tree(root: Path, commit: str) -> list[SourceFile]:
+def read_source_tree_index(root: Path, commit: str) -> dict[str, TreeEntry]:
     resolved = run_git(root, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
     if resolved != commit:
         raise ManifestError(f"headCommit must be a full exact commit SHA: expected {commit}, resolved {resolved}")
     raw = run_git(root, "ls-tree", "-r", "-z", commit)
-    files: list[SourceFile] = []
+    entries: dict[str, TreeEntry] = {}
     for record in raw.split(b"\0"):
         if not record:
             continue
@@ -143,8 +154,77 @@ def read_commit_tree(root: Path, commit: str) -> list[SourceFile]:
             raise ManifestError(f"source path is not a regular git file: {path} mode={mode}")
         if kind != "blob":
             raise ManifestError(f"source path is not a blob: {path} type={kind}")
-        files.append(SourceFile(path, run_git(root, "cat-file", "blob", object_id)))
+        entries[path] = TreeEntry(mode, kind, object_id)
+    return entries
+
+
+def read_commit_tree(root: Path, commit: str) -> list[SourceFile]:
+    files = [
+        SourceFile(path, run_git(root, "cat-file", "blob", entry.object_id))
+        for path, entry in read_source_tree_index(root, commit).items()
+    ]
     return sorted(files, key=lambda item: item.path)
+
+
+def exact_delivery_head(root: Path) -> str:
+    return run_git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+
+
+def governed_source_tree_sha256(entries: dict[str, TreeEntry]) -> str:
+    allowlist = set(AUDIT_TOOL_PATH_ALLOWLIST)
+    projection = [
+        {
+            "path": path,
+            "mode": entry.mode,
+            "type": entry.kind,
+            "blobOid": entry.object_id,
+        }
+        for path, entry in sorted(entries.items())
+        if path not in allowlist
+    ]
+    return sha256(canonical_bytes(projection))
+
+
+def verify_delivery_source_guard(root: Path, source_commit: str, expected_digest: str) -> str:
+    delivery_head = exact_delivery_head(root)
+    ancestor = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", source_commit, delivery_head],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+    )
+    if ancestor.returncode != 0:
+        raise ManifestError("headCommit/sourceTreeCommit is not an ancestor of delivery HEAD")
+
+    source_entries = read_source_tree_index(root, source_commit)
+    delivery_entries = read_source_tree_index(root, delivery_head)
+    source_digest = governed_source_tree_sha256(source_entries)
+    delivery_digest = governed_source_tree_sha256(delivery_entries)
+    if source_digest != expected_digest:
+        raise ManifestError("governed source tree digest does not match headCommit/sourceTreeCommit")
+    allowlist = set(AUDIT_TOOL_PATH_ALLOWLIST)
+    source_governed = {path: entry for path, entry in source_entries.items() if path not in allowlist}
+    delivery_governed = {path: entry for path, entry in delivery_entries.items() if path not in allowlist}
+    if source_governed != delivery_governed:
+        source_paths = set(source_governed)
+        delivery_paths = set(delivery_governed)
+        changed = sorted(
+            path for path in source_paths & delivery_paths
+            if source_governed[path] != delivery_governed[path]
+        )
+        details = {
+            "added": sorted(delivery_paths - source_paths)[:20],
+            "deleted": sorted(source_paths - delivery_paths)[:20],
+            "changed": changed[:20],
+        }
+        raise ManifestError(
+            "consumer-governed source bytes drifted between headCommit/sourceTreeCommit "
+            "and delivery HEAD: " + json.dumps(details, sort_keys=True)
+        )
+    if delivery_digest != expected_digest:
+        raise ManifestError("governed source tree digest does not match delivery HEAD")
+    return delivery_head
 
 
 def validate_local_artifact(path: Path) -> bytes:
@@ -424,12 +504,24 @@ def validate_manifest_shape(manifest: object) -> dict[str, object]:
     expected_source = {
         "derivation": "git-tree-independent-v3",
         "pathPatterns": list(SOURCE_PATTERNS),
+        "deliveryGuard": "exact-tree-entries-equal-except-audit-tools",
+        "auditToolPathAllowlist": list(AUDIT_TOOL_PATH_ALLOWLIST),
         "symlinkPolicy": "reject",
         "nonRegularFilePolicy": "reject",
         "setEquality": "bidirectional-exact",
     }
-    if manifest["source"] != expected_source:
+    source = manifest["source"]
+    if not isinstance(source, dict):
+        raise ManifestError("source derivation contract must be an object")
+    if set(source) != set(expected_source) | {"governedSourceTreeSha256"}:
         raise ManifestError("source derivation contract drift")
+    for key, value in expected_source.items():
+        if source.get(key) != value:
+            raise ManifestError("source derivation contract drift")
+    if not isinstance(source.get("governedSourceTreeSha256"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", source["governedSourceTreeSha256"]
+    ):
+        raise ManifestError("governedSourceTreeSha256 must be a lowercase SHA-256")
     occurrences = manifest["occurrences"]
     if not isinstance(occurrences, list):
         raise ManifestError("occurrences must be an array")
@@ -459,6 +551,10 @@ def verify(root: Path, manifest_path: Path) -> dict[str, object]:
     )
     if ancestor.returncode != 0:
         raise ManifestError("baseCommit is not an ancestor of headCommit")
+    source = manifest["source"]
+    assert isinstance(source, dict)
+    governed_digest = str(source["governedSourceTreeSha256"])
+    delivery_head = verify_delivery_source_guard(root, head, governed_digest)
     derived = derive_occurrences(read_commit_tree(root, head))
     declared = manifest["occurrences"]
     assert isinstance(declared, list)
@@ -479,6 +575,9 @@ def verify(root: Path, manifest_path: Path) -> dict[str, object]:
         "repository": REPOSITORY,
         "baseCommit": base,
         "headCommit": head,
+        "sourceTreeCommit": head,
+        "deliveryHead": delivery_head,
+        "governedSourceTreeSha256": governed_digest,
         "manifestSha256": sha256(raw),
         "occurrenceCountDerived": len(derived),
         "setEquality": True,
@@ -489,6 +588,7 @@ def verify(root: Path, manifest_path: Path) -> dict[str, object]:
 def build_manifest(root: Path, base: str, head: str) -> dict[str, object]:
     base_sha = run_git(root, "rev-parse", "--verify", f"{base}^{{commit}}").decode().strip()
     head_sha = run_git(root, "rev-parse", "--verify", f"{head}^{{commit}}").decode().strip()
+    source_entries = read_source_tree_index(root, head_sha)
     return {
         "schema": SCHEMA,
         "version": 3,
@@ -503,6 +603,9 @@ def build_manifest(root: Path, base: str, head: str) -> dict[str, object]:
         "source": {
             "derivation": "git-tree-independent-v3",
             "pathPatterns": list(SOURCE_PATTERNS),
+            "deliveryGuard": "exact-tree-entries-equal-except-audit-tools",
+            "auditToolPathAllowlist": list(AUDIT_TOOL_PATH_ALLOWLIST),
+            "governedSourceTreeSha256": governed_source_tree_sha256(source_entries),
             "symlinkPolicy": "reject",
             "nonRegularFilePolicy": "reject",
             "setEquality": "bidirectional-exact",
