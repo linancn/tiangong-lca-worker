@@ -504,18 +504,24 @@ def apply_exact_migrations(endpoint: DockerEndpoint, root: Path, database_url: s
     if version != EXPECTED_SUPABASE_CLI_VERSION:
         raise HarnessError("Supabase CLI version changed from the reviewed harness version")
     endpoint.assert_stable()
-    run(
-        [
-            "supabase", "migration", "up",
-            "--db-url", database_url,
-            "--include-all",
-            "--workdir", str(root),
-            "--yes",
-        ],
-        cwd=root,
-        environment=endpoint.environment(),
-        timeout=600,
-    )
+    try:
+        run(
+            [
+                "supabase", "migration", "up",
+                "--db-url", database_url,
+                "--include-all",
+                "--workdir", str(root),
+                "--yes",
+            ],
+            cwd=root,
+            environment=endpoint.environment(),
+            timeout=600,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "Supabase CLI returned no diagnostic").replace(
+            database_url, "<owned-loopback-dsn>"
+        ).strip()
+        raise HarnessError(f"exact migration application failed: {detail}") from None
     endpoint.assert_stable()
 
 

@@ -8,6 +8,7 @@ import os
 import signal
 import socket
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -228,6 +229,26 @@ class WorkerControlPlaneHarnessTest(unittest.TestCase):
             harness.EXPECTED_POSTGRES_IMAGE,
             r"^public\.ecr\.aws/supabase/postgres@sha256:[0-9a-f]{64}$",
         )
+
+    def test_migration_failure_does_not_disclose_owned_password(self) -> None:
+        endpoint = mock.Mock(spec=harness.DockerEndpoint)
+        endpoint.environment.return_value = {}
+        database_url = "postgresql://postgres:private-secret@127.0.0.1:55432/postgres"
+        failure = subprocess.CalledProcessError(
+            1,
+            ["supabase", "migration", "up", "--db-url", database_url],
+            stderr=f"failed to connect to {database_url}",
+        )
+        with mock.patch.object(
+            harness, "capture", return_value=harness.EXPECTED_SUPABASE_CLI_VERSION
+        ), mock.patch.object(harness, "run", side_effect=failure), self.assertRaises(
+            harness.HarnessError
+        ) as raised:
+            harness.apply_exact_migrations(
+                endpoint, Path("/tmp/database-engine"), database_url
+            )
+        self.assertNotIn("private-secret", str(raised.exception))
+        self.assertIn("<owned-loopback-dsn>", str(raised.exception))
 
 
 if __name__ == "__main__":
