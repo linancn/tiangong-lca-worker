@@ -91,12 +91,14 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 
 ## Isolated Worker Control-Plane Database Contract
 
-Run `scripts/run_worker_control_plane_db_integration.sh` against either a fresh
-loopback Supabase/Postgres stack or an explicitly named hosted Preview built
-from the exact accepted Database Engine head and migration ledger head. Hosted
-targets must include the exact Preview ref and required TLS in the connection
-string; production targets are forbidden. The wrapper verifies the clean
-database worktree HEAD before emitting a locator-free SHA manifest. The Rust harness performs
+Run `scripts/run_worker_control_plane_db_integration.sh` only against a fresh
+literal-loopback Supabase/Postgres stack built from the exact accepted Database
+Engine head and migration ledger head. The parsed URL hostname must be exactly
+`localhost`, `127.0.0.1`, or `::1`; host/service query overrides are rejected.
+Hosted and production targets are unconditionally forbidden because the
+behavioral harness performs persistent job/artifact mutations. The wrapper
+verifies the clean database worktree HEAD before emitting a locator-free SHA
+manifest. The Rust harness performs
 migration metadata preflight before switching every behavioral connection with
 `SET ROLE service_role`; this proves the local ACL matrix only and must never be
 reported as proof of the deployment login role. Production `DATABASE_URL`
@@ -107,9 +109,12 @@ The harness covers duplicate enqueue/lost response, two-worker concurrent
 claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
 terminal result, transaction rollback, and old-public/new-private parity. It
 also proves the frozen versioned API routines and canonical domain-ref view are
-available to `service_role` but denied to browser roles. It refuses an unnamed
-or non-TLS hosted target and does not create or reuse containers or volumes.
-The caller owns creation and teardown of the isolated exact-head stack.
+available to `service_role` but denied to browser roles. Hosted Preview evidence
+must be collected separately through a read-only management-plane query that
+checks only project ref, exact migration head, object signatures, and ACLs; it
+must never invoke this behavioral runner. The runner does not create or reuse
+containers or volumes. The caller owns creation and teardown of the isolated
+exact-head stack.
 
 ### Scope-closure capacity input modes
 

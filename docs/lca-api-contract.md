@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: 19a019b4e1b56f2106e6f74207d2ec4571357bf6
 lastReviewedNote: "Reviewed for Worker Issue #186: qualification child-result envelopes and owning-repo provider fragments do not change public Worker, Edge, or Next DTOs."
 related:
   - AGENTS.md

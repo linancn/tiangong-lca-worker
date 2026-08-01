@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: 7a665f9357ee05e0c745b939821e6857c93f1f9d
+lastReviewedCommit: 19a019b4e1b56f2106e6f74207d2ec4571357bf6
 lastReviewedNote: "Reviewed for Worker Issue #192: the frozen API consumer cutover remains Worker-owned implementation under the Database-owned exact contract."
 related:
   - .docpact/config.yaml
