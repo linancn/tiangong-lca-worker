@@ -98,12 +98,14 @@ class SourceFile:
 
 
 def run_git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     result = subprocess.run(
         ["git", "-C", str(root), *args],
         input=input_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=git_env,
     )
     if result.returncode:
         message = result.stderr.decode("utf-8", "replace").strip()
@@ -453,6 +455,7 @@ def verify(root: Path, manifest_path: Path) -> dict[str, object]:
     ancestor = subprocess.run(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", base, head],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
     )
     if ancestor.returncode != 0:
         raise ManifestError("baseCommit is not an ancestor of headCommit")

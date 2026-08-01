@@ -20,6 +20,21 @@ from check_supabase_consumer_manifest import (
 )
 
 
+def clean_git_environment() -> dict[str, str]:
+    """Drop repository-local variables exported to Git hooks."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def fixture_git(root: Path, *args: str, text: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", f"--git-dir={root / '.git'}", f"--work-tree={root}", *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=text,
+        env=clean_git_environment(),
+    )
+
+
 class DerivationTests(unittest.TestCase):
     def test_derives_relation_rpc_pgmq_postgrest_and_dynamic_helpers(self) -> None:
         files = [SourceFile("crates/solver-worker/src/example.rs", b'''\
@@ -50,15 +65,21 @@ class ManifestNegativeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        subprocess.run(["git", "init", "-q", "-b", "main", self.root], check=True)
-        subprocess.run(["git", "-C", self.root, "config", "user.email", "test@example.invalid"], check=True)
-        subprocess.run(["git", "-C", self.root, "config", "user.name", "Manifest Test"], check=True)
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.root)],
+            check=True,
+            cwd="/",
+            env=clean_git_environment(),
+        )
+        fixture_git(self.root, "config", "core.hooksPath", "/dev/null")
+        fixture_git(self.root, "config", "user.email", "test@example.invalid")
+        fixture_git(self.root, "config", "user.name", "Manifest Test")
         source = self.root / "crates/solver-worker/src/example.rs"
         source.parent.mkdir(parents=True)
         source.write_text('sqlx::query("SELECT * FROM public.worker_jobs");\n')
-        subprocess.run(["git", "-C", self.root, "add", "."], check=True)
-        subprocess.run(["git", "-C", self.root, "commit", "-qm", "fixture"], check=True)
-        self.head = subprocess.check_output(["git", "-C", self.root, "rev-parse", "HEAD"], text=True).strip()
+        fixture_git(self.root, "add", ".")
+        fixture_git(self.root, "commit", "-qm", "fixture")
+        self.head = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
         self.manifest = build_manifest(self.root, self.head, self.head)
         contract = self.root / "contracts"
         contract.mkdir()
@@ -127,12 +148,10 @@ class ManifestNegativeTests(unittest.TestCase):
         link = self.root / "scripts/linked.py"
         link.parent.mkdir(exist_ok=True)
         os.symlink("../crates/solver-worker/src/example.rs", link)
-        subprocess.run(["git", "-C", self.root, "add", "scripts/linked.py"], check=True)
-        subprocess.run(["git", "-C", self.root, "commit", "-qm", "symlink"], check=True)
+        fixture_git(self.root, "add", "scripts/linked.py")
+        fixture_git(self.root, "commit", "-qm", "symlink")
         changed = copy.deepcopy(self.manifest)
-        changed["headCommit"] = subprocess.check_output(
-            ["git", "-C", self.root, "rev-parse", "HEAD"], text=True
-        ).strip()
+        changed["headCommit"] = fixture_git(self.root, "rev-parse", "HEAD", text=True).stdout.strip()
         self.write(changed)
         with self.assertRaisesRegex(ManifestError, "not a regular git file"):
             verify(self.root, self.path)
@@ -142,6 +161,21 @@ class ManifestNegativeTests(unittest.TestCase):
         changed["occurrenceCount"] = 1
         with self.assertRaisesRegex(ManifestError, "manifest fields differ"):
             validate_manifest_shape(changed)
+
+    def test_fixture_git_ignores_outer_hook_repository_environment(self) -> None:
+        original = {key: os.environ.get(key) for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        try:
+            os.environ["GIT_DIR"] = "/must/not/be/used.git"
+            os.environ["GIT_WORK_TREE"] = "/must/not/be/used"
+            os.environ["GIT_COMMON_DIR"] = "/must/not/be/used-common"
+            resolved = fixture_git(self.root, "rev-parse", "--absolute-git-dir", text=True).stdout.strip()
+            self.assertEqual((self.root / ".git").resolve(), Path(resolved).resolve())
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
