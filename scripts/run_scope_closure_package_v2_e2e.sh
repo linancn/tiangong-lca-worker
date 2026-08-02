@@ -32,4 +32,6 @@ export TIDAS_EXPECTED_VERSION="${TIDAS_EXPECTED_VERSION:-0.1.3}"
 
 cd "$worker_root"
 cargo build -p solver-worker --bin snapshot_builder
-cargo test -p solver-worker --test scope_closure_package_v2_e2e -- --ignored --nocapture
+cargo test -p solver-worker --test scope_closure_package_v2_e2e \
+  certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed \
+  -- --ignored --exact --nocapture

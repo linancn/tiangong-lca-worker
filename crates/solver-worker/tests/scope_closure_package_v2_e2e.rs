@@ -30,6 +30,10 @@ use uuid::{Uuid, Version};
 
 const VERSION: &str = "01.00.000";
 const ISOLATED_STORAGE_BUCKET_PREFIX: &str = "scope-closure-e2e-";
+const LIFECYCLE_RUNNER_SOURCE: &str =
+    include_str!("../../../scripts/run_scope_closure_package_v2_e2e.sh");
+const BENCHMARK_RUNNER_SOURCE: &str =
+    include_str!("../../../scripts/run_review_submit_source_closure_benchmark.sh");
 
 #[derive(Debug)]
 struct Fixture {
@@ -1345,6 +1349,23 @@ fn isolated_bucket_reuse_is_rejected() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn shell_runners_select_one_exact_fixture_and_generate_independent_buckets() {
+    assert!(
+        LIFECYCLE_RUNNER_SOURCE
+            .contains("certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed")
+    );
+    assert!(LIFECYCLE_RUNNER_SOURCE.contains("-- --ignored --exact --nocapture"));
+    assert!(!LIFECYCLE_RUNNER_SOURCE.contains("review_submit_source_closure_benchmark_fixture"));
+    assert!(BENCHMARK_RUNNER_SOURCE.contains("review_submit_source_closure_benchmark_fixture"));
+    assert!(BENCHMARK_RUNNER_SOURCE.contains("-- --ignored --exact --nocapture"));
+    for runner in [LIFECYCLE_RUNNER_SOURCE, BENCHMARK_RUNNER_SOURCE] {
+        assert!(runner.contains(
+            "export S3_BUCKET=\"scope-closure-e2e-$(uuidgen | tr '[:upper:]' '[:lower:]')\""
+        ));
+    }
 }
 
 #[test]
