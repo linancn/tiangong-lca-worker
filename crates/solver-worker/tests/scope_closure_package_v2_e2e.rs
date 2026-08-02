@@ -8,7 +8,7 @@
 
 #![allow(clippy::needless_raw_string_hashes, clippy::too_many_lines)]
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, fs, process::Command, sync::Arc, time::Duration};
 
 use clap::Parser;
 use serde_json::{Value, json};
@@ -38,6 +38,8 @@ struct Fixture {
     elementary_flow: Uuid,
     flow_property: Uuid,
     unit_group: Uuid,
+    source: Uuid,
+    contact: Uuid,
 }
 
 #[derive(Debug)]
@@ -196,26 +198,36 @@ fn process_document(
     elementary: Uuid,
     amount: f64,
     input_product: Option<Uuid>,
+    source: Uuid,
+    contact: Uuid,
 ) -> Value {
     let mut exchanges = vec![
         json!({
             "@dataSetInternalID": "1",
             "exchangeDirection": "Output",
+            "meanAmount": "1",
             "resultingAmount": "1",
+            "dataDerivationTypeStatus": "Measured",
             "referenceToFlowDataSet": {
                 "@type": "flow data set",
                 "@refObjectId": product,
-                "@version": VERSION
+                "@version": VERSION,
+                "@uri": format!("../flows/{product}.xml"),
+                "common:shortDescription": localized("Product fixture flow")
             }
         }),
         json!({
             "@dataSetInternalID": "2",
             "exchangeDirection": "Output",
+            "meanAmount": amount.to_string(),
             "resultingAmount": amount.to_string(),
+            "dataDerivationTypeStatus": "Measured",
             "referenceToFlowDataSet": {
                 "@type": "flow data set",
                 "@refObjectId": elementary,
-                "@version": VERSION
+                "@version": VERSION,
+                "@uri": format!("../flows/{elementary}.xml"),
+                "common:shortDescription": localized("Elementary fixture flow")
             }
         }),
     ];
@@ -223,73 +235,227 @@ fn process_document(
         exchanges.push(json!({
             "@dataSetInternalID": "3",
             "exchangeDirection": "Input",
+            "meanAmount": "0.2",
             "resultingAmount": "0.2",
+            "dataDerivationTypeStatus": "Measured",
             "referenceToFlowDataSet": {
                 "@type": "flow data set",
                 "@refObjectId": input_product,
-                "@version": VERSION
+                "@version": VERSION,
+                "@uri": format!("../flows/{input_product}.xml"),
+                "common:shortDescription": localized("Input product fixture flow")
             }
         }));
     }
     json!({
         "processDataSet": {
+            "@xmlns": "http://lca.jrc.it/ILCD/Process",
+            "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+            "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "@version": "1.1",
+            "@locations": "../ILCDLocations.xml",
+            "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/Process ../../schemas/ILCD_ProcessDataSet.xsd",
             "processInformation": {
                 "dataSetInformation": {
                     "common:UUID": process,
-                    "name": {"baseName": format!("E2E process {process}")}
+                    "name": {
+                        "baseName": localized(format!("E2E process {process}")),
+                        "treatmentStandardsRoutes": localized("fixture route"),
+                        "mixAndLocationTypes": localized("fixture production mix")
+                    },
+                    "classificationInformation": {"common:classification": {"common:class": [{
+                        "@level": "0", "@classId": "A", "#text": "Agriculture, forestry and fishing"
+                    }]}},
+                    "common:generalComment": localized("Schema-valid scope-closure lifecycle fixture")
                 },
-                "quantitativeReference": {"referenceToReferenceFlow": "1"}
+                "quantitativeReference": {"@type": "Reference flow(s)", "referenceToReferenceFlow": "1"},
+                "time": {"common:referenceYear": 2026},
+                "geography": {"locationOfOperationSupplyOrProduction": {"@location": "GLO"}}
             },
+            "modellingAndValidation": {
+                "LCIMethodAndAllocation": {"typeOfDataSet": "Unit process, single operation"},
+                "validation": {"review": {"@type": "Not reviewed"}},
+                "complianceDeclarations": {"compliance": process_compliance(source)}
+            },
+            "administrativeInformation": process_administrative_information(source, contact),
             "exchanges": {"exchange": exchanges}
         }
     })
 }
 
-fn flow_document(flow: Uuid, flow_type: &str, flow_property: Uuid) -> Value {
+fn localized(text: impl Into<String>) -> Value {
+    json!({"@xml:lang": "en", "#text": text.into()})
+}
+
+fn dataset_reference(kind: &str, id: Uuid, description: &str) -> Value {
+    let category = match kind {
+        "source data set" => "sources",
+        "contact data set" => "contacts",
+        "flow property data set" => "flowproperties",
+        "unit group data set" => "unitgroups",
+        "flow data set" => "flows",
+        _ => "datasets",
+    };
+    json!({
+        "@type": kind,
+        "@refObjectId": id,
+        "@version": VERSION,
+        "@uri": format!("../{category}/{id}.xml"),
+        "common:shortDescription": localized(description)
+    })
+}
+
+fn process_compliance(source: Uuid) -> Value {
+    json!({
+        "common:referenceToComplianceSystem": dataset_reference("source data set", source, "Fixture compliance and format source"),
+        "common:approvalOfOverallCompliance": "Fully compliant",
+        "common:nomenclatureCompliance": "Fully compliant",
+        "common:methodologicalCompliance": "Fully compliant",
+        "common:reviewCompliance": "Fully compliant",
+        "common:documentationCompliance": "Fully compliant",
+        "common:qualityCompliance": "Fully compliant"
+    })
+}
+
+fn simple_compliance(source: Uuid) -> Value {
+    json!({
+        "common:referenceToComplianceSystem": dataset_reference("source data set", source, "Fixture compliance and format source"),
+        "common:approvalOfOverallCompliance": "Fully compliant"
+    })
+}
+
+fn administrative_information(source: Uuid, contact: Uuid) -> Value {
+    json!({
+        "dataEntryBy": {
+            "common:timeStamp": "2026-08-02T00:00:00Z",
+            "common:referenceToDataSetFormat": dataset_reference("source data set", source, "Fixture compliance and format source"),
+            "common:referenceToPersonOrEntityEnteringTheData": dataset_reference("contact data set", contact, "Fixture maintainer")
+        },
+        "publicationAndOwnership": {
+            "common:dataSetVersion": VERSION,
+            "common:permanentDataSetURI": "https://example.invalid/tidas-fixture",
+            "common:referenceToOwnershipOfDataSet": dataset_reference("contact data set", contact, "Fixture maintainer"),
+            "common:copyright": "false",
+            "common:licenseType": "Free of charge for all users and uses"
+        }
+    })
+}
+
+fn process_administrative_information(source: Uuid, contact: Uuid) -> Value {
+    let mut administrative = administrative_information(source, contact);
+    administrative["common:commissionerAndGoal"] = json!({
+        "common:referenceToCommissioner": dataset_reference("contact data set", contact, "Fixture maintainer"),
+        "common:intendedApplications": localized("Isolated Worker lifecycle validation")
+    });
+    administrative
+}
+
+fn flow_document(
+    flow: Uuid,
+    flow_type: &str,
+    flow_property: Uuid,
+    source: Uuid,
+    contact: Uuid,
+) -> Value {
+    let classification = if flow_type == "Elementary flow" {
+        json!({"common:elementaryFlowCategorization": {"common:category": [{
+            "@level": "0", "@catId": "1", "#text": "Emissions"
+        }]}})
+    } else {
+        json!({"common:classification": {"common:class": [{
+            "@level": "0", "@classId": "0", "#text": "Agriculture, forestry and fishery products"
+        }]}})
+    };
     json!({
         "flowDataSet": {
+            "@xmlns": "http://lca.jrc.it/ILCD/Flow",
+            "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+            "@xmlns:ecn": "http://eplca.jrc.ec.europa.eu/ILCD/Extensions/2018/ECNumber",
+            "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "@version": "1.1",
+            "@locations": "../ILCDLocations.xml",
+            "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/Flow ../../schemas/ILCD_FlowDataSet.xsd",
             "flowInformation": {
                 "dataSetInformation": {
                     "common:UUID": flow,
-                    "name": {"baseName": format!("E2E flow {flow}")}
+                    "name": {
+                        "baseName": localized(format!("E2E flow {flow}")),
+                        "treatmentStandardsRoutes": localized("fixture route"),
+                        "mixAndLocationTypes": localized("fixture flow")
+                    },
+                    "classificationInformation": classification
                 },
                 "quantitativeReference": {"referenceToReferenceFlowProperty": "1"}
             },
             "flowProperties": {"flowProperty": {
                 "@dataSetInternalID": "1",
-                "referenceToFlowPropertyDataSet": {
-                    "@type": "flow property data set",
-                    "@refObjectId": flow_property,
-                    "@version": VERSION
-                }
+                "referenceToFlowPropertyDataSet": dataset_reference("flow property data set", flow_property, "Mass"),
+                "meanValue": "1"
             }},
-            "modellingAndValidation": {"LCIMethod": {"typeOfDataSet": flow_type}}
+            "modellingAndValidation": {
+                "LCIMethod": {"typeOfDataSet": flow_type},
+                "complianceDeclarations": {"compliance": simple_compliance(source)}
+            },
+            "administrativeInformation": administrative_information(source, contact)
         }
     })
 }
 
-fn flow_property_document(flow_property: Uuid, unit_group: Uuid) -> Value {
+fn flow_property_document(
+    flow_property: Uuid,
+    unit_group: Uuid,
+    source: Uuid,
+    contact: Uuid,
+) -> Value {
     json!({
         "flowPropertyDataSet": {
+            "@xmlns": "http://lca.jrc.it/ILCD/FlowProperty",
+            "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+            "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "@version": "1.1",
+            "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/FlowProperty ../../schemas/ILCD_FlowPropertyDataSet.xsd",
             "flowPropertiesInformation": {
-                "dataSetInformation": {"common:UUID": flow_property},
-                "quantitativeReference": {"referenceToReferenceUnitGroup": {
-                    "@type": "unit group data set",
-                    "@refObjectId": unit_group,
-                    "@version": VERSION
-                }}
-            }
+                "dataSetInformation": {
+                    "common:UUID": flow_property,
+                    "common:name": localized("Mass"),
+                    "classificationInformation": {"common:classification": {"common:class": {
+                        "@level": "0", "@classId": "1", "#text": "Technical flow properties"
+                    }}}
+                },
+                "quantitativeReference": {"referenceToReferenceUnitGroup":
+                    dataset_reference("unit group data set", unit_group, "Units of mass")
+                }
+            },
+            "modellingAndValidation": {
+                "complianceDeclarations": {"compliance": simple_compliance(source)}
+            },
+            "administrativeInformation": administrative_information(source, contact)
         }
     })
 }
 
-fn unit_group_document(unit_group: Uuid) -> Value {
+fn unit_group_document(unit_group: Uuid, source: Uuid, contact: Uuid) -> Value {
     json!({
         "unitGroupDataSet": {
+            "@xmlns": "http://lca.jrc.it/ILCD/UnitGroup",
+            "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+            "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "@version": "1.1",
+            "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/UnitGroup ../../schemas/ILCD_UnitGroupDataSet.xsd",
             "unitGroupInformation": {
-                "dataSetInformation": {"common:UUID": unit_group},
+                "dataSetInformation": {
+                    "common:UUID": unit_group,
+                    "common:name": localized("Units of mass"),
+                    "classificationInformation": {"common:classification": {"common:class": {
+                        "@level": "0", "@classId": "1", "#text": "Technical unit groups"
+                    }}}
+                },
                 "quantitativeReference": {"referenceToReferenceUnit": "1"}
             },
+            "modellingAndValidation": {
+                "complianceDeclarations": {"compliance": simple_compliance(source)}
+            },
+            "administrativeInformation": administrative_information(source, contact),
             "units": {"unit": {
                 "@dataSetInternalID": "1",
                 "name": "kg",
@@ -299,25 +465,339 @@ fn unit_group_document(unit_group: Uuid) -> Value {
     })
 }
 
-fn method_document(method: Uuid, elementary: Uuid) -> Value {
+fn method_document(
+    method: Uuid,
+    elementary: Uuid,
+    flow_property: Uuid,
+    source: Uuid,
+    contact: Uuid,
+) -> Value {
     json!({
         "LCIAMethodDataSet": {
+            "@xmlns": "http://lca.jrc.it/ILCD/LCIAMethod",
+            "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+            "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "@version": "1.1",
+            "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/LCIAMethod ../../schemas/ILCD_LCIAMethodDataSet.xsd",
             "LCIAMethodInformation": {
-                "dataSetInformation": {"common:UUID": method}
+                "dataSetInformation": {
+                    "common:UUID": method,
+                    "common:name": localized("E2E impact method"),
+                    "classificationInformation": {"common:classification": {"common:class": [{
+                        "@level": "0", "@classId": "1", "#text": "Damage level LCIA methods"
+                    }]}}
+                },
+                "quantitativeReference": {"referenceQuantity":
+                    dataset_reference("flow property data set", flow_property, "Mass")
+                },
+                "time": {
+                    "referenceYear": localized("2026"),
+                    "duration": localized("One year"),
+                    "timeRepresentativenessDescription": localized("Synthetic lifecycle fixture")
+                },
+                "impactModel": {
+                    "modelName": "Synthetic fixture model",
+                    "modelDescription": localized("Deterministic factor used by the lifecycle fixture")
+                }
             },
-            "methodInformation": {
-                "dataSetInformation": {"name": {"baseName": "E2E impact"}}
+            "modellingAndValidation": {
+                "LCIAMethodNormalisationAndWeighting": {
+                    "typeOfDataSet": "Damage indicator",
+                    "LCIAMethodPrinciple": "other"
+                },
+                "dataSources": {"referenceToDataSource":
+                    dataset_reference("source data set", source, "Fixture compliance and format source")
+                },
+                "validation": {"review": {"@type": "Not reviewed"}},
+                "complianceDeclarations": {"compliance": process_compliance(source)}
+            },
+            "administrativeInformation": {
+                "dataGenerator": {"common:referenceToPersonOrEntityGeneratingTheDataSet":
+                    dataset_reference("contact data set", contact, "Fixture maintainer")
+                },
+                "dataEntryBy": {
+                    "common:timeStamp": "2026-08-02T00:00:00Z",
+                    "common:referenceToDataSetFormat": dataset_reference("source data set", source, "Fixture compliance and format source"),
+                    "recommendationBy": {
+                        "referenceToEntity": dataset_reference("contact data set", contact, "Fixture maintainer"),
+                        "level": "Not recommended",
+                        "meaning": localized("Synthetic test fixture only")
+                    }
+                },
+                "publicationAndOwnership": {
+                    "common:dateOfLastRevision": "2026-08-02T00:00:00Z",
+                    "common:dataSetVersion": VERSION,
+                    "common:referenceToOwnershipOfDataSet": dataset_reference("contact data set", contact, "Fixture maintainer")
+                }
             },
             "characterisationFactors": {"factor": {
-                "referenceToFlowDataSet": {
-                    "@type": "flow data set",
-                    "@refObjectId": elementary,
-                    "@version": VERSION
-                },
-                "meanValue": "2"
+                "referenceToFlowDataSet": dataset_reference("flow data set", elementary, "Elementary fixture flow"),
+                "exchangeDirection": "Output",
+                "meanValue": "2",
+                "deviatingRecommendation": "Not recommended"
             }}
         }
     })
+}
+
+fn source_document(source: Uuid, contact: Uuid) -> Value {
+    json!({"sourceDataSet": {
+        "@xmlns": "http://lca.jrc.it/ILCD/Source",
+        "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+        "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "@version": "1.1",
+        "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/Source ../../schemas/ILCD_SourceDataSet.xsd",
+        "sourceInformation": {"dataSetInformation": {
+            "common:UUID": source,
+            "common:shortName": localized("Fixture format and compliance source"),
+            "classificationInformation": {"common:classification": {"common:class": {
+                "@level": "0", "@classId": "3", "#text": "Compliance systems"
+            }}}
+        }},
+        "administrativeInformation": administrative_information(source, contact)
+    }})
+}
+
+fn contact_document(contact: Uuid, source: Uuid) -> Value {
+    json!({"contactDataSet": {
+        "@xmlns": "http://lca.jrc.it/ILCD/Contact",
+        "@xmlns:common": "http://lca.jrc.it/ILCD/Common",
+        "@xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "@version": "1.1",
+        "@xsi:schemaLocation": "http://lca.jrc.it/ILCD/Contact ../../schemas/ILCD_ContactDataSet.xsd",
+        "contactInformation": {"dataSetInformation": {
+            "common:UUID": contact,
+            "common:shortName": localized("Fixture maintainer"),
+            "common:name": localized("TianGong Worker fixture maintainer"),
+            "classificationInformation": {"common:classification": {"common:class": {
+                "@level": "0", "@classId": "1", "#text": "Group of organisations, project"
+            }}}
+        }},
+        "administrativeInformation": administrative_information(source, contact)
+    }})
+}
+
+fn validation_documents(
+    fixture: &Fixture,
+) -> anyhow::Result<Vec<(&'static str, Uuid, String, Value)>> {
+    let processes = [
+        process_document(
+            fixture.processes[0],
+            fixture.product_flows[0],
+            fixture.elementary_flow,
+            3.0,
+            None,
+            fixture.source,
+            fixture.contact,
+        ),
+        process_document(
+            fixture.processes[1],
+            fixture.product_flows[1],
+            fixture.elementary_flow,
+            5.0,
+            Some(fixture.product_flows[0]),
+            fixture.source,
+            fixture.contact,
+        ),
+    ];
+    let flows = [
+        (
+            fixture.product_flows[0],
+            flow_document(
+                fixture.product_flows[0],
+                "Product flow",
+                fixture.flow_property,
+                fixture.source,
+                fixture.contact,
+            ),
+        ),
+        (
+            fixture.product_flows[1],
+            flow_document(
+                fixture.product_flows[1],
+                "Product flow",
+                fixture.flow_property,
+                fixture.source,
+                fixture.contact,
+            ),
+        ),
+        (
+            fixture.elementary_flow,
+            flow_document(
+                fixture.elementary_flow,
+                "Elementary flow",
+                fixture.flow_property,
+                fixture.source,
+                fixture.contact,
+            ),
+        ),
+    ];
+    let mut documents = vec![
+        (
+            "processes",
+            fixture.processes[0],
+            VERSION.to_owned(),
+            processes[0].clone(),
+        ),
+        (
+            "processes",
+            fixture.processes[1],
+            VERSION.to_owned(),
+            processes[1].clone(),
+        ),
+    ];
+    documents.extend(
+        flows
+            .into_iter()
+            .map(|(id, document)| ("flows", id, VERSION.to_owned(), document)),
+    );
+    documents.push((
+        "flowproperties",
+        fixture.flow_property,
+        VERSION.to_owned(),
+        flow_property_document(
+            fixture.flow_property,
+            fixture.unit_group,
+            fixture.source,
+            fixture.contact,
+        ),
+    ));
+    documents.push((
+        "unitgroups",
+        fixture.unit_group,
+        VERSION.to_owned(),
+        unit_group_document(fixture.unit_group, fixture.source, fixture.contact),
+    ));
+    for (method_id, version, _) in RELEASE_METHOD_IDENTITIES {
+        let method_id = Uuid::parse_str(method_id)?;
+        documents.push((
+            "lciamethods",
+            method_id,
+            version.to_owned(),
+            method_document(
+                method_id,
+                fixture.elementary_flow,
+                fixture.flow_property,
+                fixture.source,
+                fixture.contact,
+            ),
+        ));
+    }
+    documents.push((
+        "sources",
+        fixture.source,
+        VERSION.to_owned(),
+        source_document(fixture.source, fixture.contact),
+    ));
+    documents.push((
+        "contacts",
+        fixture.contact,
+        VERSION.to_owned(),
+        contact_document(fixture.contact, fixture.source),
+    ));
+    Ok(documents)
+}
+
+fn preflight_tidas_fixture(fixture: &Fixture) -> anyhow::Result<()> {
+    const EXPECTED_DOCUMENT_COUNT: usize = 34;
+    const EXPECTED_TIDAS_VERSION: &str = "0.1.3";
+    let tidas_bin = required_env("TIDAS_BIN");
+    let version_output = Command::new(&tidas_bin)
+        .args(["version", "--format", "json"])
+        .output()?;
+    let version_report: Value = serde_json::from_slice(&version_output.stdout)?;
+    anyhow::ensure!(
+        version_output.status.success()
+            && version_report.pointer("/summary/binary_version")
+                == Some(&json!(EXPECTED_TIDAS_VERSION)),
+        "fixture preflight requires TIDAS {EXPECTED_TIDAS_VERSION}: report={version_report}; stderr={}",
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+    let documents = validation_documents(fixture)?;
+    anyhow::ensure!(
+        documents.len() == EXPECTED_DOCUMENT_COUNT,
+        "fixture document count drifted: expected {EXPECTED_DOCUMENT_COUNT}, got {}",
+        documents.len()
+    );
+    let temp = tempfile::tempdir()?;
+    let input_dir = temp.path().join("documents");
+    fs::create_dir(&input_dir)?;
+    let manifest_path = temp.path().join("manifest.jsonl");
+    let events_path = temp.path().join("events.jsonl");
+    let mut manifest = Vec::new();
+    for (index, (category, id, version, document)) in documents.iter().enumerate() {
+        let file_name = format!("{index:08}.json");
+        let bytes = serde_json::to_vec(document)?;
+        fs::write(input_dir.join(&file_name), &bytes)?;
+        serde_json::to_writer(
+            &mut manifest,
+            &json!({
+                "document_key": format!("{category}:{id}:{version}"),
+                "category": category,
+                "relative_path": file_name,
+                "content_sha256": sha256(&bytes),
+                "identity": {
+                    "dataset_type": category,
+                    "dataset_id": id,
+                    "dataset_version": version,
+                }
+            }),
+        )?;
+        manifest.push(b'\n');
+    }
+    fs::write(&manifest_path, manifest)?;
+    let output = Command::new(tidas_bin)
+        .args([
+            "validate",
+            input_dir.to_str().expect("fixture temp path must be UTF-8"),
+            "--protocol",
+            "document-validation-batch.v1",
+            "--input-manifest",
+            manifest_path
+                .to_str()
+                .expect("fixture manifest path must be UTF-8"),
+            "--events",
+            events_path
+                .to_str()
+                .expect("fixture events path must be UTF-8"),
+            "--format",
+            "json",
+            "--progress",
+            "never",
+        ])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(
+        output.status.success() && report["status"] == "succeeded",
+        "TIDAS fixture preflight failed: report={report}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = fs::read_to_string(&events_path)?;
+    let parsed = events
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let issue_count = parsed
+        .iter()
+        .filter(|event| event["type"] == "issue")
+        .count();
+    let issue_sample = parsed
+        .iter()
+        .filter(|event| event["type"] == "issue")
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+    let final_event = parsed
+        .iter()
+        .find(|event| event["type"] == "final")
+        .ok_or_else(|| anyhow::anyhow!("TIDAS fixture preflight omitted final event"))?;
+    anyhow::ensure!(
+        final_event.pointer("/summary/document_count") == Some(&json!(EXPECTED_DOCUMENT_COUNT))
+            && final_event.pointer("/summary/issue_count") == Some(&json!(0))
+            && issue_count == 0,
+        "TIDAS fixture preflight expected {EXPECTED_DOCUMENT_COUNT} documents and zero issues; final={final_event}; issues={issue_count}; sample={issue_sample:?}"
+    );
+    Ok(())
 }
 
 async fn setup_fixture(pool: &PgPool) -> anyhow::Result<Fixture> {
@@ -328,19 +808,20 @@ async fn setup_fixture(pool: &PgPool) -> anyhow::Result<Fixture> {
         elementary_flow: Uuid::new_v4(),
         flow_property: Uuid::new_v4(),
         unit_group: Uuid::new_v4(),
+        source: Uuid::new_v4(),
+        contact: Uuid::new_v4(),
     };
     setup_fixture_with(pool, fixture).await
 }
 
 async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<Fixture> {
+    preflight_tidas_fixture(&fixture)?;
     let release_run = Uuid::new_v4();
     let approval = Uuid::new_v4();
 
     sqlx::query(
         r#"INSERT INTO storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
-           VALUES($1,$1,false,52428800,ARRAY['application/x-hdf5','application/json',
-             'application/x-ndjson','application/gzip',
-             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'])
+           VALUES($1,$1,false,52428800,NULL)
            ON CONFLICT(id) DO NOTHING"#,
     )
     .bind(required_env("S3_BUCKET"))
@@ -394,6 +875,8 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
             fixture.elementary_flow,
             3.0,
             None,
+            fixture.source,
+            fixture.contact,
         ),
         process_document(
             fixture.processes[1],
@@ -401,6 +884,8 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
             fixture.elementary_flow,
             5.0,
             Some(fixture.product_flows[0]),
+            fixture.source,
+            fixture.contact,
         ),
     ];
     for (id, document) in fixture.processes.iter().zip(&processes) {
@@ -422,6 +907,8 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
                 fixture.product_flows[0],
                 "Product flow",
                 fixture.flow_property,
+                fixture.source,
+                fixture.contact,
             ),
         ),
         (
@@ -430,6 +917,8 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
                 fixture.product_flows[1],
                 "Product flow",
                 fixture.flow_property,
+                fixture.source,
+                fixture.contact,
             ),
         ),
         (
@@ -438,6 +927,8 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
                 fixture.elementary_flow,
                 "Elementary flow",
                 fixture.flow_property,
+                fixture.source,
+                fixture.contact,
             ),
         ),
     ];
@@ -452,7 +943,12 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
         .execute(pool)
         .await?;
     }
-    let flow_property = flow_property_document(fixture.flow_property, fixture.unit_group);
+    let flow_property = flow_property_document(
+        fixture.flow_property,
+        fixture.unit_group,
+        fixture.source,
+        fixture.contact,
+    );
     sqlx::query(
         "INSERT INTO public.flowproperties(id,version,json,json_ordered,user_id,state_code) VALUES($1,$2,$3,$3::text::json,$4,100)",
     )
@@ -462,7 +958,7 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     .bind(fixture.actor)
     .execute(pool)
     .await?;
-    let unit_group = unit_group_document(fixture.unit_group);
+    let unit_group = unit_group_document(fixture.unit_group, fixture.source, fixture.contact);
     sqlx::query(
         "INSERT INTO public.unitgroups(id,version,json,json_ordered,user_id,state_code) VALUES($1,$2,$3,$3::text::json,$4,100)",
     )
@@ -476,7 +972,13 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     for (method_id, version, locator_id) in RELEASE_METHOD_IDENTITIES {
         let method_id = Uuid::parse_str(method_id)?;
         let locator_id = Uuid::parse_str(locator_id)?;
-        let method = method_document(method_id, fixture.elementary_flow);
+        let method = method_document(
+            method_id,
+            fixture.elementary_flow,
+            fixture.flow_property,
+            fixture.source,
+            fixture.contact,
+        );
         sqlx::query(
             "INSERT INTO public.lciamethods(id,version,json,json_ordered,user_id,state_code) VALUES($1,$2,$3,$3::text::json,$4,100)",
         )
@@ -488,6 +990,26 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
         .await?;
         methods.push((method_id, version, method));
     }
+    let source = source_document(fixture.source, fixture.contact);
+    sqlx::query(
+        "INSERT INTO public.sources(id,version,json,json_ordered,user_id,state_code) VALUES($1,$2,$3,$3::text::json,$4,100)",
+    )
+    .bind(fixture.source)
+    .bind(VERSION)
+    .bind(&source)
+    .bind(fixture.actor)
+    .execute(pool)
+    .await?;
+    let contact = contact_document(fixture.contact, fixture.source);
+    sqlx::query(
+        "INSERT INTO public.contacts(id,version,json,json_ordered,user_id,state_code) VALUES($1,$2,$3,$3::text::json,$4,100)",
+    )
+    .bind(fixture.contact)
+    .bind(VERSION)
+    .bind(&contact)
+    .bind(fixture.actor)
+    .execute(pool)
+    .await?;
     sqlx::query("ALTER TABLE public.processes ENABLE TRIGGER USER")
         .execute(pool)
         .await?;
@@ -613,6 +1135,15 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
             None,
             VERSION,
         ),
+        ("source", "support", fixture.source, source, None, VERSION),
+        (
+            "contact",
+            "support",
+            fixture.contact,
+            contact,
+            None,
+            VERSION,
+        ),
     ];
     released.extend(
         methods
@@ -658,6 +1189,8 @@ fn review_submit_benchmark_fixture() -> anyhow::Result<Fixture> {
         elementary_flow: Uuid::parse_str("16000000-0000-4000-8000-000000000022")?,
         flow_property: Uuid::parse_str("16000000-0000-4000-8000-000000000030")?,
         unit_group: Uuid::parse_str("16000000-0000-4000-8000-000000000040")?,
+        source: Uuid::parse_str("16000000-0000-4000-8000-000000000050")?,
+        contact: Uuid::parse_str("16000000-0000-4000-8000-000000000060")?,
     })
 }
 
@@ -972,6 +1505,12 @@ async fn review_submit_source_closure_benchmark_fixture() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[test]
+#[ignore = "requires the governed TIDAS release binary selected by TIDAS_BIN"]
+fn scope_closure_fixture_is_tidas_013_valid() -> anyhow::Result<()> {
+    preflight_tidas_fixture(&review_submit_benchmark_fixture()?)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a reset local Supabase DB + Storage; run scripts/run_scope_closure_package_v2_e2e.sh"]
 async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> anyhow::Result<()> {
@@ -1063,6 +1602,8 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
         fixture.elementary_flow,
         999.0,
         None,
+        fixture.source,
+        fixture.contact,
     );
     sqlx::query("ALTER TABLE public.processes DISABLE TRIGGER USER")
         .execute(&state.pool)
@@ -1197,8 +1738,29 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     .fetch_one(&state.pool)
     .await?;
     anyhow::ensure!(event["ok"] == json!(true));
+    let claim_error = claim_worker_jobs(
+        &state.pool,
+        "solver",
+        "scope-closure-package-v2-e2e-revoked",
+        1,
+        300,
+    )
+    .await
+    .expect_err("revoked certificate must reject worker admission");
     anyhow::ensure!(
-        run_one_job(state.clone(), revoked_build.worker_job_id, "revoked").await? == "failed"
+        claim_error
+            .to_string()
+            .contains("closure_certificate_expired_or_unavailable"),
+        "revoked certificate returned unexpected admission error: {claim_error:#}"
+    );
+    let revoked_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM public.worker_jobs WHERE id=$1")
+            .bind(revoked_build.worker_job_id)
+            .fetch_one(&state.pool)
+            .await?;
+    anyhow::ensure!(
+        revoked_status == "queued",
+        "revoked build unexpectedly entered execution: status={revoked_status}"
     );
     assert_zero_package(&state.pool, &revoked_build).await?;
 
