@@ -20,8 +20,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/edge-function-integration.md
   - docs/review-submit-fast-gate-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Reviewed for Worker Issue #177: the frontend continues to consume the existing XLSX plus manifest projection through Edge; canonical v3 storage and staged publication do not change the public DTO."
 related:
   - AGENTS.md

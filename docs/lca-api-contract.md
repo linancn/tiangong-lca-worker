@@ -55,12 +55,12 @@ related:
 
 ## 2. 关键表与职责
 
-- `lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
-- `lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
+- `private.lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
+- `private.lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
 - `worker_jobs`: canonical worker 生命周期表；solver 队列任务使用 `worker_queue=solver`，用于服务端任务中心、operator 查询、lease fencing、状态、错误、进度和 result projection。
 - `lca_jobs`: optional retained LCA domain/history 兼容表，用于历史诊断和 legacy pgmq/debug 路径；统一 `worker_jobs` 路径不得要求该表存在。
 - `lca_results`: 作业结果主表（仅 artifact 元数据 + diagnostics）。
-- `lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
+- `private.lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
 - `lca_result_cache`: 请求级缓存/去重状态。
 - `lca_factorization_registry`: 分解状态注册表（当前 schema 已就绪，运行时待接入）。
 

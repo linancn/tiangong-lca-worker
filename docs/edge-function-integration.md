@@ -24,8 +24,8 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Reviewed for Worker Issue #177: canonical scope-closure v3 and Database #316 staged publication remain behind the existing Edge-owned XLSX plus manifest projection; no Edge request or response DTO change is required."
 related:
   - AGENTS.md
@@ -138,7 +138,7 @@ Header 建议：
 2. 解析请求并标准化（默认 `amount=1.0`，补 `solve` 默认值）。
 3. 选择 `snapshot_id`：
    - 若请求显式给出，校验存在且可用。
-   - 否则读 `lca_active_snapshots(scope='prod')`。
+   - 否则通过 Data API 读取兼容 façade `public.lca_active_snapshots(scope='prod')`；只有 Worker 的 direct-PostgreSQL 持久化路径使用 canonical `private.lca_active_snapshots`，Edge 不跨越该边界。
    - `data_scope=public_plus_owner_draft` 时，Edge 必须使用 `lca.build_snapshot.request.v2` 创建独立 snapshot family：只传 public `state_code=100` 与当前 actor `state_code=0`，并携带 frozen scope manifest、method/factor source contract 和 factor-coverage contract。不能复用 legacy `100..199 + all owner states` snapshot。
 4. 构造求解负载：
    - `demand_mode=single`：构造 `rhs`（长度 = `process_count`，只在目标 index 赋值 `amount`）。

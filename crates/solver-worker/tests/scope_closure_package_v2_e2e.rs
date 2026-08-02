@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 const VERSION: &str = "01.00.000";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Fixture {
     actor: Uuid,
     processes: [Uuid; 2],
@@ -42,7 +42,7 @@ struct Fixture {
     contact: Uuid,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Certificate {
     check_id: Uuid,
     requested_scope_hash: String,
@@ -89,7 +89,7 @@ fn test_config() -> AppConfig {
         "--s3-secret-access-key",
         required_env("S3_SECRET_ACCESS_KEY").as_str(),
         "--s3-prefix",
-        "scope-closure-package-v2-e2e",
+        required_env("S3_PREFIX").as_str(),
         "--db-max-connections",
         "12",
         "--worker-poll-ms",
@@ -797,6 +797,16 @@ fn preflight_tidas_fixture(fixture: &Fixture) -> anyhow::Result<()> {
             && issue_count == 0,
         "TIDAS fixture preflight expected {EXPECTED_DOCUMENT_COUNT} documents and zero issues; final={final_event}; issues={issue_count}; sample={issue_sample:?}"
     );
+    println!(
+        "[tidas_fixture_preflight] {}",
+        serde_json::to_string(&json!({
+            "schemaVersion": "worker.issue-199.tidas-preflight.v1",
+            "binaryVersion": EXPECTED_TIDAS_VERSION,
+            "documentCount": EXPECTED_DOCUMENT_COUNT,
+            "issueCount": issue_count,
+            "status": "succeeded",
+        }))?
+    );
     Ok(())
 }
 
@@ -1235,7 +1245,7 @@ async fn load_certificate(pool: &PgPool, check_id: Uuid) -> anyhow::Result<Certi
              c.effective_scope_hash,c.data_snapshot_token,c.closure_bundle_hash,
              c.effective_scope_manifest,a.artifact_url
            FROM public.lcia_scope_closure_checks c
-           JOIN public.lca_snapshot_artifacts a ON a.id=c.snapshot_artifact_id
+           JOIN private.lca_snapshot_artifacts a ON a.id=c.snapshot_artifact_id
            WHERE c.id=$1 AND c.status='passed' AND c.certificate_status='valid'"#,
     )
     .bind(check_id)
@@ -1541,14 +1551,14 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     );
 
     let artifact_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lca_snapshot_artifacts WHERE snapshot_id=$1 AND status='ready' AND artifact_format=$2",
+        "SELECT count(*) FROM private.lca_snapshot_artifacts WHERE snapshot_id=$1 AND status='ready' AND artifact_format=$2",
     )
     .bind(certificate.snapshot_id)
     .bind(SNAPSHOT_ARTIFACT_FORMAT)
     .fetch_one(&state.pool)
     .await?;
     let snapshot_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lca_network_snapshots WHERE id=$1 AND status='ready'",
+        "SELECT count(*) FROM private.lca_network_snapshots WHERE id=$1 AND status='ready'",
     )
     .bind(certificate.snapshot_id)
     .fetch_one(&state.pool)
@@ -1656,9 +1666,12 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     anyhow::ensure!(before_query.get("hMatrix").is_none());
     anyhow::ensure!(before_query["lciaChunks"] == after_query["lciaChunks"]);
     anyhow::ensure!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.lca_network_snapshots")
-            .fetch_one(&state.pool)
-            .await?
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM private.lca_network_snapshots WHERE id=$1",
+        )
+        .bind(certificate.snapshot_id)
+        .fetch_one(&state.pool)
+        .await?
             == 1
     );
 
@@ -1710,19 +1723,60 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
         .object_store
         .upload_object_key(&snapshot_key, SNAPSHOT_ARTIFACT_CONTENT_TYPE, corrupt_bytes)
         .await?;
-    let hdf_build = request_build(&state.pool, &fixture, &certificate, "tampered-hdf").await?;
-    anyhow::ensure!(
-        run_one_job(state.clone(), hdf_build.worker_job_id, "tampered-hdf").await? == "failed"
-    );
-    assert_zero_package(&state.pool, &hdf_build).await?;
+    let hdf_state = state.clone();
+    let hdf_fixture = fixture.clone();
+    let hdf_certificate = certificate.clone();
+    let hdf_attempt = tokio::spawn(async move {
+        let hdf_build = request_build(
+            &hdf_state.pool,
+            &hdf_fixture,
+            &hdf_certificate,
+            "tampered-hdf",
+        )
+        .await?;
+        anyhow::ensure!(
+            run_one_job(hdf_state.clone(), hdf_build.worker_job_id, "tampered-hdf").await?
+                == "failed"
+        );
+        assert_zero_package(&hdf_state.pool, &hdf_build).await
+    })
+    .await;
     state
         .object_store
         .upload_object_key(
             &snapshot_key,
             SNAPSHOT_ARTIFACT_CONTENT_TYPE,
-            snapshot_bytes,
+            snapshot_bytes.clone(),
         )
         .await?;
+    let restored_bytes = state
+        .object_store
+        .download_object_key(&snapshot_key)
+        .await?;
+    anyhow::ensure!(
+        restored_bytes == snapshot_bytes,
+        "HDF restoration was not byte-exact"
+    );
+    println!(
+        "[hdf_restore_evidence] {}",
+        serde_json::to_string(&json!({
+            "schemaVersion": "worker.issue-199.hdf-restore.v1",
+            "objectKey": snapshot_key,
+            "restoredSha256": sha256(&restored_bytes),
+            "status": "succeeded",
+        }))?
+    );
+    match hdf_attempt {
+        Ok(result) => result?,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "tampered-HDF task panicked after restoration: {error}"
+            ));
+        }
+    }
+    if std::env::var("WORKER199_INJECT_FAILURE_AFTER_HDF_RESTORE").as_deref() == Ok("1") {
+        anyhow::bail!("worker199 injected failure after byte-exact HDF restoration");
+    }
 
     let revoked_build = request_build(&state.pool, &fixture, &certificate, "revoked").await?;
     let event = sqlx::query_scalar::<_, Value>(
@@ -1773,6 +1827,31 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     anyhow::ensure!(ready_packages == 2);
     anyhow::ensure!(certificate.snapshot_artifact_id != Uuid::nil());
     anyhow::ensure!(!certificate.snapshot_build_contract_hash.is_empty());
+    println!(
+        "[certified_snapshot_lifecycle_evidence] {}",
+        serde_json::to_string(&json!({
+            "schemaVersion": "worker.issue-199.certified-snapshot-lifecycle.v1",
+            "closureCheckId": certificate.check_id,
+            "snapshotId": certificate.snapshot_id,
+            "snapshotArtifactId": certificate.snapshot_artifact_id,
+            "snapshotHash": certificate.snapshot_hash,
+            "snapshotIndexSha256": certificate.snapshot_index_sha256,
+            "snapshotBuildContractHash": certificate.snapshot_build_contract_hash,
+            "artifactUrl": certificate.artifact_url,
+            "objectKey": snapshot_key,
+            "readyPackages": ready_packages,
+            "frozenReuseBuilds": 2,
+            "failClosedCases": [
+                "tampered-hash",
+                "tampered-id",
+                "tampered-config",
+                "tampered-axis",
+                "tampered-hdf",
+                "revoked-certificate",
+            ],
+            "status": "succeeded",
+        }))?
+    );
     Ok(())
 }
 

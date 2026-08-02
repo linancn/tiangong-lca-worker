@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-02
-lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issue #198: a schema-valid lifecycle fixture and its preflight remain test-owned and do not alter Worker orchestration or repository ownership."
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedNote: "Reviewed for Worker Issue #199: the snapshot persistence family moves to exact private direct-PostgreSQL identities without moving durable schema ownership out of database-engine."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -172,6 +172,7 @@ Route those tasks to:
 - solve result persistence is S3-only; `lca_results` stores artifact metadata and diagnostics, not inline payloads
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
+- LCA snapshot canonical persistence uses exact `private.lca_active_snapshots`, `private.lca_network_snapshots`, and `private.lca_snapshot_artifacts` identities over direct PostgreSQL. `DATABASE_URL` / `CONN` must identify a dedicated non-superuser, non-BYPASSRLS Worker login that inherits the `service_role` privileges granted by database-engine for this table family; public compatibility views and search-path fallback are not runtime paths.
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure

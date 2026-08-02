@@ -191,11 +191,11 @@ gen_uuid() {
 }
 
 if [ -z "$SNAPSHOT_ID" ]; then
-  SNAPSHOT_ID="$(sql_scalar_soft "SELECT snapshot_id::text FROM public.lca_snapshot_artifacts WHERE status = 'ready' ORDER BY created_at DESC LIMIT 1;")"
+  SNAPSHOT_ID="$(sql_scalar_soft "SELECT snapshot_id::text FROM private.lca_snapshot_artifacts WHERE status = 'ready' ORDER BY created_at DESC LIMIT 1;")"
 fi
 
 if [ -z "$SNAPSHOT_ID" ]; then
-  SNAPSHOT_ID="$(sql_scalar_soft "SELECT id::text FROM public.lca_network_snapshots ORDER BY created_at DESC LIMIT 1;")"
+  SNAPSHOT_ID="$(sql_scalar_soft "SELECT id::text FROM private.lca_network_snapshots ORDER BY created_at DESC LIMIT 1;")"
 fi
 
 if [ -z "$SNAPSHOT_ID" ]; then
@@ -216,7 +216,7 @@ SELECT
   a_nnz::text || '|' ||
   b_nnz::text || '|' ||
   c_nnz::text
-FROM public.lca_snapshot_artifacts
+FROM private.lca_snapshot_artifacts
 WHERE snapshot_id = '$SNAPSHOT_ID'::uuid
   AND status = 'ready'
 ORDER BY created_at DESC

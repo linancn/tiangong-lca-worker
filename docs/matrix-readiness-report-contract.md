@@ -24,8 +24,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Issue #146 adds selected LCIA-factor Flow source-closure policy to build identity; readiness schema and blocker semantics are unchanged."
 related:
   - AGENTS.md

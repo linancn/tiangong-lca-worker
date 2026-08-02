@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Reviewed for Worker Issue #186: the external qualification harness streams a local ZIP and exact TIDAS validation without changing asynchronous package import/export semantics."
 related:
   - AGENTS.md

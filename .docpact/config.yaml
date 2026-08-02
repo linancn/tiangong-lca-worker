@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-02"
-lastReviewedCommit: "cabb2518a69272c20abe61692eadb292b95596f2"
-lastReviewedNote: "Reviewed for Worker Issue #198: existing routing and coverage govern the scope-closure lifecycle fixture and validation guide."
+lastReviewedCommit: "10183162a1944252fd01eeb5ffc1548cbe8c4ec1"
+lastReviewedNote: "Reviewed for Worker Issue #199: runtime SQL routing now includes scoped static diagnostics plus exact private dedicated-login and disposable lifecycle evidence."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -173,6 +173,7 @@ routing:
         - scripts/build_snapshot_from_ilcd.sh
         - scripts/export_provider_link_diagnostics.sh
         - scripts/export_unmatched_no_provider_diagnostics.sh
+        - scripts/qualify_snapshot_private_cutover.py
         - docs/agents/repo-architecture.md
         - docs/provider-linking.md
         - docs/implicit-regional-supply-mix-modeling.md
@@ -184,7 +185,9 @@ routing:
     runtime-sql-boundary:
       paths:
         - supabase/migrations/**
+        - docs/sql/**
         - scripts/validate_additive_migration.sh
+        - scripts/qualify_snapshot_private_cutover.py
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
     debug-and-parity:
@@ -415,6 +418,10 @@ rules:
     triggers:
       - path: supabase/migrations/**
         kind: runtime-sql
+      - path: docs/sql/**
+        kind: executable-diagnostic-sql
+      - path: scripts/qualify_snapshot_private_cutover.py
+        kind: validation-test
     requiredDocs:
       - path: .docpact/config.yaml
         mode: review_or_update

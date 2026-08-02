@@ -27,8 +27,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Reviewed for Worker Issue #193: tidas v0.1.3 evidence preserves the existing bounded memory, result, four-mode identity, and owner-evidence contracts."
 related:
   - ../../../AGENTS.md
