@@ -240,7 +240,7 @@ set +a
 export DATABASE_URL="$DB_URL"
 export S3_ENDPOINT="$STORAGE_S3_URL"
 export S3_REGION="$S3_PROTOCOL_REGION"
-export S3_BUCKET="worker-pr161-source-closure-bench"
+export S3_BUCKET="scope-closure-e2e-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 export S3_ACCESS_KEY_ID="$S3_PROTOCOL_ACCESS_KEY_ID"
 export S3_SECRET_ACCESS_KEY="$S3_PROTOCOL_ACCESS_KEY_SECRET"
 export S3_PREFIX="worker-pr161-source-closure-bench/$candidate_sha"
