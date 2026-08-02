@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: existing runtime, release-binary, scope-closure, and docpact proof requirements apply to tidas v0.1.3."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issue #198: the certificate lifecycle fixture now preflights its exact 34-document TIDAS 0.1.3 closure with zero validation issues."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -106,6 +106,10 @@ claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
 terminal result, transaction rollback, and old-public/new-private parity. It
 refuses non-loopback targets and does not create or reuse containers or volumes.
 The caller owns creation and teardown of the isolated exact-head stack.
+
+### Scope-closure lifecycle fixture
+
+The ignored `scope_closure_package_v2_e2e` lifecycle fixture is a self-contained TIDAS 0.1.3 mini graph. Before it mutates the isolated database, it must validate exactly 34 documents with zero issues using the release `tidas` binary. Schema evolution must be handled by updating the fixture documents and their closed references; never bypass or weaken this preflight. The revoked-certificate case proves fail-closed admission by requiring the database claim boundary to reject the queued job before runtime execution and by verifying that no result package exists.
 
 ### Scope-closure capacity input modes
 
