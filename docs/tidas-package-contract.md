@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #190: schema-qualified worker job access preserves asynchronous TIDAS package import/export semantics."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issues #190 and #192: schema-qualified worker job access and the private hash-helper cutover preserve asynchronous TIDAS package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

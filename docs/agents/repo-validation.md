@@ -42,7 +42,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-02
 lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issue #198: the certificate lifecycle fixture now preflights its exact 34-document TIDAS 0.1.3 closure with zero validation issues."
+lastReviewedNote: "Reviewed for Worker Issues #192 and #198: existing runtime, scope-closure, real-DB, and docpact proof cover the private hash-helper cutover, while the lifecycle fixture preflights its exact 34-document TIDAS 0.1.3 closure with zero validation issues."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

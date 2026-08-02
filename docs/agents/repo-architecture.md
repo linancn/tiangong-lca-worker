@@ -37,7 +37,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-02
 lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issue #198: fixture-only TIDAS validation changes do not move runtime, provider, or root-integration ownership boundaries."
+lastReviewedNote: "Reviewed for Worker Issues #192 and #198: the private hash-helper cutover and fixture-only TIDAS validation do not move runtime topology, provider, cross-repo, or root-integration ownership boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

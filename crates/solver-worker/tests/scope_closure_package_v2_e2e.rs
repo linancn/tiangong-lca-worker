@@ -1398,7 +1398,7 @@ async fn assert_build_binding_wire(
     );
     anyhow::ensure!(data["inputManifest"]["selectionMode"] == "closure_certificate");
     let authoritative_input_hash =
-        sqlx::query_scalar::<_, String>("SELECT public.lcia_scope_closure_sha256($1::jsonb)")
+        sqlx::query_scalar::<_, String>("SELECT private.lcia_scope_closure_sha256($1::jsonb)")
             .bind(&data["inputManifest"])
             .fetch_one(&state.pool)
             .await?;
@@ -1529,7 +1529,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     let certificate = load_certificate(&state.pool, check_id).await?;
     assert_record_result_v3_wire(&state.pool, check_id).await?;
     let database_effective_scope_hash =
-        sqlx::query_scalar::<_, String>("SELECT public.lcia_scope_closure_sha256($1::jsonb)")
+        sqlx::query_scalar::<_, String>("SELECT private.lcia_scope_closure_sha256($1::jsonb)")
             .bind(&certificate.effective_scope)
             .fetch_one(&state.pool)
             .await?;

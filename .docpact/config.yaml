@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedAt: "2026-08-02"
 lastReviewedCommit: "cabb2518a69272c20abe61692eadb292b95596f2"
-lastReviewedNote: "Reviewed for Worker Issues #190, #193, and #198: private control-plane qualification, the exact tidas v0.1.3 runtime default, and the schema-valid scope-closure lifecycle fixture preserve existing ownership and routing."
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, and #198: private control-plane and hash-helper qualification, the exact tidas v0.1.3 runtime default, and the schema-valid scope-closure lifecycle fixture preserve existing ownership and routing."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

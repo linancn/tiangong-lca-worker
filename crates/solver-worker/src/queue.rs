@@ -623,8 +623,8 @@ async fn validate_authoritative_package_closure_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
-               public.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
+               private.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
         FROM _service_role
         ",
     )

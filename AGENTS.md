@@ -43,7 +43,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-02
 lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issues #190, #193, and #198: private control-plane access, the exact tidas v0.1.3 default, and a schema-valid lifecycle fixture preserve Worker orchestration, ownership, and the Database-owned schema boundary."
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, and #198: private control-plane and hash-helper access, the exact tidas v0.1.3 default, and a schema-valid lifecycle fixture preserve Worker orchestration, service-role, ownership, and the Database-owned schema boundary."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

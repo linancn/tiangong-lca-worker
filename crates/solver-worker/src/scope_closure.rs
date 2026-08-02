@@ -1831,8 +1831,8 @@ async fn validate_worker_input_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
-               public.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
+               private.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
         FROM _service_role
         ",
     )
@@ -4156,7 +4156,7 @@ async fn scope_closure_snapshot_binding(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
         FROM _service_role
         ",
     )
@@ -7524,7 +7524,7 @@ async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
 async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyhow::Result<String> {
     let row = sqlx::query(concat!(
         r"
-        SELECT public.lcia_scope_closure_sha256(jsonb_build_object(
+        SELECT private.lcia_scope_closure_sha256(jsonb_build_object(
             'artifactId', id,
             'bucket', storage_bucket,
             'objectPath', storage_path,

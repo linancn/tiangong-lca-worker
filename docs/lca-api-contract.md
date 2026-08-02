@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-02
 lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issue #198: the schema-valid test fixture and preflight do not change public Worker, Edge, or Next DTOs."
+lastReviewedNote: "Reviewed for Worker Issues #192 and #198: the private hash-helper cutover and schema-valid test fixture preflight do not change public Worker, Edge, or Next DTOs."
 related:
   - AGENTS.md
   - .docpact/config.yaml

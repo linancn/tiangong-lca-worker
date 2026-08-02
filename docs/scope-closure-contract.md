@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #190: private worker control-plane access preserves the scope-closure package and qualification contract."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issues #190 and #192: private worker control-plane access and hash helpers preserve closure hashes, service-role behavior, artifacts, reuse, certificate bindings, and the qualification contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml
