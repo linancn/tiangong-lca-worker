@@ -20,8 +20,8 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-02
-lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issues #190 and #192: schema-qualified worker job access and the private hash-helper cutover preserve asynchronous TIDAS package import/export semantics."
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedNote: "Reviewed for Worker Issues #186, #190, and #192: schema-qualified worker job access, private hash helpers, and the external local-ZIP/exact-TIDAS qualification harness preserve asynchronous package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

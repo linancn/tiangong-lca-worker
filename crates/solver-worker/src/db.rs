@@ -890,7 +890,7 @@ async fn fetch_snapshot_artifact_meta(
     let row = match sqlx::query(
         r"
         SELECT artifact_url, artifact_format, artifact_sha256
-        FROM lca_snapshot_artifacts
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = $1
           AND status = 'ready'
         ORDER BY created_at DESC
@@ -2842,8 +2842,8 @@ async fn load_scope_closure_snapshot_facts(
                a.artifact_format, a.artifact_sha256,
                a.snapshot_index_sha256, a.snapshot_build_contract_hash,
                a.effective_scope_hash, a.data_snapshot_token, a.closure_bundle_hash
-        FROM public.lca_network_snapshots s
-        JOIN public.lca_snapshot_artifacts a
+        FROM private.lca_network_snapshots s
+        JOIN private.lca_snapshot_artifacts a
           ON a.snapshot_id = s.id AND a.status = 'ready'
         WHERE s.id = $1
           AND ($2::uuid IS NULL OR a.id = $2)
@@ -3923,7 +3923,7 @@ async fn fetch_snapshot_source_hash(
     pool: &PgPool,
     snapshot_id: Uuid,
 ) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query("SELECT source_hash FROM public.lca_network_snapshots WHERE id = $1")
+    let row = sqlx::query("SELECT source_hash FROM private.lca_network_snapshots WHERE id = $1")
         .bind(snapshot_id)
         .fetch_optional(pool)
         .await?;
@@ -3979,7 +3979,7 @@ async fn upsert_active_snapshot(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r"
-        INSERT INTO public.lca_active_snapshots (
+        INSERT INTO private.lca_active_snapshots (
             scope,
             snapshot_id,
             source_hash,
@@ -4196,7 +4196,7 @@ async fn fetch_snapshot_process_count(pool: &PgPool, snapshot_id: Uuid) -> anyho
     let row = sqlx::query(
         r"
         SELECT process_count
-        FROM lca_snapshot_artifacts
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = $1
           AND status = 'ready'
         ORDER BY created_at DESC
