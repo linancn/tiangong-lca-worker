@@ -53,30 +53,6 @@ pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
 pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
 pub const REFERENCE_ISSUE_SCHEMA_VERSION: &str = "tidas.reference-extraction-issue.v1";
-pub const SCOPE_CLOSURE_JSON_CONTENT_TYPE: &str = "application/json";
-pub const SCOPE_CLOSURE_NDJSON_ZSTD_CONTENT_TYPE: &str = "application/x-ndjson+zstd";
-pub const SCOPE_CLOSURE_XLSX_CONTENT_TYPE: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-pub const SCOPE_CLOSURE_ROOT_IMPACT_INDEX_CONTENT_TYPE: &str =
-    "application/vnd.tiangong.scope-closure-root-impact-index+zstd";
-pub const SCOPE_CLOSURE_FROZEN_REFERENCE_GRAPH_CONTENT_TYPE: &str =
-    "application/vnd.tiangong.scope-closure-frozen-reference-graph+zstd";
-pub const SCOPE_CLOSURE_CANONICAL_JSON_CHUNK_CONTENT_TYPE: &str =
-    "application/vnd.tiangong.scope-closure-canonical-json-chunk";
-pub const SCOPE_CLOSURE_OVERSIZED_RECORD_INDEX_CONTENT_TYPE: &str =
-    "application/vnd.tiangong.scope-closure-oversized-record-index+json";
-pub const SCOPE_CLOSURE_MANIFEST_CONTENT_TYPE: &str =
-    "application/vnd.tiangong.scope-closure-manifest+json";
-pub const SCOPE_CLOSURE_STORAGE_CONTENT_TYPES: &[&str] = &[
-    SCOPE_CLOSURE_JSON_CONTENT_TYPE,
-    SCOPE_CLOSURE_NDJSON_ZSTD_CONTENT_TYPE,
-    SCOPE_CLOSURE_XLSX_CONTENT_TYPE,
-    SCOPE_CLOSURE_ROOT_IMPACT_INDEX_CONTENT_TYPE,
-    SCOPE_CLOSURE_FROZEN_REFERENCE_GRAPH_CONTENT_TYPE,
-    SCOPE_CLOSURE_CANONICAL_JSON_CHUNK_CONTENT_TYPE,
-    SCOPE_CLOSURE_OVERSIZED_RECORD_INDEX_CONTENT_TYPE,
-    SCOPE_CLOSURE_MANIFEST_CONTENT_TYPE,
-];
 const FETCH_BATCH_SIZE: usize = 96;
 const VALIDATION_CACHE_LOOKUP_BATCH_SIZE: usize = 256;
 const VALIDATION_EXECUTION_BATCH_SIZE: usize = 64;
@@ -964,7 +940,7 @@ impl RootImpactIndexWriter {
     fn new(root_count: usize) -> anyhow::Result<Self> {
         let mut evidence = CompactEvidenceWriter::new(
             "evidence/root-impact-index-v1.bin.zst",
-            SCOPE_CLOSURE_ROOT_IMPACT_INDEX_CONTENT_TYPE,
+            "application/vnd.tiangong.scope-closure-root-impact-index+zstd",
         )?;
         evidence.write_all(ROOT_IMPACT_INDEX_MAGIC)?;
         write_u16(&mut evidence, 1)?;
@@ -1081,7 +1057,7 @@ fn build_frozen_reference_graph_file(
 ) -> anyhow::Result<CompactEvidenceFile> {
     let mut evidence = CompactEvidenceWriter::new(
         "evidence/frozen-reference-graph-v1.bin.zst",
-        SCOPE_CLOSURE_FROZEN_REFERENCE_GRAPH_CONTENT_TYPE,
+        "application/vnd.tiangong.scope-closure-frozen-reference-graph+zstd",
     )?;
     evidence.write_all(FROZEN_REFERENCE_GRAPH_MAGIC)?;
     write_u16(&mut evidence, 1)?;
@@ -1123,10 +1099,8 @@ fn compress_tidas_issue_stream(
     events: &JsonlValueSpool,
     cancellation: &CancellationToken,
 ) -> anyhow::Result<CompactEvidenceFile> {
-    let mut evidence = CompactEvidenceWriter::new(
-        "tidas/issues.ndjson.zst",
-        SCOPE_CLOSURE_NDJSON_ZSTD_CONTENT_TYPE,
-    )?;
+    let mut evidence =
+        CompactEvidenceWriter::new("tidas/issues.ndjson.zst", "application/x-ndjson+zstd")?;
     let file = File::open(&events.path)?;
     advise_sequential_access(&file);
     let mut reader = BufReader::with_capacity(64 * 1024, file);
@@ -5095,7 +5069,7 @@ async fn reuse_completed_scan_execution(
         "closure_report_xlsx",
         ScopeClosureArtifactRole::ClosureReport,
         "closure-report-v1.xlsx",
-        SCOPE_CLOSURE_XLSX_CONTENT_TYPE,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         xlsx_path,
     )?;
     let content_manifest_hash = canonical_json_sha256(&vec![artifact.descriptor.clone()])?;
@@ -5823,7 +5797,8 @@ impl IssuePartitionAccumulator {
                     artifact_type: "closure_complete_machine_result".to_owned(),
                     artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
                     file_name: relative_path,
-                    content_type: SCOPE_CLOSURE_CANONICAL_JSON_CHUNK_CONTENT_TYPE.to_owned(),
+                    content_type: "application/vnd.tiangong.scope-closure-canonical-json-chunk"
+                        .to_owned(),
                     byte_size: usize::try_from(byte_size)?,
                     checksum_sha256: sha256,
                 },
@@ -5859,7 +5834,8 @@ impl IssuePartitionAccumulator {
                 artifact_type: "closure_complete_machine_result".to_owned(),
                 artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
                 file_name: index_path.clone(),
-                content_type: SCOPE_CLOSURE_OVERSIZED_RECORD_INDEX_CONTENT_TYPE.to_owned(),
+                content_type: "application/vnd.tiangong.scope-closure-oversized-record-index+json"
+                    .to_owned(),
                 byte_size: usize::try_from(index_byte_size)?,
                 checksum_sha256: index_sha256.clone(),
             },
@@ -5932,7 +5908,7 @@ impl IssuePartitionAccumulator {
         let entry = IssuePartitionManifestEntry {
             relation: self.relation.clone(),
             path: active.relative_path.clone(),
-            media_type: SCOPE_CLOSURE_NDJSON_ZSTD_CONTENT_TYPE.to_owned(),
+            media_type: "application/x-ndjson+zstd".to_owned(),
             record_count: active.record_count,
             uncompressed_byte_size: active.uncompressed_bytes,
             uncompressed_sha256: hex::encode(active.uncompressed_digest.finalize()),
@@ -5952,7 +5928,7 @@ impl IssuePartitionAccumulator {
                 artifact_type: "closure_complete_machine_result".to_owned(),
                 artifact_role: ScopeClosureArtifactRole::CompleteMachineResult,
                 file_name: active.relative_path,
-                content_type: SCOPE_CLOSURE_NDJSON_ZSTD_CONTENT_TYPE.to_owned(),
+                content_type: "application/x-ndjson+zstd".to_owned(),
                 byte_size: usize::try_from(compressed_byte_size)?,
                 checksum_sha256: compressed_sha256,
             },
@@ -6210,7 +6186,7 @@ fn prepare_issue_partition_artifacts_with_cancellation(
         "closure_complete_machine_result",
         ScopeClosureArtifactRole::CompleteMachineResult,
         "manifest.json",
-        SCOPE_CLOSURE_MANIFEST_CONTENT_TYPE,
+        "application/vnd.tiangong.scope-closure-manifest+json",
         manifest_path,
     )?);
     Ok(artifacts)
@@ -6493,7 +6469,7 @@ fn prepare_closure_content_artifacts_with_cancellation(
                 artifact_type: "closure_bundle".to_owned(),
                 artifact_role: ScopeClosureArtifactRole::ClosureBundle,
                 file_name: "closure-bundle-v4.json".to_owned(),
-                content_type: SCOPE_CLOSURE_JSON_CONTENT_TYPE.to_owned(),
+                content_type: "application/json".to_owned(),
                 byte_size: usize::try_from(bundle_byte_size)?,
                 checksum_sha256: bundle_sha256,
             },
@@ -6505,7 +6481,7 @@ fn prepare_closure_content_artifacts_with_cancellation(
             "closure_report_xlsx",
             ScopeClosureArtifactRole::ClosureReport,
             "closure-report-v1.xlsx",
-            SCOPE_CLOSURE_XLSX_CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_path,
         )?,
     ];

@@ -8,22 +8,18 @@
 
 #![allow(clippy::needless_raw_string_hashes, clippy::too_many_lines)]
 
-use std::{collections::BTreeSet, fs, process::Command, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet, fs, net::IpAddr, process::Command, sync::Arc, time::Duration,
+};
 
 use clap::Parser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solver_worker::{
-    artifacts::{
-        ALL_UNIT_QUERY_ARTIFACT_CONTENT_TYPE, ARTIFACT_CONTENT_TYPE,
-        CONTRIBUTION_PATH_ARTIFACT_CONTENT_TYPE,
-    },
-    calculation_bundle::CALCULATION_BUNDLE_STORAGE_CONTENT_TYPES,
     calculation_evidence::RELEASE_METHOD_IDENTITIES,
     config::AppConfig,
     db::AppState,
     queue::run_solver_worker_jobs_loop,
-    scope_closure::SCOPE_CLOSURE_STORAGE_CONTENT_TYPES,
     snapshot_artifacts::{
         SNAPSHOT_ARTIFACT_CONTENT_TYPE, SNAPSHOT_ARTIFACT_FORMAT, decode_snapshot_artifact,
     },
@@ -32,21 +28,10 @@ use solver_worker::{
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::{task::JoinHandle, time::sleep};
-use uuid::Uuid;
+use uuid::{Uuid, Version};
 
 const VERSION: &str = "01.00.000";
-const ISOLATED_STORAGE_ALLOWED_MIME_TYPES: &[&str] = &[
-    "application/x-hdf5",
-    "application/json",
-    "application/gzip",
-    "application/x-ndjson+zstd",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.tiangong.scope-closure-root-impact-index+zstd",
-    "application/vnd.tiangong.scope-closure-frozen-reference-graph+zstd",
-    "application/vnd.tiangong.scope-closure-canonical-json-chunk",
-    "application/vnd.tiangong.scope-closure-oversized-record-index+json",
-    "application/vnd.tiangong.scope-closure-manifest+json",
-];
+const ISOLATED_STORAGE_BUCKET_PREFIX: &str = "scope-closure-e2e-";
 
 #[derive(Debug)]
 struct Fixture {
@@ -89,6 +74,59 @@ fn required_env(name: &str) -> String {
             "{name} is required; run scripts/run_scope_closure_package_v2_e2e.sh from the Worker repo"
         )
     })
+}
+
+fn ensure_loopback_url(name: &str, value: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("{name} must be a valid URL: {error}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{name} must include a host"))?;
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || ip_host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    anyhow::ensure!(is_loopback, "{name} host must be loopback, got {host}");
+    Ok(())
+}
+
+fn ensure_one_time_bucket_name(bucket: &str) -> anyhow::Result<()> {
+    let suffix = bucket
+        .strip_prefix(ISOLATED_STORAGE_BUCKET_PREFIX)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "S3_BUCKET must use the isolated prefix {ISOLATED_STORAGE_BUCKET_PREFIX}"
+            )
+        })?;
+    let id = Uuid::parse_str(suffix)
+        .map_err(|error| anyhow::anyhow!("S3_BUCKET must end in a canonical UUID: {error}"))?;
+    anyhow::ensure!(
+        id.get_version() == Some(Version::Random) && suffix == id.hyphenated().to_string(),
+        "S3_BUCKET must end in a lowercase canonical UUID v4"
+    );
+    Ok(())
+}
+
+fn validate_isolated_targets(
+    database_url: &str,
+    s3_endpoint: &str,
+    bucket: &str,
+) -> anyhow::Result<()> {
+    ensure_loopback_url("DATABASE_URL", database_url)?;
+    ensure_loopback_url("S3_ENDPOINT", s3_endpoint)?;
+    ensure_one_time_bucket_name(bucket)
+}
+
+fn ensure_bucket_does_not_exist(exists: bool, bucket: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !exists,
+        "isolated E2E bucket already exists and must not be reused: {bucket}"
+    );
+    Ok(())
 }
 
 fn test_config() -> AppConfig {
@@ -836,15 +874,24 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     preflight_tidas_fixture(&fixture)?;
     let release_run = Uuid::new_v4();
     let approval = Uuid::new_v4();
+    let database_url = required_env("DATABASE_URL");
+    let s3_endpoint = required_env("S3_ENDPOINT");
+    let bucket = required_env("S3_BUCKET");
+    validate_isolated_targets(&database_url, &s3_endpoint, &bucket)?;
+
+    let bucket_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM storage.buckets WHERE id=$1 OR name=$1)",
+    )
+    .bind(&bucket)
+    .fetch_one(pool)
+    .await?;
+    ensure_bucket_does_not_exist(bucket_exists, &bucket)?;
 
     sqlx::query(
         r#"INSERT INTO storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
-           VALUES($1,$1,false,52428800,$2::text[])
-           ON CONFLICT(id) DO UPDATE
-           SET allowed_mime_types=EXCLUDED.allowed_mime_types"#,
+           VALUES($1,$1,false,52428800,NULL)"#,
     )
-    .bind(required_env("S3_BUCKET"))
-    .bind(ISOLATED_STORAGE_ALLOWED_MIME_TYPES)
+    .bind(bucket)
     .execute(pool)
     .await?;
     sqlx::query(
@@ -1797,23 +1844,72 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
 }
 
 #[test]
-fn isolated_storage_allowlist_matches_worker_lifecycle_content_types() {
-    let mut runtime_content_types = BTreeSet::from([
-        SNAPSHOT_ARTIFACT_CONTENT_TYPE,
-        ARTIFACT_CONTENT_TYPE,
-        ALL_UNIT_QUERY_ARTIFACT_CONTENT_TYPE,
-        CONTRIBUTION_PATH_ARTIFACT_CONTENT_TYPE,
-    ]);
-    runtime_content_types.extend(CALCULATION_BUNDLE_STORAGE_CONTENT_TYPES.iter().copied());
-    runtime_content_types.extend(SCOPE_CLOSURE_STORAGE_CONTENT_TYPES.iter().copied());
+fn isolated_target_validation_accepts_loopback_and_one_time_bucket() {
+    assert!(
+        validate_isolated_targets(
+            "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+            "http://[::1]:54321/storage/v1/s3",
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
+        )
+        .is_ok()
+    );
+}
 
-    assert_eq!(
-        ISOLATED_STORAGE_ALLOWED_MIME_TYPES
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>(),
-        runtime_content_types,
-        "isolated Storage bucket allowlist drifted from Worker lifecycle upload content types"
+#[test]
+fn isolated_target_validation_rejects_hosted_endpoints() {
+    assert!(
+        validate_isolated_targets(
+            "postgresql://postgres:secret@db.example.supabase.co:5432/postgres",
+            "https://example.supabase.co/storage/v1/s3",
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
+        )
+        .is_err()
+    );
+    assert!(
+        validate_isolated_targets(
+            "postgresql://postgres:postgres@localhost:54322/postgres",
+            "https://example.supabase.co/storage/v1/s3",
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn isolated_target_validation_rejects_bad_bucket_names() {
+    for bucket in [
+        "lca-results-e2e",
+        "scope-closure-e2e-reused",
+        "scope-closure-e2e-550E8400-E29B-41D4-A716-446655440000",
+        "scope-closure-e2e-550e8400-e29b-11d4-a716-446655440000",
+    ] {
+        assert!(
+            validate_isolated_targets(
+                "postgresql://postgres:postgres@localhost:54322/postgres",
+                "http://127.0.0.1:54321/storage/v1/s3",
+                bucket,
+            )
+            .is_err(),
+            "unsafe bucket name was accepted: {bucket}"
+        );
+    }
+}
+
+#[test]
+fn isolated_bucket_reuse_is_rejected() {
+    assert!(
+        ensure_bucket_does_not_exist(
+            true,
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000"
+        )
+        .is_err()
+    );
+    assert!(
+        ensure_bucket_does_not_exist(
+            false,
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000"
+        )
+        .is_ok()
     );
 }
 
