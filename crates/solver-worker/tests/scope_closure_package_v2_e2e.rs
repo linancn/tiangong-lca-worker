@@ -14,10 +14,16 @@ use clap::Parser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solver_worker::{
+    artifacts::{
+        ALL_UNIT_QUERY_ARTIFACT_CONTENT_TYPE, ARTIFACT_CONTENT_TYPE,
+        CONTRIBUTION_PATH_ARTIFACT_CONTENT_TYPE,
+    },
+    calculation_bundle::CALCULATION_BUNDLE_STORAGE_CONTENT_TYPES,
     calculation_evidence::RELEASE_METHOD_IDENTITIES,
     config::AppConfig,
     db::AppState,
     queue::run_solver_worker_jobs_loop,
+    scope_closure::SCOPE_CLOSURE_STORAGE_CONTENT_TYPES,
     snapshot_artifacts::{
         SNAPSHOT_ARTIFACT_CONTENT_TYPE, SNAPSHOT_ARTIFACT_FORMAT, decode_snapshot_artifact,
     },
@@ -29,6 +35,18 @@ use tokio::{task::JoinHandle, time::sleep};
 use uuid::Uuid;
 
 const VERSION: &str = "01.00.000";
+const ISOLATED_STORAGE_ALLOWED_MIME_TYPES: &[&str] = &[
+    "application/x-hdf5",
+    "application/json",
+    "application/gzip",
+    "application/x-ndjson+zstd",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.tiangong.scope-closure-root-impact-index+zstd",
+    "application/vnd.tiangong.scope-closure-frozen-reference-graph+zstd",
+    "application/vnd.tiangong.scope-closure-canonical-json-chunk",
+    "application/vnd.tiangong.scope-closure-oversized-record-index+json",
+    "application/vnd.tiangong.scope-closure-manifest+json",
+];
 
 #[derive(Debug)]
 struct Fixture {
@@ -338,12 +356,12 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
 
     sqlx::query(
         r#"INSERT INTO storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
-           VALUES($1,$1,false,52428800,ARRAY['application/x-hdf5','application/json',
-             'application/x-ndjson','application/gzip',
-             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'])
-           ON CONFLICT(id) DO NOTHING"#,
+           VALUES($1,$1,false,52428800,$2::text[])
+           ON CONFLICT(id) DO UPDATE
+           SET allowed_mime_types=EXCLUDED.allowed_mime_types"#,
     )
     .bind(required_env("S3_BUCKET"))
+    .bind(ISOLATED_STORAGE_ALLOWED_MIME_TYPES)
     .execute(pool)
     .await?;
     sqlx::query(
@@ -1212,6 +1230,27 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     anyhow::ensure!(certificate.snapshot_artifact_id != Uuid::nil());
     anyhow::ensure!(!certificate.snapshot_build_contract_hash.is_empty());
     Ok(())
+}
+
+#[test]
+fn isolated_storage_allowlist_matches_worker_lifecycle_content_types() {
+    let mut runtime_content_types = BTreeSet::from([
+        SNAPSHOT_ARTIFACT_CONTENT_TYPE,
+        ARTIFACT_CONTENT_TYPE,
+        ALL_UNIT_QUERY_ARTIFACT_CONTENT_TYPE,
+        CONTRIBUTION_PATH_ARTIFACT_CONTENT_TYPE,
+    ]);
+    runtime_content_types.extend(CALCULATION_BUNDLE_STORAGE_CONTENT_TYPES.iter().copied());
+    runtime_content_types.extend(SCOPE_CLOSURE_STORAGE_CONTENT_TYPES.iter().copied());
+
+    assert_eq!(
+        ISOLATED_STORAGE_ALLOWED_MIME_TYPES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        runtime_content_types,
+        "isolated Storage bucket allowlist drifted from Worker lifecycle upload content types"
+    );
 }
 
 #[test]

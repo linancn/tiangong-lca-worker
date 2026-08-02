@@ -33,7 +33,11 @@ use crate::{
 pub const CALCULATION_BUNDLE_FORMAT: &str = "tiangong.calculation-bundle.v2";
 pub const CALCULATION_BUNDLE_MANIFEST_CONTENT_TYPE: &str = "application/json";
 pub const CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT: usize = 256;
-const CALCULATION_BUNDLE_GZIP_CONTENT_TYPE: &str = "application/gzip";
+pub const CALCULATION_BUNDLE_GZIP_CONTENT_TYPE: &str = "application/gzip";
+pub const CALCULATION_BUNDLE_STORAGE_CONTENT_TYPES: &[&str] = &[
+    CALCULATION_BUNDLE_MANIFEST_CONTENT_TYPE,
+    CALCULATION_BUNDLE_GZIP_CONTENT_TYPE,
+];
 const CALCULATION_CONTRACT_VERSION: &str = "1.0.0";
 const GZIP_LEVEL: u32 = 6;
 
