@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: existing runtime, release-binary, scope-closure, and docpact proof requirements apply to tidas v0.1.3."
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issue #192: existing runtime, scope-closure, real-DB, and docpact proof requirements cover the private hash-helper cutover."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
