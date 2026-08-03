@@ -23,6 +23,7 @@ use crate::{
         record_scope_closure_failure,
     },
     types::JobPayload,
+    worker_control_plane::worker_jobs_table,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
 
@@ -92,10 +93,10 @@ fn calculation_evidence_binding_for_payload(payload: &JobPayload) -> Option<Valu
     }
 }
 
-/// Fetches snapshot coverage from `lca_snapshot_artifacts` for richer error diagnostics.
+/// Fetches snapshot coverage from `private.lca_snapshot_artifacts` for richer error diagnostics.
 async fn fetch_snapshot_coverage(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Option<Value> {
     sqlx::query_scalar::<Value>(
-        "SELECT coverage FROM public.lca_snapshot_artifacts \
+        "SELECT coverage FROM private.lca_snapshot_artifacts \
          WHERE snapshot_id = $1 AND status = 'ready' \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -622,8 +623,8 @@ async fn validate_authoritative_package_closure_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
-               public.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
+               private.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
         FROM _service_role
         ",
     )
@@ -907,7 +908,7 @@ async fn build_solver_worker_job_result(
                 "workerJobId": worker_job_id,
                 "lcaJobId": lca_job_id,
                 "snapshot": {
-                    "table": "lca_network_snapshots",
+                    "table": "private.lca_network_snapshots",
                     "id": snapshot_id,
                 },
             })),
@@ -962,11 +963,15 @@ async fn fetch_worker_job_diagnostics(
     pool: &sqlx::PgPool,
     worker_job_id: Uuid,
 ) -> anyhow::Result<Value> {
-    let row = sqlx::query("SELECT diagnostics FROM public.worker_jobs WHERE id = $1")
-        .bind(worker_job_id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("worker_jobs row disappeared before result projection"))?;
+    let row = sqlx::query(concat!(
+        "SELECT diagnostics FROM ",
+        worker_jobs_table!(),
+        " WHERE id = $1"
+    ))
+    .bind(worker_job_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("worker_jobs row disappeared before result projection"))?;
     Ok(row
         .try_get::<Option<Value>, _>("diagnostics")?
         .unwrap_or_else(|| json!({})))

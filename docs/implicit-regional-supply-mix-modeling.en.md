@@ -24,8 +24,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
+lastReviewedAt: 2026-08-02
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedNote: "Reviewed for Issue #146: LCIA-factor source support is separate from implicit signed-flow routing and provider selection."
 related:
   - AGENTS.md

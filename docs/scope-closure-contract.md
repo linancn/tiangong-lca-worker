@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Updated for Worker Issue #186: git-tracked external and isolated-provider executables emit the exact root qualification child contracts and fail closed on identity, payload, target, or cleanup drift."
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedAt: 2026-08-03
+lastReviewedNote: "Reviewed for Worker Issues #186, #190, #192, and #202: private control-plane access, hashes, and solve-result UUID locators preserve closure traversal, service-role behavior, artifacts, certificate evidence, staged publication, reuse, and package binding; qualification fails closed on identity, payload, target, or cleanup drift."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -204,7 +204,7 @@ The actor-bound download projection is `get_lcia_scope_closure_report_download(u
 
 `closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
 
-For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real `snapshot-hdf5:v1` artifact and snapshot-index sidecar through `lca_network_snapshots` and `lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`; its exact compiled Process axis must match the frozen discovered axis. Generic live-snapshot reuse cannot substitute an artifact that lacks this binding.
+For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real `snapshot-hdf5:v1` artifact and snapshot-index sidecar through exact direct-PostgreSQL identities `private.lca_network_snapshots` and `private.lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`; its exact compiled Process axis must match the frozen discovered axis. Generic live-snapshot reuse cannot substitute an artifact that lacks this binding.
 
 Administrative artifacts are uploaded before terminal projection. The report artifact manifest hash is recomputed from persisted database metadata. `evidenceHash` is `lcia.scope-closure-evidence.v2` and binds the immutable scan hashes plus the persisted numerical snapshot identity and hashes, while intentionally excluding the run-specific report artifact manifest. A certificate additionally binds the current closure check and its current report artifact manifest, so copied or stale reports cannot be substituted.
 

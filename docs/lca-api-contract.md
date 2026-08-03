@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 default does not change public Worker, Edge, or Next DTOs."
+lastReviewedAt: 2026-08-03
+lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedNote: "Reviewed for Worker Issues #192, #198, and #202: private closure hashes, schema-valid fixtures, preallocated result identity, and exact object-target deletion validation do not change public Worker, Edge, or Next DTO labels."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -55,12 +55,12 @@ related:
 
 ## 2. 关键表与职责
 
-- `lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
-- `lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
+- `private.lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
+- `private.lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
 - `worker_jobs`: canonical worker 生命周期表；solver 队列任务使用 `worker_queue=solver`，用于服务端任务中心、operator 查询、lease fencing、状态、错误、进度和 result projection。
 - `lca_jobs`: optional retained LCA domain/history 兼容表，用于历史诊断和 legacy pgmq/debug 路径；统一 `worker_jobs` 路径不得要求该表存在。
-- `lca_results`: 作业结果主表（仅 artifact 元数据 + diagnostics）。
-- `lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
+- `lca_results`: 作业结果主表（仅 artifact 元数据 + diagnostics）。Worker 在上传主 artifact 前预分配 `id`，对象 key 只包含一个大小写敏感的 `/results/<result_uuid>/` 身份段，并以同一 UUID 显式插入该行；`job_id` 仍是兼容关联，不是对象唯一身份。INSERT 返回错误后必须按该 UUID 回读 immutable artifact identity：全量相等的已提交 row 可视为 lost acknowledgement；单次回读无 row 不能证明原 statement 不会稍后提交，因此仍属 indeterminate，不得触发补偿删除。无 row、冲突或 DB outcome 未知时均保留对象，并输出 exact `result_id`、object key、locator、原始 error 与 recovery action；安全自动清理必须等待 DB-side staged identity/fence 合同。
+- `private.lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
 - `lca_result_cache`: 请求级缓存/去重状态。
 - `lca_factorization_registry`: 分解状态注册表（当前 schema 已就绪，运行时待接入）。
 
@@ -155,7 +155,9 @@ worker 反序列化时 `model_version` 仍可作为 `snapshot_id` 的别名（�
 
 ### 3.6 `worker_jobs` solver 队列映射
 
-solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs` 的 `public.worker_jobs` claim 模式。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
+Worker 的数据库适配使用稳定 `public.worker_*` service RPC 处理 enqueue、claim、heartbeat、cancel、read 和 terminal result；所有 direct job/artifact SQL 使用显式 schema-qualified `private.worker_jobs` / `private.worker_job_artifacts` Expand contract，不依赖 `search_path`。Expand 阶段这些 private relations 可以是 public 物理存储上的 security-invoker compatibility views；物理存储切换属于后续 gated Contract migration。`public.worker_job_domain_refs` 继续是跨 domain table 的稳定 `UNION ALL` projection view，不迁入 private。上述物理边界不得出现在 job payload、result DTO、`domainSource` 或错误语义中。
+
+solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs`，通过稳定 public claim RPC 消费 schema-qualified private Expand contract。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
 
 | `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
 | --- | --- | --- | --- |
@@ -447,6 +449,8 @@ Worker 重任务可使用共享 `worker.resource-profile.v1` primitive 声明并
 
 - `download_object_url_to_file`：必须传显式 byte cap；即使响应没有 `Content-Length` 也在每个 chunk 后执行累计上限检查；可校验 SHA-256 和 cooperative cancellation；只有完整成功后才原子发布目标文件。
 - `upload_object_key_file_bounded`：在网络传输前按文件 metadata 拒绝超限、流式计算/校验 SHA-256，并在每个 multipart boundary 检查 cancellation；失败或取消会 abort 已创建的 multipart upload。
+
+`lca_results.artifact_url` 的 PUT 与删除边界使用同一 result-aware 校验：URL 的 scheme/host/effective port 必须与 `S3_ENDPOINT` canonical origin 相同，bucket 与 `S3_BUCKET` 相同，key 位于规范化 `S3_PREFIX` 下，并且只有一个 exact `/results/<result_uuid>/` 段与冻结的结果 UUID 相等。userinfo、query、fragment、redirect、空/重复/dot segment、反斜线和百分号编码均在网络 I/O 前 fail closed；result-aware PUT 与 DELETE 都不跟随 redirect。该 strict client 不扩展到 generic package/snapshot/artifact GC 删除；后者保留 shared client 的既有 redirect 行为。历史 locator 不会因为缺少新身份段而自动获得删除资格。
 
 旧 `download_object_url -> Vec<u8>`、`download_object_key -> Vec<u8>` 与现有 file-upload 方法保留作兼容面；新迁移的 snapshot、package、graph-cache 或 solve 路径不得继续采用完整对象内存物化。具体算法迁移由 #162 的后续独立交付完成，不改变本节现有 jobs/results consumer schema。
 

@@ -23,8 +23,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
 lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
-lastReviewedNote: "Reviewed for Issue #193: the active governed Rust tidas baseline is v0.1.3 while scope-closure v3 retains the 2048 MiB Linux RSS guard."
+lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
+lastReviewedNote: "Reviewed for Worker Issues #190 and #193: private control-plane access leaves operator entry points unchanged; the governed Rust tidas baseline is v0.1.3 and scope-closure v3 retains the 2048 MiB Linux RSS guard."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -295,7 +295,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 最小必需：
 
-- `DATABASE_URL` 或 `CONN`
+- `DATABASE_URL` 或 `CONN`（主业务连接必须使用专用的非 superuser、非 BYPASSRLS Worker login；该 login 继承 snapshot family 所需的最小 `service_role` grants）
 - `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅 legacy pgmq read/archive 需要，未设置时复用 `DATABASE_URL` / `CONN`）
 - `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
 - `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
@@ -337,7 +337,7 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 
 Supabase 连接说明：
 
-- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
+- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询，其中 snapshot canonical persistence 只访问 `private.lca_active_snapshots`、`private.lca_network_snapshots` 与 `private.lca_snapshot_artifacts`，不使用 Expand 期 `public` compatibility views 或 search-path fallback；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
 - 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
@@ -880,7 +880,7 @@ execute job 由 `maintenance_worker` 调用 `package_gc --execute`，仍会先�
 
 - CLI 默认 dry-run；实际删除必须显式传 `--execute`。
 - active snapshot 永远保护；执行前会再次检查 `lca_active_snapshots`。
-- 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `public.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
+- 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `private.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
 - orphan storage directory 只删除 Storage objects，不做 DB 操作。
 - 404 object delete 视为成功，便于重试幂等。
 - timer 只负责 enqueue `lca.snapshot_gc` worker job；`snapshot_gc` 仍使用 `solver_worker_snapshot_gc` PostgreSQL advisory lock，抢不到锁会写 `skipped` audit run 并退出 0。

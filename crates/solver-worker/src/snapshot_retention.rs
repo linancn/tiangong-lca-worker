@@ -477,7 +477,7 @@ pub async fn is_snapshot_active(pool: &PgPool, snapshot_id: Uuid) -> anyhow::Res
         r"
         SELECT EXISTS (
           SELECT 1
-          FROM public.lca_active_snapshots
+          FROM private.lca_active_snapshots
           WHERE snapshot_id = $1
         )
         ",
@@ -495,11 +495,11 @@ pub async fn delete_snapshot_row_if_inactive(
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r"
-        DELETE FROM public.lca_network_snapshots AS snapshots
+        DELETE FROM private.lca_network_snapshots AS snapshots
         WHERE snapshots.id = $1
           AND NOT EXISTS (
             SELECT 1
-            FROM public.lca_active_snapshots AS active
+            FROM private.lca_active_snapshots AS active
             WHERE active.snapshot_id = snapshots.id
           )
         ",
