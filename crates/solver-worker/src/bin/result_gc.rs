@@ -104,8 +104,11 @@ async fn run_gc(
 
         let mut deletable_ids = Vec::with_capacity(candidates.len());
         for c in candidates {
-            match store.delete_object_url(&c.artifact_url).await {
-                Ok(()) => {
+            match store
+                .delete_result_object_url(c.result_id, &c.artifact_url)
+                .await
+            {
+                Ok(_) => {
                     deletable_ids.push(c.result_id);
                     totals.total_s3_deleted += 1;
                 }

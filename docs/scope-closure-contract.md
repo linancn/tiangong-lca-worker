@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-02
 lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issues #186, #190, and #192: private control-plane access and hash helpers preserve closure hashes, service-role behavior, artifacts, reuse, and certificate bindings; tracked qualification executables emit exact child contracts and fail closed on identity, payload, target, or cleanup drift."
+lastReviewedAt: 2026-08-03
+lastReviewedNote: "Reviewed for Worker Issues #186, #190, #192, and #202: private control-plane access, hashes, and solve-result UUID locators preserve closure traversal, service-role behavior, artifacts, certificate evidence, staged publication, reuse, and package binding; qualification fails closed on identity, payload, target, or cleanup drift."
 related:
   - AGENTS.md
   - .docpact/config.yaml

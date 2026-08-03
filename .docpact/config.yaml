@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-02"
 lastReviewedCommit: "10183162a1944252fd01eeb5ffc1548cbe8c4ec1"
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, and #199: private control-plane, hash-helper, and snapshot-consumer qualification, the exact tidas v0.1.3 runtime default, and the schema-valid lifecycle fixture preserve ownership and routing while adding scoped static diagnostics and exact private dedicated-login evidence."
+lastReviewedAt: "2026-08-03"
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot consumers, result identity, and strict object-target validation remain within existing Worker ownership and routing while retaining exact TIDAS and dedicated-login proof."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

@@ -19,7 +19,7 @@ use tokio::{
     process::Command,
     time::{sleep, timeout},
 };
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -47,7 +47,7 @@ use crate::{
         SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
     },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
-    storage::{ObjectStoreClient, ObjectTransferOptions},
+    storage::{ObjectStoreClient, ObjectTransferOptions, ResultObjectIdentity},
     types::{JobPayload, SolveOptionsPayload},
     worker_control_plane::{worker_job_artifacts_table, worker_jobs_table},
 };
@@ -544,11 +544,68 @@ pub async fn update_legacy_lca_job_status(
 
 #[derive(Debug, Default)]
 struct ResultInsert {
+    result_id: Uuid,
     diagnostics: Value,
+    artifact_url: String,
+    object_key: String,
+    artifact_sha256: String,
+    artifact_byte_size: i64,
+    artifact_format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedResultIdentity {
+    job_id: Uuid,
+    snapshot_id: Uuid,
     artifact_url: String,
     artifact_sha256: String,
     artifact_byte_size: i64,
     artifact_format: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultInsertReconciliation {
+    CommittedExact,
+    NoVisibleRow,
+    ConflictingIdentity,
+}
+
+fn classify_result_insert_reconciliation(
+    expected_job_id: Uuid,
+    expected_snapshot_id: Uuid,
+    expected: &ResultInsert,
+    observed: Option<&PersistedResultIdentity>,
+) -> ResultInsertReconciliation {
+    let Some(observed) = observed else {
+        return ResultInsertReconciliation::NoVisibleRow;
+    };
+    if observed.job_id == expected_job_id
+        && observed.snapshot_id == expected_snapshot_id
+        && observed.artifact_url == expected.artifact_url
+        && observed.artifact_sha256 == expected.artifact_sha256
+        && observed.artifact_byte_size == expected.artifact_byte_size
+        && observed.artifact_format == expected.artifact_format
+    {
+        ResultInsertReconciliation::CommittedExact
+    } else {
+        ResultInsertReconciliation::ConflictingIdentity
+    }
+}
+
+fn result_insert_outcome_pending_error(
+    expected: &ResultInsert,
+    insert_error: &anyhow::Error,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "result_insert_outcome_pending result_id={} object_key={} artifact_url={} artifact_sha256={} artifact_byte_size={} artifact_format={} insert_error={}; operator_action=preserve the object and reconcile through a DB-side staged identity/fence; a single absent readback is not final and must never authorize deletion",
+        expected.result_id,
+        expected.object_key,
+        expected.artifact_url,
+        expected.artifact_sha256,
+        expected.artifact_byte_size,
+        expected.artifact_format,
+        insert_error
+    )
 }
 
 /// Inserts one `lca_results` row.
@@ -557,11 +614,12 @@ async fn insert_result(
     pool: &PgPool,
     job_id: Uuid,
     snapshot_id: Uuid,
-    data: ResultInsert,
+    data: &ResultInsert,
 ) -> anyhow::Result<Uuid> {
     let row = sqlx::query(
         r"
         INSERT INTO lca_results (
+            id,
             job_id,
             snapshot_id,
             diagnostics,
@@ -571,20 +629,60 @@ async fn insert_result(
             artifact_format,
             created_at
         )
-        VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, NOW())
+        VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, NOW())
         RETURNING id
         ",
     )
+    .bind(data.result_id)
     .bind(job_id)
     .bind(snapshot_id)
-    .bind(data.diagnostics)
-    .bind(data.artifact_url)
-    .bind(data.artifact_sha256)
+    .bind(&data.diagnostics)
+    .bind(data.artifact_url.as_str())
+    .bind(data.artifact_sha256.as_str())
     .bind(data.artifact_byte_size)
-    .bind(data.artifact_format)
+    .bind(data.artifact_format.as_str())
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<Uuid, _>("id")?)
+    let stored_result_id = row.try_get::<Uuid, _>("id")?;
+    if stored_result_id != data.result_id {
+        return Err(anyhow::anyhow!(
+            "database returned result identity {stored_result_id} instead of preallocated {}",
+            data.result_id
+        ));
+    }
+    Ok(stored_result_id)
+}
+
+async fn fetch_persisted_result_identity(
+    pool: &PgPool,
+    result_id: Uuid,
+) -> anyhow::Result<Option<PersistedResultIdentity>> {
+    let row = sqlx::query(
+        r"
+        SELECT job_id,
+               snapshot_id,
+               artifact_url,
+               artifact_sha256,
+               artifact_byte_size,
+               artifact_format
+        FROM lca_results
+        WHERE id = $1
+        ",
+    )
+    .bind(result_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(PersistedResultIdentity {
+            job_id: row.try_get("job_id")?,
+            snapshot_id: row.try_get("snapshot_id")?,
+            artifact_url: row.try_get("artifact_url")?,
+            artifact_sha256: row.try_get("artifact_sha256")?,
+            artifact_byte_size: row.try_get("artifact_byte_size")?,
+            artifact_format: row.try_get("artifact_format")?,
+        })
+    })
+    .transpose()
 }
 
 #[instrument(skip(pool, diagnostics))]
@@ -2003,7 +2101,7 @@ async fn persist_solve_all_unit_query_artifact(
         .map_err(|_| anyhow::anyhow!("query artifact size overflow"))?;
     let artifact_url = state
         .object_store
-        .upload_result(
+        .upload_job_artifact(
             snapshot_id,
             job_id,
             "solve_all_unit_query",
@@ -3226,10 +3324,21 @@ async fn persist_result_artifact(
         artifact_len: i64::try_from(encoded_len)
             .map_err(|_| anyhow::anyhow!("artifact size overflow: {encoded_len}"))?,
     };
+    let result_id = Uuid::new_v4();
     let upload_started = Instant::now();
     let artifact_url = state
         .object_store
-        .upload_result(snapshot_id, job_id, suffix, extension, content_type, bytes)
+        .upload_result(
+            ResultObjectIdentity {
+                snapshot_id,
+                job_id,
+                result_id,
+            },
+            suffix,
+            extension,
+            content_type,
+            bytes,
+        )
         .await?;
     let timing = PersistTimingContext {
         compute_timing,
@@ -3245,6 +3354,7 @@ async fn persist_result_artifact(
         &artifact_meta,
         &timing,
         &artifact_url,
+        result_id,
     )
     .await
 }
@@ -4014,7 +4124,11 @@ async fn persist_object_storage_result(
     artifact_meta: &ArtifactMeta,
     timing: &PersistTimingContext,
     artifact_url: &str,
+    result_id: Uuid,
 ) -> anyhow::Result<Value> {
+    let object_key = state
+        .object_store
+        .result_object_key_from_url(result_id, artifact_url)?;
     let diagnostics_without_db_write = serde_json::json!({
         "storage": "object_storage",
         "persist_mode": "s3-strict",
@@ -4032,20 +4146,23 @@ async fn persist_object_storage_result(
         ),
     });
 
+    let insert = ResultInsert {
+        result_id,
+        diagnostics: diagnostics_without_db_write.clone(),
+        artifact_url: artifact_url.to_owned(),
+        object_key,
+        artifact_sha256: artifact_meta.sha256.clone(),
+        artifact_byte_size: artifact_meta.artifact_len,
+        artifact_format: artifact_meta.format.clone(),
+    };
     let db_write_started = Instant::now();
-    let result_id = insert_result(
-        &state.pool,
-        job_id,
-        snapshot_id,
-        ResultInsert {
-            diagnostics: diagnostics_without_db_write.clone(),
-            artifact_url: artifact_url.to_owned(),
-            artifact_sha256: artifact_meta.sha256.clone(),
-            artifact_byte_size: artifact_meta.artifact_len,
-            artifact_format: artifact_meta.format.clone(),
-        },
-    )
-    .await?;
+    let result_id = match insert_result(&state.pool, job_id, snapshot_id, &insert).await {
+        Ok(result_id) => result_id,
+        Err(insert_error) => {
+            reconcile_failed_result_insert(&state.pool, job_id, snapshot_id, &insert, &insert_error)
+                .await?
+        }
+    };
     let db_write_sec = db_write_started.elapsed().as_secs_f64();
 
     let diagnostics = serde_json::json!({
@@ -4069,6 +4186,103 @@ async fn persist_object_storage_result(
     }
 
     Ok(diagnostics)
+}
+
+async fn reconcile_failed_result_insert(
+    pool: &PgPool,
+    job_id: Uuid,
+    snapshot_id: Uuid,
+    expected: &ResultInsert,
+    insert_error: &anyhow::Error,
+) -> anyhow::Result<Uuid> {
+    let observed = match fetch_persisted_result_identity(pool, expected.result_id).await {
+        Ok(observed) => observed,
+        Err(reconciliation_error) => {
+            error!(
+                result_id = %expected.result_id,
+                object_key = expected.object_key,
+                artifact_url = expected.artifact_url,
+                artifact_sha256 = expected.artifact_sha256,
+                artifact_byte_size = expected.artifact_byte_size,
+                artifact_format = expected.artifact_format,
+                error_code = "result_insert_outcome_unknown",
+                insert_error = %insert_error,
+                reconciliation_error = %reconciliation_error,
+                recovery_action = "preserve the object; reconcile through a future DB-side staged identity/fence; never delete from a single absent readback",
+                "result insert outcome is unknown; object was preserved for operator recovery"
+            );
+            return Err(anyhow::anyhow!(
+                "result_insert_outcome_unknown result_id={} object_key={} artifact_url={} artifact_sha256={} artifact_byte_size={} artifact_format={} insert_error={} reconciliation_error={}; operator_action=preserve the object and reconcile through a DB-side staged identity/fence; never delete from a single absent readback",
+                expected.result_id,
+                expected.object_key,
+                expected.artifact_url,
+                expected.artifact_sha256,
+                expected.artifact_byte_size,
+                expected.artifact_format,
+                insert_error,
+                reconciliation_error
+            ));
+        }
+    };
+
+    match classify_result_insert_reconciliation(job_id, snapshot_id, expected, observed.as_ref()) {
+        ResultInsertReconciliation::CommittedExact => {
+            warn!(
+                result_id = %expected.result_id,
+                object_key = expected.object_key,
+                artifact_url = expected.artifact_url,
+                insert_error = %insert_error,
+                "result insert acknowledgement was lost; exact persisted identity reconciled"
+            );
+            Ok(expected.result_id)
+        }
+        ResultInsertReconciliation::NoVisibleRow => {
+            error!(
+                result_id = %expected.result_id,
+                object_key = expected.object_key,
+                artifact_url = expected.artifact_url,
+                artifact_sha256 = expected.artifact_sha256,
+                artifact_byte_size = expected.artifact_byte_size,
+                artifact_format = expected.artifact_format,
+                error_code = "result_insert_outcome_pending",
+                insert_error = %insert_error,
+                recovery_action = "preserve the object; reconcile through a future DB-side staged identity/fence; never delete from a single absent readback",
+                "result row was not visible after an INSERT error; outcome remains indeterminate and object was preserved"
+            );
+            Err(result_insert_outcome_pending_error(expected, insert_error))
+        }
+        ResultInsertReconciliation::ConflictingIdentity => {
+            let observed = observed
+                .as_ref()
+                .expect("conflicting reconciliation requires an observed row");
+            error!(
+                result_id = %expected.result_id,
+                object_key = expected.object_key,
+                artifact_url = expected.artifact_url,
+                artifact_sha256 = expected.artifact_sha256,
+                artifact_byte_size = expected.artifact_byte_size,
+                artifact_format = expected.artifact_format,
+                observed_artifact_url = observed.artifact_url,
+                observed_artifact_sha256 = observed.artifact_sha256,
+                error_code = "result_insert_identity_conflict",
+                insert_error = %insert_error,
+                recovery_action = "preserve the object; resolve the conflicting row through a DB-side staged identity/fence; do not delete from readback alone",
+                "result insert reconciled to a conflicting persisted identity; object was preserved"
+            );
+            Err(anyhow::anyhow!(
+                "result_insert_identity_conflict result_id={} object_key={} artifact_url={} artifact_sha256={} artifact_byte_size={} artifact_format={} observed_artifact_url={} observed_artifact_sha256={} insert_error={}; operator_action=preserve the object and resolve through a DB-side staged identity/fence; do not delete from readback alone",
+                expected.result_id,
+                expected.object_key,
+                expected.artifact_url,
+                expected.artifact_sha256,
+                expected.artifact_byte_size,
+                expected.artifact_format,
+                observed.artifact_url,
+                observed.artifact_sha256,
+                insert_error
+            ))
+        }
+    }
 }
 
 fn persistence_timing_json(
@@ -4286,15 +4500,17 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 mod tests {
     use super::{
         BuildSnapshotWorkerLease, BuilderCommandCandidate, JobLifecycleBackend,
-        PackageSnapshotExecutionMode, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
+        PackageSnapshotExecutionMode, PersistedResultIdentity, ResultInsert,
+        ResultInsertReconciliation, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
         SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
         acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
-        build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
-        lcia_result_package_version, missing_legacy_tables_sparse_data_error,
-        normalize_all_unit_batch_size, package_snapshot_execution_mode,
-        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        read_certified_closure_bundle_binding, redact_sensitive_diagnostics,
-        redacted_builder_command, resolve_solve_all_unit_options, run_snapshot_builder_job,
+        build_snapshot_heartbeat_interval, classify_result_insert_reconciliation,
+        lcia_result_package_request_roots, lcia_result_package_version,
+        missing_legacy_tables_sparse_data_error, normalize_all_unit_batch_size,
+        package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
+        parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
+        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
+        result_insert_outcome_pending_error, run_snapshot_builder_job,
         run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_wall_timeout_seconds_from,
         tail_text, utf8_safe_tail, validate_certified_process_axis,
     };
@@ -4316,6 +4532,88 @@ mod tests {
     use crate::graph_types::RequestRootProcess;
 
     static SNAPSHOT_BUILDER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn result_insert_fixture(result_id: Uuid) -> ResultInsert {
+        ResultInsert {
+            result_id,
+            diagnostics: json!({"storage": "object_storage"}),
+            artifact_url: format!(
+                "https://storage.example.test/bucket/results/{result_id}/solve_one.json"
+            ),
+            object_key: format!("results/{result_id}/solve_one.json"),
+            artifact_sha256: "a".repeat(64),
+            artifact_byte_size: 42,
+            artifact_format: "lca-solve-one-json:v1".to_owned(),
+        }
+    }
+
+    fn persisted_result_fixture(
+        job_id: Uuid,
+        snapshot_id: Uuid,
+        expected: &ResultInsert,
+    ) -> PersistedResultIdentity {
+        PersistedResultIdentity {
+            job_id,
+            snapshot_id,
+            artifact_url: expected.artifact_url.clone(),
+            artifact_sha256: expected.artifact_sha256.clone(),
+            artifact_byte_size: expected.artifact_byte_size,
+            artifact_format: expected.artifact_format.clone(),
+        }
+    }
+
+    #[test]
+    fn result_insert_lost_ack_reconciles_only_exact_artifact_identity() {
+        let job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let expected = result_insert_fixture(Uuid::new_v4());
+        let observed = persisted_result_fixture(job_id, snapshot_id, &expected);
+
+        assert_eq!(
+            classify_result_insert_reconciliation(job_id, snapshot_id, &expected, Some(&observed)),
+            ResultInsertReconciliation::CommittedExact
+        );
+    }
+
+    #[test]
+    fn result_insert_unique_conflict_never_converges_mismatched_artifact() {
+        let job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let expected = result_insert_fixture(Uuid::new_v4());
+        let mut observed = persisted_result_fixture(job_id, snapshot_id, &expected);
+        observed.artifact_url = format!(
+            "https://storage.example.test/bucket/results/{}/other.json",
+            expected.result_id
+        );
+
+        assert_eq!(
+            classify_result_insert_reconciliation(job_id, snapshot_id, &expected, Some(&observed)),
+            ResultInsertReconciliation::ConflictingIdentity
+        );
+    }
+
+    #[test]
+    fn result_insert_absent_readback_remains_indeterminate() {
+        let job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let expected = result_insert_fixture(Uuid::new_v4());
+
+        assert_eq!(
+            classify_result_insert_reconciliation(job_id, snapshot_id, &expected, None),
+            ResultInsertReconciliation::NoVisibleRow
+        );
+
+        let error = result_insert_outcome_pending_error(
+            &expected,
+            &anyhow::anyhow!("connection reset after dispatch"),
+        )
+        .to_string();
+        assert!(error.contains(expected.result_id.to_string().as_str()));
+        assert!(error.contains(expected.object_key.as_str()));
+        assert!(error.contains("connection reset after dispatch"));
+        assert!(error.contains("DB-side staged identity/fence"));
+        assert!(error.contains("must never authorize deletion"));
+    }
 
     struct SnapshotBuilderEnvGuard {
         _lock: MutexGuard<'static, ()>,

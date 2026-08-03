@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-02
 lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issues #192, #198, and #199: private hash helpers, fixture-only TIDAS validation, and private snapshot persistence preserve runtime, provider, cross-repo, and root-integration ownership while making the Worker direct-PostgreSQL consumer boundary explicit and retaining database-engine as schema owner."
+lastReviewedAt: 2026-08-03
+lastReviewedNote: "Reviewed for Worker Issues #192, #198, #199, and #202: private hashes, exact TIDAS fixtures, private snapshot persistence, result UUID preallocation, and fail-closed object-target validation remain Worker runtime behavior while database-engine remains schema owner."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -194,6 +194,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
 - The worker uses a main DB pool plus an optional queue-only DB pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it must use a dedicated non-superuser, non-BYPASSRLS Worker login on a session/direct connection or session pooler. The queue-only pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; if no queue URL is set it reuses the main pool.
+- A solve result UUID is allocated before its primary artifact upload and is written explicitly into both `lca_results.id` and the case-sensitive `/results/<result_uuid>/` object-key segment. Job identity remains routing context, not the unique artifact identity. Result-aware PUT and GC accept only locators whose canonical origin, bucket, configured prefix, normalized key, and exact frozen result UUID match; redirects and ambiguous or encoded paths fail closed, while generic package/snapshot/artifact deletion keeps the shared client's prior redirect policy. If INSERT acknowledgement fails after upload, Worker re-reads that UUID: an exact immutable row converges as lost-ack success, but no visible row is not final proof that the original statement cannot commit later. Every indeterminate or conflicting outcome therefore preserves the object and returns exact `result_id`, object key, locator, and error evidence. Safe automatic orphan cleanup is deferred until a DB-side staged identity/fence exists.
 - `WORKER_ID`, `WORKER_JOBS_CLAIM_LIMIT`, and `WORKER_JOBS_LEASE_SECONDS` control solver `worker_jobs` claim diagnostics, batch size, and lease renewal. Keep the lease longer than a normal solve/snapshot heartbeat interval and use `BUILD_SNAPSHOT_MAX_CONCURRENCY` for actual snapshot build throttling.
 - `build_snapshot` is globally throttled with a PostgreSQL transaction-level advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
 - Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. High-frequency pgmq polling and archive operations use the queue-only pool plus `raw_sql` with validated queue-name literals so they can run through the simple query protocol on Supabase's 6543 transaction pooler without moving compute/package/snapshot queries onto that pooler.

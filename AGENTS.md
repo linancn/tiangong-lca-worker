@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-02
 lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, and #199: private control-plane, hash-helper, and snapshot persistence access, the exact tidas v0.1.3 default, and a schema-valid fixture preserve Worker orchestration and service-role boundaries while moving snapshot consumers to exact private direct-PostgreSQL identities without moving durable schema ownership out of database-engine."
+lastReviewedAt: 2026-08-03
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot persistence, and preallocated immutable result UUID locators preserve Worker orchestration and service-role boundaries; result deletion validates the configured object target before network I/O; database-engine remains durable schema owner."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -170,6 +170,8 @@ Route those tasks to:
 ## Operational Invariants
 
 - solve result persistence is S3-only; `lca_results` stores artifact metadata and diagnostics, not inline payloads
+- every new `lca_results` artifact preallocates its result UUID before upload and binds that UUID into one case-sensitive `/results/<result_uuid>/` locator segment; result-aware PUT and DELETE must validate the configured S3 origin, bucket, prefix, normalized key, and frozen result identity before network I/O and must not follow redirects; generic package, snapshot, and artifact deletion retains the shared client's historical redirect behavior
+- a failed result INSERT is reconciled by exact immutable identity: an exact visible row is lost-ack success, but an absent one-time readback is still indeterminate and must preserve the object with exact `result_id`, object key, locator, and error evidence; automatic cleanup requires a future DB-side staged identity/fence and must never be authorized by that readback alone
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - LCA snapshot canonical persistence uses exact `private.lca_active_snapshots`, `private.lca_network_snapshots`, and `private.lca_snapshot_artifacts` identities over direct PostgreSQL. `DATABASE_URL` / `CONN` must identify a dedicated non-superuser, non-BYPASSRLS Worker login that inherits the `service_role` privileges granted by database-engine for this table family; public compatibility views and search-path fallback are not runtime paths.

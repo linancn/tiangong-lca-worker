@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-02
 lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, and #193: schema-qualified job and artifact access, private hash helpers, and tidas v0.1.3 evidence preserve bounded memory, result, publication, four-mode identity, and owner-evidence semantics."
+lastReviewedAt: 2026-08-03
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, and #202: schema-qualified access, private hashes, exact TIDAS evidence, and solve-result identity preserve bounded memory, scope-closure artifact layout, publication, four-mode identity, owner evidence, and qualification result contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
