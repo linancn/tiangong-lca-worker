@@ -53,10 +53,10 @@ CRITICAL_RELATIONS = {
 }
 ACTIVE_SOURCE_ROOTS = ("crates", "scripts", "tools", "docs/sql")
 SCANNED_SUFFIXES = {".rs", ".py", ".sh", ".sql"}
-EXPECTED_STATIC_FILE_COUNT = 94
+EXPECTED_STATIC_FILE_COUNT = 98
 # Deliberately pinned to the reviewed active-source inventory. Adding/removing a
 # Rust, Python, shell, or SQL source requires updating this qualification contract.
-EXPECTED_STATIC_INVENTORY_SHA256 = "fbbdb55245f3c56a6ee7dcf5b0ca0325d46a0f257a20245d6ea6616a97ca7cff"
+EXPECTED_STATIC_INVENTORY_SHA256 = "76e06c5c42e1bc15b3455fef6919fc76fa3d543097c29341f6c49c433c2e26ea"
 
 
 def require(condition: bool, message: str) -> None:
