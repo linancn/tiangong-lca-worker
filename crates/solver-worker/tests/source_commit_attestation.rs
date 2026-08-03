@@ -4,16 +4,38 @@ use solver_worker::build_metadata::{
     DOCUMENT_VALIDATION_DATABASE_CONTRACT_ACCEPTED_MESSAGE, SOURCE_COMMIT,
 };
 
+fn checkout_git() -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(env!("CARGO_MANIFEST_DIR"));
+    for variable in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
 #[test]
 fn compiled_source_commit_matches_exact_checkout_head() {
-    let status = Command::new("git")
+    let status = checkout_git()
         .args([
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
         ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("git must be available for source cleanliness qualification");
     assert!(
@@ -25,9 +47,8 @@ fn compiled_source_commit_matches_exact_checkout_head() {
         "source checkout must be clean when qualifying compiled source commit"
     );
 
-    let output = Command::new("git")
+    let output = checkout_git()
         .args(["rev-parse", "--verify", "HEAD^{commit}"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("git must be available for source commit qualification");
     assert!(
