@@ -42,7 +42,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #192, #198, #199, and #202: private hashes and exact TIDAS fixtures retain runtime/DB proof; snapshot qualification adds dedicated-login lifecycle evidence; and result locator proof covers exact identity, target drift, encoded paths, and redirects without destructive validation."
+lastReviewedNote: "Reviewed for Worker Issues #192, #198, #199, and #202: the exact-head combined runner binds private control-plane, snapshot, scope-closure, and result-identity proof to one disposable local stack and credential-free receipt."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -74,7 +74,7 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | Change type | Minimum local proof | Additional proof when risk is higher | Notes |
 | --- | --- | --- | --- |
 | `crates/**` solver or worker code | `make check`; hard Clippy gate; hard format gate | run the narrow manual script that matches the touched area, such as snapshot build, full compute debug, or BW25 validation | Record which job family or worker path was exercised. |
-| private LCA snapshot persistence consumer | `python3 scripts/qualify_snapshot_private_cutover.py --static-only`; `cargo test -p solver-worker --bin snapshot_builder`; snapshot retention and scope-closure lifecycle tests; baseline hard gates | pass only an exact source checkout: `python3 scripts/qualify_snapshot_private_cutover.py --database-repo <database-engine-at-86ba7ee2> --run-lifecycle --tidas-bin <exact-tidas-0.1.3-binary> --evidence-output <outside-git.json>` | Static scanning is a scoped diagnostic, not final consumer-zero proof. Live qualification rejects caller-supplied database URLs: the runner locally clones the exact Database commit into its own temporary workdir, allocates a unique project identity and seven loopback ports, starts that stack, and permits reset only through the runner-owned object. Teardown uses `supabase stop --no-backup`, verifies zero project-labeled containers/volumes/networks, and removes the temporary workdir. Each failure/success lifecycle creates a unique bucket/prefix and writes both an owned sentinel and a sibling-prefix sentinel. Exact-prefix cleanup must leave zero owned keys while the sibling bytes/SHA remain identical; only then is the sibling deleted by exact key. No bucket-wide deletion is used. Evidence labels the 91 discovered auth/private/public/storage relations as count-only cardinality comparison and lists the nine critical auth users/sessions, package, and private snapshot relations with before/after full-content hashes and row counts. It also binds the frozen Worker status/tree/patch, exact Database/TIDAS identities, lifecycle objects, cleanup readbacks, full log, and stack destruction. |
+| private LCA snapshot persistence consumer | `python3 scripts/qualify_snapshot_private_cutover.py --static-only`; `cargo test -p solver-worker --bin snapshot_builder`; snapshot retention and scope-closure lifecycle tests; baseline hard gates | pass only an exact source checkout: `python3 scripts/qualify_combined_candidate.py --database-repo <database-engine-at-c5356d2b0d340f9c5c31a645479be5f3d19a52db> --tidas-bin <exact-tidas-0.1.3-binary> --receipt-output <outside-git.json>` | Static scanning is a scoped diagnostic, not final consumer-zero proof. Live qualification rejects caller-supplied database URLs: the runner locally clones the exact Database commit into its own temporary workdir, allocates a unique project identity and seven loopback ports, starts that stack, and permits reset only through the runner-owned object. Teardown uses `supabase stop --no-backup`, verifies zero project-labeled containers/volumes/networks, and removes the temporary workdir. Each failure/success lifecycle creates a unique bucket/prefix and writes both an owned sentinel and a sibling-prefix sentinel. Exact-prefix cleanup must leave zero owned keys while the sibling bytes/SHA remain identical; only then is the sibling deleted by exact key. No bucket-wide deletion is used. Evidence labels the 99 discovered auth/private/public/storage relations as count-only cardinality comparison and lists the nine critical auth users/sessions, package, and private snapshot relations with before/after full-content hashes and row counts. It also binds the frozen Worker status/tree/patch, exact Database/TIDAS identities, lifecycle objects, cleanup readbacks, full log, and stack destruction. |
 | shared resource admission or object file I/O | `cargo test -p solver-worker --lib resource::tests`; `cargo test -p solver-worker --lib storage::tests`; `cargo test -p solver-worker --lib result_insert_`; `cargo check -p solver-worker --all-targets`; hard Clippy/format gates | exercise a local no-`Content-Length` response, cancellation during streaming, hash mismatch, preflight oversize rejection, multipart abort, result PUT/delete redirect rejection, generic delete redirect following, lost INSERT acknowledgement, absent readback, identity conflict, and unknown DB outcome when isolated test infrastructure is available | Assert stable resource error codes, fixed buffers, and absence of destination partial files. New result locators must bind the preallocated UUID in one exact `/results/<result_uuid>/` segment; reject origin, scheme/port, bucket, prefix, case, UUID, query/fragment, duplicate/empty/dot, encoded, and redirect drift before result-aware PUT or deletion. Exact persisted identity is the only lost-ack success. A single absent readback remains indeterminate, preserves exact `result_id`/object-key/error evidence, and must never trigger deletion; safe automatic cleanup requires a DB-side staged identity/fence. Keep generic package/snapshot/artifact delete redirect behavior and legacy byte-returning APIs compatible, but use explicit-cap file APIs for newly migrated heavy paths. |
 | Calculation Bundle / all-unit directional LCI | `cargo test -p solver-worker calculation_bundle`; `cargo test -p solver-worker artifacts`; `cargo test -p solver-core cache`; `cargo test -p solver-worker --bin snapshot_builder`; `cargo check -p solver-worker --all-targets`; hard Clippy and format gates | with safe DB/S3 env, rebuild one snapshot, run `solve_all_unit`, verify manifest-last upload, all compressed/uncompressed hashes, exact 256-process boundaries, query-v2 chunk ranges/hashes without `h_matrix`, reviewed 25-method identities, recursively complete TIDAS source closure, directional LCI parity, and retry byte determinism. Exercise multiple admitted snapshots and prove resident cache bytes never exceed capacity, LRU eviction is deterministic, invalidation releases bytes, oversized workloads reject before factorization, and actual UMFPACK peak/retained estimates are reported. Include an LCIA-factor-only Elementary Flow and prove it appears as `support` with transitive Flow Property/Unit Group/Source/Contact documents while compiled Flow count, B/C axes, and provider decisions remain inventory-derived; also prove a non-Elementary factor target fails closed. | Old snapshots without `compiled_graph.release_evidence.source_datasets`, or with the legacy exchange-only source-closure policy, must fail closed and be rebuilt. Never infer exchange IDs, versions, units, directions, provider output IDs, or source documents from matrix indices or mutable solve-time database state. Sparse factorization fill-in is workload-dependent; tune admission from observed workloads and do not claim an input-independent constant bound. |
 | solver `worker_jobs` queue backend | `cargo test -p solver-worker worker_jobs`; `cargo test -p solver-worker maps_worker_jobs`; `cargo check -p solver-worker`; hard Clippy gate; hard format gate | when DB/S3 env is available, enqueue one safe `worker_queue=solver` job and run `solver-worker --queue-backend worker-jobs --mode worker` to verify claim/heartbeat/result projection; for legacy-table retirement, run against a schema where `public.lca_jobs` is absent or ignored | Keep `docs/lca-api-contract.md` and `docs/edge-function-integration.md` aligned with job kind, payload schema, worker_jobs result_ref, and optional legacy `lca_jobs` compatibility expectations. |
@@ -107,6 +107,38 @@ claim, stale-lease reclaim, lease-token fencing, restart/retry, cancellation,
 terminal result, transaction rollback, and old-public/new-private parity. It
 refuses non-loopback targets and does not create or reuse containers or volumes.
 The caller owns creation and teardown of the isolated exact-head stack.
+
+## Combined Candidate Exact-Head Qualification
+
+Run `scripts/qualify_combined_candidate.py` only from a clean committed Worker
+tree. The runner accepts the exact Database Engine
+`c5356d2b0d340f9c5c31a645479be5f3d19a52db` source checkout with migration head
+`20260803090000`; it never accepts a database URL. It owns the temporary clone,
+project identity, loopback ports, database reset authority, Storage
+buckets/prefixes, and teardown. Receipt output must stay outside the repository.
+The deterministic receipt binds the Worker commit/tree, Database commit,
+migration file/blob/hash, exact TIDAS 0.1.3 binary hash, passing contract names,
+cleanup facts, and the explicit claim that result-GC claiming remained disabled.
+It contains no endpoint, credential, token, random object name, or hosted target.
+The exact migration tree remains clean; the only permitted tracked checkout
+change is the runner-owned `supabase/config.toml` project identity and seven
+loopback port substitutions, which the receipt records separately.
+The scope-closure DB/Storage lifecycle runs first against the fresh stack so its
+reset comparison is not contaminated by later control-plane contract fixtures.
+The receipt reports any later runner-owned fixture cardinality delta before
+teardown separately from the final zero-container/volume/network/workdir
+destruction proof. The result sentinel uses exact-key deletion followed by
+deletion of only its unique empty runner-owned bucket.
+
+The real result-identity contract inserts an explicitly preallocated UUID,
+reconciles only an exact visible row after a simulated lost acknowledgement,
+keeps absence/conflict/query-error outcomes non-destructive, and checks strict
+locator boundaries. It receives no Storage credentials; a runner-owned local
+sentinel must remain byte-identical until the runner deletes that exact key.
+The exact-head production insert path remains explicitly
+`public.lca_results`; this qualification claims neither a result-family physical
+move nor a result-consumer cut. Snapshot/control/hash-family consumer-zero proof
+does not extend that claim to the result family.
 
 ### Scope-closure lifecycle fixture
 

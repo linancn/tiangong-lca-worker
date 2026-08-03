@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedCommit: "10183162a1944252fd01eeb5ffc1548cbe8c4ec1"
 lastReviewedAt: "2026-08-03"
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot consumers, result identity, and strict object-target validation remain within existing Worker ownership and routing while retaining exact TIDAS and dedicated-login proof."
+lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot-consumer, and result-identity qualification remain Worker-owned and now converge on one exact-head disposable-stack receipt."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -174,6 +174,7 @@ routing:
         - scripts/export_provider_link_diagnostics.sh
         - scripts/export_unmatched_no_provider_diagnostics.sh
         - scripts/qualify_snapshot_private_cutover.py
+        - scripts/qualify_combined_candidate.py
         - docs/agents/repo-architecture.md
         - docs/provider-linking.md
         - docs/implicit-regional-supply-mix-modeling.md
@@ -188,6 +189,7 @@ routing:
         - docs/sql/**
         - scripts/validate_additive_migration.sh
         - scripts/qualify_snapshot_private_cutover.py
+        - scripts/qualify_combined_candidate.py
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
     debug-and-parity:
@@ -421,6 +423,8 @@ rules:
       - path: docs/sql/**
         kind: executable-diagnostic-sql
       - path: scripts/qualify_snapshot_private_cutover.py
+        kind: validation-test
+      - path: scripts/qualify_combined_candidate.py
         kind: validation-test
     requiredDocs:
       - path: .docpact/config.yaml

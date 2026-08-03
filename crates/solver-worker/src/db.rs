@@ -4504,15 +4504,16 @@ mod tests {
         ResultInsertReconciliation, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
         SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
         acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
-        build_snapshot_heartbeat_interval, classify_result_insert_reconciliation,
+        build_snapshot_heartbeat_interval, classify_result_insert_reconciliation, insert_result,
         lcia_result_package_request_roots, lcia_result_package_version,
         missing_legacy_tables_sparse_data_error, normalize_all_unit_batch_size,
         package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
         parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
-        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
-        result_insert_outcome_pending_error, run_snapshot_builder_job,
-        run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_wall_timeout_seconds_from,
-        tail_text, utf8_safe_tail, validate_certified_process_axis,
+        reconcile_failed_result_insert, redact_sensitive_diagnostics, redacted_builder_command,
+        resolve_solve_all_unit_options, result_insert_outcome_pending_error,
+        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
+        snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
+        validate_certified_process_axis,
     };
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -4529,7 +4530,7 @@ mod tests {
     use tokio::time::sleep;
     use uuid::Uuid;
 
-    use crate::graph_types::RequestRootProcess;
+    use crate::{graph_types::RequestRootProcess, storage::ObjectStoreClient};
 
     static SNAPSHOT_BUILDER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4613,6 +4614,172 @@ mod tests {
         assert!(error.contains("connection reset after dispatch"));
         assert!(error.contains("DB-side staged identity/fence"));
         assert!(error.contains("must never authorize deletion"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a runner-owned loopback Database Engine exact-head stack"]
+    #[allow(clippy::too_many_lines)]
+    async fn result_identity_database_contract_preserves_objects_on_uncertain_outcomes()
+    -> anyhow::Result<()> {
+        let database_url = std::env::var("RESULT_IDENTITY_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("RESULT_IDENTITY_DATABASE_URL is required"))?;
+        let parsed = reqwest::Url::parse(&database_url)?;
+        anyhow::ensure!(
+            parsed.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            }),
+            "result identity DB contract refuses non-loopback targets"
+        );
+
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?;
+        let snapshot_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO private.lca_network_snapshots
+              (id, scope, process_filter, source_hash, status)
+            VALUES ($1, 'full_library', '{"qualification":"result_identity"}'::jsonb, $2, 'ready')
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind(format!("result-identity-{snapshot_id}"))
+        .execute(&pool)
+        .await?;
+
+        let exact = result_insert_fixture(Uuid::new_v4());
+        let inserted_id = insert_result(&pool, job_id, snapshot_id, &exact).await?;
+        anyhow::ensure!(
+            inserted_id == exact.result_id,
+            "preallocated UUID was not preserved"
+        );
+        let reconciled = reconcile_failed_result_insert(
+            &pool,
+            job_id,
+            snapshot_id,
+            &exact,
+            &anyhow::anyhow!("simulated lost INSERT acknowledgement"),
+        )
+        .await?;
+        anyhow::ensure!(reconciled == exact.result_id);
+
+        let absent = result_insert_fixture(Uuid::new_v4());
+        let absent_error = reconcile_failed_result_insert(
+            &pool,
+            job_id,
+            snapshot_id,
+            &absent,
+            &anyhow::anyhow!("simulated ambiguous INSERT response"),
+        )
+        .await
+        .expect_err("absent readback must remain indeterminate")
+        .to_string();
+        anyhow::ensure!(absent_error.contains("result_insert_outcome_pending"));
+        anyhow::ensure!(absent_error.contains("preserve the object"));
+
+        let conflict_id = Uuid::new_v4();
+        let mut observed_conflict = result_insert_fixture(conflict_id);
+        observed_conflict.artifact_url =
+            format!("https://storage.example.test/bucket/results/{conflict_id}/observed.json");
+        observed_conflict.object_key = format!("results/{conflict_id}/observed.json");
+        insert_result(&pool, job_id, snapshot_id, &observed_conflict).await?;
+        let expected_conflict = result_insert_fixture(conflict_id);
+        let conflict_error = reconcile_failed_result_insert(
+            &pool,
+            job_id,
+            snapshot_id,
+            &expected_conflict,
+            &anyhow::anyhow!("simulated unique conflict"),
+        )
+        .await
+        .expect_err("mismatched identity must not converge")
+        .to_string();
+        anyhow::ensure!(conflict_error.contains("result_insert_identity_conflict"));
+        anyhow::ensure!(conflict_error.contains("preserve the object"));
+
+        let closed_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        closed_pool.close().await;
+        let query_error_identity = result_insert_fixture(Uuid::new_v4());
+        let query_error = reconcile_failed_result_insert(
+            &closed_pool,
+            job_id,
+            snapshot_id,
+            &query_error_identity,
+            &anyhow::anyhow!("simulated INSERT transport failure"),
+        )
+        .await
+        .expect_err("readback query failure must remain unknown")
+        .to_string();
+        anyhow::ensure!(query_error.contains("result_insert_outcome_unknown"));
+        anyhow::ensure!(query_error.contains("preserve the object"));
+
+        let exact_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM public.lca_results WHERE id = ANY($1::uuid[])",
+        )
+        .bind(vec![exact.result_id, conflict_id])
+        .fetch_one(&pool)
+        .await?;
+        anyhow::ensure!(
+            exact_rows == 2,
+            "uncertain outcomes removed persisted identities"
+        );
+        let absent_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM public.lca_results WHERE id = $1")
+                .bind(absent.result_id)
+                .fetch_one(&pool)
+                .await?;
+        anyhow::ensure!(absent_rows == 0);
+
+        let object_store = ObjectStoreClient::new(
+            "http://127.0.0.1:9/storage/v1/s3",
+            "local",
+            "qualification-bucket",
+            "qualification-prefix",
+            "qualification-key",
+            "qualification-secret",
+            None,
+        )?;
+        let locator = format!(
+            "http://127.0.0.1:9/storage/v1/s3/qualification-bucket/qualification-prefix/snapshots/{snapshot_id}/jobs/{job_id}/results/{}/solve_one.json",
+            exact.result_id
+        );
+        let key = object_store.result_object_key_from_url(exact.result_id, &locator)?;
+        anyhow::ensure!(key.contains(&format!("/results/{}/", exact.result_id)));
+        anyhow::ensure!(
+            object_store
+                .result_object_key_from_url(absent.result_id, &locator)
+                .is_err(),
+            "locator accepted the wrong frozen result UUID"
+        );
+        anyhow::ensure!(
+            object_store
+                .result_object_key_from_url(
+                    exact.result_id,
+                    &locator.replace("/results/", "/%72esults/")
+                )
+                .is_err(),
+            "locator accepted encoded path drift"
+        );
+
+        sqlx::query("DELETE FROM public.lca_results WHERE id = ANY($1::uuid[])")
+            .bind(vec![exact.result_id, conflict_id])
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM private.lca_network_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        Ok(())
     }
 
     struct SnapshotBuilderEnvGuard {

@@ -33,8 +33,8 @@ from psycopg import conninfo, sql
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_SHA = "86ba7ee2c33e45df8008117a2dec3ee4deedc32c"
-MIGRATION_HEAD = "20260802091342"
+DB_SHA = "c5356d2b0d340f9c5c31a645479be5f3d19a52db"
+MIGRATION_HEAD = "20260803090000"
 RELATIONS = (
     "lca_active_snapshots",
     "lca_network_snapshots",
@@ -53,10 +53,10 @@ CRITICAL_RELATIONS = {
 }
 ACTIVE_SOURCE_ROOTS = ("crates", "scripts", "tools", "docs/sql")
 SCANNED_SUFFIXES = {".rs", ".py", ".sh", ".sql"}
-EXPECTED_STATIC_FILE_COUNT = 98
+EXPECTED_STATIC_FILE_COUNT = 99
 # Deliberately pinned to the reviewed active-source inventory. Adding/removing a
 # Rust, Python, shell, or SQL source requires updating this qualification contract.
-EXPECTED_STATIC_INVENTORY_SHA256 = "76e06c5c42e1bc15b3455fef6919fc76fa3d543097c29341f6c49c433c2e26ea"
+EXPECTED_STATIC_INVENTORY_SHA256 = "fd5a15a595b20719c590d1d797440c4c56ddacbee73d2e8c8c0e17ff24fc32ed"
 
 
 def require(condition: bool, message: str) -> None:
@@ -1379,35 +1379,34 @@ def execute_lifecycle_test(
     test_command: list[str],
     inject_failure: bool,
 ) -> tuple[str, dict[str, object]]:
-    run_id = uuid.uuid4().hex
-    bucket = f"worker199-{run_id}"
-    prefix = f"worker199/{run_id}"
+    run_id = str(uuid.uuid4())
+    bucket = f"scope-closure-e2e-{run_id}"
+    prefix = f"scope-closure-package-v2-e2e/{run_id}"
     stack.assert_owned_running()
+    parsed_run_id = uuid.UUID(run_id)
+    require(
+        parsed_run_id.version == 4 and run_id == str(parsed_run_id),
+        "lifecycle run identity is not a lowercase canonical UUID v4",
+    )
+    require(
+        normalized_database_endpoint(stack.database_url)["host"] == "loopback"
+        and normalized_http_endpoint(stack.storage_endpoint)["host"] == "loopback",
+        "lifecycle endpoint preflight did not resolve to loopback",
+    )
+    require(
+        prefix == f"scope-closure-package-v2-e2e/{run_id}",
+        "lifecycle prefix is not bound to the one-time run identity",
+    )
     baseline = database_cardinalities(stack.database_url)
     critical_baseline = critical_database_state(stack.database_url)
     require(
         list_s3_keys(stack.storage_endpoint, bucket, stack.storage_environment) is None,
         f"runner-generated lifecycle bucket already exists: {bucket}",
     )
-    create_s3_bucket(stack.storage_endpoint, bucket, stack.storage_environment)
     owned_sentinel_key = f"{prefix}/runner-owned-sentinel.bin"
     sibling_key = f"{prefix}-sibling/runner-sibling-sentinel.bin"
     owned_payload = f"owned:{run_id}".encode()
     sibling_payload = f"sibling:{run_id}".encode()
-    put_s3_object(
-        stack.storage_endpoint,
-        bucket,
-        owned_sentinel_key,
-        owned_payload,
-        stack.storage_environment,
-    )
-    put_s3_object(
-        stack.storage_endpoint,
-        bucket,
-        sibling_key,
-        sibling_payload,
-        stack.storage_environment,
-    )
     environment = os.environ.copy()
     environment.update(stack.storage_environment)
     environment.update(
@@ -1425,6 +1424,24 @@ def execute_lifecycle_test(
         test_command, cwd=ROOT, env=environment, text=True, capture_output=True, check=False
     )
     test_log = "$ " + " ".join(test_command) + "\n" + test.stdout + test.stderr
+    require(
+        list_s3_keys(stack.storage_endpoint, bucket, stack.storage_environment) is not None,
+        "lifecycle fixture did not create its one-time bucket",
+    )
+    put_s3_object(
+        stack.storage_endpoint,
+        bucket,
+        owned_sentinel_key,
+        owned_payload,
+        stack.storage_environment,
+    )
+    put_s3_object(
+        stack.storage_endpoint,
+        bucket,
+        sibling_key,
+        sibling_payload,
+        stack.storage_environment,
+    )
     cleanup = cleanup_lifecycle_run(
         stack,
         bucket,
@@ -1435,6 +1452,11 @@ def execute_lifecycle_test(
         owned_payload,
         sibling_key,
         sibling_payload,
+    )
+    require(
+        "[hdf_restore_evidence] " in test_log,
+        "lifecycle did not reach HDF restoration evidence; "
+        f"test exit code was {test.returncode}; bounded log tail follows:\n{test_log[-16000:]}",
     )
     hdf_restore = parse_marker(test_log, "hdf_restore_evidence")
     require(

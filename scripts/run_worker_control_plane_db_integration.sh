@@ -21,8 +21,14 @@ if [[ "${database_sha}" != "${WORKER_CONTROL_PLANE_DATABASE_SHA}" ]]; then
   echo "database worktree HEAD does not match WORKER_CONTROL_PLANE_DATABASE_SHA" >&2
   exit 2
 fi
-if [[ -n "$(git -C "${database_worktree}" status --porcelain --untracked-files=no)" ]]; then
-  echo "database worktree has tracked changes; exact-SHA evidence would be ambiguous" >&2
+if ! git -C "${database_worktree}" diff --quiet -- . ':(exclude)supabase/config.toml' || \
+   ! git -C "${database_worktree}" diff --cached --quiet -- . || \
+   [[ -n "$(git -C "${database_worktree}" ls-files --others --exclude-standard)" ]]; then
+  echo "database worktree has changes outside the runner-owned Supabase config mutation" >&2
+  exit 2
+fi
+if git -C "${database_worktree}" diff --quiet -- supabase/config.toml; then
+  echo "database worktree is missing the expected runner-owned Supabase config mutation" >&2
   exit 2
 fi
 
