@@ -4,6 +4,7 @@ use crate::pgbouncer_sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 
 pub const APP_SOLVER_WORKER: &str = "solver-worker";
 pub const APP_SOLVER_WORKER_QUEUE: &str = "solver-worker-queue";
+pub const APP_DOCUMENT_VALIDATION_EVIDENCE: &str = "document-validation-evidence";
 pub const APP_SNAPSHOT_BUILDER: &str = "snapshot-builder";
 pub const APP_PACKAGE_WORKER: &str = "package-worker";
 pub const APP_PACKAGE_WORKER_QUEUE: &str = "package-worker-queue";

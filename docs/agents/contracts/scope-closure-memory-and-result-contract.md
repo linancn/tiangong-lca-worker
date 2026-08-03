@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issue #205: temporary file transport for the frozen manifest preserves bounded cleanup, artifact layout, publication, and qualification result contracts."
+lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedAt: 2026-08-04
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed frozen-manifest transport and isolated document-validation SQL preserve bounded cleanup, artifact layout, publication, and qualification result schemas."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

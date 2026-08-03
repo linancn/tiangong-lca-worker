@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issue #205: scope-closure snapshot_builder input transport does not change TIDAS package import/export artifacts, retention, semantics, or package-worker state."
+lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedAt: 2026-08-04
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the solver-only document-validation pool do not change TIDAS package import/export artifacts, retention, semantics, or package-worker state."
 related:
   - AGENTS.md
   - .docpact/config.yaml

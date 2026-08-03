@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-08-02
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issue #177: canonical scope-closure v3 and Database #316 staged publication remain behind the existing Edge-owned XLSX plus manifest projection; no Edge request or response DTO change is required."
+lastReviewedAt: 2026-08-03
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
+lastReviewedNote: "Reviewed for Worker Issue #207: the dedicated document-validation database pool and private Database #409 routines remain internal to the solver worker; no Edge request or response DTO change is required."
 related:
   - AGENTS.md
   - .docpact/config.yaml
