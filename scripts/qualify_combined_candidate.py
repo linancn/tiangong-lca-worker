@@ -82,8 +82,8 @@ def run_control_plane_contract(
     result = run_test(["bash", "scripts/run_worker_control_plane_db_integration.sh"], environment)
     return {
         **result,
-        "claimsEnabled": False,
-        "claimExercise": "isolated worker lifecycle rows only; result-GC claims not enabled",
+        "resultGcClaimsEnabled": False,
+        "claimExercise": "worker job claim/reclaim lifecycle exercised; result-GC claims not enabled",
         "deploymentLoginClaimed": False,
     }
 
@@ -121,7 +121,7 @@ def run_result_identity_contract(
             "RESULT_IDENTITY_DATABASE_URL": stack.database_url,
         }
     )
-    result = run_test(
+    database_result = run_test(
         [
             "cargo",
             "test",
@@ -131,6 +131,20 @@ def run_result_identity_contract(
             "db::tests::result_identity_database_contract_preserves_objects_on_uncertain_outcomes",
             "--",
             "--ignored",
+            "--exact",
+            "--nocapture",
+        ],
+        environment,
+    )
+    locator_result = run_test(
+        [
+            "cargo",
+            "test",
+            "-p",
+            "solver-worker",
+            "--lib",
+            "storage::tests::result_locator_validation_rejects_target_and_path_drift",
+            "--",
             "--exact",
             "--nocapture",
         ],
@@ -171,7 +185,11 @@ def run_result_identity_contract(
         "runner-owned result bucket remains after exact cleanup",
     )
     return {
-        **result,
+        "passed": True,
+        "commands": {
+            "databaseContract": database_result["command"],
+            "locatorBoundary": locator_result["command"],
+        },
         "assertions": [
             "preallocated UUID INSERT is exact",
             "lost acknowledgement converges only to an exact visible row",

@@ -133,8 +133,12 @@ deletion of only its unique empty runner-owned bucket.
 The real result-identity contract inserts an explicitly preallocated UUID,
 reconciles only an exact visible row after a simulated lost acknowledgement,
 keeps absence/conflict/query-error outcomes non-destructive, and checks strict
-locator boundaries. It receives no Storage credentials; a runner-owned local
-sentinel must remain byte-identical until the runner deletes that exact key.
+locator boundaries. The combined runner separately executes and records the
+exact narrow `result_locator_validation_rejects_target_and_path_drift` unit
+test command, so origin, bucket, prefix, result UUID, and encoded-path claims are
+bound to that run rather than inferred from the broader `make check`. The DB
+fixture receives no Storage credentials; a runner-owned local sentinel must
+remain byte-identical until the runner deletes that exact key.
 The exact-head production insert path remains explicitly
 `public.lca_results`; this qualification claims neither a result-family physical
 move nor a result-consumer cut. Snapshot/control/hash-family consumer-zero proof
