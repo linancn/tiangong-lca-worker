@@ -8,9 +8,7 @@
 
 #![allow(clippy::needless_raw_string_hashes, clippy::too_many_lines)]
 
-use std::{
-    collections::BTreeSet, fs, net::IpAddr, process::Command, sync::Arc, time::Duration,
-};
+use std::{collections::BTreeSet, fs, net::IpAddr, process::Command, sync::Arc, time::Duration};
 
 use clap::Parser;
 use serde_json::{Value, json};
