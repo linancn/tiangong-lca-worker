@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot persistence, and result identity stay Worker-owned; exact-head qualification uses only a runner-owned disposable loopback stack and leaves database-engine as schema owner."
+lastReviewedNote: "Reviewed for Worker Issue #205: file-backed snapshot_builder input remains Worker-owned runtime behavior; repository ownership, branch policy, and database-engine schema boundaries are unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

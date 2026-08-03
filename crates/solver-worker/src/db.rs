@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     future::Future,
-    io::{BufReader, ErrorKind},
+    io::{BufReader, ErrorKind, Write},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -2335,6 +2335,18 @@ pub(crate) enum SnapshotBuilderProcessFailure {
     },
 }
 
+pub(crate) fn snapshot_builder_process_failure_code(error: &anyhow::Error) -> Option<&'static str> {
+    let failure = error.downcast_ref::<SnapshotBuilderProcessFailure>()?;
+    Some(match failure {
+        SnapshotBuilderProcessFailure::Launch { .. } => "snapshot_builder_launch_failed",
+        SnapshotBuilderProcessFailure::Timeout { .. } => "snapshot_builder_timeout",
+        SnapshotBuilderProcessFailure::Signal { .. } => "snapshot_builder_signal",
+        SnapshotBuilderProcessFailure::Exit { .. } => "snapshot_builder_exit_failed",
+        SnapshotBuilderProcessFailure::Protocol { .. } => "snapshot_builder_protocol_failed",
+        SnapshotBuilderProcessFailure::Blocked { .. } => "snapshot_builder_blocked",
+    })
+}
+
 #[derive(Debug, Clone)]
 struct BuilderCommandCandidate {
     program: String,
@@ -3616,14 +3628,8 @@ async fn run_snapshot_builder_job(
         builder_args.push("--lcia-factor-coverage-contract-json".to_owned());
         builder_args.push(serde_json::to_string(&scope.lcia_factor_coverage_contract)?);
     }
-    if let Some(scope) = scope_closure {
-        builder_args.push("--scope-closure-mode".to_owned());
-        builder_args.push(scope.mode.as_str().to_owned());
-        builder_args.push("--scope-closure-binding-json".to_owned());
-        builder_args.push(serde_json::to_string(&scope.binding)?);
-        builder_args.push("--scope-closure-data-snapshot-json".to_owned());
-        builder_args.push(serde_json::to_string(&scope.data_snapshot)?);
-    }
+    let _scope_closure_snapshot_file =
+        append_scope_closure_snapshot_args(&mut builder_args, scope_closure)?;
 
     let candidates = snapshot_builder_candidates(builder_args);
     let mut last_not_found = false;
@@ -3797,6 +3803,36 @@ async fn run_snapshot_builder_job(
         ));
     }
     Err(anyhow::anyhow!("failed to execute snapshot_builder"))
+}
+
+fn append_scope_closure_snapshot_args(
+    builder_args: &mut Vec<String>,
+    scope_closure: Option<&ScopeClosureSnapshotBuilderArgs>,
+) -> anyhow::Result<Option<tempfile::NamedTempFile>> {
+    let Some(scope) = scope_closure else {
+        return Ok(None);
+    };
+
+    let mut snapshot_file = tempfile::Builder::new()
+        .prefix("scope-closure-data-snapshot-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|error| {
+            anyhow::anyhow!("create scope-closure snapshot_builder input file: {error}")
+        })?;
+    serde_json::to_writer(&mut snapshot_file, &scope.data_snapshot)
+        .map_err(|error| anyhow::anyhow!("write scope-closure snapshot_builder input: {error}"))?;
+    snapshot_file.flush().map_err(|error| {
+        anyhow::anyhow!("flush scope-closure snapshot_builder input file: {error}")
+    })?;
+
+    builder_args.push("--scope-closure-mode".to_owned());
+    builder_args.push(scope.mode.as_str().to_owned());
+    builder_args.push("--scope-closure-binding-json".to_owned());
+    builder_args.push(serde_json::to_string(&scope.binding)?);
+    builder_args.push("--scope-closure-data-snapshot-file".to_owned());
+    builder_args.push(snapshot_file.path().to_string_lossy().into_owned());
+    Ok(Some(snapshot_file))
 }
 
 fn snapshot_builder_candidates(builder_args: Vec<String>) -> Vec<BuilderCommandCandidate> {
@@ -4502,16 +4538,18 @@ mod tests {
         BuildSnapshotWorkerLease, BuilderCommandCandidate, JobLifecycleBackend,
         PackageSnapshotExecutionMode, PersistedResultIdentity, ResultInsert,
         ResultInsertReconciliation, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
+        ScopeClosureSnapshotBuilderArgs, ScopeClosureSnapshotBuilderMode,
         SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
-        acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
-        build_snapshot_heartbeat_interval, classify_result_insert_reconciliation, insert_result,
-        lcia_result_package_request_roots, lcia_result_package_version,
-        missing_legacy_tables_sparse_data_error, normalize_all_unit_batch_size,
-        package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
-        parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
-        reconcile_failed_result_insert, redact_sensitive_diagnostics, redacted_builder_command,
-        resolve_solve_all_unit_options, result_insert_outcome_pending_error,
-        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
+        acquire_build_snapshot_worker_jobs_slot_sql, append_scope_closure_snapshot_args,
+        build_all_unit_rhs_batch, build_snapshot_heartbeat_interval,
+        classify_result_insert_reconciliation, insert_result, lcia_result_package_request_roots,
+        lcia_result_package_version, missing_legacy_tables_sparse_data_error,
+        normalize_all_unit_batch_size, package_snapshot_execution_mode,
+        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
+        read_certified_closure_bundle_binding, reconcile_failed_result_insert,
+        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
+        result_insert_outcome_pending_error, run_snapshot_builder_job,
+        run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_process_failure_code,
         snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
         validate_certified_process_axis,
     };
@@ -4942,6 +4980,66 @@ mod tests {
         );
         assert!(!diagnostic.contains("secret"));
         assert!(!diagnostic.contains(Uuid::nil().to_string().as_str()));
+    }
+
+    #[test]
+    fn snapshot_builder_launch_failure_has_stable_terminal_error_code() {
+        let error = anyhow::Error::new(SnapshotBuilderProcessFailure::Launch {
+            command: "snapshot_builder --scope-closure-data-snapshot-file".to_owned(),
+            source: std::io::Error::from_raw_os_error(7),
+        });
+
+        assert_eq!(
+            snapshot_builder_process_failure_code(&error),
+            Some("snapshot_builder_launch_failed")
+        );
+    }
+
+    #[test]
+    fn scope_closure_snapshot_transport_keeps_large_manifest_out_of_argv_and_cleans_up() {
+        let marker = "manifest-secret-marker";
+        let scope = ScopeClosureSnapshotBuilderArgs {
+            mode: ScopeClosureSnapshotBuilderMode::Discovery,
+            binding: json!({"schemaVersion": "binding"}),
+            data_snapshot: json!({
+                "schemaVersion": "lcia.scope-closure-data-snapshot.v2",
+                "payload": format!("{marker}{}", "x".repeat(4 * 1024 * 1024)),
+            }),
+        };
+        let mut args = Vec::new();
+        let input = append_scope_closure_snapshot_args(&mut args, Some(&scope))
+            .expect("prepare snapshot transport")
+            .expect("snapshot input file");
+        let input_path = input.path().to_path_buf();
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--scope-closure-data-snapshot-file")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--scope-closure-data-snapshot-json")
+        );
+        assert!(!args.iter().any(|arg| arg.contains(marker)));
+        assert!(fs::metadata(&input_path).expect("snapshot metadata").len() > 4 * 1024 * 1024);
+        assert_eq!(
+            fs::metadata(&input_path)
+                .expect("snapshot metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "snapshot input must not be group/world accessible"
+        );
+        assert!(
+            fs::read_to_string(&input_path)
+                .expect("read snapshot input")
+                .contains(marker)
+        );
+
+        drop(input);
+        assert!(!input_path.exists(), "snapshot input must be cleaned up");
     }
 
     #[test]

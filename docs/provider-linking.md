@@ -22,9 +22,9 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-02
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Issue #146 separates selected LCIA-factor Flow source evidence from the inventory-derived matrix and provider Flow universe."
+lastReviewedAt: 2026-08-03
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
+lastReviewedNote: "Reviewed for Worker Issue #205: changing frozen-manifest transport does not change signed-flow eligibility, routing order, provider rules, or diagnostics semantics."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-03
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Reviewed for Worker Issues #192, #198, and #202: private closure hashes, schema-valid fixtures, preallocated result identity, and exact object-target deletion validation do not change public Worker, Edge, or Next DTO labels."
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
+lastReviewedNote: "Reviewed for Worker Issue #205: the internal Worker-to-snapshot_builder file handoff changes no public Worker, Edge, Next, job payload, or result DTO labels."
 related:
   - AGENTS.md
   - .docpact/config.yaml

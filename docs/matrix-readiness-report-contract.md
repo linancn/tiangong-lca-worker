@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-02
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
-lastReviewedNote: "Issue #146 adds selected LCIA-factor Flow source-closure policy to build identity; readiness schema and blocker semantics are unchanged."
+lastReviewedAt: 2026-08-03
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
+lastReviewedNote: "Reviewed for Worker Issue #205: file-backed scope-closure manifest input does not change readiness schema, blocker semantics, policy, or report artifacts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

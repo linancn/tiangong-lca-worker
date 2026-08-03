@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #192, #198, #199, and #202: the exact-head combined runner binds private control-plane, snapshot, scope-closure, and result-identity proof to one disposable local stack and credential-free receipt."
+lastReviewedNote: "Reviewed for Worker Issue #205: scope-closure proof includes file-backed large-manifest handoff, restricted permissions, cleanup, and exclusion of manifest bytes from argv and diagnostics."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -70,6 +70,8 @@ Treat the last two commands as non-negotiable hard gates after code changes.
 The local `pre-push` hook runs the docpact gate first and then runs `make check`. The GitHub `ci` workflow is manual-dispatch only, so ordinary branch pushes do not spend Actions minutes on standalone tests.
 
 ## Validation Matrix
+
+For scope-closure transport changes, include `cargo test -p solver-worker scope_closure_snapshot_transport_keeps_large_manifest_out_of_argv_and_cleans_up` and `cargo test -p solver-worker --bin snapshot_builder snapshot_builder_reads_scope_closure_snapshot_from_file`. These tests must prove that a manifest larger than ordinary argv capacity is file-backed, permission-restricted, available for parsing, absent from argv/diagnostics, and removed after the owning handle is dropped.
 
 | Change type | Minimum local proof | Additional proof when risk is higher | Notes |
 | --- | --- | --- | --- |

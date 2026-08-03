@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedCommit: "10183162a1944252fd01eeb5ffc1548cbe8c4ec1"
+lastReviewedCommit: "2ee74ffaf431c0d43b9613bcb6bfed76fa447b66"
 lastReviewedAt: "2026-08-03"
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, #198, #199, and #202: private control-plane, closure hash, snapshot-consumer, and result-identity qualification remain Worker-owned and now converge on one exact-head disposable-stack receipt."
+lastReviewedNote: "Reviewed for Worker Issue #205: existing scope-closure, snapshot-builder, readiness, and provider routing rules already cover the file-backed input change; ownership and routing are unchanged."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

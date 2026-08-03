@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #190, #192, #193, and #202: schema-qualified access, private hashes, exact TIDAS evidence, and solve-result identity preserve bounded memory, scope-closure artifact layout, publication, four-mode identity, owner evidence, and qualification result contracts."
+lastReviewedNote: "Reviewed for Worker Issue #205: temporary file transport for the frozen manifest preserves bounded cleanup, artifact layout, publication, and qualification result contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

@@ -5372,7 +5372,7 @@ pub async fn record_scope_closure_failure(
     closure_check_id: Uuid,
     worker_job_id: Uuid,
     lease_token: Uuid,
-    _error: &str,
+    error_code: &str,
 ) -> anyhow::Result<Value> {
     let row = sqlx::query(
         r"
@@ -5380,7 +5380,7 @@ pub async fn record_scope_closure_failure(
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
         SELECT public.svc_lcia_scope_closure_fail_before_scan(
-            $1, $2, $3, 'scope_closure_execution_failed'
+            $1, $2, $3, $4
         ) AS result
         FROM _service_role
         ",
@@ -5388,6 +5388,7 @@ pub async fn record_scope_closure_failure(
     .bind(closure_check_id)
     .bind(worker_job_id)
     .bind(lease_token)
+    .bind(error_code)
     .fetch_one(pool)
     .await?;
     let result = row.try_get::<Value, _>("result")?;
