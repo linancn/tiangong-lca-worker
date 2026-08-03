@@ -24,6 +24,17 @@ fn emit_source_commit() -> Result<(), String> {
 
     require_clean_worktree(&repository_root)?;
 
+    // `rerun-if-changed` narrows Cargo's default package scan.  Track every
+    // versioned worktree input (and the checkout index) so an incremental build
+    // cannot reuse a clean attestation after compiling later dirty sources with
+    // the same HEAD.
+    track_versioned_worktree(&manifest_dir, &repository_root)?;
+    let index_path = git_path(
+        &manifest_dir,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    track(index_path);
+
     let checkout_dot_git = repository_root.join(".git");
     if checkout_dot_git.is_file() {
         track(checkout_dot_git);
@@ -101,6 +112,31 @@ fn require_clean_worktree(repository_root: &Path) -> Result<(), String> {
             "source worktree must be completely clean, including untracked files, before building"
                 .to_owned(),
         );
+    }
+    Ok(())
+}
+
+fn track_versioned_worktree(manifest_dir: &Path, repository_root: &Path) -> Result<(), String> {
+    let output = git_command(manifest_dir)
+        .args(["ls-files", "-z", "--cached"])
+        .output()
+        .map_err(|error| format!("failed to enumerate versioned source inputs: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files failed with status {} while attesting source inputs",
+            output.status
+        ));
+    }
+    let paths = String::from_utf8(output.stdout)
+        .map_err(|_| "git ls-files returned non-UTF-8 source paths".to_owned())?;
+    for relative in paths.split_terminator('\0') {
+        if relative.is_empty()
+            || relative.starts_with('/')
+            || relative.split('/').any(|p| p == "..")
+        {
+            return Err("git ls-files returned an unsafe source path".to_owned());
+        }
+        track(repository_root.join(relative));
     }
     Ok(())
 }
