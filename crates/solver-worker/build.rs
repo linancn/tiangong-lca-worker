@@ -64,9 +64,8 @@ fn git_path(current_dir: &Path, arguments: &[&str]) -> Result<PathBuf, String> {
 }
 
 fn git_output(current_dir: &Path, arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command(current_dir)
         .args(arguments)
-        .current_dir(current_dir)
         .output()
         .map_err(|error| format!("failed to execute git: {error}"))?;
     if !output.status.success() {
@@ -82,14 +81,13 @@ fn git_output(current_dir: &Path, arguments: &[&str]) -> Result<String, String> 
 }
 
 fn require_clean_worktree(repository_root: &Path) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command(repository_root)
         .args([
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
         ])
-        .current_dir(repository_root)
         .output()
         .map_err(|error| format!("failed to inspect source worktree: {error}"))?;
     if !output.status.success() {
@@ -105,6 +103,31 @@ fn require_clean_worktree(repository_root: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn git_command(current_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(current_dir);
+    // Git hooks export repository-local context. A build invoked from a hook must
+    // still attest CARGO_MANIFEST_DIR's checkout rather than the hook caller.
+    for variable in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(variable);
+    }
+    command
 }
 
 fn read_one_line(path: &Path) -> Result<String, String> {
