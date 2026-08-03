@@ -37,7 +37,7 @@ checkPaths:
   - scripts/install-git-hooks.sh
 lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
 lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed frozen-manifest handoff stays inside the Worker/snapshot_builder boundary, while document-validation evidence uses a temporary fail-closed family pool and exact Database #409 private routines."
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed frozen-manifest handoff stays inside the Worker/snapshot_builder boundary, while the fail-closed document-validation pool uses exact Database #409 routines and exposes the exact Worker build commit in its acceptance marker."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -203,7 +203,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.
 - Worker-owned DB pools set explicit PostgreSQL `application_name` values for observability. `snapshot_builder` also applies `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS` as a bounded statement timeout; `0` is reserved for targeted manual recovery, not normal production operation.
-- The snapshot private-cutover scanner's reviewed active-source inventory is 100 files after adding the isolated document-validation DB module; its snapshot relation consumer-zero semantics are unchanged.
+- The snapshot private-cutover scanner's reviewed active-source inventory is 103 files after adding the isolated document-validation DB module, source-commit build metadata, and qualification test; its snapshot relation consumer-zero semantics are unchanged.
 - TIDAS validation semantics belong to the published Rust tool. Worker retains lease/heartbeat/cancellation, timeout, deterministic evidence, and terminal error projection; it never reimplements those operations in deployment or API repositories.
 
 ## Runtime SQL Boundary

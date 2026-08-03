@@ -20,9 +20,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/edge-function-integration.md
   - docs/review-submit-fast-gate-contract.md
-lastReviewedAt: 2026-08-03
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedNote: "Reviewed for Worker Issue #207: the solver-only document-validation database pool does not change the frontend or Edge-facing DTO."
+lastReviewedAt: 2026-08-04
+lastReviewedCommit: 0ccd8128b46d383425700c3c2f7b6d1edb92a90c
+lastReviewedNote: "Reviewed for Worker Issue #207: solver source-commit journal attestation does not change the frontend or Edge-facing DTO."
 related:
   - AGENTS.md
   - .docpact/config.yaml

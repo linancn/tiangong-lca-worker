@@ -2,7 +2,7 @@ version: 1
 layout: repo
 lastReviewedCommit: "cfc356d96f7fe47e4f128ce1551c5ce3f3f47326"
 lastReviewedAt: "2026-08-04"
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the temporary no-fallback document-validation family preserve ownership/routing while leaving package and review-runner DB topology unchanged."
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the no-fallback document-validation family preserve routing, while the solver build binds its exact source commit into the secret-free acceptance marker."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

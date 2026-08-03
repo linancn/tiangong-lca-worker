@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
+    build_metadata::{DOCUMENT_VALIDATION_DATABASE_CONTRACT_ACCEPTED_MESSAGE, SOURCE_COMMIT},
     config::AppConfig,
     db_pool::{APP_DOCUMENT_VALIDATION_EVIDENCE, WorkerDbPoolOptions},
     pgbouncer_sqlx::{self as sqlx, PgPool, Row, postgres::PgConnectOptions},
@@ -234,8 +235,10 @@ impl DocumentValidationDb {
         tracing::info!(
             contract = "document-validation-evidence.private.v1",
             contract_source_migration = CONTRACT_SOURCE_MIGRATION,
+            worker_source_commit = SOURCE_COMMIT,
             pg_major = 17,
-            "document-validation database contract accepted; identity and target omitted"
+            "{}",
+            DOCUMENT_VALIDATION_DATABASE_CONTRACT_ACCEPTED_MESSAGE
         );
         Ok(Self { pool })
     }

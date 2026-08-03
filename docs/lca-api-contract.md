@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-04
 lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder handoff and temporary document-validation SQL isolation are internal and change no Worker, Edge, Next, job-payload, or result DTO labels."
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder handoff, document-validation SQL isolation, and exact source-commit attestation are internal and change no Worker, Edge, Next, job-payload, or result DTO labels."
 related:
   - AGENTS.md
   - .docpact/config.yaml

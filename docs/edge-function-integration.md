@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-08-03
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedNote: "Reviewed for Worker Issue #207: the dedicated document-validation database pool and private Database #409 routines remain internal to the solver worker; no Edge request or response DTO change is required."
+lastReviewedAt: 2026-08-04
+lastReviewedCommit: 0ccd8128b46d383425700c3c2f7b6d1edb92a90c
+lastReviewedNote: "Reviewed for Worker Issue #207: exact source-commit journal attestation remains internal to the solver worker; no Edge request or response DTO change is required."
 related:
   - AGENTS.md
   - .docpact/config.yaml
