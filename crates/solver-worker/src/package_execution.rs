@@ -29,7 +29,6 @@ use crate::{
         PackageArtifactKind, PackageExportScope, PackageRootRef, PackageRootTable,
     },
     tidas_cli,
-    worker_control_plane::worker_jobs_table,
 };
 
 const OPEN_DATA_STATE_CODE_START: i32 = 100;
@@ -701,12 +700,10 @@ async fn fetch_worker_package_job_diagnostics(
     job_id: Uuid,
 ) -> anyhow::Result<Option<Value>> {
     let job_id_text = job_id.to_string();
-    let result = sqlx::query(concat!(
+    let result = sqlx::query(
         r"
         SELECT diagnostics
-        FROM ",
-        worker_jobs_table!(),
-        r"
+        FROM public.worker_jobs
         WHERE worker_queue = $1
           AND job_kind = $2
           AND (
@@ -717,8 +714,8 @@ async fn fetch_worker_package_job_diagnostics(
           )
         ORDER BY updated_at DESC, created_at DESC
         LIMIT 1
-        "
-    ))
+        ",
+    )
     .bind(PACKAGE_WORKER_QUEUE)
     .bind(PACKAGE_EXPORT_WORKER_JOB_KIND)
     .bind(job_id)

@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
-lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed frozen-manifest transport and isolated document-validation SQL preserve bounded cleanup, artifact layout, publication, and qualification result schemas."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #193: tidas v0.1.3 evidence preserves the existing bounded memory, result, four-mode identity, and owner-evidence contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

@@ -2,7 +2,6 @@ use clap::Parser;
 use solver_worker::db_pool::{APP_RESULT_GC, WorkerDbPoolOptions};
 use solver_worker::pgbouncer_sqlx::{self as sqlx, Row};
 use solver_worker::storage::ObjectStoreClient;
-use solver_worker::worker_control_plane::RESULT_GC_CANDIDATE_QUERY;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -61,6 +60,40 @@ struct GcTotals {
     batches: i64,
 }
 
+const GC_CANDIDATE_QUERY: &str = r"
+        WITH ranked AS (
+          SELECT
+            r.id AS result_id,
+            r.artifact_url,
+            r.created_at,
+            r.expires_at,
+            r.is_pinned,
+            ROW_NUMBER() OVER (
+              PARTITION BY
+                w.requested_by,
+                r.snapshot_id,
+                COALESCE(rc.request_key, w.request_hash, r.job_id::text)
+              ORDER BY r.created_at DESC, r.id DESC
+            ) AS rn,
+            rc.result_id AS active_cache_result_id
+          FROM public.lca_results AS r
+          LEFT JOIN public.worker_jobs AS w
+            ON w.id = r.worker_job_id
+          LEFT JOIN public.lca_result_cache AS rc
+            ON rc.result_id = r.id
+           AND rc.status IN ('pending', 'running', 'ready')
+          WHERE r.worker_job_id IS NOT NULL
+        )
+        SELECT result_id, artifact_url
+        FROM ranked
+        WHERE expires_at < now()
+          AND is_pinned = false
+          AND active_cache_result_id IS NULL
+          AND rn > 1
+        ORDER BY created_at ASC
+        LIMIT $1
+        ";
+
 fn required<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
     value.ok_or_else(|| anyhow::anyhow!("missing {name}"))
 }
@@ -104,11 +137,8 @@ async fn run_gc(
 
         let mut deletable_ids = Vec::with_capacity(candidates.len());
         for c in candidates {
-            match store
-                .delete_result_object_url(c.result_id, &c.artifact_url)
-                .await
-            {
-                Ok(_) => {
+            match store.delete_object_url(&c.artifact_url).await {
+                Ok(()) => {
                     deletable_ids.push(c.result_id);
                     totals.total_s3_deleted += 1;
                 }
@@ -185,7 +215,7 @@ async fn fetch_gc_candidates(
     pool: &sqlx::PgPool,
     batch_size: i64,
 ) -> anyhow::Result<Vec<GcCandidate>> {
-    let rows = sqlx::query(RESULT_GC_CANDIDATE_QUERY)
+    let rows = sqlx::query(GC_CANDIDATE_QUERY)
         .bind(batch_size)
         .fetch_all(pool)
         .await?;
@@ -211,7 +241,7 @@ async fn delete_results_by_ids(pool: &sqlx::PgPool, ids: Vec<Uuid>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use solver_worker::worker_control_plane::RESULT_GC_CANDIDATE_QUERY as GC_CANDIDATE_QUERY;
+    use super::GC_CANDIDATE_QUERY;
 
     #[test]
     fn candidate_query_uses_db_owned_retention_contract() {
@@ -256,7 +286,7 @@ mod tests {
     #[test]
     fn candidate_query_uses_worker_jobs_not_legacy_lca_jobs() {
         assert!(
-            GC_CANDIDATE_QUERY.contains("private.worker_jobs AS w"),
+            GC_CANDIDATE_QUERY.contains("public.worker_jobs AS w"),
             "result_gc must group retained results through canonical worker_jobs"
         );
         assert!(

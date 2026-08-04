@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
-lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: the frozen release manifest uses a permission-restricted file, while document-validation lookup/record uses a dedicated restricted-login pool and exact Database #409 private routines; traversal, artifacts, certificates, reuse, and package binding are unchanged."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Updated for Worker Issue #186: git-tracked external and isolated-provider executables emit the exact root qualification child contracts and fail closed on identity, payload, target, or cleanup drift."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -70,8 +70,6 @@ The V2 data snapshot is the only certificate-grade source boundary. It contains:
 - the complete `lca_release_dataset_versions` allowlist with exact dataset identity, role, source-process provenance, version-significant hash, semantic hash, and canonical content hash.
 
 The Worker recomputes the PostgreSQL JSONB scope and snapshot hashes with the database's authoritative hash helper. A blank or inconsistent binding fails closed. Requested process roots that are present in the release must have role `unit_process`; a root absent from the release is reported as an incomplete source-boundary blocker.
-
-The complete frozen manifest is a large internal input, not a command-line payload. For discovery and build, the Worker serializes it to a permission-restricted temporary JSON file, passes only the file path through `--scope-closure-data-snapshot-file`, keeps the file alive across the complete child-process candidate sequence, and removes it automatically afterward. `snapshot_builder` retains `--scope-closure-data-snapshot-json` for explicit small/manual invocations, but JSON and file inputs are mutually exclusive and enter the same parsing and certificate-validation path. Diagnostics may record the input flag but must not record the temporary path, manifest bytes, or full argv.
 
 ## Frozen-source traversal
 
@@ -112,18 +110,6 @@ Document validation uses only the published unified Rust `tidas` CLI selected by
 7. A command timeout, unsupported version/protocol, malformed report/event, spool mismatch, or missing final event is a system failure; document issues remain domain blockers.
 
 Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
-
-The two cache operations have one runtime SQL path: the solver-worker-only,
-mandatory `DOCUMENT_VALIDATION_DATABASE_URL` pool calls
-`private.svc_lcia_document_validation_evidence_lookup(jsonb)` and
-`private.svc_lcia_document_validation_evidence_record(jsonb,uuid)` from
-Database #409. It never reuses or falls back to the main/queue pools. Startup
-requires PG17 and a no-ownership/no-DDL LOGIN with exactly one inherited,
-non-SET/non-ADMIN `lca_worker_runtime` membership, pins the private routine
-metadata and empty envelopes, and rejects public-wrapper or physical-table
-access. Package and review-submit binaries do not construct this family pool.
-No URL, database/login identity, credential, payload, or connection-string hash
-is emitted as receipt or error evidence.
 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Raw validator issue events are stream-verified into a spool capped at 2 GiB and 5,000,000 events. The exact verified NDJSON is compressed once into the final `tidas/issues.ndjson.zst` evidence member; its logical bytes, SHA-256, and event count remain authoritative. Unified issue coalescing uses bounded external-sort runs keyed by source and issue, keeps only one coalesced issue plus one source reachability state, and feeds globally issue-key-ordered final partitions. It does not create occurrence or affected-root/witness expansion runs.
 
@@ -218,7 +204,7 @@ The actor-bound download projection is `get_lcia_scope_closure_report_download(u
 
 `closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
 
-For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real `snapshot-hdf5:v1` artifact and snapshot-index sidecar through exact direct-PostgreSQL identities `private.lca_network_snapshots` and `private.lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`; its exact compiled Process axis must match the frozen discovered axis. Generic live-snapshot reuse cannot substitute an artifact that lacks this binding.
+For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real `snapshot-hdf5:v1` artifact and snapshot-index sidecar through `lca_network_snapshots` and `lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`; its exact compiled Process axis must match the frozen discovered axis. Generic live-snapshot reuse cannot substitute an artifact that lacks this binding.
 
 Administrative artifacts are uploaded before terminal projection. The report artifact manifest hash is recomputed from persisted database metadata. `evidenceHash` is `lcia.scope-closure-evidence.v2` and binds the immutable scan hashes plus the persisted numerical snapshot identity and hashes, while intentionally excluding the run-specific report artifact manifest. A certificate additionally binds the current closure check and its current report artifact manifest, so copied or stale reports cannot be substituted.
 

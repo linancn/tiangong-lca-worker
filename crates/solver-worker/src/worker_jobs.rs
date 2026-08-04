@@ -3,7 +3,6 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
-use crate::worker_control_plane::{CLAIM_JOBS_SQL, HEARTBEAT_JOB_SQL, RECORD_JOB_RESULT_SQL};
 
 pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
 pub const REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION: &str = "review_submit.gate.request.v1";
@@ -245,13 +244,21 @@ pub async fn claim_worker_jobs(
     limit: i32,
     lease_seconds: i32,
 ) -> anyhow::Result<Vec<WorkerJob>> {
-    let row = sqlx::query(CLAIM_JOBS_SQL)
-        .bind(worker_queue)
-        .bind(worker_id)
-        .bind(limit)
-        .bind(lease_seconds)
-        .fetch_one(pool)
-        .await?;
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.worker_claim_jobs($1, $2, $3, $4) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(worker_queue)
+    .bind(worker_id)
+    .bind(limit)
+    .bind(lease_seconds)
+    .fetch_one(pool)
+    .await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_claim_jobs")?;
 
@@ -270,15 +277,23 @@ pub async fn heartbeat_worker_job(
     diagnostics: Option<Value>,
     lease_seconds: i32,
 ) -> anyhow::Result<()> {
-    let row = sqlx::query(HEARTBEAT_JOB_SQL)
-        .bind(job_id)
-        .bind(lease_token)
-        .bind(phase)
-        .bind(progress)
-        .bind(diagnostics)
-        .bind(lease_seconds)
-        .fetch_one(pool)
-        .await?;
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.worker_heartbeat_job($1, $2, $3, $4::double precision::numeric, $5::jsonb, $6) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(phase)
+    .bind(progress)
+    .bind(diagnostics)
+    .bind(lease_seconds)
+    .fetch_one(pool)
+    .await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_heartbeat_job")?;
     Ok(())
@@ -290,22 +305,44 @@ pub async fn record_worker_job_result(
     lease_token: Uuid,
     result: WorkerJobResult,
 ) -> anyhow::Result<Value> {
-    let row = sqlx::query(RECORD_JOB_RESULT_SQL)
-        .bind(job_id)
-        .bind(lease_token)
-        .bind(result.status)
-        .bind(result.result_json)
-        .bind(result.result_schema_version)
-        .bind(result.result_ref)
-        .bind(result.diagnostics)
-        .bind(result.error_code)
-        .bind(result.error_message)
-        .bind(result.error_details)
-        .bind(result.blocker_codes)
-        .bind(result.resolution_scope)
-        .bind(result.retryable)
-        .fetch_one(pool)
-        .await?;
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.worker_record_job_result(
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5,
+            $6::jsonb,
+            $7::jsonb,
+            $8,
+            $9,
+            $10::jsonb,
+            $11::text[],
+            $12,
+            $13
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(result.status)
+    .bind(result.result_json)
+    .bind(result.result_schema_version)
+    .bind(result.result_ref)
+    .bind(result.diagnostics)
+    .bind(result.error_code)
+    .bind(result.error_message)
+    .bind(result.error_details)
+    .bind(result.blocker_codes)
+    .bind(result.resolution_scope)
+    .bind(result.retryable)
+    .fetch_one(pool)
+    .await?;
     let rpc_result = row.try_get::<Value, _>("result")?;
     ensure_ok(&rpc_result, "worker_record_job_result")?;
     Ok(rpc_result)

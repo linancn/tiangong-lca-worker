@@ -167,7 +167,7 @@ def fetch_snapshot_artifact_url(conn: psycopg.Connection[Any], snapshot_id: str)
     row = conn.execute(
         """
         SELECT artifact_url
-        FROM private.lca_snapshot_artifacts
+        FROM public.lca_snapshot_artifacts
         WHERE snapshot_id = %s::uuid
           AND status = 'ready'
         ORDER BY created_at DESC

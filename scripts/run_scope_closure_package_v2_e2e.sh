@@ -19,8 +19,7 @@ eval "$(cd "$database_root" && supabase status -o env)"
 export DATABASE_URL="$DB_URL"
 export S3_ENDPOINT="$STORAGE_S3_URL"
 export S3_REGION="$S3_PROTOCOL_REGION"
-export S3_BUCKET="scope-closure-e2e-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-export S3_PREFIX="scope-closure-package-v2-e2e-$$"
+export S3_BUCKET="lca-results-e2e"
 export S3_ACCESS_KEY_ID="$S3_PROTOCOL_ACCESS_KEY_ID"
 export S3_SECRET_ACCESS_KEY="$S3_PROTOCOL_ACCESS_KEY_SECRET"
 export SNAPSHOT_BUILDER_BIN="$worker_root/target/debug/snapshot_builder"
@@ -33,6 +32,4 @@ export TIDAS_EXPECTED_VERSION="${TIDAS_EXPECTED_VERSION:-0.1.3}"
 
 cd "$worker_root"
 cargo build -p solver-worker --bin snapshot_builder
-cargo test -p solver-worker --test scope_closure_package_v2_e2e \
-  certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed \
-  -- --ignored --exact --nocapture
+cargo test -p solver-worker --test scope_closure_package_v2_e2e -- --ignored --nocapture

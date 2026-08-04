@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedCommit: "23d514c88ad7c4e334e2afd0499881cff6ef72c6"
-lastReviewedAt: "2026-08-04"
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the no-fallback document-validation family preserve routing, while the solver build binds its exact source commit into the secret-free acceptance marker."
+lastReviewedAt: "2026-08-01"
+lastReviewedCommit: "e5a7f769f4716266271eea53cb5233781635174f"
+lastReviewedNote: "Reviewed for Worker Issue #193: existing routing and ownership cover the exact tidas v0.1.3 runtime-default rollout."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -173,8 +173,6 @@ routing:
         - scripts/build_snapshot_from_ilcd.sh
         - scripts/export_provider_link_diagnostics.sh
         - scripts/export_unmatched_no_provider_diagnostics.sh
-        - scripts/qualify_snapshot_private_cutover.py
-        - scripts/qualify_combined_candidate.py
         - docs/agents/repo-architecture.md
         - docs/provider-linking.md
         - docs/implicit-regional-supply-mix-modeling.md
@@ -186,10 +184,7 @@ routing:
     runtime-sql-boundary:
       paths:
         - supabase/migrations/**
-        - docs/sql/**
         - scripts/validate_additive_migration.sh
-        - scripts/qualify_snapshot_private_cutover.py
-        - scripts/qualify_combined_candidate.py
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
     debug-and-parity:
@@ -420,12 +415,6 @@ rules:
     triggers:
       - path: supabase/migrations/**
         kind: runtime-sql
-      - path: docs/sql/**
-        kind: executable-diagnostic-sql
-      - path: scripts/qualify_snapshot_private_cutover.py
-        kind: validation-test
-      - path: scripts/qualify_combined_candidate.py
-        kind: validation-test
     requiredDocs:
       - path: .docpact/config.yaml
         mode: review_or_update

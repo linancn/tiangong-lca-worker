@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
+lastReviewedCommit: 126d0be9140ea2218a0181210c55e4dead8471b5
 lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issue #212: import conflict filtering now reuses existing state-code 100-200 datasets without changing the open-data export scope or report schema."
+lastReviewedNote: "Reviewed for rollback Issue #211 after Issue #212: removing the incremental schema qualification route does not change reusable state-code 100-200 import behavior, open-data export scope, or the package report schema."
 related:
   - AGENTS.md
   - .docpact/config.yaml

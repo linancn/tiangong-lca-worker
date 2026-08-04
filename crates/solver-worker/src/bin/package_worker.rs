@@ -59,7 +59,7 @@ struct PackageWorkerCli {
 enum PackageQueueBackend {
     /// Legacy `pgmq` queue payloads.
     Pgmq,
-    /// Unified logical `worker_jobs` payloads through the private Expand contract.
+    /// Unified `public.worker_jobs` queue payloads.
     WorkerJobs,
 }
 

@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
-lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder input, temporary document-validation isolation, and exact source-commit attestation remain Worker-owned, while Database #409 remains the private routine and schema authority."
+lastReviewedAt: 2026-08-01
+lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 runtime default changes without altering Worker orchestration or provider ownership."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -170,15 +170,11 @@ Route those tasks to:
 ## Operational Invariants
 
 - solve result persistence is S3-only; `lca_results` stores artifact metadata and diagnostics, not inline payloads
-- every new `lca_results` artifact preallocates its result UUID before upload and binds that UUID into one case-sensitive `/results/<result_uuid>/` locator segment; result-aware PUT and DELETE must validate the configured S3 origin, bucket, prefix, normalized key, and frozen result identity before network I/O and must not follow redirects; generic package, snapshot, and artifact deletion retains the shared client's historical redirect behavior
-- a failed result INSERT is reconciled by exact immutable identity: an exact visible row is lost-ack success, but an absent one-time readback is still indeterminate and must preserve the object with exact `result_id`, object key, locator, and error evidence; automatic cleanup requires a future DB-side staged identity/fence and must never be authorized by that readback alone
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
-- LCA snapshot canonical persistence uses exact `private.lca_active_snapshots`, `private.lca_network_snapshots`, and `private.lca_snapshot_artifacts` identities over direct PostgreSQL. `DATABASE_URL` / `CONN` must identify a dedicated non-superuser, non-BYPASSRLS Worker login that inherits the `service_role` privileges granted by database-engine for this table family; public compatibility views and search-path fallback are not runtime paths.
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
-- combined private-control/snapshot/result qualification is bound to the exact canonical Database Engine commit and migration head by `scripts/qualify_combined_candidate.py`; it accepts only a source checkout, creates its own loopback Supabase/Storage target, keeps result-GC claims disabled, and emits a credential-free deterministic receipt after proving teardown
 - package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION` (active governed default `0.1.3`), verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 - scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, with ordinary records unchanged in NDJSON partitions and individually oversized administrative records represented by a bounded index plus fixed canonical-byte chunks whose streamed reconstruction preserves the original relation hash; this delivery directly downloads only XLSX and the manifest, and direct member retrieval remains a separately tracked cross-repository contract

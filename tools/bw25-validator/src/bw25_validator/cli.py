@@ -591,7 +591,7 @@ def load_snapshot_payload(
     row = conn.execute(
         """
         SELECT artifact_url, artifact_format
-        FROM private.lca_snapshot_artifacts
+        FROM public.lca_snapshot_artifacts
         WHERE snapshot_id = %s::uuid
           AND status = 'ready'
         ORDER BY created_at DESC

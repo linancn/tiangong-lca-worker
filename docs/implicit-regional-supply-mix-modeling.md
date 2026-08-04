@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-03
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedNote: "Reviewed for Worker Issue #205: frozen-manifest file transport does not change implicit regional supply-mix modeling or routing weights."
+lastReviewedAt: 2026-07-28
+lastReviewedCommit: 833808c
+lastReviewedNote: "Reviewed for Issue #146: LCIA-factor source support is separate from implicit signed-flow routing and provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

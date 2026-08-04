@@ -2,7 +2,7 @@
 -- Date: 2026-03-28
 --
 -- Notes:
--- - This file only reads from the existing `private.lca_snapshot_artifacts.coverage` jsonb payload.
+-- - This file only reads from the existing `lca_snapshot_artifacts.coverage` jsonb payload.
 -- - No table / column migration is required.
 -- - Newer snapshots may already persist `snapshot_coverage.v2` grouped diagnostics;
 --   older snapshots will fall back to v1-style provider decision diagnostics or derived formulas.
@@ -25,7 +25,7 @@
 -- 1) Latest active snapshot metrics
 WITH active AS (
   SELECT scope, snapshot_id, activated_at
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -140,8 +140,8 @@ SELECT a.scope AS active_scope,
            AND j.status = 'completed'
        ), 0) AS completed_solve_jobs
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-LEFT JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+LEFT JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready';
 
@@ -260,8 +260,8 @@ SELECT ls.job_type,
        (art.coverage #>> '{allocation,allocation_fraction_present_pct}')::numeric AS allocation_fraction_present_pct,
        art.coverage #>> '{singular_risk,risk_level}' AS singular_risk_level
 FROM latest_solve ls
-JOIN private.lca_network_snapshots s ON s.id = ls.snapshot_id
-LEFT JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = ls.snapshot_id
+LEFT JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready';
 
@@ -336,8 +336,8 @@ SELECT s.id::text AS snapshot_id,
        ) AS volume_weight_summary,
        (art.coverage #>> '{allocation,allocation_fraction_present_pct}')::numeric AS allocation_fraction_present_pct
 FROM latest_completed_per_snapshot l
-JOIN private.lca_network_snapshots s ON s.id = l.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = l.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 ORDER BY l.finished_at DESC
@@ -346,7 +346,7 @@ LIMIT 8;
 -- 4) Compare the latest active snapshot against the latest successful solve-backed snapshot
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 ),
@@ -414,8 +414,8 @@ SELECT t.target_kind,
          '{}'::jsonb
        ) AS unresolved_reason_counts
 FROM targets t
-JOIN private.lca_network_snapshots s ON s.id = t.snapshot_id
-LEFT JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = t.snapshot_id
+LEFT JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 ORDER BY t.target_kind;
@@ -423,7 +423,7 @@ ORDER BY t.target_kind;
 -- 5) Latest active snapshot unresolved reason breakdown
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -431,8 +431,8 @@ SELECT s.id::text AS snapshot_id,
        reason.key AS unresolved_reason,
        reason.value::numeric AS unresolved_count
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 LEFT JOIN LATERAL jsonb_each_text(
@@ -447,7 +447,7 @@ ORDER BY unresolved_count DESC NULLS LAST, unresolved_reason;
 -- 6) Latest active snapshot resolved strategy breakdown
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -455,8 +455,8 @@ SELECT s.id::text AS snapshot_id,
        strategy.key AS resolved_strategy,
        strategy.value::numeric AS resolved_count
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 LEFT JOIN LATERAL jsonb_each_text(
@@ -471,7 +471,7 @@ ORDER BY resolved_count DESC NULLS LAST, resolved_strategy;
 -- 7) Latest active snapshot geography tier breakdown by resolution strategy
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -480,8 +480,8 @@ SELECT s.id::text AS snapshot_id,
        tier.key AS geography_tier,
        tier.value::numeric AS edge_count
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 LEFT JOIN LATERAL jsonb_each(
@@ -496,7 +496,7 @@ ORDER BY edge_count DESC NULLS LAST, resolved_strategy, geography_tier;
 -- 8) Latest active snapshot volume-weight data quality summary
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -513,15 +513,15 @@ SELECT s.id::text AS snapshot_id,
        coalesce((art.coverage #>> '{matching,volume_weight_summary,decisions_partial_missing_count}')::numeric, 0) AS decisions_partial_missing_count,
        coalesce((art.coverage #>> '{matching,volume_weight_summary,decisions_all_missing_count}')::numeric, 0) AS decisions_all_missing_count
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready';
 
 -- 9) Latest active snapshot top no-provider flow gaps
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -530,8 +530,8 @@ SELECT s.id::text AS snapshot_id,
        gap.value->>'flow_name' AS flow_name,
        (gap.value->>'count')::numeric AS unmatched_count
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 LEFT JOIN LATERAL jsonb_array_elements(
@@ -545,7 +545,7 @@ ORDER BY unmatched_count DESC NULLS LAST, flow_id;
 -- 10) Latest active snapshot top no-provider process gaps
 WITH active AS (
   SELECT snapshot_id
-  FROM private.lca_active_snapshots
+  FROM public.lca_active_snapshots
   ORDER BY activated_at DESC
   LIMIT 1
 )
@@ -556,8 +556,8 @@ SELECT s.id::text AS snapshot_id,
        (gap.value->>'unmatched_no_provider')::numeric AS unmatched_no_provider,
        (gap.value->>'a_write_pct')::numeric AS a_write_pct
 FROM active a
-JOIN private.lca_network_snapshots s ON s.id = a.snapshot_id
-JOIN private.lca_snapshot_artifacts art
+JOIN public.lca_network_snapshots s ON s.id = a.snapshot_id
+JOIN public.lca_snapshot_artifacts art
   ON art.snapshot_id = s.id
  AND art.status = 'ready'
 LEFT JOIN LATERAL jsonb_array_elements(

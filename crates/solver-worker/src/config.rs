@@ -18,7 +18,7 @@ pub enum RunMode {
 pub enum QueueBackend {
     /// Legacy pgmq queue payloads.
     Pgmq,
-    /// Unified logical `worker_jobs` payloads through the private Expand contract.
+    /// Unified `public.worker_jobs` queue payloads.
     WorkerJobs,
 }
 
@@ -42,11 +42,6 @@ pub struct AppConfig {
     /// Queue-only `PostgreSQL` URL fallback used by this project in local `.env`.
     #[arg(long, env = "QUEUE_CONN")]
     pub queue_conn: Option<String>,
-    /// Mandatory, temporary database URL dedicated to document-validation
-    /// evidence lookup and record calls. This family never falls back to the
-    /// main or queue database URL.
-    #[arg(long, env = "DOCUMENT_VALIDATION_DATABASE_URL")]
-    pub document_validation_database_url: Option<String>,
     /// Worker queue backend.
     #[arg(long, env = "SOLVER_QUEUE_BACKEND", default_value = "worker-jobs")]
     pub queue_backend: QueueBackend,
@@ -98,27 +93,6 @@ pub struct AppConfig {
         default_value_t = 30_u64
     )]
     pub queue_db_acquire_timeout_seconds: u64,
-    /// Maximum number of connections in the document-validation evidence pool.
-    #[arg(
-        long,
-        env = "DOCUMENT_VALIDATION_DB_MAX_CONNECTIONS",
-        default_value_t = 2_u32
-    )]
-    pub document_validation_db_max_connections: u32,
-    /// Minimum number of connections retained by the evidence pool.
-    #[arg(
-        long,
-        env = "DOCUMENT_VALIDATION_DB_MIN_CONNECTIONS",
-        default_value_t = 0_u32
-    )]
-    pub document_validation_db_min_connections: u32,
-    /// Acquire timeout for the evidence pool.
-    #[arg(
-        long,
-        env = "DOCUMENT_VALIDATION_DB_ACQUIRE_TIMEOUT_SECONDS",
-        default_value_t = 30_u64
-    )]
-    pub document_validation_db_acquire_timeout_seconds: u64,
     /// Maximum number of concurrent `build_snapshot` jobs across worker instances.
     #[arg(long, env = "BUILD_SNAPSHOT_MAX_CONCURRENCY", default_value_t = 1_u32)]
     pub build_snapshot_max_concurrency: u32,
@@ -197,21 +171,6 @@ impl AppConfig {
     #[must_use]
     pub fn has_explicit_queue_database_url(&self) -> bool {
         self.queue_database_url.is_some() || self.queue_conn.is_some()
-    }
-
-    /// Returns the mandatory document-validation evidence database URL.
-    ///
-    /// Deliberately do not consult `DATABASE_URL`, `CONN`, or either queue URL.
-    pub fn resolved_document_validation_database_url(&self) -> anyhow::Result<&str> {
-        self.document_validation_database_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing document-validation database URL: set DOCUMENT_VALIDATION_DATABASE_URL; fallback is forbidden"
-                )
-            })
     }
 
     /// Poll interval as Duration.
@@ -296,25 +255,6 @@ impl AppConfig {
         Duration::from_secs(self.queue_db_acquire_timeout_seconds.max(1))
     }
 
-    /// Sanitized maximum document-validation evidence DB connections.
-    #[must_use]
-    pub fn document_validation_db_max_connections(&self) -> u32 {
-        self.document_validation_db_max_connections.max(1)
-    }
-
-    /// Sanitized minimum document-validation evidence DB connections.
-    #[must_use]
-    pub fn document_validation_db_min_connections(&self) -> u32 {
-        self.document_validation_db_min_connections
-            .min(self.document_validation_db_max_connections())
-    }
-
-    /// Document-validation evidence DB acquire timeout.
-    #[must_use]
-    pub fn document_validation_db_acquire_timeout(&self) -> Duration {
-        Duration::from_secs(self.document_validation_db_acquire_timeout_seconds.max(1))
-    }
-
     /// Sanitized maximum `build_snapshot` concurrency.
     #[must_use]
     pub fn build_snapshot_max_concurrency(&self) -> u32 {
@@ -381,13 +321,6 @@ mod tests {
         assert_eq!(config.queue_db_max_connections(), 2);
         assert_eq!(config.queue_db_min_connections(), 0);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(30));
-        assert!(config.resolved_document_validation_database_url().is_err());
-        assert_eq!(config.document_validation_db_max_connections(), 2);
-        assert_eq!(config.document_validation_db_min_connections(), 0);
-        assert_eq!(
-            config.document_validation_db_acquire_timeout(),
-            Duration::from_secs(30)
-        );
         assert_eq!(config.queue_backend, QueueBackend::WorkerJobs);
         assert!(!config.allow_legacy_job_table_backend);
         assert!(config.worker_id().starts_with("solver-worker-"));
@@ -420,12 +353,6 @@ mod tests {
             "4",
             "--queue-db-acquire-timeout-seconds",
             "0",
-            "--document-validation-db-max-connections",
-            "0",
-            "--document-validation-db-min-connections",
-            "4",
-            "--document-validation-db-acquire-timeout-seconds",
-            "0",
             "--worker-jobs-claim-limit",
             "0",
             "--worker-jobs-lease-seconds",
@@ -442,12 +369,6 @@ mod tests {
         assert_eq!(config.queue_db_max_connections(), 1);
         assert_eq!(config.queue_db_min_connections(), 1);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(1));
-        assert_eq!(config.document_validation_db_max_connections(), 1);
-        assert_eq!(config.document_validation_db_min_connections(), 1);
-        assert_eq!(
-            config.document_validation_db_acquire_timeout(),
-            Duration::from_secs(1)
-        );
         assert_eq!(config.worker_jobs_claim_limit(), 1);
         assert_eq!(config.worker_jobs_lease_seconds(), 1);
         assert_eq!(config.build_snapshot_max_concurrency(), 1);
@@ -472,37 +393,6 @@ mod tests {
             "postgres://pooler.example.local/app"
         );
         assert!(config.has_explicit_queue_database_url());
-    }
-
-    #[test]
-    fn document_validation_database_url_is_mandatory_and_never_falls_back() {
-        let missing = AppConfig::parse_from([
-            "solver-worker",
-            "--database-url",
-            "postgres://main.example.local/app",
-            "--queue-database-url",
-            "postgres://queue.example.local/app",
-        ]);
-        let error = missing
-            .resolved_document_validation_database_url()
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("fallback is forbidden"));
-        assert!(!error.contains("main.example.local"));
-
-        let configured = AppConfig::parse_from([
-            "solver-worker",
-            "--database-url",
-            "postgres://main.example.local/app",
-            "--document-validation-database-url",
-            "postgres://family.example.local/app",
-        ]);
-        assert_eq!(
-            configured
-                .resolved_document_validation_database_url()
-                .unwrap(),
-            "postgres://family.example.local/app"
-        );
     }
 
     #[test]

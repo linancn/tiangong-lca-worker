@@ -8,7 +8,6 @@ fmt-check:
 
 qualification-test:
 	PYTHONPATH=scripts python3 -m unittest scripts/test_scope_closure_qualification.py
-	python3 scripts/qualify_snapshot_private_cutover.py --static-only
 
 clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
