@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #192, #198, #199, and #202: private hashes, exact TIDAS fixtures, private snapshot persistence, result UUID preallocation, and fail-closed object-target validation remain Worker runtime behavior while database-engine remains schema owner."
+lastReviewedNote: "Reviewed for Worker Issue #205: the file-backed frozen-manifest handoff stays inside the existing Worker/snapshot_builder runtime boundary; crate topology and database ownership are unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

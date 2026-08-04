@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #186, #190, #192, and #202: schema-qualified worker access, private hashes, exact-TIDAS qualification, and solve-result UUID locators preserve package import/export artifacts, retention, semantics, and package-worker state."
+lastReviewedNote: "Reviewed for Worker Issue #205: scope-closure snapshot_builder input transport does not change TIDAS package import/export artifacts, retention, semantics, or package-worker state."
 related:
   - AGENTS.md
   - .docpact/config.yaml

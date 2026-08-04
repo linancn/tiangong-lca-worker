@@ -194,6 +194,8 @@ struct Cli {
     #[arg(long)]
     scope_closure_data_snapshot_json: Option<String>,
     #[arg(long)]
+    scope_closure_data_snapshot_file: Option<PathBuf>,
+    #[arg(long)]
     scope_closure_mode: Option<String>,
     #[arg(long, env = "LCIA_STATIC_CACHE_DIR")]
     lcia_static_cache_dir: Option<PathBuf>,
@@ -749,10 +751,34 @@ fn parse_required_json_arg(value: Option<&str>, name: &str) -> anyhow::Result<Va
 fn parse_scope_closure_snapshot_args(
     cli: &Cli,
 ) -> anyhow::Result<Option<(ScopeClosureSnapshotBinding, DataSnapshotManifest, &str)>> {
-    match (
-        cli.scope_closure_binding_json.as_deref(),
+    let snapshot = match (
         cli.scope_closure_data_snapshot_json.as_deref(),
+        cli.scope_closure_data_snapshot_file.as_deref(),
     ) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "--scope-closure-data-snapshot-json and --scope-closure-data-snapshot-file are mutually exclusive"
+            ));
+        }
+        (Some(snapshot), None) => Some(
+            serde_json::from_str::<DataSnapshotManifest>(snapshot).map_err(|error| {
+                anyhow::anyhow!("invalid --scope-closure-data-snapshot-json: {error}")
+            })?,
+        ),
+        (None, Some(path)) => {
+            let file = fs::File::open(path).map_err(|error| {
+                anyhow::anyhow!("open --scope-closure-data-snapshot-file: {error}")
+            })?;
+            Some(
+                serde_json::from_reader::<_, DataSnapshotManifest>(std::io::BufReader::new(file))
+                    .map_err(|error| {
+                    anyhow::anyhow!("invalid --scope-closure-data-snapshot-file: {error}")
+                })?,
+            )
+        }
+        (None, None) => None,
+    };
+    match (cli.scope_closure_binding_json.as_deref(), snapshot) {
         (None, None) if cli.scope_closure_mode.is_none() => Ok(None),
         (Some(binding), Some(snapshot)) => {
             let mode = cli.scope_closure_mode.as_deref().ok_or_else(|| {
@@ -766,10 +792,6 @@ fn parse_scope_closure_snapshot_args(
             let binding: ScopeClosureSnapshotBinding =
                 serde_json::from_str(binding).map_err(|error| {
                     anyhow::anyhow!("invalid --scope-closure-binding-json: {error}")
-                })?;
-            let snapshot: DataSnapshotManifest =
-                serde_json::from_str(snapshot).map_err(|error| {
-                    anyhow::anyhow!("invalid --scope-closure-data-snapshot-json: {error}")
                 })?;
             if binding.schema_version != "lcia.scope-closure-snapshot-binding.v1"
                 || binding.effective_scope_hash.trim().is_empty()
@@ -806,7 +828,7 @@ fn parse_scope_closure_snapshot_args(
             Ok(Some((binding, snapshot, mode)))
         }
         _ => Err(anyhow::anyhow!(
-            "--scope-closure-binding-json and --scope-closure-data-snapshot-json must be supplied together"
+            "--scope-closure-binding-json and exactly one scope-closure data snapshot input must be supplied together"
         )),
     }
 }
@@ -9351,22 +9373,24 @@ mod tests {
         flow_reference_requests_from_source_references, geo_score, insert_compiled_source_dataset,
         load_impact_factor_sets, location_granularity_label, no_balancing_reference_failure_reason,
         normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
-        parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
-        resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
-        resolve_lcia_method_source_row, resolve_lcia_support_flows, resolve_multi_provider,
-        resolve_process_selection, resolve_reference_normalization,
-        review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
-        scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        snapshot_db_statement_timeout, source_dataset_document_id,
-        source_reference_is_satisfied_index, summarize_matching_diagnostics, time_score,
-        unique_supported_direction_by_flow, validate_compiled_sources_against_frozen_manifest,
-        validate_flow_row_visibility, validate_process_row_visibility,
-        validate_quantitative_references, validate_unique_database_lcia_method_identities,
+        parse_process_states, parse_provider_rule_list, parse_scope_closure_snapshot_args,
+        resolve_allocation_fraction, resolve_database_lcia_method_row,
+        resolve_database_lcia_method_rows, resolve_lcia_method_source_row,
+        resolve_lcia_support_flows, resolve_multi_provider, resolve_process_selection,
+        resolve_reference_normalization, review_submit_root_dependency_fingerprint,
+        reviewed_lcia_artifact_locator, scope_closure_boundary_policy,
+        scope_closure_candidate_process_axis, snapshot_db_statement_timeout,
+        source_dataset_document_id, source_reference_is_satisfied_index,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
+        validate_process_row_visibility, validate_quantitative_references,
+        validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::io::Write;
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
@@ -9941,6 +9965,61 @@ mod tests {
         );
         assert_eq!(cli.artifact_expires_in_seconds, Some(1_209_600));
         assert_eq!(cli.reuse_max_age_seconds, Some(1_209_600));
+    }
+
+    #[test]
+    fn snapshot_builder_reads_scope_closure_snapshot_from_file() {
+        let (binding, snapshot, _) =
+            frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let mut input = tempfile::NamedTempFile::new().expect("snapshot input file");
+        serde_json::to_writer(&mut input, &snapshot).expect("write snapshot input");
+        input.flush().expect("flush snapshot input");
+        let binding_json = serde_json::to_string(&binding).expect("binding JSON");
+        let input_path = input.path().to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "snapshot_builder",
+            "--scope-closure-mode",
+            "discovery",
+            "--scope-closure-binding-json",
+            binding_json.as_str(),
+            "--scope-closure-data-snapshot-file",
+            input_path.as_str(),
+        ])
+        .expect("parse file input CLI");
+
+        let (parsed_binding, parsed_snapshot, parsed_mode) =
+            parse_scope_closure_snapshot_args(&cli)
+                .expect("parse scope closure input")
+                .expect("scope closure input");
+        assert_eq!(parsed_binding, binding);
+        assert_eq!(parsed_snapshot, snapshot);
+        assert_eq!(parsed_mode, "discovery");
+    }
+
+    #[test]
+    fn snapshot_builder_rejects_conflicting_scope_closure_snapshot_inputs() {
+        let (binding, snapshot, _) =
+            frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let input = tempfile::NamedTempFile::new().expect("snapshot input file");
+        let binding_json = serde_json::to_string(&binding).expect("binding JSON");
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot JSON");
+        let input_path = input.path().to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "snapshot_builder",
+            "--scope-closure-mode",
+            "discovery",
+            "--scope-closure-binding-json",
+            binding_json.as_str(),
+            "--scope-closure-data-snapshot-json",
+            snapshot_json.as_str(),
+            "--scope-closure-data-snapshot-file",
+            input_path.as_str(),
+        ])
+        .expect("parse conflicting CLI");
+
+        let error = parse_scope_closure_snapshot_args(&cli)
+            .expect_err("conflicting snapshot inputs must fail");
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]

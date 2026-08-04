@@ -16,7 +16,7 @@ use crate::{
         AppState, archive_queue_message, fetch_snapshot_index_document, handle_job_payload,
         handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
         latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
-        update_legacy_lca_job_status,
+        snapshot_builder_process_failure_code, update_legacy_lca_job_status,
     },
     scope_closure::{
         SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION, execute_scope_closure_job,
@@ -423,6 +423,8 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 );
             }
             Err(err) => {
+                let error_code = snapshot_builder_process_failure_code(&err)
+                    .unwrap_or("scope_closure_execution_failed");
                 let message = err.to_string();
                 error!(
                     error = %message,
@@ -435,7 +437,7 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                     *closure_check_id,
                     job.id,
                     job.lease_token,
-                    message.as_str(),
+                    error_code,
                 )
                 .await
                 {

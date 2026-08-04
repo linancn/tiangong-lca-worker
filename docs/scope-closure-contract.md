@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedCommit: 10183162a1944252fd01eeb5ffc1548cbe8c4ec1
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
 lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issues #186, #190, #192, and #202: private control-plane access, hashes, and solve-result UUID locators preserve closure traversal, service-role behavior, artifacts, certificate evidence, staged publication, reuse, and package binding; qualification fails closed on identity, payload, target, or cleanup drift."
+lastReviewedNote: "Reviewed for Worker Issue #205: the complete frozen release manifest is handed to snapshot_builder through a permission-restricted temporary file without changing closure traversal, certificate evidence, or package binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -70,6 +70,8 @@ The V2 data snapshot is the only certificate-grade source boundary. It contains:
 - the complete `lca_release_dataset_versions` allowlist with exact dataset identity, role, source-process provenance, version-significant hash, semantic hash, and canonical content hash.
 
 The Worker recomputes the PostgreSQL JSONB scope and snapshot hashes with the database's authoritative hash helper. A blank or inconsistent binding fails closed. Requested process roots that are present in the release must have role `unit_process`; a root absent from the release is reported as an incomplete source-boundary blocker.
+
+The complete frozen manifest is a large internal input, not a command-line payload. For discovery and build, the Worker serializes it to a permission-restricted temporary JSON file, passes only the file path through `--scope-closure-data-snapshot-file`, keeps the file alive across the complete child-process candidate sequence, and removes it automatically afterward. `snapshot_builder` retains `--scope-closure-data-snapshot-json` for explicit small/manual invocations, but JSON and file inputs are mutually exclusive and enter the same parsing and certificate-validation path. Diagnostics may record the input flag but must not record the temporary path, manifest bytes, or full argv.
 
 ## Frozen-source traversal
 
