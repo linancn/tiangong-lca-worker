@@ -35,7 +35,7 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
 lastReviewedAt: 2026-08-04
 lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed frozen-manifest handoff stays inside the Worker/snapshot_builder boundary, while the fail-closed document-validation pool uses exact Database #409 routines and exposes the exact Worker build commit in its acceptance marker."
 related:
