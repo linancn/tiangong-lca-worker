@@ -13,6 +13,7 @@ pub fn default_snapshot_process_states_arg() -> String {
 
 pub mod artifact_gc;
 pub mod artifacts;
+pub mod build_metadata;
 pub mod calculation_bundle;
 pub mod calculation_evidence;
 pub mod compiled_graph;
@@ -20,6 +21,7 @@ pub mod config;
 pub mod contribution_path;
 pub mod db;
 pub mod db_pool;
+pub mod document_validation_db;
 pub mod file_cache;
 pub mod graph_types;
 pub mod http;

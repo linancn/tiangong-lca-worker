@@ -39,6 +39,7 @@ use crate::{
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
+    document_validation_db::DocumentValidationDb,
     graph_types::RequestRootProcess,
     snapshot_artifacts::{
         DecodedSnapshotArtifact, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
@@ -68,6 +69,10 @@ pub struct AppState {
     pub pool: PgPool,
     /// Queue-only DB pool for pgmq read/archive operations.
     pub queue_pool: PgPool,
+    /// Optional only because package/review binaries cannot consume this family.
+    /// Solver construction always initializes it and scope closure uses the
+    /// fail-closed accessor below.
+    document_validation_db: Option<DocumentValidationDb>,
     /// Core solver service.
     pub solver: SolverService,
     /// Object storage for result/snapshot artifacts.
@@ -243,7 +248,7 @@ fn acquire_build_snapshot_worker_jobs_slot_sql() -> &'static str {
 impl AppState {
     /// Creates app state with DB pool and required object storage.
     pub async fn new(config: &AppConfig) -> anyhow::Result<Self> {
-        Self::new_with_application_names(config, APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE).await
+        Self::new_with_pool_policy(config, APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, true).await
     }
 
     /// Creates app state with explicit DB application names for the main and queue pools.
@@ -251,6 +256,15 @@ impl AppState {
         config: &AppConfig,
         application_name: &str,
         queue_application_name: &str,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_policy(config, application_name, queue_application_name, false).await
+    }
+
+    async fn new_with_pool_policy(
+        config: &AppConfig,
+        application_name: &str,
+        queue_application_name: &str,
+        require_document_validation_db: bool,
     ) -> anyhow::Result<Self> {
         let pool = connect_pool(
             application_name,
@@ -272,6 +286,12 @@ impl AppState {
             .await?
         } else {
             pool.clone()
+        };
+
+        let document_validation_db = if require_document_validation_db {
+            Some(DocumentValidationDb::connect(config).await?)
+        } else {
+            None
         };
 
         let endpoint = config
@@ -306,6 +326,7 @@ impl AppState {
         Ok(Self {
             pool,
             queue_pool,
+            document_validation_db,
             solver: SolverService::with_cache_policy(
                 config.factorization_cache_max_bytes(),
                 config.factorization_admission_fill_in_multiplier(),
@@ -313,6 +334,16 @@ impl AppState {
             object_store,
             build_snapshot_max_concurrency: config.build_snapshot_max_concurrency(),
             build_snapshot_lock_poll_interval: config.build_snapshot_lock_poll_interval(),
+        })
+    }
+
+    /// Returns the dedicated evidence connection or fails without consulting
+    /// either main or queue pool.
+    pub fn document_validation_db(&self) -> anyhow::Result<&DocumentValidationDb> {
+        self.document_validation_db.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "document-validation database pool is unavailable; fallback to main or queue pool is forbidden"
+            )
         })
     }
 }

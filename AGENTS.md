@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issue #205: file-backed snapshot_builder input remains Worker-owned runtime behavior; repository ownership, branch policy, and database-engine schema boundaries are unchanged."
+lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedAt: 2026-08-04
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder input, temporary document-validation isolation, and exact source-commit attestation remain Worker-owned, while Database #409 remains the private routine and schema authority."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

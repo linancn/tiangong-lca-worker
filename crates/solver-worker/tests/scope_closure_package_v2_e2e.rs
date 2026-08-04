@@ -115,10 +115,15 @@ fn ensure_one_time_bucket_name(bucket: &str) -> anyhow::Result<()> {
 
 fn validate_isolated_targets(
     database_url: &str,
+    document_validation_database_url: &str,
     s3_endpoint: &str,
     bucket: &str,
 ) -> anyhow::Result<()> {
     ensure_loopback_url("DATABASE_URL", database_url)?;
+    ensure_loopback_url(
+        "DOCUMENT_VALIDATION_DATABASE_URL",
+        document_validation_database_url,
+    )?;
     ensure_loopback_url("S3_ENDPOINT", s3_endpoint)?;
     ensure_one_time_bucket_name(bucket)
 }
@@ -136,6 +141,8 @@ fn test_config() -> AppConfig {
         "solver-worker-e2e",
         "--database-url",
         required_env("DATABASE_URL").as_str(),
+        "--document-validation-database-url",
+        required_env("DOCUMENT_VALIDATION_DATABASE_URL").as_str(),
         "--s3-endpoint",
         required_env("S3_ENDPOINT").as_str(),
         "--s3-region",
@@ -887,9 +894,15 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     let release_run = Uuid::new_v4();
     let approval = Uuid::new_v4();
     let database_url = required_env("DATABASE_URL");
+    let document_validation_database_url = required_env("DOCUMENT_VALIDATION_DATABASE_URL");
     let s3_endpoint = required_env("S3_ENDPOINT");
     let bucket = required_env("S3_BUCKET");
-    validate_isolated_targets(&database_url, &s3_endpoint, &bucket)?;
+    validate_isolated_targets(
+        &database_url,
+        &document_validation_database_url,
+        &s3_endpoint,
+        &bucket,
+    )?;
 
     let bucket_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM storage.buckets WHERE id=$1 OR name=$1)",
@@ -1929,6 +1942,7 @@ fn isolated_target_validation_accepts_loopback_and_one_time_bucket() {
     assert!(
         validate_isolated_targets(
             "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+            "postgresql://lca_worker_runtime:secret@localhost:54322/postgres",
             "http://[::1]:54321/storage/v1/s3",
             "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
         )
@@ -1941,6 +1955,7 @@ fn isolated_target_validation_rejects_hosted_endpoints() {
     assert!(
         validate_isolated_targets(
             "postgresql://postgres:secret@db.example.supabase.co:5432/postgres",
+            "postgresql://lca_worker_runtime:secret@localhost:54322/postgres",
             "https://example.supabase.co/storage/v1/s3",
             "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
         )
@@ -1949,7 +1964,17 @@ fn isolated_target_validation_rejects_hosted_endpoints() {
     assert!(
         validate_isolated_targets(
             "postgresql://postgres:postgres@localhost:54322/postgres",
+            "postgresql://lca_worker_runtime:secret@localhost:54322/postgres",
             "https://example.supabase.co/storage/v1/s3",
+            "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
+        )
+        .is_err()
+    );
+    assert!(
+        validate_isolated_targets(
+            "postgresql://postgres:postgres@localhost:54322/postgres",
+            "postgresql://lca_worker_runtime:secret@db.example.supabase.co:5432/postgres",
+            "http://127.0.0.1:54321/storage/v1/s3",
             "scope-closure-e2e-550e8400-e29b-41d4-a716-446655440000",
         )
         .is_err()
@@ -1967,6 +1992,7 @@ fn isolated_target_validation_rejects_bad_bucket_names() {
         assert!(
             validate_isolated_targets(
                 "postgresql://postgres:postgres@localhost:54322/postgres",
+                "postgresql://lca_worker_runtime:secret@localhost:54322/postgres",
                 "http://127.0.0.1:54321/storage/v1/s3",
                 bucket,
             )

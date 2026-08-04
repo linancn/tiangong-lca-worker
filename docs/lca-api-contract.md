@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-03
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedNote: "Reviewed for Worker Issue #205: the internal Worker-to-snapshot_builder file handoff changes no public Worker, Edge, Next, job payload, or result DTO labels."
+lastReviewedAt: 2026-08-04
+lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder handoff, document-validation SQL isolation, and exact source-commit attestation are internal and change no Worker, Edge, Next, job-payload, or result DTO labels."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -50,6 +50,7 @@ related:
 - `snapshot_builder` 对 elementary flow 的 `B` 采用 `gross` 口径（`Input/Output` 均按原始 `amount` 入模，不做方向符号翻转）。
 - 计算入口是异步任务；默认统一队列路径使用 `worker_jobs(worker_queue=solver)`，legacy `lca_jobs` + `pgmq` 仅保留为显式兼容/debug 路径。前端不直连队列。
 - worker 连接池可通过 `DB_MAX_CONNECTIONS`、`DB_MIN_CONNECTIONS` 和 `DB_ACQUIRE_TIMEOUT_SECONDS` 调整；默认采用 `max_connections = 8`、`min_connections = 1`、`acquire_timeout = 30s`、`idle_timeout = 5min` 与 `max_lifetime = 30min`，以保证长时求解与 artifact 落盘阶段有稳定连接窗口。
+- scope-closure 的 document-validation evidence lookup/record 是 Worker 内部例外：仅 solver-worker 使用 mandatory、无 fallback 的 `DOCUMENT_VALIDATION_DATABASE_URL` dedicated pool 调用 Database #409 private routines；该过渡连接不改变 job payload、result、Edge 或 Next contract。
 - 主路径读取 `lca_snapshot_artifacts`（artifact-first），旧 `lca_*_entries` 仅兼容回退。
 - 所有写操作由服务端（Edge Function / worker，`service_role`）执行。
 

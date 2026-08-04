@@ -22,9 +22,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: cabb2518a69272c20abe61692eadb292b95596f2
-lastReviewedNote: "Reviewed for Worker Issues #190 and #193: private control-plane access leaves operator entry points unchanged; the governed Rust tidas baseline is v0.1.3 and scope-closure v3 retains the 2048 MiB Linux RSS guard."
+lastReviewedAt: 2026-08-03
+lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
+lastReviewedNote: "Reviewed for Worker Issue #207: solver scope closure uses one temporary fail-closed document-validation evidence pool pinned to Database #409; package and review runners do not create it."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -296,6 +296,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 最小必需：
 
 - `DATABASE_URL` 或 `CONN`（主业务连接必须使用专用的非 superuser、非 BYPASSRLS Worker login；该 login 继承 snapshot family 所需的最小 `service_role` grants）
+- `DOCUMENT_VALIDATION_DATABASE_URL`（仅 solver-worker 启动及其 scope-closure 必需；临时 dedicated PG17 restricted LOGIN，只直接继承 `lca_worker_runtime`，且绝不回退到主/队列连接；package worker 与 review-submit runner 不消费此变量）
 - `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅 legacy pgmq read/archive 需要，未设置时复用 `DATABASE_URL` / `CONN`）
 - `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
 - `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
@@ -321,6 +322,9 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 - `QUEUE_DB_MAX_CONNECTIONS`（队列轮询连接池上限，默认 `2`）
 - `QUEUE_DB_MIN_CONNECTIONS`（队列轮询连接池保留连接数，默认 `0`）
 - `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`（队列轮询获取连接超时，默认 `30`）
+- `DOCUMENT_VALIDATION_DB_MAX_CONNECTIONS`（document-validation evidence dedicated pool 上限，默认 `2`）
+- `DOCUMENT_VALIDATION_DB_MIN_CONNECTIONS`（该 pool 常驻连接数，默认 `0`）
+- `DOCUMENT_VALIDATION_DB_ACQUIRE_TIMEOUT_SECONDS`（该 pool 获取连接超时，默认 `30`）
 - `BUILD_SNAPSHOT_MAX_CONCURRENCY`（跨 worker 实例的 `build_snapshot` 并发上限，默认 `1`）
 - `BUILD_SNAPSHOT_LOCK_POLL_MS`（等待 `build_snapshot` 并发槽位时的轮询间隔，默认 `5000`）
 - `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
@@ -337,7 +341,8 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 
 Supabase 连接说明：
 
-- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询，其中 snapshot canonical persistence 只访问 `private.lca_active_snapshots`、`private.lca_network_snapshots` 与 `private.lca_snapshot_artifacts`，不使用 Expand 期 `public` compatibility views 或 search-path fallback；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
+- worker / package worker 支持主连接与可选 queue 连接：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询，其中 snapshot canonical persistence 只访问 `private.lca_active_snapshots`、`private.lca_network_snapshots` 与 `private.lca_snapshot_artifacts`，不使用 Expand 期 `public` compatibility views 或 search-path fallback；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
+- solver-worker 另为 scope-closure document-validation evidence 临时建立 `DOCUMENT_VALIDATION_DATABASE_URL` dedicated pool；lookup/record 唯一调用 Database #409 的两个 `private.svc_lcia_document_validation_evidence_*` routines。缺失、错误、非 PG17、高权限/有对象 ownership、membership/ACL/routine fingerprint 不符均拒绝 solver-worker 启动，不回退主或 queue pool。启动 receipt 不记录 URL、数据库名、用户名、密码或连接串 hash。package worker 与 review-submit runner 不创建此 pool。
 - 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。

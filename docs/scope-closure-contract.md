@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedCommit: 2ee74ffaf431c0d43b9613bcb6bfed76fa447b66
-lastReviewedAt: 2026-08-03
-lastReviewedNote: "Reviewed for Worker Issue #205: the complete frozen release manifest is handed to snapshot_builder through a permission-restricted temporary file without changing closure traversal, certificate evidence, or package binding."
+lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedAt: 2026-08-04
+lastReviewedNote: "Reviewed for Worker Issues #205 and #207: the frozen release manifest uses a permission-restricted file, while document-validation lookup/record uses a dedicated restricted-login pool and exact Database #409 private routines; traversal, artifacts, certificates, reuse, and package binding are unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -112,6 +112,18 @@ Document validation uses only the published unified Rust `tidas` CLI selected by
 7. A command timeout, unsupported version/protocol, malformed report/event, spool mismatch, or missing final event is a system failure; document issues remain domain blockers.
 
 Document-validation evidence is cached only under the full immutable key: exact dataset identity, canonical content hash, validator package version, validation profile, report schema, engine/ruleset fingerprint, and full published asset fingerprint. Cached issue events are replayed into the current scan; cache identity never depends on a mutable row alone.
+
+The two cache operations have one runtime SQL path: the solver-worker-only,
+mandatory `DOCUMENT_VALIDATION_DATABASE_URL` pool calls
+`private.svc_lcia_document_validation_evidence_lookup(jsonb)` and
+`private.svc_lcia_document_validation_evidence_record(jsonb,uuid)` from
+Database #409. It never reuses or falls back to the main/queue pools. Startup
+requires PG17 and a no-ownership/no-DDL LOGIN with exactly one inherited,
+non-SET/non-ADMIN `lca_worker_runtime` membership, pins the private routine
+metadata and empty envelopes, and rejects public-wrapper or physical-table
+access. Package and review-submit binaries do not construct this family pool.
+No URL, database/login identity, credential, payload, or connection-string hash
+is emitted as receipt or error evidence.
 
 The Worker consumes validation evidence under fixed resource windows: at most 256 cache keys per lookup, 64 uncached documents per `tidas` execution, and 8 MiB of encoded evidence per cache-record RPC. Raw validator issue events are stream-verified into a spool capped at 2 GiB and 5,000,000 events. The exact verified NDJSON is compressed once into the final `tidas/issues.ndjson.zst` evidence member; its logical bytes, SHA-256, and event count remain authoritative. Unified issue coalescing uses bounded external-sort runs keyed by source and issue, keeps only one coalesced issue plus one source reachability state, and feeds globally issue-key-ordered final partitions. It does not create occurrence or affected-root/witness expansion runs.
 
