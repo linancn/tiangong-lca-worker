@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Reviewed for Worker Issue #186: the external qualification harness streams a local ZIP and exact TIDAS validation without changing asynchronous package import/export semantics."
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
+lastReviewedAt: 2026-08-04
+lastReviewedNote: "Reviewed for Worker Issue #212: import conflict filtering now reuses existing state-code 100-200 datasets without changing the open-data export scope or report schema."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -148,6 +148,8 @@ payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_
    - 不执行 conflict checks
    - 不执行任何 inserts
 6. 若无校验错误，再执行现有冲突检测和导入流程。
+
+冲突检测以 `table + UUID + 规范化 version` 为精确键。目标环境中已存在的 `state_code = 100..=200` 记录统一视为可复用记录：Worker 跳过 package 中的对应条目，并继续导入其余数据；为保持现有 consumer 兼容，这些记录仍投影到 `filtered_open_data_count` 与 `filtered_open_data`。`state_code` 为 `null` 或不在 `100..=200` 时仍属于 `user_conflicts`，任一此类冲突都会返回 `USER_DATA_CONFLICT` 并阻止整包写入。该导入规则不改变 `open_data` export scope；导出仍只选择 `state_code = 100..=199`。
 
 运行时不得探测 Python module、`tidas-validate` 或其他候选命令。统一 binary 无法启动、版本/协议不匹配、超时、report/spool 不完整或 hash/count 不一致时，任务必须 fail closed，并映射为稳定的 `tidas_*` error code；这些 system failures 不能伪装为数据 validation issue。Worker 继续独立持有 job lease、heartbeat、取消检查、request-cache 状态和 terminal result projection，`tidas` 不接管这些行为。等待长时 validation 时，worker-jobs executor 每个 lease 的三分之一周期续租；heartbeat 被拒绝即丢弃当前 operation future，禁止继续接受或投影 validator evidence。
 
