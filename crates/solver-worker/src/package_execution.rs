@@ -936,7 +936,7 @@ fn is_open_data_state_code(state_code: i32) -> bool {
 }
 
 fn is_skippable_import_conflict_state_code(state_code: i32) -> bool {
-    (OPEN_DATA_STATE_CODE_START..=200).contains(&state_code)
+    is_open_data_state_code(state_code) || state_code == 200
 }
 
 async fn fetch_scope_root_refs_single(
