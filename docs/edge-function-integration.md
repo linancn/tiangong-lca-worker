@@ -25,8 +25,8 @@ checkPaths:
   - crates/**
   - supabase/migrations/**
 lastReviewedAt: 2026-08-04
-lastReviewedCommit: 0ccd8128b46d383425700c3c2f7b6d1edb92a90c
-lastReviewedNote: "Reviewed for Worker Issue #207: exact source-commit journal attestation remains internal to the solver worker; no Edge request or response DTO change is required."
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
+lastReviewedNote: "Reviewed for Worker Issue #209: exact-private snapshot-GC audit DML remains internal to Worker maintenance and changes no Edge request, response, or table-access contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml

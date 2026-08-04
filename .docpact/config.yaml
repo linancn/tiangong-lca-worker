@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedCommit: "cfc356d96f7fe47e4f128ce1551c5ce3f3f47326"
+lastReviewedCommit: "23d514c88ad7c4e334e2afd0499881cff6ef72c6"
 lastReviewedAt: "2026-08-04"
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the no-fallback document-validation family preserve routing, while the solver build binds its exact source commit into the secret-free acceptance marker."
+lastReviewedNote: "Reviewed for Worker Issue #209: exact-private snapshot-GC audit DML changes no ownership, routing, coverage, or consumer-facing contract facts."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

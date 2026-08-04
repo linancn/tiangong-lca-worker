@@ -326,7 +326,7 @@ pub async fn create_snapshot_gc_run(
 
     let row = sqlx::query(
         r"
-        INSERT INTO public.lca_snapshot_gc_runs (
+        INSERT INTO private.lca_snapshot_gc_runs (
           mode,
           status,
           snapshot_retention_window,
@@ -385,7 +385,7 @@ pub async fn insert_snapshot_gc_run_items(
     for candidate in candidates {
         sqlx::query(
             r"
-            INSERT INTO public.lca_snapshot_gc_run_items (
+            INSERT INTO private.lca_snapshot_gc_run_items (
               run_id,
               candidate_type,
               snapshot_id,
@@ -423,7 +423,7 @@ pub async fn update_snapshot_gc_run_item_status(
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r"
-        UPDATE public.lca_snapshot_gc_run_items
+        UPDATE private.lca_snapshot_gc_run_items
         SET action_status = $3,
             error_message = $4,
             updated_at = NOW()
@@ -450,7 +450,7 @@ pub async fn finish_snapshot_gc_run(
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r"
-        UPDATE public.lca_snapshot_gc_runs
+        UPDATE private.lca_snapshot_gc_runs
         SET status = $2,
             finished_at = NOW(),
             storage_deleted_count = $3,

@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
 lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: proof retains file-backed large-manifest permissions/cleanup and requires restricted-login, exact Database #409, concurrency/reconnect, no-fallback, secret-free evidence, and exact compile-time source-commit attestation."
+lastReviewedNote: "Reviewed for Worker Issue #209: the pinned active-source gate now rejects public or unqualified snapshot-GC audit consumers; joint restricted-login runtime proof remains with Database #414."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -70,6 +70,9 @@ Treat the last two commands as non-negotiable hard gates after code changes.
 The snapshot private-cutover static gate currently pins 103 active Rust,
 Python, shell, and SQL sources with inventory SHA-256
 `fe645b0ca9f44ec12b763ca90e967cf88788fcb5fe598a7247789aa9c09d8d9d`.
+It rejects public or unqualified SQL consumers for the three canonical snapshot
+relations plus `lca_snapshot_gc_runs` and `lca_snapshot_gc_run_items`; generated
+and historical prose is not classified as active runtime source.
 Issue #207 adds the document-validation database module plus its source-commit
 build metadata and qualification test. The reviewed inventory change does not
 alter the three private snapshot relation identities scanned by that gate.

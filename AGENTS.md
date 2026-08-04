@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
 lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder input, temporary document-validation isolation, and exact source-commit attestation remain Worker-owned, while Database #409 remains the private routine and schema authority."
+lastReviewedNote: "Reviewed for Worker Issue #209: snapshot-GC audit DML is Worker-owned and exact-private; Database #414 remains the schema, migration, privilege, and compatibility authority."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -175,6 +175,7 @@ Route those tasks to:
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - LCA snapshot canonical persistence uses exact `private.lca_active_snapshots`, `private.lca_network_snapshots`, and `private.lca_snapshot_artifacts` identities over direct PostgreSQL. `DATABASE_URL` / `CONN` must identify a dedicated non-superuser, non-BYPASSRLS Worker login that inherits the `service_role` privileges granted by database-engine for this table family; public compatibility views and search-path fallback are not runtime paths.
+- Snapshot-retention audit writes use exact `private.lca_snapshot_gc_runs` and `private.lca_snapshot_gc_run_items` identities over direct PostgreSQL. The Worker must not probe, dual-write, or fall back to public compatibility views or search-path resolution; missing private relations and insufficient privileges fail closed.
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure

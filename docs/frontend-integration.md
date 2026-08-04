@@ -21,8 +21,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/review-submit-fast-gate-contract.md
 lastReviewedAt: 2026-08-04
-lastReviewedCommit: 0ccd8128b46d383425700c3c2f7b6d1edb92a90c
-lastReviewedNote: "Reviewed for Worker Issue #207: solver source-commit journal attestation does not change the frontend or Edge-facing DTO."
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
+lastReviewedNote: "Reviewed for Worker Issue #209: exact-private snapshot-GC audit DML changes no frontend or Edge-facing DTO."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -39,6 +39,8 @@ RELATIONS = (
     "lca_active_snapshots",
     "lca_network_snapshots",
     "lca_snapshot_artifacts",
+    "lca_snapshot_gc_runs",
+    "lca_snapshot_gc_run_items",
 )
 CRITICAL_RELATIONS = {
     "auth.sessions",
@@ -64,7 +66,10 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-RELATION_NAME = r"(?:lca_active_snapshots|lca_network_snapshots|lca_snapshot_artifacts)"
+RELATION_NAME = (
+    r"(?:lca_active_snapshots|lca_network_snapshots|lca_snapshot_artifacts|"
+    r"lca_snapshot_gc_runs|lca_snapshot_gc_run_items)"
+)
 RELATION_PATTERN = rf'(?:{RELATION_NAME}|"{RELATION_NAME}")'
 IDENTIFIER_PATTERN = r'(?:[a-z_][a-z0-9_]*|"[a-z_][a-z0-9_]*")'
 PUBLIC_PATTERN = re.compile(rf'(?:\bpublic\b|"public")\s*\.\s*{RELATION_PATTERN}', re.I)
@@ -129,6 +134,14 @@ def static_scanner_self_test() -> None:
     commented_out = "-- SELECT * FROM public.lca_network_snapshots\nSELECT 1"
     public_hits, unqualified_hits = scan_consumer_text(commented_out, "comment-only-fixture")
     require(not public_hits and not unqualified_hits, "scanner treated a SQL comment as a consumer")
+    gc_public = "UPDATE public.lca_snapshot_gc_run_items SET action_status = 'failed'"
+    public_hits, unqualified_hits = scan_consumer_text(gc_public, "gc-public-fixture")
+    require(len(public_hits) == 1, "scanner failed snapshot-GC public fixture")
+    require(not unqualified_hits, "qualified snapshot-GC fixture was misclassified as unqualified")
+    gc_unqualified = "INSERT INTO lca_snapshot_gc_runs (mode) VALUES ('dry-run')"
+    public_hits, unqualified_hits = scan_consumer_text(gc_unqualified, "gc-unqualified-fixture")
+    require(not public_hits, "unqualified snapshot-GC fixture was misclassified as public")
+    require(len(unqualified_hits) == 1, "scanner failed snapshot-GC unqualified fixture")
 
 
 def partition_s3_keys(keys: list[str], prefix: str) -> tuple[list[str], list[str]]:
@@ -181,7 +194,7 @@ def static_consumer_zero() -> dict[str, object]:
         "inventorySha256": inventory_hash,
         "publicConsumers": 0,
         "unqualifiedConsumers": 0,
-        "scannerFixtures": 4,
+        "scannerFixtures": 6,
         "destructiveSafetyFixtures": 1,
     }
 
