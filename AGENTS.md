@@ -41,7 +41,7 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
 lastReviewedAt: 2026-08-04
 lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed snapshot_builder input, temporary document-validation isolation, and exact source-commit attestation remain Worker-owned, while Database #409 remains the private routine and schema authority."
 related:

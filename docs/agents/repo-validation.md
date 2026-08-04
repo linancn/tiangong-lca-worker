@@ -40,7 +40,7 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
+lastReviewedCommit: 23d514c88ad7c4e334e2afd0499881cff6ef72c6
 lastReviewedAt: 2026-08-04
 lastReviewedNote: "Reviewed for Worker Issues #205 and #207: proof retains file-backed large-manifest permissions/cleanup and requires restricted-login, exact Database #409, concurrency/reconnect, no-fallback, secret-free evidence, and exact compile-time source-commit attestation."
 related:

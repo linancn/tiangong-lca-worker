@@ -935,6 +935,10 @@ fn is_open_data_state_code(state_code: i32) -> bool {
     (OPEN_DATA_STATE_CODE_START..=OPEN_DATA_STATE_CODE_END).contains(&state_code)
 }
 
+fn is_skippable_import_conflict_state_code(state_code: i32) -> bool {
+    (OPEN_DATA_STATE_CODE_START..=200).contains(&state_code)
+}
+
 async fn fetch_scope_root_refs_single(
     pool: &PgPool,
     requested_by: Uuid,
@@ -3707,7 +3711,10 @@ fn partition_conflicts_from_rows(
             state_code: row.state_code,
             user_id: row.user_id,
         };
-        if row.state_code.is_some_and(is_open_data_state_code) {
+        if row
+            .state_code
+            .is_some_and(is_skippable_import_conflict_state_code)
+        {
             sets.open_data_conflicts.push(record);
         } else {
             sets.user_conflicts.push(record);
@@ -4721,7 +4728,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_conflicts_filters_open_data_but_flags_user_conflicts() {
+    fn partition_conflicts_filters_existing_open_and_commercial_data() {
         let id = Uuid::nil();
         let entries = vec![PackageEntry {
             table: PackageRootTable::Processes,
@@ -4732,25 +4739,19 @@ mod tests {
             json_tg: None,
             model_id: None,
         }];
-        let rows = vec![
-            ConflictRow {
+        for state_code in [100, 199, 200] {
+            let rows = vec![ConflictRow {
                 id,
                 version: "01.00.000".to_owned(),
-                state_code: Some(100),
+                state_code: Some(state_code),
                 user_id: None,
-            },
-            ConflictRow {
-                id,
-                version: "02.00.000".to_owned(),
-                state_code: Some(150),
-                user_id: None,
-            },
-        ];
+            }];
 
-        let partitioned =
-            partition_conflicts_from_rows(PackageRootTable::Processes, &entries, &rows);
-        assert_eq!(partitioned.open_data_conflicts.len(), 1);
-        assert_eq!(partitioned.user_conflicts.len(), 0);
+            let partitioned =
+                partition_conflicts_from_rows(PackageRootTable::Processes, &entries, &rows);
+            assert_eq!(partitioned.open_data_conflicts.len(), 1);
+            assert_eq!(partitioned.user_conflicts.len(), 0);
+        }
     }
 
     #[test]
@@ -4802,6 +4803,31 @@ mod tests {
         assert_eq!(partitioned.open_data_conflicts.len(), 0);
         assert_eq!(partitioned.user_conflicts.len(), 1);
         assert_eq!(partitioned.user_conflicts[0].user_id, Some(user_id));
+    }
+
+    #[test]
+    fn partition_conflicts_rejects_states_above_commercial_data() {
+        let id = Uuid::nil();
+        let entries = vec![PackageEntry {
+            table: PackageRootTable::Processes,
+            id,
+            version: "01.00.000".to_owned(),
+            json_ordered: json!({"name": "Process"}),
+            rule_verification: true,
+            json_tg: None,
+            model_id: None,
+        }];
+        let rows = vec![ConflictRow {
+            id,
+            version: "01.00.000".to_owned(),
+            state_code: Some(201),
+            user_id: None,
+        }];
+
+        let partitioned =
+            partition_conflicts_from_rows(PackageRootTable::Processes, &entries, &rows);
+        assert_eq!(partitioned.open_data_conflicts.len(), 0);
+        assert_eq!(partitioned.user_conflicts.len(), 1);
     }
 
     #[test]
