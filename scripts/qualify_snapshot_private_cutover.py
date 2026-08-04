@@ -39,6 +39,9 @@ RELATIONS = (
     "lca_active_snapshots",
     "lca_network_snapshots",
     "lca_snapshot_artifacts",
+)
+STATIC_RELATIONS = (
+    *RELATIONS,
     "lca_snapshot_gc_runs",
     "lca_snapshot_gc_run_items",
 )
@@ -66,10 +69,7 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-RELATION_NAME = (
-    r"(?:lca_active_snapshots|lca_network_snapshots|lca_snapshot_artifacts|"
-    r"lca_snapshot_gc_runs|lca_snapshot_gc_run_items)"
-)
+RELATION_NAME = "(?:" + "|".join(map(re.escape, STATIC_RELATIONS)) + ")"
 RELATION_PATTERN = rf'(?:{RELATION_NAME}|"{RELATION_NAME}")'
 IDENTIFIER_PATTERN = r'(?:[a-z_][a-z0-9_]*|"[a-z_][a-z0-9_]*")'
 PUBLIC_PATTERN = re.compile(rf'(?:\bpublic\b|"public")\s*\.\s*{RELATION_PATTERN}', re.I)
