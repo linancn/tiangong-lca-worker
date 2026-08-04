@@ -3,7 +3,6 @@ use uuid::Uuid;
 use crate::{
     package_types::PackageArtifactKind,
     pgbouncer_sqlx::{self as sqlx, PgPool, Row},
-    worker_control_plane::worker_jobs_table,
 };
 
 pub const DEFAULT_EXPORT_PACKAGE_ARTIFACT_RETENTION_DAYS: i32 = 30;
@@ -231,7 +230,7 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
     request_cache_retention_days: i32,
 ) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
     let rows = sqlx::query(
-        concat!(r"
+        r"
         WITH artifact_classified AS (
           SELECT
             'lca_package_artifacts'::text AS retention_area,
@@ -269,7 +268,7 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
                 ELSE 'eligible_expired_unpinned_artifact'
               END AS reason
             FROM public.lca_package_artifacts AS artifacts
-            LEFT JOIN ", worker_jobs_table!(), r" AS worker_job
+            LEFT JOIN public.worker_jobs AS worker_job
               ON worker_job.id = artifacts.worker_job_id
           ) AS classified
         ),
@@ -293,7 +292,7 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
                 ELSE 'eligible_stale_request_cache'
               END AS reason
             FROM public.lca_package_request_cache AS request_cache
-            LEFT JOIN ", worker_jobs_table!(), r" AS worker_job
+            LEFT JOIN public.worker_jobs AS worker_job
               ON worker_job.id = request_cache.worker_job_id
           ) AS classified
         ),
@@ -313,7 +312,7 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
         FROM classified
         GROUP BY retention_area, retention_action, is_eligible, reason
         ORDER BY retention_area, is_eligible DESC, reason
-        "),
+        ",
     )
     .bind(request_cache_retention_days)
     .fetch_all(pool)
@@ -340,7 +339,7 @@ pub async fn fetch_package_artifact_gc_candidates(
     batch_size: i64,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<Vec<PackageArtifactGcCandidate>> {
-    let rows = sqlx::query(concat!(
+    let rows = sqlx::query(
         r"
         SELECT
           artifacts.id AS artifact_id,
@@ -348,9 +347,7 @@ pub async fn fetch_package_artifact_gc_candidates(
           artifacts.artifact_kind,
           artifacts.artifact_url
         FROM public.lca_package_artifacts AS artifacts
-        JOIN ",
-        worker_jobs_table!(),
-        r" AS worker_job
+        JOIN public.worker_jobs AS worker_job
           ON worker_job.id = artifacts.worker_job_id
         WHERE artifacts.status = 'ready'
           AND artifacts.is_pinned = FALSE
@@ -371,8 +368,8 @@ pub async fn fetch_package_artifact_gc_candidates(
           )
         ORDER BY artifacts.expires_at ASC, artifacts.created_at ASC, artifacts.id ASC
         LIMIT $1
-        "
-    ))
+        ",
+    )
     .bind(batch_size)
     .bind(request_cache_retention_days)
     .fetch_all(pool)
@@ -453,14 +450,12 @@ pub async fn delete_stale_package_request_cache_rows(
     batch_size: i64,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<u64> {
-    let result = sqlx::query(concat!(
+    let result = sqlx::query(
         r"
         WITH candidates AS (
           SELECT request_cache.id
           FROM public.lca_package_request_cache AS request_cache
-          LEFT JOIN ",
-        worker_jobs_table!(),
-        r" AS worker_job
+          LEFT JOIN public.worker_jobs AS worker_job
             ON worker_job.id = request_cache.worker_job_id
           WHERE request_cache.status NOT IN ('pending', 'running')
             AND request_cache.last_accessed_at < NOW() - make_interval(days => $2::integer)
@@ -472,8 +467,8 @@ pub async fn delete_stale_package_request_cache_rows(
         DELETE FROM public.lca_package_request_cache AS request_cache
         USING candidates
         WHERE request_cache.id = candidates.id
-        "
-    ))
+        ",
+    )
     .bind(batch_size)
     .bind(request_cache_retention_days)
     .execute(pool)

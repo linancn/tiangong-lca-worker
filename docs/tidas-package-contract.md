@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: cfc356d96f7fe47e4f128ce1551c5ce3f3f47326
-lastReviewedAt: 2026-08-04
-lastReviewedNote: "Reviewed for Worker Issues #205 and #207: file-backed scope-closure input and the solver-only document-validation pool do not change TIDAS package import/export artifacts, retention, semantics, or package-worker state."
+lastReviewedAt: 2026-07-31
+lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
+lastReviewedNote: "Reviewed for Worker Issue #186: the external qualification harness streams a local ZIP and exact TIDAS validation without changing asynchronous package import/export semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

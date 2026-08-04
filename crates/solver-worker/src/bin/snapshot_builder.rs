@@ -6543,8 +6543,8 @@ async fn find_reusable_snapshot_with_age_basis(
           a.a_nnz,
           a.b_nnz,
           a.c_nnz
-        FROM private.lca_network_snapshots s
-        INNER JOIN private.lca_snapshot_artifacts a
+        FROM public.lca_network_snapshots s
+        INNER JOIN public.lca_snapshot_artifacts a
           ON a.snapshot_id = s.id
         WHERE s.status = 'ready'
           AND a.status = 'ready'
@@ -6607,7 +6607,7 @@ async fn touch_reused_snapshot_artifact(
     let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
-        UPDATE private.lca_snapshot_artifacts
+        UPDATE public.lca_snapshot_artifacts
         SET updated_at = NOW()
         WHERE snapshot_id = $1
           AND artifact_format = $2
@@ -6621,7 +6621,7 @@ async fn touch_reused_snapshot_artifact(
     if let Some(expires_at) = refreshed_expires_at {
         sqlx::query(
             r#"
-            UPDATE private.lca_network_snapshots
+            UPDATE public.lca_network_snapshots
             SET
               updated_at = NOW(),
               process_filter = jsonb_set(
@@ -6640,7 +6640,7 @@ async fn touch_reused_snapshot_artifact(
     } else {
         sqlx::query(
             r#"
-            UPDATE private.lca_network_snapshots
+            UPDATE public.lca_network_snapshots
             SET updated_at = NOW()
             WHERE id = $1
             "#,
@@ -8455,7 +8455,7 @@ async fn persist_snapshot_metadata(
     let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
-        INSERT INTO private.lca_network_snapshots (
+        INSERT INTO public.lca_network_snapshots (
             id,
             scope,
             process_filter,
@@ -8490,7 +8490,7 @@ async fn persist_snapshot_metadata(
 
     sqlx::query(
         r#"
-        INSERT INTO private.lca_snapshot_artifacts (
+        INSERT INTO public.lca_snapshot_artifacts (
             snapshot_id,
             artifact_url,
             artifact_sha256,

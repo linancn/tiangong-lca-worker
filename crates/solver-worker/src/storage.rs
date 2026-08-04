@@ -43,7 +43,6 @@ pub struct ObjectStoreClient {
     session_token: Option<String>,
     max_upload_bytes: Option<u64>,
     client: reqwest::Client,
-    strict_client: reqwest::Client,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +50,6 @@ pub struct ObjectUploadResult {
     pub object_url: String,
     pub upload_mode: &'static str,
     pub part_count: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResultObjectIdentity {
-    pub snapshot_id: Uuid,
-    pub job_id: Uuid,
-    pub result_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +216,6 @@ impl ObjectStoreClient {
                 "S3 max upload bytes must be greater than 0"
             ));
         }
-        validate_configured_object_target(endpoint.as_str(), bucket.as_str(), prefix)?;
 
         Ok(Self {
             endpoint,
@@ -236,31 +227,11 @@ impl ObjectStoreClient {
             session_token,
             max_upload_bytes,
             client: reqwest::Client::new(),
-            strict_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
         })
     }
 
     /// Uploads bytes to object storage and returns object URL.
     pub async fn upload_result(
-        &self,
-        identity: ResultObjectIdentity,
-        suffix: &str,
-        extension: &str,
-        content_type: &str,
-        bytes: Vec<u8>,
-    ) -> anyhow::Result<String> {
-        let key = self.result_object_key(identity, suffix, extension)?;
-        let object_url = self.object_url_for_key(key.as_str());
-        self.validate_result_object_url(identity.result_id, object_url.as_str())?;
-        self.upload_object_with_client(&self.strict_client, &key, content_type, bytes, None)
-            .await
-            .map(|result| result.object_url)
-    }
-
-    /// Uploads a job-scoped sidecar that is not the canonical `lca_results` artifact.
-    pub async fn upload_job_artifact(
         &self,
         snapshot_id: Uuid,
         job_id: Uuid,
@@ -269,11 +240,7 @@ impl ObjectStoreClient {
         content_type: &str,
         bytes: Vec<u8>,
     ) -> anyhow::Result<String> {
-        validate_key_component(suffix, "job artifact suffix")?;
-        validate_key_component(extension, "job artifact extension")?;
-        let key = self.prefixed_object_key(
-            format!("snapshots/{snapshot_id}/jobs/{job_id}/{suffix}.{extension}").as_str(),
-        )?;
+        let key = self.object_key(snapshot_id, job_id, suffix, extension);
         self.upload_object(&key, content_type, bytes, None)
             .await
             .map(|result| result.object_url)
@@ -523,107 +490,9 @@ impl ObjectStoreClient {
 
     /// Deletes an object by full object URL.
     pub async fn delete_object_url(&self, object_url: &str) -> anyhow::Result<()> {
-        self.delete_object_url_with_client(&self.client, object_url)
+        self.delete_object_url_with_outcome(object_url)
             .await
             .map(|_| ())
-    }
-
-    /// Deletes one result object only after its immutable locator matches this client config.
-    pub async fn delete_result_object_url(
-        &self,
-        result_id: Uuid,
-        object_url: &str,
-    ) -> anyhow::Result<ObjectDeleteOutcome> {
-        self.validate_result_object_url(result_id, object_url)?;
-        self.delete_object_url_with_client(&self.strict_client, object_url)
-            .await
-    }
-
-    /// Validates origin, bucket, prefix, normalized key, and exact result identity.
-    pub fn validate_result_object_url(
-        &self,
-        result_id: Uuid,
-        object_url: &str,
-    ) -> anyhow::Result<()> {
-        self.result_object_key_from_url(result_id, object_url)
-            .map(|_| ())
-    }
-
-    /// Returns the exact bucket-relative key after result-aware locator validation.
-    pub fn result_object_key_from_url(
-        &self,
-        result_id: Uuid,
-        object_url: &str,
-    ) -> anyhow::Result<String> {
-        if object_url.contains('%') || object_url.contains('\\') {
-            return Err(anyhow::anyhow!(
-                "result object URL must not contain encoded or backslash path syntax"
-            ));
-        }
-        let url = Url::parse(object_url)
-            .map_err(|err| anyhow::anyhow!("invalid result object URL {object_url}: {err}"))?;
-        let endpoint = Url::parse(self.endpoint.as_str())
-            .map_err(|err| anyhow::anyhow!("invalid configured S3 endpoint: {err}"))?;
-        validate_url_authority(&url, "result object URL")?;
-        validate_url_authority(&endpoint, "configured S3 endpoint")?;
-        validate_configured_object_target(
-            self.endpoint.as_str(),
-            self.bucket.as_str(),
-            self.prefix.as_str(),
-        )?;
-        if url.origin() != endpoint.origin() {
-            return Err(anyhow::anyhow!(
-                "result object URL origin does not match configured S3 endpoint"
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(anyhow::anyhow!(
-                "result object URL must not contain query or fragment"
-            ));
-        }
-
-        let raw_path = raw_url_path(object_url)?;
-        let actual_segments = normalized_path_segments(raw_path, "result object URL")?;
-        let endpoint_segments =
-            normalized_path_segments(endpoint.path(), "configured S3 endpoint")?;
-        let prefix_segments = normalized_config_segments(self.prefix.as_str(), "S3 prefix")?;
-        validate_key_component(self.bucket.as_str(), "S3 bucket")?;
-
-        let expected_leading = endpoint_segments
-            .iter()
-            .copied()
-            .chain(std::iter::once(self.bucket.as_str()))
-            .chain(prefix_segments.iter().copied())
-            .collect::<Vec<_>>();
-        if actual_segments.len() <= expected_leading.len()
-            || actual_segments[..expected_leading.len()] != expected_leading
-        {
-            return Err(anyhow::anyhow!(
-                "result object URL bucket or prefix does not match configured S3 target"
-            ));
-        }
-
-        let key_segments = &actual_segments[expected_leading.len()..];
-        let result_positions = key_segments
-            .iter()
-            .enumerate()
-            .filter_map(|(index, segment)| (*segment == "results").then_some(index))
-            .collect::<Vec<_>>();
-        if result_positions.len() != 1 {
-            return Err(anyhow::anyhow!(
-                "result object URL must contain exactly one case-sensitive /results/{result_id}/ segment"
-            ));
-        }
-        let result_position = result_positions[0];
-        if result_position + 2 >= key_segments.len()
-            || Uuid::parse_str(key_segments[result_position + 1]).ok() != Some(result_id)
-        {
-            return Err(anyhow::anyhow!(
-                "result object URL must contain exact /results/{result_id}/ identity followed by an object name"
-            ));
-        }
-        let object_key_start = endpoint_segments.len() + 1;
-        Ok(actual_segments[object_key_start..].join("/"))
     }
 
     /// Deletes an object by bucket-relative object key.
@@ -632,18 +501,12 @@ impl ObjectStoreClient {
         if key.trim().is_empty() {
             return Err(anyhow::anyhow!("object key must not be empty"));
         }
-        let object_url = self.object_url_for_key(key);
-        self.delete_object_url_with_client(&self.client, &object_url)
-            .await
+        let object_url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+        self.delete_object_url_with_outcome(&object_url).await
     }
 
-    fn object_url_for_key(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.endpoint, self.bucket, key)
-    }
-
-    async fn delete_object_url_with_client(
+    async fn delete_object_url_with_outcome(
         &self,
-        client: &reqwest::Client,
         object_url: &str,
     ) -> anyhow::Result<ObjectDeleteOutcome> {
         let url = Url::parse(object_url)
@@ -665,7 +528,8 @@ impl ObjectStoreClient {
             },
         )?;
 
-        let mut request = client
+        let mut request = self
+            .client
             .delete(url)
             .header("host", host)
             .header("x-amz-content-sha256", payload_hash)
@@ -865,19 +729,7 @@ impl ObjectStoreClient {
         bytes: Vec<u8>,
         object_byte_size: Option<u64>,
     ) -> anyhow::Result<ObjectUploadResult> {
-        self.upload_object_with_client(&self.client, key, content_type, bytes, object_byte_size)
-            .await
-    }
-
-    async fn upload_object_with_client(
-        &self,
-        client: &reqwest::Client,
-        key: &str,
-        content_type: &str,
-        bytes: Vec<u8>,
-        object_byte_size: Option<u64>,
-    ) -> anyhow::Result<ObjectUploadResult> {
-        let object_url = self.object_url_for_key(key);
+        let object_url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
         let url = Url::parse(&object_url)
             .map_err(|err| anyhow::anyhow!("invalid S3 URL {object_url}: {err}"))?;
         let host = canonical_host(&url)?;
@@ -899,7 +751,8 @@ impl ObjectStoreClient {
             },
         )?;
 
-        let mut request = client
+        let mut request = self
+            .client
             .put(url)
             .header("host", host)
             .header("content-type", content_type)
@@ -1298,24 +1151,14 @@ impl ObjectStoreClient {
             .await;
     }
 
-    fn result_object_key(
-        &self,
-        identity: ResultObjectIdentity,
-        suffix: &str,
-        extension: &str,
-    ) -> anyhow::Result<String> {
-        validate_key_component(suffix, "result object suffix")?;
-        validate_key_component(extension, "result object extension")?;
-        let ResultObjectIdentity {
-            snapshot_id,
-            job_id,
-            result_id,
-        } = identity;
-        self.prefixed_object_key(
-            format!(
-                "snapshots/{snapshot_id}/jobs/{job_id}/results/{result_id}/{suffix}.{extension}"
-            )
-            .as_str(),
+    fn object_key(&self, snapshot_id: Uuid, job_id: Uuid, suffix: &str, extension: &str) -> String {
+        if self.prefix.is_empty() {
+            return format!("snapshots/{snapshot_id}/jobs/{job_id}/{suffix}.{extension}");
+        }
+
+        format!(
+            "{}/snapshots/{snapshot_id}/jobs/{job_id}/{suffix}.{extension}",
+            self.prefix
         )
     }
 
@@ -1422,104 +1265,6 @@ fn canonical_host(url: &Url) -> anyhow::Result<String> {
         Some(port) => Ok(format!("{host}:{port}")),
         None => Ok(host.to_owned()),
     }
-}
-
-fn validate_url_authority(url: &Url, label: &str) -> anyhow::Result<()> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(anyhow::anyhow!("{label} must use http or https"));
-    }
-    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
-        return Err(anyhow::anyhow!(
-            "{label} must have a host and must not contain userinfo"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_configured_object_target(
-    endpoint: &str,
-    bucket: &str,
-    prefix: &str,
-) -> anyhow::Result<()> {
-    if endpoint.contains('%') || endpoint.contains('\\') {
-        return Err(anyhow::anyhow!(
-            "configured S3 endpoint must not contain encoded or backslash path syntax"
-        ));
-    }
-    let endpoint_url = Url::parse(endpoint)
-        .map_err(|error| anyhow::anyhow!("invalid configured S3 endpoint: {error}"))?;
-    validate_url_authority(&endpoint_url, "configured S3 endpoint")?;
-    if endpoint_url.query().is_some() || endpoint_url.fragment().is_some() {
-        return Err(anyhow::anyhow!(
-            "configured S3 endpoint must not contain query or fragment"
-        ));
-    }
-    normalized_path_segments(raw_url_path(endpoint)?, "configured S3 endpoint")?;
-    validate_key_component(bucket, "S3 bucket")?;
-    normalized_config_segments(prefix.trim_matches('/'), "S3 prefix")?;
-    Ok(())
-}
-
-fn raw_url_path(url: &str) -> anyhow::Result<&str> {
-    let scheme_end = url
-        .find("://")
-        .ok_or_else(|| anyhow::anyhow!("result object URL is missing scheme separator"))?;
-    let authority_start = scheme_end + 3;
-    let Some(path_start) = url[authority_start..]
-        .find('/')
-        .map(|offset| authority_start + offset)
-    else {
-        return Ok("/");
-    };
-    Ok(&url[path_start..])
-}
-
-fn normalized_path_segments<'a>(path: &'a str, label: &str) -> anyhow::Result<Vec<&'a str>> {
-    if !path.starts_with('/') {
-        return Err(anyhow::anyhow!("{label} path must be absolute"));
-    }
-    if path == "/" {
-        return Ok(Vec::new());
-    }
-    let segments = path[1..].split('/').collect::<Vec<_>>();
-    if segments
-        .iter()
-        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
-    {
-        return Err(anyhow::anyhow!("{label} path must be normalized"));
-    }
-    Ok(segments)
-}
-
-fn normalized_config_segments<'a>(value: &'a str, label: &str) -> anyhow::Result<Vec<&'a str>> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    let segments = value.split('/').collect::<Vec<_>>();
-    if segments
-        .iter()
-        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
-        || value.contains('%')
-        || value.contains('\\')
-    {
-        return Err(anyhow::anyhow!("configured {label} must be normalized"));
-    }
-    Ok(segments)
-}
-
-fn validate_key_component(value: &str, label: &str) -> anyhow::Result<()> {
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains('%')
-        || value.contains('?')
-        || value.contains('#')
-    {
-        return Err(anyhow::anyhow!("{label} must be one normalized segment"));
-    }
-    Ok(())
 }
 
 fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
@@ -1724,8 +1469,8 @@ mod tests {
 
     use super::{
         MULTIPART_UPLOAD_THRESHOLD_BYTES, ObjectDeleteOutcome, ObjectStoreClient,
-        ObjectStoreUploadError, ObjectTransferOptions, ResultObjectIdentity, extract_xml_tag,
-        object_delete_outcome, object_upload_error,
+        ObjectStoreUploadError, ObjectTransferOptions, extract_xml_tag, object_delete_outcome,
+        object_upload_error,
     };
     use crate::resource::{CancellationToken, ResourceError};
 
@@ -1752,307 +1497,6 @@ mod tests {
     #[test]
     fn delete_rejects_non_success_statuses() {
         assert_eq!(object_delete_outcome(StatusCode::FORBIDDEN), None);
-    }
-
-    #[test]
-    fn result_key_contains_preallocated_identity() {
-        let client = ObjectStoreClient::new(
-            "https://storage.example.test/api",
-            "test",
-            "bucket",
-            "tenant/lca",
-            "key",
-            "secret",
-            None,
-        )
-        .expect("client");
-        let snapshot_id = Uuid::new_v4();
-        let job_id = Uuid::new_v4();
-        let result_id = Uuid::new_v4();
-
-        let key = client
-            .result_object_key(
-                ResultObjectIdentity {
-                    snapshot_id,
-                    job_id,
-                    result_id,
-                },
-                "solve_one",
-                "json",
-            )
-            .expect("result key");
-
-        assert_eq!(
-            key,
-            format!(
-                "tenant/lca/snapshots/{snapshot_id}/jobs/{job_id}/results/{result_id}/solve_one.json"
-            )
-        );
-    }
-
-    #[test]
-    fn result_locator_validation_accepts_exact_configured_target() {
-        let client = ObjectStoreClient::new(
-            "https://storage.example.test/api",
-            "test",
-            "bucket",
-            "tenant/lca",
-            "key",
-            "secret",
-            None,
-        )
-        .expect("client");
-        let result_id = Uuid::new_v4();
-        let snapshot_id = Uuid::new_v4();
-        let job_id = Uuid::new_v4();
-        let locator = format!(
-            "https://storage.example.test/api/bucket/tenant/lca/snapshots/{snapshot_id}/jobs/{job_id}/results/{result_id}/solve_one.json"
-        );
-
-        assert_eq!(
-            client
-                .result_object_key_from_url(result_id, locator.as_str())
-                .expect("exact locator"),
-            format!(
-                "tenant/lca/snapshots/{snapshot_id}/jobs/{job_id}/results/{result_id}/solve_one.json"
-            )
-        );
-    }
-
-    #[test]
-    fn result_locator_validation_rejects_target_and_path_drift() {
-        let client = ObjectStoreClient::new(
-            "https://storage.example.test/api",
-            "test",
-            "bucket",
-            "tenant/lca",
-            "key",
-            "secret",
-            None,
-        )
-        .expect("client");
-        let result_id = Uuid::new_v4();
-        let other_result_id = Uuid::new_v4();
-        let valid_path = format!(
-            "api/bucket/tenant/lca/snapshots/{}/jobs/{}/results/{result_id}/solve_one.json",
-            Uuid::new_v4(),
-            Uuid::new_v4()
-        );
-        let rejected = [
-            format!("https://evil.example.test/{valid_path}"),
-            format!("http://storage.example.test/{valid_path}"),
-            format!("https://storage.example.test/api/wrong/tenant/lca/results/{result_id}/x"),
-            format!("https://storage.example.test/api/bucket/wrong/results/{result_id}/x"),
-            format!("https://storage.example.test/{valid_path}?version=1"),
-            format!("https://storage.example.test/{valid_path}#fragment"),
-            format!("https://storage.example.test/api/bucket/tenant/lca//results/{result_id}/x"),
-            format!(
-                "https://storage.example.test/api/bucket/tenant/lca/%2e%2e/results/{result_id}/x"
-            ),
-            format!("https://storage.example.test/api/bucket/tenant/lca/Results/{result_id}/x"),
-            format!(
-                "https://storage.example.test/api/bucket/tenant/lca/results/{other_result_id}/x"
-            ),
-            format!("https://storage.example.test/api/bucket/tenant/lca/results/{result_id}"),
-            format!(
-                "https://storage.example.test/api/bucket/tenant/lca/results/{result_id}/results/{result_id}/x"
-            ),
-        ];
-
-        for locator in rejected {
-            assert!(
-                client
-                    .validate_result_object_url(result_id, locator.as_str())
-                    .is_err(),
-                "locator should fail closed: {locator}"
-            );
-        }
-    }
-
-    #[test]
-    fn object_store_constructor_rejects_noncanonical_result_targets() {
-        let rejected = [
-            ("ftp://storage.example.test", "bucket", "tenant/lca"),
-            ("https://user@storage.example.test", "bucket", "tenant/lca"),
-            (
-                "https://storage.example.test/api?mode=write",
-                "bucket",
-                "tenant/lca",
-            ),
-            (
-                "https://storage.example.test/api#fragment",
-                "bucket",
-                "tenant/lca",
-            ),
-            (
-                "https://storage.example.test/api/%2e%2e/evil",
-                "bucket",
-                "tenant/lca",
-            ),
-            (
-                "https://storage.example.test/api//evil",
-                "bucket",
-                "tenant/lca",
-            ),
-            ("https://storage.example.test", "wrong/bucket", "tenant/lca"),
-            ("https://storage.example.test", "bucket", "tenant//lca"),
-            ("https://storage.example.test", "bucket", "tenant/../lca"),
-            ("https://storage.example.test", "bucket", "tenant/%2f/lca"),
-        ];
-
-        for (endpoint, bucket, prefix) in rejected {
-            assert!(
-                ObjectStoreClient::new(endpoint, "test", bucket, prefix, "key", "secret", None)
-                    .is_err(),
-                "target config should fail closed endpoint={endpoint} bucket={bucket} prefix={prefix}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn result_put_revalidates_target_before_network_io() {
-        let mut client = test_client("http://127.0.0.1:9");
-        client.prefix = "tenant//lca".to_owned();
-        let result_id = Uuid::new_v4();
-
-        let error = client
-            .upload_result(
-                ResultObjectIdentity {
-                    snapshot_id: Uuid::new_v4(),
-                    job_id: Uuid::new_v4(),
-                    result_id,
-                },
-                "solve_one",
-                "json",
-                "application/json",
-                Vec::new(),
-            )
-            .await
-            .expect_err("drifted target must fail before PUT");
-
-        assert!(error.to_string().contains("configured S3 prefix"));
-    }
-
-    #[tokio::test]
-    async fn result_put_does_not_follow_redirects() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
-        let address = listener.local_addr().expect("redirect address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept result PUT");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/evil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("write redirect");
-        });
-        let endpoint = format!("http://{address}");
-        let client = test_client(endpoint.as_str());
-
-        let error = client
-            .upload_result(
-                ResultObjectIdentity {
-                    snapshot_id: Uuid::new_v4(),
-                    job_id: Uuid::new_v4(),
-                    result_id: Uuid::new_v4(),
-                },
-                "solve_one",
-                "json",
-                "application/json",
-                Vec::new(),
-            )
-            .await
-            .expect_err("result PUT redirect must fail closed");
-
-        assert!(error.to_string().contains("307 Temporary Redirect"));
-    }
-
-    #[tokio::test]
-    async fn result_delete_does_not_follow_redirects() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
-        let address = listener.local_addr().expect("redirect address");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept delete request");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/evil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("write redirect");
-        });
-        let endpoint = format!("http://{address}");
-        let client = test_client(endpoint.as_str());
-        let result_id = Uuid::new_v4();
-        let locator = format!(
-            "{endpoint}/bucket/snapshots/{}/jobs/{}/results/{result_id}/solve_one.json",
-            Uuid::new_v4(),
-            Uuid::new_v4()
-        );
-
-        let error = client
-            .delete_result_object_url(result_id, locator.as_str())
-            .await
-            .expect_err("redirect must fail closed");
-
-        assert!(error.to_string().contains("307 Temporary Redirect"));
-    }
-
-    fn redirecting_delete_endpoint() -> String {
-        let destination = TcpListener::bind("127.0.0.1:0").expect("bind delete destination");
-        let destination_address = destination.local_addr().expect("destination address");
-        thread::spawn(move || {
-            let (mut stream, _) = destination.accept().expect("accept redirected delete");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("write delete success");
-        });
-
-        let source = TcpListener::bind("127.0.0.1:0").expect("bind delete redirect");
-        let source_address = source.local_addr().expect("source address");
-        thread::spawn(move || {
-            let (mut stream, _) = source.accept().expect("accept generic delete");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            let response = format!(
-                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination_address}/redirected-object\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write redirect");
-        });
-
-        format!("http://{source_address}")
-    }
-
-    #[tokio::test]
-    async fn generic_key_delete_preserves_redirect_following_behavior() {
-        let endpoint = redirecting_delete_endpoint();
-        let client = test_client(&endpoint);
-
-        assert_eq!(
-            client
-                .delete_object_key("packages/jobs/example/archive.zip")
-                .await
-                .expect("generic delete follows the historical redirect policy"),
-            ObjectDeleteOutcome::Deleted
-        );
-    }
-
-    #[tokio::test]
-    async fn generic_url_delete_preserves_redirect_following_behavior() {
-        let endpoint = redirecting_delete_endpoint();
-        let client = test_client(&endpoint);
-
-        client
-            .delete_object_url(format!("{endpoint}/bucket/packages/example.zip").as_str())
-            .await
-            .expect("generic URL delete follows the historical redirect policy");
     }
 
     #[test]

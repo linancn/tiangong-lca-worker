@@ -30,7 +30,6 @@ use crate::{
         ScopeClosureSnapshotFacts, fetch_scope_closure_snapshot_facts,
         run_scope_closure_snapshot_builder, scope_closure_evidence_hash,
     },
-    document_validation_db::DocumentValidationDb,
     file_cache::{advise_sequential_access, release_file_cache},
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
@@ -39,7 +38,6 @@ use crate::{
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
     tidas_cli,
-    worker_control_plane::worker_job_artifacts_table,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
 };
 
@@ -1832,8 +1830,8 @@ async fn validate_worker_input_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
-               private.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
+        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
+               public.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
         FROM _service_role
         ",
     )
@@ -3874,14 +3872,13 @@ struct ScopeClosureSnapshotDiscovery {
 
 async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     provider: &P,
-    document_validation_db: &DocumentValidationDb,
+    pool: &PgPool,
     worker_job_id: Uuid,
     requested_scope: &RequestedScopeManifest,
 ) -> anyhow::Result<(ScopeClosureScan, TidasBatchValidation)> {
     let mut scan = collect_scope_closure(provider, requested_scope).await?;
     let validation =
-        run_tidas_batch_validation_cached(document_validation_db, worker_job_id, &scan.documents)
-            .await?;
+        run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
     let (scan, validation) = tokio::task::spawn_blocking(move || {
         merge_tidas_validation_issues(&mut scan, &validation.issue_events)?;
         scan.issues
@@ -3894,19 +3891,14 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
 
 async fn scan_and_validate_scope_with_heartbeat<P: ScopeClosureProvider>(
     provider: &P,
-    document_validation_db: &DocumentValidationDb,
+    pool: &PgPool,
     worker_job_id: Uuid,
     requested_scope: &RequestedScopeManifest,
     progress: &WorkerJobProgress<'_>,
     closure_check_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<(ScopeClosureScan, TidasBatchValidation)> {
-    let operation = scan_and_validate_scope(
-        provider,
-        document_validation_db,
-        worker_job_id,
-        requested_scope,
-    );
+    let operation = scan_and_validate_scope(provider, pool, worker_job_id, requested_scope);
     tokio::pin!(operation);
     let mut heartbeat = tokio::time::interval(lease_heartbeat_period(lease_seconds));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4163,7 +4155,7 @@ async fn scope_closure_snapshot_binding(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
+        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
         FROM _service_role
         ",
     )
@@ -4560,7 +4552,7 @@ pub async fn execute_scope_closure_job(
     );
     let (mut scan, mut validation) = scan_and_validate_scope_with_heartbeat(
         &provider,
-        state.document_validation_db()?,
+        &state.pool,
         worker_job_id,
         &input.requested_scope,
         &progress,
@@ -4698,7 +4690,7 @@ pub async fn execute_scope_closure_job(
             .await?;
         (scan, validation) = scan_and_validate_scope_with_heartbeat(
             &provider,
-            state.document_validation_db()?,
+            &state.pool,
             worker_job_id,
             &final_requested_scope,
             &progress,
@@ -7530,9 +7522,9 @@ async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
 }
 
 async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyhow::Result<String> {
-    let row = sqlx::query(concat!(
+    let row = sqlx::query(
         r"
-        SELECT private.lcia_scope_closure_sha256(jsonb_build_object(
+        SELECT public.lcia_scope_closure_sha256(jsonb_build_object(
             'artifactId', id,
             'bucket', storage_bucket,
             'objectPath', storage_path,
@@ -7540,12 +7532,10 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
             'byteSize', byte_size,
             'checksumSha256', checksum_sha256
         )) AS manifest_hash
-        FROM ",
-        worker_job_artifacts_table!(),
-        r"
+        FROM public.worker_job_artifacts
         WHERE id = $1
-        "
-    ))
+        ",
+    )
     .bind(artifact_id)
     .fetch_one(pool)
     .await?;
@@ -7554,7 +7544,7 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
 
 #[allow(clippy::too_many_lines)]
 async fn run_tidas_batch_validation_cached(
-    document_validation_db: &DocumentValidationDb,
+    pool: &PgPool,
     worker_job_id: Uuid,
     documents: &ClosureDocumentSpool,
 ) -> anyhow::Result<TidasBatchValidation> {
@@ -7578,7 +7568,7 @@ async fn run_tidas_batch_validation_cached(
                 .collect::<anyhow::Result<Vec<_>>>()
         })
         .await??;
-        let cached = document_validation_db.lookup(&cache_keys).await?;
+        let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
         let cached_by_key = cached
             .into_iter()
             .map(|item| (document_evidence_key(&item), item))
@@ -7656,8 +7646,7 @@ async fn run_tidas_batch_validation_cached(
                     && record_bytes.saturating_add(encoded_bytes)
                         > VALIDATION_CACHE_RECORD_BATCH_BYTES
                 {
-                    document_validation_db
-                        .record(worker_job_id, records.as_slice())
+                    record_document_validation_evidence(pool, worker_job_id, records.as_slice())
                         .await?;
                     records.clear();
                     record_bytes = 0;
@@ -7671,9 +7660,7 @@ async fn run_tidas_batch_validation_cached(
                 records.push(record);
             }
             if !records.is_empty() {
-                document_validation_db
-                    .record(worker_job_id, &records)
-                    .await?;
+                record_document_validation_evidence(pool, worker_job_id, &records).await?;
             }
             enforce_scope_closure_memory_budget("validation_cache_record")?;
         }
@@ -7982,6 +7969,56 @@ fn document_evidence_key(value: &Value) -> String {
     .map(|key| value.get(key).map(Value::to_string).unwrap_or_default())
     .collect::<Vec<_>>()
     .join("|")
+}
+
+async fn lookup_document_validation_evidence(
+    pool: &PgPool,
+    keys: &[Value],
+) -> anyhow::Result<Vec<Value>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_document_validation_evidence_lookup($1::jsonb) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(serde_json::to_value(keys)?)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    ensure_rpc_ok(&result, "svc_lcia_document_validation_evidence_lookup")?;
+    Ok(result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+async fn record_document_validation_evidence(
+    pool: &PgPool,
+    worker_job_id: Uuid,
+    records: &[Value],
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.svc_lcia_document_validation_evidence_record($1::jsonb, $2) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(serde_json::to_value(records)?)
+    .bind(worker_job_id)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    ensure_rpc_ok(&result, "svc_lcia_document_validation_evidence_record")
 }
 
 fn merge_tidas_validation_issues(
