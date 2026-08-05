@@ -172,7 +172,10 @@ The numerical snapshot source walk is `path-aware-bounded-frontier-v2`. It consu
 reference edges produced by `scope_closure.rs`, but applies a separate role × artifact-purpose
 policy. Each exact document identity/hash is processed once; exact and omitted-version indexes make
 satisfaction checks deterministic; support reads use fixed 512-identity batches with a 64 MiB
-returned-byte ceiling, and the build enforces cumulative document/reference/edge/depth limits.
+returned-byte ceiling. The cumulative canonical source-document ceiling is configured by
+`SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES` and defaults to 1 GiB; zero, malformed, and overflow
+values fail back to that bounded default. The build separately enforces cumulative
+document/reference/edge/depth limits.
 Identity/hash drift and limit overflow are operator errors. Metrics expose source document count,
 classified reference count, frontier rounds, support query count, and decoded document bytes.
 

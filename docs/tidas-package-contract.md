@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 126d0be9140ea2218a0181210c55e4dead8471b5
-lastReviewedAt: 2026-08-04
+lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
+lastReviewedAt: 2026-08-05
 lastReviewedNote: "Reviewed for rollback Issue #211 after Issue #212: removing the incremental schema qualification route does not change reusable state-code 100-200 import behavior, open-data export scope, or the package report schema."
 related:
   - AGENTS.md

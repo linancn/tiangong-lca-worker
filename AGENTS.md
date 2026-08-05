@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedAt: 2026-08-05
+lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
 lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 runtime default changes without altering Worker orchestration or provider ownership."
 related:
   - .docpact/config.yaml
