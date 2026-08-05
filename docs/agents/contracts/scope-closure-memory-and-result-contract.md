@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
-lastReviewedNote: "Reviewed for Worker Issue #217: the numerical source-reference policy correction does not change bounded memory, result, or owner-evidence contracts."
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
+lastReviewedNote: "Reviewed for Worker Issue #219: byte-planned numerical source-support reads preserve the bounded memory, result, and owner-evidence contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
-lastReviewedNote: "Reviewed for Worker Issue #217: the source-reference classifier correction stays within existing Worker and root-integration boundaries."
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
+lastReviewedNote: "Reviewed for Worker Issue #219: source-support read planning stays within existing Worker and root-integration boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
