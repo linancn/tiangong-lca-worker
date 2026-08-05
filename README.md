@@ -101,7 +101,8 @@ related:
 - factorization cache 使用 `FACTORIZATION_CACHE_MAX_BYTES` hard capacity 和 deterministic LRU eviction；admission 结合 `FACTORIZATION_ADMISSION_FILL_IN_MULTIPLIER` 与 UMFPACK 实际 symbolic/numeric size telemetry，fill-in 仍按 workload 评估
 - 已支持 snapshot artifact-first：
   - builder 直接生成 `M/B/C` 并上传只包含数值 payload/config/coverage 的 `HDF5`；普通计算快照不持久化完整 `CompiledGraph`
-  - Calculation Bundle 所需的 immutable release evidence 单独流式压缩为 `release-evidence-v1.json.zst`，由 HDF5 内的 URL/SHA-256/byte-size descriptor 绑定；大文件上传自动使用 multipart
+  - Calculation Bundle 的发布元数据流式压缩为 `release-evidence-v2-<sha256>.json.zst`，完整 TIDAS 源文档另存为 `source-closure-v1-<sha256>.json.zst`；HDF5 → release evidence → source closure 形成 URL/SHA-256/byte-size/format/count 绑定链，大文件上传自动使用 multipart
+  - review-submit baseline 只持久化可继续构建 overlay 的 baseline projection；最终 overlay 只持久化 gate 实际读取的 flow/provider/edge evidence，不写入完整 `CompiledGraph`
   - worker 优先从 `lca_snapshot_artifacts` 下载 artifact，失败才回退到旧 `lca_*_entries` 读取
 - 已支持 review-submit gate：
   - `review_submit_gate` 可对文件输入产出 `review_submit_gate_report.v1`
@@ -121,8 +122,8 @@ related:
 
 - 压缩作用在 `envelope_json` dataset（不是额外包一层 `.gz`）
 - `hdf5:v1` / `snapshot-hdf5:v1` 的读写接口保持不变，读取端会透明解压
-- 普通 snapshot 的 `CompiledReleaseEvidence` 使用 `snapshot-release-evidence-json-zstd:v1` sidecar；常规数值求解不下载该 sidecar，只有 Calculation Bundle materialization 才按 descriptor 校验并读取
-- 历史上内嵌 `compiled_graph` 的 `snapshot-hdf5:v1` 仍可读取；新普通快照不再写入该 legacy 字段
+- 普通 snapshot 使用 `snapshot-release-evidence-json-zstd:v2` 元数据 sidecar 和 `snapshot-source-closure-json-zstd:v1` 内容寻址源闭包；常规数值求解不下载它们，只有 Calculation Bundle materialization 才沿 descriptor chain 校验并读取
+- 历史上内嵌 `compiled_graph` 的 `snapshot-hdf5:v1` 始终可读取 numerical payload；若旧 compiler schema 已不兼容则忽略该字段，普通 solve 继续可用，而依赖旧 release evidence 的 Calculation Bundle 明确要求重建 snapshot
 
 worker 上传 artifact 到 S3 兼容存储，并在 `lca_results` 中写入：
 

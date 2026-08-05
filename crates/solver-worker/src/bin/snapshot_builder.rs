@@ -74,9 +74,10 @@ use solver_worker::snapshot_artifacts::{
     SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary, SnapshotLinkedArtifact,
     SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProcessGapEntry,
     SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
-    SnapshotSingularRisk, SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary,
-    decode_snapshot_artifact, encode_snapshot_artifact_with_graph,
-    encode_snapshot_artifact_with_links, encode_snapshot_release_evidence_artifact,
+    SnapshotReviewBaseline, SnapshotReviewGateEvidence, SnapshotSingularRisk,
+    SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
+    encode_snapshot_artifact_with_links, encode_snapshot_artifact_with_purpose_artifacts,
+    encode_snapshot_release_evidence_artifact, encode_snapshot_source_closure_artifact,
 };
 use solver_worker::snapshot_builder_protocol::{
     SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal,
@@ -1200,7 +1201,7 @@ async fn run_snapshot_builder() -> anyhow::Result<()> {
     let store = build_object_store(&cli)?;
 
     if is_review_submit_overlay_mode(&cli, &request_roots) {
-        return run_review_submit_overlay_build(
+        return Box::pin(run_review_submit_overlay_build(
             &pool,
             &store,
             &cli,
@@ -1219,7 +1220,7 @@ async fn run_snapshot_builder() -> anyhow::Result<()> {
             artifact_expires_in_seconds,
             reuse_max_age_seconds,
             report_policy,
-        )
+        ))
         .await;
     }
 
@@ -1375,37 +1376,74 @@ async fn run_snapshot_builder() -> anyhow::Result<()> {
     }
 
     let encode_started = Instant::now();
-    let encoded_release_evidence = built
+    let encoded_source_closure = built
         .compiled_graph
         .release_evidence
         .as_ref()
-        .map(|evidence| encode_snapshot_release_evidence_artifact(snapshot_id, evidence))
+        .map(|evidence| encode_snapshot_source_closure_artifact(&evidence.source_datasets))
         .transpose()?;
     build_timing.encode_artifact_sec = encode_started.elapsed().as_secs_f64();
 
     let upload_started = Instant::now();
-    let release_evidence_artifact =
-        if let Some(encoded_evidence) = encoded_release_evidence.as_ref() {
-            let filename = format!("release-evidence-v1.{}", encoded_evidence.extension);
-            let uploaded = store
-                .upload_snapshot_sidecar_file(
-                    snapshot_id,
-                    filename.as_str(),
-                    encoded_evidence.content_type,
-                    encoded_evidence.path(),
-                    encoded_evidence.byte_size,
-                )
-                .await?;
-            Some(SnapshotLinkedArtifact {
-                format: encoded_evidence.format.to_owned(),
-                object_url: uploaded.object_url,
-                sha256: encoded_evidence.sha256.clone(),
-                byte_size: encoded_evidence.byte_size,
-                content_type: encoded_evidence.content_type.to_owned(),
-            })
-        } else {
-            None
-        };
+    let source_closure_artifact = if let Some(encoded) = encoded_source_closure.as_ref() {
+        let filename = format!("source-closure-v1-{}.{}", encoded.sha256, encoded.extension);
+        let uploaded = store
+            .upload_snapshot_sidecar_file(
+                snapshot_id,
+                filename.as_str(),
+                encoded.content_type,
+                encoded.path(),
+                encoded.byte_size,
+            )
+            .await?;
+        Some(SnapshotLinkedArtifact {
+            format: encoded.format.to_owned(),
+            object_url: uploaded.object_url,
+            sha256: encoded.sha256.clone(),
+            byte_size: encoded.byte_size,
+            content_type: encoded.content_type.to_owned(),
+        })
+    } else {
+        None
+    };
+
+    let encoded_release_evidence = built
+        .compiled_graph
+        .release_evidence
+        .as_ref()
+        .zip(source_closure_artifact.as_ref())
+        .map(|(evidence, source_closure_artifact)| {
+            encode_snapshot_release_evidence_artifact(
+                snapshot_id,
+                evidence,
+                source_closure_artifact,
+            )
+        })
+        .transpose()?;
+    let release_evidence_artifact = if let Some(encoded) = encoded_release_evidence.as_ref() {
+        let filename = format!(
+            "release-evidence-v2-{}.{}",
+            encoded.sha256, encoded.extension
+        );
+        let uploaded = store
+            .upload_snapshot_sidecar_file(
+                snapshot_id,
+                filename.as_str(),
+                encoded.content_type,
+                encoded.path(),
+                encoded.byte_size,
+            )
+            .await?;
+        Some(SnapshotLinkedArtifact {
+            format: encoded.format.to_owned(),
+            object_url: uploaded.object_url,
+            sha256: encoded.sha256.clone(),
+            byte_size: encoded.byte_size,
+            content_type: encoded.content_type.to_owned(),
+        })
+    } else {
+        None
+    };
     build_timing.upload_artifact_sec = upload_started.elapsed().as_secs_f64();
 
     let encode_started = Instant::now();
@@ -1981,7 +2019,7 @@ async fn run_review_submit_overlay_build(
         &method,
         &built,
         &overlay_config,
-        built.compiled_graph.clone(),
+        ReviewSnapshotProjection::Gate,
         artifact_expires_in_seconds,
         &mut build_timing,
     )
@@ -2071,6 +2109,21 @@ async fn load_or_build_review_submit_baseline(
         match store.download_object_url(&reused.artifact_url).await {
             Ok(bytes) => {
                 let decoded = decode_snapshot_artifact(&bytes)?;
+                if let Some(baseline) = decoded.review_baseline {
+                    touch_reused_snapshot_artifact(
+                        pool,
+                        reused.snapshot_id,
+                        SNAPSHOT_ARTIFACT_FORMAT,
+                        Some(REVIEW_SUBMIT_BASELINE_TTL_SECONDS),
+                    )
+                    .await?;
+                    build_timing.review_submit_baseline_reused = true;
+                    println!(
+                        "[review_submit] baseline_snapshot_id={} reused=true",
+                        reused.snapshot_id
+                    );
+                    return Ok(baseline.into_compiled_graph());
+                }
                 if let Some(graph) = decoded.compiled_graph {
                     touch_reused_snapshot_artifact(
                         pool,
@@ -2136,7 +2189,7 @@ async fn load_or_build_review_submit_baseline(
         method,
         &built,
         baseline_config,
-        built.compiled_graph.clone(),
+        ReviewSnapshotProjection::Baseline,
         Some(REVIEW_SUBMIT_BASELINE_TTL_SECONDS),
         build_timing,
     )
@@ -2157,6 +2210,12 @@ async fn load_or_build_review_submit_baseline(
     Ok(built.compiled_graph)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReviewSnapshotProjection {
+    Baseline,
+    Gate,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_built_snapshot_artifact(
     pool: &PgPool,
@@ -2171,17 +2230,30 @@ async fn persist_built_snapshot_artifact(
     method: &MethodSelection,
     built: &BuildOutput,
     config: &SnapshotBuildConfig,
-    compiled_graph: CompiledGraph,
+    projection: ReviewSnapshotProjection,
     artifact_expires_in_seconds: Option<i64>,
     build_timing: &mut BuildTimingSec,
 ) -> anyhow::Result<String> {
     let encode_started = Instant::now();
-    let encoded = encode_snapshot_artifact_with_graph(
+    let (review_baseline, review_gate_evidence) = match projection {
+        ReviewSnapshotProjection::Baseline => (
+            Some(SnapshotReviewBaseline::from(&built.compiled_graph)),
+            None,
+        ),
+        ReviewSnapshotProjection::Gate => (
+            None,
+            Some(SnapshotReviewGateEvidence::from(&built.compiled_graph)),
+        ),
+    };
+    let encoded = encode_snapshot_artifact_with_purpose_artifacts(
         snapshot_id,
         config.clone(),
         built.coverage.clone(),
         &built.data,
-        Some(compiled_graph),
+        None,
+        None,
+        review_baseline,
+        review_gate_evidence,
     )?;
     build_timing.encode_artifact_sec += encode_started.elapsed().as_secs_f64();
 
@@ -10937,7 +11009,7 @@ mod tests {
             Some(solver_worker::snapshot_artifacts::SnapshotLinkedArtifact {
                 format: solver_worker::snapshot_artifacts::SNAPSHOT_RELEASE_EVIDENCE_FORMAT
                     .to_owned(),
-                object_url: "https://objects.test/release-evidence-v1.json.zst".to_owned(),
+                object_url: "https://objects.test/release-evidence-v2.json.zst".to_owned(),
                 sha256: "a".repeat(64),
                 byte_size: 123,
                 content_type:
@@ -10949,6 +11021,8 @@ mod tests {
         let decoded = super::decode_snapshot_artifact(&encoded.bytes).expect("decode snapshot");
 
         assert!(decoded.compiled_graph.is_none());
+        assert!(decoded.review_baseline.is_none());
+        assert!(decoded.review_gate_evidence.is_none());
         assert_eq!(
             decoded
                 .release_evidence_artifact

@@ -22,9 +22,9 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
-lastReviewedNote: "Reviewed for Worker Issue #223: persistence separation does not change provider Flow universe or linking decisions."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Reviewed for Worker Issue #223: consumer-owned artifact projections do not change provider Flow universe or linking decisions."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
-lastReviewedNote: "Reviewed for Worker Issue #223: persistence separation does not change readiness schema or numerical blocker semantics."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Reviewed for Worker Issue #223: replacing persisted compiler IR with purpose projections does not change readiness schema or numerical blocker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

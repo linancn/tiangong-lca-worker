@@ -463,7 +463,10 @@ async fn execute_claimed_gate_run(
         config: Some(artifact.config),
         coverage: artifact.coverage,
         payload: artifact.payload,
-        compiled_graph: artifact.compiled_graph,
+        compiled_graph: artifact
+            .review_gate_evidence
+            .map(crate::snapshot_artifacts::SnapshotReviewGateEvidence::into_compiled_graph)
+            .or(artifact.compiled_graph),
         target_process_indices: target_process_idx.into_iter().collect(),
         process_records: vec![process_record],
         policy,

@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
-lastReviewedNote: "Updated for Worker Issue #223: documents numerical snapshot and release-evidence artifact boundaries."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Updated for Worker Issue #223: documents numerical, Review, release-metadata, and source-closure artifact boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -79,7 +79,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
 | `crates/solver-worker/src/resource.rs` | shared `worker.resource-profile.v1` admission, cancellation, Linux RSS/cgroup telemetry, and owned/temp/object/cache counters |
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
-| `crates/solver-worker/src/snapshot_artifacts.rs` | numerical HDF5 envelope, legacy graph reader, and file-backed compressed Calculation Bundle release-evidence sidecar contract |
+| `crates/solver-worker/src/snapshot_artifacts.rs` | numerical HDF5 envelope, Review projections, release-metadata/source-closure descriptor chain, and legacy graph/v1 readers |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
 | `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
@@ -140,7 +140,7 @@ Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limite
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
-`CompiledGraph` is compiler IR, not the durable ordinary-snapshot schema. A fresh ordinary snapshot persists only numerical payload/config/coverage in `snapshot-hdf5:v1` and binds purpose-specific `CompiledReleaseEvidence` through a URL/SHA-256/byte-size descriptor. The evidence sidecar is streamed to zstd and uploaded through the bounded multipart file path. Ordinary solve loads only the numerical artifact; Calculation Bundle materialization explicitly hydrates the sidecar. Historical HDF5 artifacts with an embedded graph remain readable. Review-submit baseline/overlay artifacts are a separate purpose-specific compatibility path until their bounded review projection replaces the persisted graph.
+`CompiledGraph` is compiler IR, not a durable snapshot schema. A fresh ordinary snapshot persists only numerical payload/config/coverage in `snapshot-hdf5:v1`. Its descriptor binds `snapshot-release-evidence-json-zstd:v2`, which contains Calculation Bundle metadata and a second descriptor for the content-addressed `snapshot-source-closure-json-zstd:v1`; neither metadata sidecar contains source documents twice. Both encoders borrow compiler data and stream to zstd-backed temporary files before bounded multipart upload. Ordinary solve loads only the numerical artifact; Calculation Bundle materialization explicitly hydrates and verifies the two-level descriptor chain. Historical HDF5 numerical payloads remain readable even when an embedded compiler schema has drifted: graph decoding is isolated, incompatible metadata is ignored for ordinary solve, and a purpose-specific consumer reports rebuild guidance. Compatible embedded graphs and v1 full-evidence sidecars remain readable. Review-submit baseline/overlay now persist consumer-owned `SnapshotReviewBaseline` / `SnapshotReviewGateEvidence` projections instead of compiler IR.
 The current provider-link runtime contract lives in `docs/provider-linking.md`. The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
 The process-column contract is one complete TIDAS Process revision per snapshot matrix column. `quantitativeReference.referenceToReferenceFlow` selects that column's signed normalization pivot; it does not require Product, Output, or a positive amount. Non-reference exchanges do not create derived matrix columns. When another exchange needs an independent activity pivot, upstream must publish another complete Process revision.
@@ -190,7 +190,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 
 `crates/solver-worker/src/calculation_bundle.rs` owns canonical `tiangong.calculation-bundle.v2` generation. Its technosphere edge schema uses dependent/residual/balancing/reference/routing/activity fields rather than assuming consumer Input and provider Output. Solver evidence records allocation and link semantics versions, boundary policy, and exact flow identity policy. The frozen source-document closure and directional LCI release guarantees remain unchanged; older snapshots without exact signed-flow release evidence must be rebuilt.
 
-Calculation Bundle reads exact release evidence from either the current integrity-bound `snapshot-release-evidence-json-zstd:v1` sidecar or the legacy embedded `compiled_graph.release_evidence`. This compatibility is read-only: new ordinary snapshots never serialize the complete graph.
+Calculation Bundle reads exact release evidence from the current integrity-bound v2 metadata + v1 source-closure chain, the transitional v1 full-evidence sidecar, or a schema-compatible legacy embedded `compiled_graph.release_evidence`. Incompatible embedded evidence fails with explicit rebuild guidance without making the numerical payload unreadable. Compatibility is read-only: new snapshots never serialize the complete graph. Publication uploads source closure, release metadata, numerical HDF5 and index before the database ready record becomes visible; failed pre-publication uploads remain unreferenced objects under the same snapshot directory and are removed by directory-level snapshot/orphan GC.
 
 ## Operational Baseline
 

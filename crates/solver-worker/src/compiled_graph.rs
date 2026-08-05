@@ -7,6 +7,7 @@ use crate::graph_types::ScopeProcessPartition;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompiledFlowKind {
+    #[serde(alias = "waste")]
     Product,
     Elementary,
 }
@@ -147,7 +148,9 @@ pub struct CompiledProviderAllocation {
 pub enum CompiledProviderCandidateEligibility {
     #[default]
     Unknown,
+    #[serde(alias = "accepted_reference_input")]
     AcceptedReferenceOutput,
+    #[serde(alias = "rejected_non_reference_input")]
     RejectedNonReferenceOutput,
     AcceptedOppositeSignReference,
     RejectedSameSignReference,
@@ -563,7 +566,10 @@ pub struct CompiledReleaseTechnosphereEdge {
 mod tests {
     use serde_json::json;
 
-    use super::{CompiledAllocationStats, CompiledEdgePartition, ScopeProcessPartition};
+    use super::{
+        CompiledAllocationStats, CompiledEdgePartition, CompiledFlowKind,
+        CompiledProviderCandidateEligibility, ScopeProcessPartition,
+    };
 
     #[test]
     fn compiled_edge_partition_tracks_cross_partition_edges() {
@@ -596,5 +602,27 @@ mod tests {
         assert_eq!(stats.legacy_empty_allocation_as_undeclared_count, 0);
         assert_eq!(stats.legacy_single_output_target_inferred_count, 0);
         assert_eq!(stats.legacy_single_reference_target_inferred_count, 0);
+    }
+
+    #[test]
+    fn legacy_directional_labels_map_to_current_technosphere_semantics() {
+        let kind: CompiledFlowKind =
+            serde_json::from_value(json!("waste")).expect("parse legacy waste flow kind");
+        let accepted: CompiledProviderCandidateEligibility =
+            serde_json::from_value(json!("accepted_reference_input"))
+                .expect("parse legacy reference input eligibility");
+        let rejected: CompiledProviderCandidateEligibility =
+            serde_json::from_value(json!("rejected_non_reference_input"))
+                .expect("parse legacy non-reference input eligibility");
+
+        assert_eq!(kind, CompiledFlowKind::Product);
+        assert_eq!(
+            accepted,
+            CompiledProviderCandidateEligibility::AcceptedReferenceOutput
+        );
+        assert_eq!(
+            rejected,
+            CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
+        );
     }
 }

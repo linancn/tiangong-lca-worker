@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
-lastReviewedAt: 2026-08-05
-lastReviewedNote: "Updated for Worker Issue #223: certificate-bound builds can load release evidence from the linked sidecar."
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedAt: 2026-08-06
+lastReviewedNote: "Updated for Worker Issue #223: certificate-bound builds load release metadata and source closure through a verified descriptor chain."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -244,7 +244,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 
 ### 7.3 与 certificate-bound LCIA result package 的边界
 
-`lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。数值 HDF5 不再要求内嵌完整 `CompiledGraph`；Calculation Bundle 所需 release evidence 由 HDF5 内 integrity-bound descriptor 指向 `snapshot-release-evidence-json-zstd:v1` sidecar，并在 materialization 时按 size/SHA-256/format 校验后读取。Legacy graph-bearing snapshot 仍可读。
+`lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。数值 HDF5 不再要求内嵌完整 `CompiledGraph`；Calculation Bundle 所需 release metadata 由 HDF5 descriptor 指向 `snapshot-release-evidence-json-zstd:v2`，后者再绑定 `snapshot-source-closure-json-zstd:v1`，materialization 逐层校验 size/SHA-256/format/content type/dataset count。Legacy numerical payload 即使 graph schema 漂移也仍可读；schema-compatible graph-bearing snapshot 与 v1 full-evidence sidecar 可用于 bundle，incompatible evidence 明确要求重建。
 
 Fresh scope closure uses the bounded `lcia.scope-closure-bundle.v4` binding manifest. Package verification downloads that JSON through the bounded file API, recomputes its exact hash, and streams only the schema/token binding fields; historical v1/v3 bundle files remain readable without materializing the complete object in memory. The growing administrative evidence is partitioned under the closure manifest and does not change TIDAS import/export ZIP semantics.
 

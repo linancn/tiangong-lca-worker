@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
-lastReviewedNote: "Reviewed for Worker Issue #223: numerical snapshot separation does not change administrative closure result or memory limits."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Updated for Worker Issue #223: numerical release metadata and immutable source documents have separate file-backed artifacts without an encoding-time document clone."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -109,6 +109,8 @@ The implementation is window-bounded rather than relation-cardinality-bounded:
 - one active issue partition writer, root-impact writer, frozen-graph writer, and TIDAS compression buffer is retained per stage;
 - residual sort records contain the compact issue key and coalesced record, not repeated affected-root identities or JSON witness paths;
 - temporary-space admission uses observed input and measured intermediate bytes plus the configured reserve, never `issue count × global root count`.
+
+The later numerical snapshot publication does not copy this administrative artifact graph into HDF5. `CompiledGraph` remains transient compiler IR. Calculation Bundle metadata and source documents are encoded as separate zstd temporary files; both encoders borrow the already-frozen compiler slices and do not clone the source-document vector during serialization. Ordinary solve reads neither file. Calculation Bundle materialization downloads them through explicit byte/SHA bounds and only then hydrates the source vector required by the existing bundle validator/writer. Review Submit persists bounded baseline/gate projections and never embeds source documents.
 
 Cancellation is checked during raw merge, issue coalescing, graph reachability, partition writing, frozen-graph writing, TIDAS compression, and between bundle/report stages. A lease-heartbeat failure cancels the blocking task and waits for it to exit before returning. Temporary directories own all runs and artifacts, so success, cancellation, admission failure, crash recovery, and retry do not leave committed partial files. Object upload uses cancellable bounded file transfer; multipart cancellation aborts the remote upload.
 

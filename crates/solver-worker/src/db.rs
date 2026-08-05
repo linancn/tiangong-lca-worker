@@ -2,7 +2,7 @@ use std::{
     fs::File,
     future::Future,
     io::{BufReader, ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -42,9 +42,11 @@ use crate::{
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
     graph_types::RequestRootProcess,
     snapshot_artifacts::{
-        DecodedSnapshotArtifact, SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE,
-        SNAPSHOT_RELEASE_EVIDENCE_FORMAT, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
-        decode_snapshot_release_evidence_artifact,
+        DecodedSnapshotArtifact, DecodedSnapshotReleaseEvidence,
+        SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE, SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+        SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE, SNAPSHOT_SOURCE_CLOSURE_FORMAT,
+        ScopeClosureSnapshotBinding, SnapshotReleaseEvidence, decode_snapshot_artifact,
+        decode_snapshot_release_evidence_artifact, decode_snapshot_source_closure_artifact,
     },
     snapshot_builder_protocol::{
         SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
@@ -964,11 +966,18 @@ async fn fetch_snapshot_release_evidence(
     }
 
     let artifact = decoded.release_evidence_artifact.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "snapshot {snapshot_id} lacks exact Calculation Bundle release evidence; rebuild the snapshot"
+        decoded.compiled_graph_decode_error.as_ref().map_or_else(
+            || anyhow::anyhow!(
+                "snapshot {snapshot_id} lacks exact Calculation Bundle release evidence; rebuild the snapshot"
+            ),
+            |error| anyhow::anyhow!(
+                "snapshot {snapshot_id} contains incompatible legacy compiler evidence ({error}); rebuild the snapshot"
+            ),
         )
     })?;
-    if artifact.format != SNAPSHOT_RELEASE_EVIDENCE_FORMAT {
+    if artifact.format != SNAPSHOT_RELEASE_EVIDENCE_FORMAT
+        && artifact.format != "snapshot-release-evidence-json-zstd:v1"
+    {
         return Err(anyhow::anyhow!(
             "snapshot {snapshot_id} has unsupported release evidence format: {}",
             artifact.format
@@ -1004,7 +1013,65 @@ async fn fetch_snapshot_release_evidence(
             downloaded.byte_size
         ));
     }
-    decode_snapshot_release_evidence_artifact(&destination, snapshot_id)
+    match decode_snapshot_release_evidence_artifact(&destination, snapshot_id)? {
+        DecodedSnapshotReleaseEvidence::Legacy(evidence) => Ok(evidence),
+        DecodedSnapshotReleaseEvidence::Linked(evidence) => {
+            hydrate_snapshot_release_evidence(state, snapshot_id, temp_dir.path(), evidence).await
+        }
+    }
+}
+
+async fn hydrate_snapshot_release_evidence(
+    state: &AppState,
+    snapshot_id: Uuid,
+    temp_dir: &Path,
+    evidence: SnapshotReleaseEvidence,
+) -> anyhow::Result<CompiledReleaseEvidence> {
+    let source = &evidence.source_closure_artifact;
+    if source.format != SNAPSHOT_SOURCE_CLOSURE_FORMAT
+        || source.content_type != SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE
+        || source.byte_size == 0
+    {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} has invalid source closure descriptor: format={} content_type={} byte_size={}",
+            source.format,
+            source.content_type,
+            source.byte_size
+        ));
+    }
+    let source_destination = temp_dir.join("source-closure-v1.json.zst");
+    let downloaded = state
+        .object_store
+        .download_object_url_to_file(
+            source.object_url.as_str(),
+            &source_destination,
+            ObjectTransferOptions::new(source.byte_size)
+                .with_expected_sha256(source.sha256.as_str()),
+        )
+        .await?;
+    if downloaded.byte_size != source.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} source closure size mismatch: expected={} observed={}",
+            source.byte_size,
+            downloaded.byte_size
+        ));
+    }
+    let source_datasets = decode_snapshot_source_closure_artifact(&source_destination)?;
+    if u64::try_from(source_datasets.len())? != evidence.source_dataset_count {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} source closure dataset count mismatch: expected={} observed={}",
+            evidence.source_dataset_count,
+            source_datasets.len()
+        ));
+    }
+    Ok(CompiledReleaseEvidence {
+        processes: evidence.processes,
+        inventory_exchanges: evidence.inventory_exchanges,
+        technosphere_edges: evidence.technosphere_edges,
+        biosphere_edges: evidence.biosphere_edges,
+        source_datasets,
+        source_reference_provenance: evidence.source_reference_provenance,
+    })
 }
 
 pub(crate) async fn fetch_decoded_snapshot_artifact(

@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-05"
-lastReviewedCommit: "b0d5bfb8f96a5b43b520ed56191123aa16f12026"
-lastReviewedNote: "Reviewed for Worker Issue #223: snapshot artifact separation remains within existing Worker routing and ownership rules."
+lastReviewedAt: "2026-08-06"
+lastReviewedCommit: "5a463eed331aeacd64b9762db81ce9061d41afdb"
+lastReviewedNote: "Reviewed for Worker Issue #223: numerical, Review, release-metadata, and source-closure projections remain within existing Worker routing and ownership rules."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

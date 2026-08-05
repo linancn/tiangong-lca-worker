@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Updated for Worker Issue #221: numerical artifacts distinguish optional administrative support from fail-closed numerical dependencies."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Updated for Worker Issue #223: certified numerical snapshots bind separate release metadata and immutable source closure."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -220,7 +220,7 @@ The actor-bound download projection is `get_lcia_scope_closure_report_download(u
 
 `closure-snapshot-v1.json` is not a numerical snapshot and must not be produced. A blocked or incomplete run persists only the administrative artifacts above; its snapshot identity, snapshot hashes, snapshot artifact reference, numerical `evidenceHash`, and certificate are absent.
 
-For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real numerical `snapshot-hdf5:v1` artifact and snapshot-index sidecar through `lca_network_snapshots` and `lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`. The snapshot-index sidecar is the authoritative exact ordered Process axis; its count must also match the numerical payload. Calculation Bundle release evidence is a separate integrity-bound zstd sidecar referenced from the HDF5 envelope, not a persisted full compiler graph. Generic live-snapshot reuse cannot substitute an artifact that lacks these bindings.
+For a complete blocker-free run, the existing frozen `snapshot_builder` persists the real numerical `snapshot-hdf5:v1` artifact and snapshot-index sidecar through `lca_network_snapshots` and `lca_snapshot_artifacts`. Passed evidence comes back from those persisted records and binds `snapshotId`, the HDF5 artifact SHA-256 as `snapshotHash`, `snapshotArtifactId`, `snapshotIndexSha256`, and `snapshotBuildContractHash`. The embedded HDF5 binding uses `lcia.scope-closure-snapshot-binding.v1` and binds `effectiveScopeHash`, `dataSnapshotToken`, and `closureBundleHash`. The snapshot-index sidecar is the authoritative exact ordered Process axis; its count must also match the numerical payload. Calculation Bundle metadata and immutable source documents are separate integrity-bound zstd artifacts: HDF5 binds release-evidence v2, and release evidence binds the content-addressed source closure by URL/SHA-256/size/format/dataset count. No layer persists a full compiler graph or duplicates source documents. Generic live-snapshot reuse cannot substitute an artifact that lacks these bindings.
 
 Administrative artifacts are uploaded before terminal projection. The report artifact manifest hash is recomputed from persisted database metadata. `evidenceHash` is `lcia.scope-closure-evidence.v2` and binds the immutable scan hashes plus the persisted numerical snapshot identity and hashes, while intentionally excluding the run-specific report artifact manifest. A certificate additionally binds the current closure check and its current report artifact manifest, so copied or stale reports cannot be substituted.
 
@@ -254,7 +254,7 @@ The database Build V2 command atomically enqueues `lcia_result.package_build` wi
 - `closure_bundle_artifact_id`
 - `closure_bundle_hash`
 
-The Worker accepts this authoritative eleven-field binding only all-or-none and validates every field against a currently valid, complete, passed closure check before package execution. It downloads the exact closure-bundle artifact and numerical snapshot artifact by their certified IDs, recomputes their hashes, and requires the snapshot-index sidecar to preserve the exact ordered effective Process axis while the numerical payload preserves the same count. When Calculation Bundle materialization needs release evidence, Worker follows the integrity-bound sidecar descriptor in the verified HDF5 rather than requiring a persisted compiled graph. `report_artifact_manifest_hash` remains certificate/audit evidence in the job payload, but it is not a substitute for the exact closure-bundle artifact identity. The Worker consumes the certificate and frozen snapshot; it does not rerun administrative closure.
+The Worker accepts this authoritative eleven-field binding only all-or-none and validates every field against a currently valid, complete, passed closure check before package execution. It downloads the exact closure-bundle artifact and numerical snapshot artifact by their certified IDs, recomputes their hashes, and requires the snapshot-index sidecar to preserve the exact ordered effective Process axis while the numerical payload preserves the same count. When Calculation Bundle materialization needs release evidence, Worker follows the verified HDF5 descriptor to release metadata and then the verified source-closure descriptor; it checks compressed hash/size/format/content type and dataset count at every hop rather than requiring a persisted compiled graph. `report_artifact_manifest_hash` remains certificate/audit evidence in the job payload, but it is not a substitute for the exact closure-bundle artifact identity. The Worker consumes the certificate and frozen snapshot; it does not rerun administrative closure.
 
 Closure binding changes provenance and eligibility, not numerical computation. The existing package snapshot build, all-unit solve, result artifact, and ready-marking path remains unchanged. Result JSON, result refs, persisted package metadata, and audit context preserve `closureCheckId` so downstream consumers can prove which certificate authorized the unchanged numerical output.
 
