@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::scope_closure::ReferenceEdge;
 
-pub const SOURCE_REFERENCE_POLICY_VERSION: &str = "source-reference-policy.v3";
+pub const SOURCE_REFERENCE_POLICY_VERSION: &str = "source-reference-policy.v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +18,7 @@ pub enum SourceReferenceRole {
     ExchangeFlow,
     ProviderProcess,
     RequiredSupport,
+    AdministrativeSupport,
     Lineage,
     ModelComposition,
 }
@@ -29,6 +30,7 @@ impl SourceReferenceRole {
             Self::ExchangeFlow => "exchange_flow",
             Self::ProviderProcess => "provider_process",
             Self::RequiredSupport => "required_support",
+            Self::AdministrativeSupport => "administrative_support",
             Self::Lineage => "lineage",
             Self::ModelComposition => "model_composition",
         }
@@ -41,6 +43,7 @@ pub enum SourceReferenceAction {
     ValidateExchangeAxis,
     ValidateProviderInvariant,
     FetchRequiredSupport,
+    FetchOptionalSupport,
     RecordEvidence,
     TraverseAdministrative,
 }
@@ -77,6 +80,9 @@ pub fn classify_reference(
             SourceReferenceAction::ValidateProviderInvariant
         }
         (_, SourceReferenceRole::RequiredSupport) => SourceReferenceAction::FetchRequiredSupport,
+        (_, SourceReferenceRole::AdministrativeSupport) => {
+            SourceReferenceAction::FetchOptionalSupport
+        }
         (_, SourceReferenceRole::Lineage | SourceReferenceRole::ModelComposition) => {
             SourceReferenceAction::RecordEvidence
         }
@@ -107,6 +113,9 @@ pub fn classify_malformed_reference_role(
     }
     if is_model_composition_path(source_category, &path) {
         return Some(SourceReferenceRole::ModelComposition);
+    }
+    if is_administrative_support_path(&path) {
+        return Some(SourceReferenceRole::AdministrativeSupport);
     }
     if source_category == "processes"
         && path.contains("exchange")
@@ -150,6 +159,9 @@ fn classify_role_parts(
     {
         return Ok(SourceReferenceRole::ModelComposition);
     }
+    if is_administrative_support_path(&path) {
+        return Ok(SourceReferenceRole::AdministrativeSupport);
+    }
     if source == "processes"
         && target == "processes"
         && (path.contains("provider") || path.contains("referenceprocess"))
@@ -182,6 +194,31 @@ fn is_model_composition_path(source: &str, path: &str) -> bool {
     path.contains("referencetoincludedprocesses")
         || path.contains("referencetoincludedprocess")
         || (source == "lifecyclemodels" && path.contains("referenceto"))
+}
+
+fn is_administrative_support_path(path: &str) -> bool {
+    [
+        "referencetocommissioner",
+        "referencetocompliancesystem",
+        "referencetocontact",
+        "referencetoconvertedoriginaldatasetfrom",
+        "referencetodatahandlingprinciples",
+        "referencetodatasetformat",
+        "referencetodatasetuseapproval",
+        "referencetodatasource",
+        "referencetoentitieswithexclusiveaccess",
+        "referencetolcamethoddetails",
+        "referencetologo",
+        "referencetoownershipofdataset",
+        "referencetopersonorentityenteringthedata",
+        "referencetopersonorentitygeneratingthedataset",
+        "referencetoregistrationauthority",
+        "referencetotechnologyflowdiagrammorpicture",
+        "referencetotechnologypictogramme",
+        "referencetounchangedrepublication",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -257,6 +294,91 @@ mod tests {
     }
 
     #[test]
+    fn administrative_support_is_optional_for_numeric_artifacts_and_strict_for_certificate() {
+        let contact = one_edge(
+            DatasetCategory::Flows,
+            r#"{
+                "administrativeInformation": {
+                    "dataEntryBy": {
+                        "common:referenceToPersonOrEntityEnteringTheData": {
+                            "@type": "contact data set",
+                            "@refObjectId": "0d9e9b91-3fbf-4a3b-8f11-a582389ea4f1",
+                            "@version": "01.00.000"
+                        }
+                    }
+                }
+            }"#,
+        );
+        for purpose in [
+            ArtifactPurpose::ReviewSubmit,
+            ArtifactPurpose::CalculationBundle,
+        ] {
+            let classified = classify_reference(&contact, purpose).unwrap();
+            assert_eq!(classified.role, SourceReferenceRole::AdministrativeSupport);
+            assert_eq!(
+                classified.action,
+                SourceReferenceAction::FetchOptionalSupport
+            );
+        }
+        assert_eq!(
+            classify_reference(&contact, ArtifactPurpose::CertificateClosure)
+                .unwrap()
+                .action,
+            SourceReferenceAction::TraverseAdministrative
+        );
+        assert_eq!(
+            classify_malformed_reference_role(
+                "flows",
+                "$.administrativeInformation.dataEntryBy.common:referenceToPersonOrEntityEnteringTheData",
+            ),
+            Some(SourceReferenceRole::AdministrativeSupport)
+        );
+    }
+
+    #[test]
+    fn numerical_flow_property_and_unit_group_support_remain_required() {
+        let flow_property = one_edge(
+            DatasetCategory::Flows,
+            r#"{
+                "flowProperties": {
+                    "flowProperty": {
+                        "referenceToFlowPropertyDataSet": {
+                            "@type": "flow property data set",
+                            "@refObjectId": "93a60a57-a3c8-11da-a746-0800200b9a66",
+                            "@version": "03.00.003"
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(
+            classify_reference(&flow_property, ArtifactPurpose::CalculationBundle)
+                .unwrap()
+                .action,
+            SourceReferenceAction::FetchRequiredSupport
+        );
+
+        let unit_group = one_edge(
+            DatasetCategory::Flowproperties,
+            r#"{
+                "quantitativeReference": {
+                    "referenceToReferenceUnitGroup": {
+                        "@type": "unit group data set",
+                        "@refObjectId": "93a60a57-a4c8-11da-a746-0800200b9a66",
+                        "@version": "03.00.003"
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(
+            classify_reference(&unit_group, ArtifactPurpose::CalculationBundle)
+                .unwrap()
+                .action,
+            SourceReferenceAction::FetchRequiredSupport
+        );
+    }
+
+    #[test]
     fn role_names_are_stable_snake_case() {
         assert_eq!(
             SourceReferenceRole::ModelComposition.as_str(),
@@ -265,6 +387,10 @@ mod tests {
         assert_eq!(
             SourceReferenceRole::RequiredSupport.as_str(),
             "required_support"
+        );
+        assert_eq!(
+            SourceReferenceRole::AdministrativeSupport.as_str(),
+            "administrative_support"
         );
         assert_eq!(
             serde_json::to_value(SourceReferenceRole::ModelComposition).unwrap(),

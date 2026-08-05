@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
-lastReviewedNote: "Reviewed for Worker Issue #219: bounded numerical source-support reads remain Worker-owned and do not alter orchestration or provider ownership."
+lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
+lastReviewedNote: "Reviewed for Worker Issue #221: purpose-aware source-reference handling, bounded blocker diagnostics, and read-only auditing remain Worker-owned."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

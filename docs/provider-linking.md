@@ -23,8 +23,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
-lastReviewedNote: "Reviewed for Worker Issue #219: source-support read batching does not change the provider Flow universe or linking decisions."
+lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
+lastReviewedNote: "Reviewed for Worker Issue #221: optional administrative support does not change the provider Flow universe or linking decisions."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

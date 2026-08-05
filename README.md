@@ -289,6 +289,18 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `service_loop_candidates`：同 flow input/output 金额完全相等的可疑 service-loop process
 - `pn_pm_candidates`：PN / PM0.2 / particle 相关的可疑 process
 
+### 4.1.2 只读审计 source reference 完整性
+
+```bash
+DATABASE_URL='postgresql://...' ./scripts/audit_source_references.sh > source-reference-audit.json
+```
+
+脚本使用 repeatable-read、read-only 事务扫描所有 dataset revisions，只输出聚合统计，不输出
+dataset payload。`worker.source-reference-audit.v1` 分开统计空对象占位、缺失或非法
+`@refObjectId`、无法识别的 target type、缺失 target ID、缺失 exact version、非法 version，以及
+各类文档最大字节数和超过 64 MiB support-read 单文档上限的数量。该脚本只用于发现和生成修复
+清单；它不会更新引用或修改生产数据。
+
 ## 5. 环境变量
 
 可从 `.env.example` 复制模板到 `.env`、`.env.dev` 或 systemd `EnvironmentFile`，再填入真实连接串和密钥。`.env.example` 只应保留占位值和安全默认值。

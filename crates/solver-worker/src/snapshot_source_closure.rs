@@ -114,7 +114,11 @@ pub fn classify_source_document(
             );
             let evidence_only = matches!(
                 role,
-                Some(SourceReferenceRole::Lineage | SourceReferenceRole::ModelComposition)
+                Some(
+                    SourceReferenceRole::AdministrativeSupport
+                        | SourceReferenceRole::Lineage
+                        | SourceReferenceRole::ModelComposition
+                )
             ) && purpose != ArtifactPurpose::CertificateClosure;
             if evidence_only {
                 if !references
@@ -124,12 +128,11 @@ pub fn classify_source_document(
                     let role = role.expect("evidence-only role is present");
                     references.push(ClassifiedSourceReference {
                         source_identity: source_identity.clone(),
-                        target_type: match role {
-                            SourceReferenceRole::ModelComposition => {
-                                CompiledReleaseSourceDatasetType::Process
-                            }
-                            _ => source.dataset_type,
-                        },
+                        target_type: malformed_evidence_target_type(
+                            role,
+                            issue.json_path.as_str(),
+                            source.dataset_type,
+                        ),
                         target_uuid: issue
                             .details
                             .get("raw_ref_object_id")
@@ -166,6 +169,35 @@ fn is_external_digital_file_path(json_path: &str) -> bool {
     json_path
         .to_ascii_lowercase()
         .ends_with("referencetodigitalfile")
+}
+
+fn malformed_evidence_target_type(
+    role: SourceReferenceRole,
+    json_path: &str,
+    source_type: CompiledReleaseSourceDatasetType,
+) -> CompiledReleaseSourceDatasetType {
+    if role == SourceReferenceRole::ModelComposition {
+        return CompiledReleaseSourceDatasetType::Process;
+    }
+    let path = json_path.to_ascii_lowercase();
+    if path.contains("contact")
+        || path.contains("commissioner")
+        || path.contains("ownership")
+        || path.contains("personorentity")
+        || path.contains("registrationauthority")
+        || path.contains("entitieswithexclusiveaccess")
+    {
+        return CompiledReleaseSourceDatasetType::Contact;
+    }
+    if path.contains("source")
+        || path.contains("datasetformat")
+        || path.contains("compliancesystem")
+        || path.contains("logo")
+        || path.contains("technology")
+    {
+        return CompiledReleaseSourceDatasetType::Source;
+    }
+    source_type
 }
 
 pub fn validate_resource_limits(
@@ -221,7 +253,12 @@ pub fn provenance_summary(
 ) -> Result<Option<CompiledSourceReferenceProvenance>, SnapshotSourceClosureError> {
     let mut evidence = references
         .iter()
-        .filter(|reference| reference.action == SourceReferenceAction::RecordEvidence)
+        .filter(|reference| {
+            matches!(
+                reference.action,
+                SourceReferenceAction::FetchOptionalSupport | SourceReferenceAction::RecordEvidence
+            )
+        })
         .map(|reference| CompiledSourceReferenceSample {
             source_identity: reference.source_identity.clone(),
             json_path: reference.json_path.clone(),
@@ -438,6 +475,46 @@ mod tests {
             required.extraction_issues[0]["referenceRole"],
             "exchange_flow"
         );
+    }
+
+    #[test]
+    fn empty_administrative_placeholder_is_evidence_only_for_numeric_artifacts() {
+        let document = json!({
+            "flowDataSet": {
+                "administrativeInformation": {
+                    "dataEntryBy": {
+                        "common:referenceToPersonOrEntityEnteringTheData": {}
+                    }
+                }
+            }
+        });
+        for purpose in [
+            ArtifactPurpose::ReviewSubmit,
+            ArtifactPurpose::CalculationBundle,
+        ] {
+            let classified = classify_source_document(
+                &source(CompiledReleaseSourceDatasetType::Flow, document.clone()),
+                purpose,
+            )
+            .unwrap();
+            assert!(classified.extraction_issues.is_empty());
+            assert_eq!(classified.references.len(), 1);
+            assert_eq!(
+                classified.references[0].role,
+                SourceReferenceRole::AdministrativeSupport
+            );
+            assert_eq!(
+                classified.references[0].action,
+                SourceReferenceAction::RecordEvidence
+            );
+        }
+
+        let certificate = classify_source_document(
+            &source(CompiledReleaseSourceDatasetType::Flow, document),
+            ArtifactPurpose::CertificateClosure,
+        )
+        .unwrap();
+        assert!(!certificate.extraction_issues.is_empty());
     }
 
     #[test]

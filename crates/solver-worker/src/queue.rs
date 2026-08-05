@@ -259,9 +259,14 @@ async fn detect_service_loop_processes(
 async fn build_failure_diagnostics(
     state: &AppState,
     payload: &JobPayload,
-    err_message: &str,
+    error: &anyhow::Error,
 ) -> Value {
+    let err_message = error.to_string();
     let mut diag = serde_json::json!({"error": err_message});
+
+    if let Some(blocked) = snapshot_builder_blocked_diagnostics(error) {
+        diag["snapshot_builder_blocked"] = blocked;
+    }
 
     // For factorization/singular errors, attach snapshot coverage and problem process info.
     if (err_message.contains("singular") || err_message.contains("factorization"))
@@ -292,6 +297,27 @@ async fn build_failure_diagnostics(
     }
 
     diag
+}
+
+fn snapshot_builder_blocked_diagnostics(error: &anyhow::Error) -> Option<Value> {
+    let crate::db::SnapshotBuilderProcessFailure::Blocked {
+        code,
+        blocking_reasons,
+        blocking_reason_count,
+        blocking_reasons_sha256,
+        blocking_reasons_truncated,
+    } = error.downcast_ref::<crate::db::SnapshotBuilderProcessFailure>()?
+    else {
+        return None;
+    };
+    Some(json!({
+        "code": code,
+        "blocking_reasons": blocking_reasons,
+        "blocking_reason_count": blocking_reason_count,
+        "blocking_reasons_sha256": blocking_reasons_sha256,
+        "blocking_reasons_truncated": blocking_reasons_truncated,
+        "sample_count": blocking_reasons.len(),
+    }))
 }
 
 fn snapshot_diagnostic_scope_pairs(
@@ -496,8 +522,7 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
             record_solver_worker_job_success(state, &job, &payload, lca_job_id).await;
         }
         Err(err) => {
-            record_solver_worker_job_failure(state, &job, &payload, lca_job_id, &err.to_string())
-                .await;
+            record_solver_worker_job_failure(state, &job, &payload, lca_job_id, &err).await;
         }
     }
 }
@@ -680,8 +705,9 @@ async fn record_solver_worker_job_failure(
     job: &WorkerJob,
     payload: &JobPayload,
     lca_job_id: Uuid,
-    err_message: &str,
+    error: &anyhow::Error,
 ) {
+    let err_message = error.to_string();
     error!(
         error = %err_message,
         worker_job_id = %job.id,
@@ -698,9 +724,13 @@ async fn record_solver_worker_job_failure(
             "error": err_message,
             "buildId": build_id,
         });
+        let mut diagnostics = diagnostics;
+        if let Some(blocked) = snapshot_builder_blocked_diagnostics(error) {
+            diagnostics["snapshot_builder_blocked"] = blocked;
+        }
         let mut result = WorkerJobResult::failed(
             "lcia_result_package_build_failed",
-            err_message.to_owned(),
+            err_message.clone(),
             json!({
                 "workerJobId": job.id,
                 "buildId": build_id,
@@ -727,9 +757,14 @@ async fn record_solver_worker_job_failure(
         return;
     }
 
-    let diagnostics = build_failure_diagnostics(state, payload, err_message).await;
-    let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
-        .await;
+    let diagnostics = build_failure_diagnostics(state, payload, error).await;
+    let _ = mark_result_cache_failed(
+        &state.pool,
+        lca_job_id,
+        "job_execution_failed",
+        &err_message,
+    )
+    .await;
     if let Err(err) = link_lca_worker_job_domain_refs(&state.pool, job.id, lca_job_id).await {
         warn!(
             error = %err,
@@ -740,7 +775,7 @@ async fn record_solver_worker_job_failure(
     }
     let mut result = WorkerJobResult::failed(
         "solver_worker_job_failed",
-        err_message.to_owned(),
+        err_message,
         json!({
             "workerJobId": job.id,
             "lcaJobId": lca_job_id,
@@ -1702,7 +1737,7 @@ pub async fn run_worker_loop(
                             let job_id = extract_job_id(&payload);
                             let err_message = err.to_string();
                             let diagnostics =
-                                build_failure_diagnostics(&state, &payload, &err_message).await;
+                                build_failure_diagnostics(&state, &payload, &err).await;
                             let _ = update_legacy_lca_job_status(
                                 &state.pool,
                                 job_id,
@@ -1807,8 +1842,8 @@ mod tests {
             AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
             lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
             payload_type_name, result_schema_version_for_payload,
-            skipped_legacy_lca_job_projection, snapshot_diagnostic_scope_pairs,
-            solver_worker_job_payload, solver_worker_result_ref,
+            skipped_legacy_lca_job_projection, snapshot_builder_blocked_diagnostics,
+            snapshot_diagnostic_scope_pairs, solver_worker_job_payload, solver_worker_result_ref,
             validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
@@ -2600,6 +2635,33 @@ mod tests {
                     "id": result_id,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn snapshot_builder_blocker_diagnostics_preserve_bounded_terminal_metadata() {
+        let reason = json!({
+            "code": "source_dependency_unavailable",
+            "jsonPath": "$.flow.referenceToFlowPropertyDataSet",
+        });
+        let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Blocked {
+            code: "source_reference_invalid".to_owned(),
+            blocking_reasons: vec![reason.clone()],
+            blocking_reason_count: 5_849,
+            blocking_reasons_sha256: "a".repeat(64),
+            blocking_reasons_truncated: true,
+        });
+
+        assert_eq!(
+            snapshot_builder_blocked_diagnostics(&error),
+            Some(json!({
+                "code": "source_reference_invalid",
+                "blocking_reasons": [reason],
+                "blocking_reason_count": 5_849,
+                "blocking_reasons_sha256": "a".repeat(64),
+                "blocking_reasons_truncated": true,
+                "sample_count": 1,
+            }))
         );
     }
 
