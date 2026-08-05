@@ -267,6 +267,27 @@ impl ObjectStoreClient {
             .map(|result| result.object_url)
     }
 
+    /// Uploads a file-backed, purpose-specific artifact beside the numerical snapshot.
+    pub async fn upload_snapshot_sidecar_file(
+        &self,
+        snapshot_id: Uuid,
+        filename: &str,
+        content_type: &str,
+        file_path: &Path,
+        artifact_byte_size: u64,
+    ) -> anyhow::Result<ObjectUploadResult> {
+        let filename = filename.trim_matches('/');
+        if filename.is_empty() || filename.contains('/') || filename == ".." {
+            return Err(anyhow::anyhow!(
+                "snapshot sidecar filename must be one normalized path segment"
+            ));
+        }
+        let relative_key = format!("snapshots/{snapshot_id}/snapshot/{filename}");
+        let key = self.prefixed_object_key(relative_key.as_str())?;
+        self.upload_object_key_file(&key, content_type, file_path, artifact_byte_size)
+            .await
+    }
+
     /// Uploads snapshot index sidecar and returns object URL.
     pub async fn upload_snapshot_index(
         &self,

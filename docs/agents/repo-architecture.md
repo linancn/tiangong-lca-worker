@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: source-reference policy, diagnostics, and audit changes stay within existing Worker and root-integration boundaries."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Updated for Worker Issue #223: documents numerical, Review, release-metadata, and source-closure artifact boundaries."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -79,6 +79,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
 | `crates/solver-worker/src/resource.rs` | shared `worker.resource-profile.v1` admission, cancellation, Linux RSS/cgroup telemetry, and owned/temp/object/cache counters |
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
+| `crates/solver-worker/src/snapshot_artifacts.rs` | numerical HDF5 envelope, Review projections, release-metadata/source-closure descriptor chain, and legacy graph/v1 readers |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
 | `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
@@ -139,6 +140,7 @@ Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limite
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
+`CompiledGraph` is compiler IR, not a durable snapshot schema. A fresh ordinary snapshot persists only numerical payload/config/coverage in `snapshot-hdf5:v1`. Its descriptor binds `snapshot-release-evidence-json-zstd:v2`, which contains Calculation Bundle metadata and a second descriptor for the content-addressed `snapshot-source-closure-json-zstd:v1`; neither metadata sidecar contains source documents twice. Both encoders borrow compiler data and stream to zstd-backed temporary files before bounded multipart upload. Ordinary solve loads only the numerical artifact; Calculation Bundle materialization explicitly hydrates and verifies the two-level descriptor chain. Historical HDF5 numerical payloads remain readable even when an embedded compiler schema has drifted: graph decoding is isolated, incompatible metadata is ignored for ordinary solve, and a purpose-specific consumer reports rebuild guidance. Compatible embedded graphs and v1 full-evidence sidecars remain readable. Review-submit baseline/overlay now persist consumer-owned `SnapshotReviewBaseline` / `SnapshotReviewGateEvidence` projections instead of compiler IR.
 The current provider-link runtime contract lives in `docs/provider-linking.md`. The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
 The process-column contract is one complete TIDAS Process revision per snapshot matrix column. `quantitativeReference.referenceToReferenceFlow` selects that column's signed normalization pivot; it does not require Product, Output, or a positive amount. Non-reference exchanges do not create derived matrix columns. When another exchange needs an independent activity pivot, upstream must publish another complete Process revision.
@@ -171,7 +173,7 @@ Generic `artifact_gc` consumes only bounded Database Engine #309 scope-closure c
 
 `crates/solver-worker/src/resource.rs` defines the reusable `worker.resource-profile.v1` contract. Heavy job families can admit owned-memory estimates, temporary bytes, object download/upload bytes, cache bytes, stage-window bytes, and concurrency before work begins. Rejections expose stable `resource_admission_rejected`, `artifact_limit_exceeded`, and `operation_cancelled` classes. Phase measurements separate owned estimates from process RSS and Linux cgroup v2 `anon`, `file`, `memory.current`, and `memory.peak`.
 
-`crates/solver-worker/src/storage.rs` retains the existing byte-returning and file-upload methods for compatibility. New or migrated heavy paths must prefer `download_object_url_to_file` and `upload_object_key_file_bounded`, pass an explicit task-specific byte cap, and optionally pass an expected SHA-256 and cancellation token. Downloads stream into an adjacent temporary file and publish the destination only after limit/hash/cancellation checks pass. Multipart uploads hash and admit the source before network work, use a fixed part buffer, and abort the multipart upload on a detected cancellation or failure. This primitive layer does not itself migrate snapshot HDF5, package, graph-cache, or solve algorithms.
+`crates/solver-worker/src/storage.rs` retains the existing byte-returning and file-upload methods for compatibility. New or migrated heavy paths must prefer `download_object_url_to_file` and `upload_object_key_file_bounded`, pass an explicit task-specific byte cap, and optionally pass an expected SHA-256 and cancellation token. Downloads stream into an adjacent temporary file and publish the destination only after limit/hash/cancellation checks pass. Multipart uploads hash and admit the source before network work, use a fixed part buffer, and abort the multipart upload on a detected cancellation or failure. Calculation Bundle release evidence now uses this file path; the smaller numerical HDF5, package, graph-cache, and solve paths retain their existing transport until separately migrated.
 
 ### Package worker
 
@@ -187,6 +189,8 @@ It also owns package-job artifacts and diagnostics. Import validation uses the s
 Result artifacts are persisted through the worker and supporting runtime storage flows instead of inlining heavy compute payloads into the API layer.
 
 `crates/solver-worker/src/calculation_bundle.rs` owns canonical `tiangong.calculation-bundle.v2` generation. Its technosphere edge schema uses dependent/residual/balancing/reference/routing/activity fields rather than assuming consumer Input and provider Output. Solver evidence records allocation and link semantics versions, boundary policy, and exact flow identity policy. The frozen source-document closure and directional LCI release guarantees remain unchanged; older snapshots without exact signed-flow release evidence must be rebuilt.
+
+Calculation Bundle reads exact release evidence from the current integrity-bound v2 metadata + v1 source-closure chain, the transitional v1 full-evidence sidecar, or a schema-compatible legacy embedded `compiled_graph.release_evidence`. Incompatible embedded evidence fails with explicit rebuild guidance without making the numerical payload unreadable. Compatibility is read-only: new snapshots never serialize the complete graph. Publication uploads source closure, release metadata, numerical HDF5 and index before the database ready record becomes visible; failed pre-publication uploads remain unreferenced objects under the same snapshot directory and are removed by directory-level snapshot/orphan GC.
 
 ## Operational Baseline
 

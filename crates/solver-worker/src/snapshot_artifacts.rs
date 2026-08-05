@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use hdf5::File;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solver_core::ModelSparseData;
-use tempfile::Builder;
+use tempfile::{Builder, NamedTempFile};
 use uuid::Uuid;
 
 use crate::calculation_evidence::LcaMethodFactorSourceSnapshot;
-use crate::compiled_graph::CompiledGraph;
+use crate::compiled_graph::{self, CompiledGraph, CompiledReleaseEvidence};
 use crate::graph_types::{RequestRootProcess, SnapshotSelectionMode};
 
 const SCHEMA_VERSION: u8 = 1;
@@ -25,6 +26,21 @@ pub const SNAPSHOT_ARTIFACT_FORMAT: &str = "snapshot-hdf5:v1";
 pub const SNAPSHOT_ARTIFACT_EXTENSION: &str = "h5";
 /// Snapshot artifact content type.
 pub const SNAPSHOT_ARTIFACT_CONTENT_TYPE: &str = "application/x-hdf5";
+/// Purpose-specific Calculation Bundle evidence format identifier.
+pub const SNAPSHOT_RELEASE_EVIDENCE_FORMAT: &str = "snapshot-release-evidence-json-zstd:v2";
+const SNAPSHOT_RELEASE_EVIDENCE_LEGACY_FORMAT: &str = "snapshot-release-evidence-json-zstd:v1";
+/// Purpose-specific Calculation Bundle evidence file extension.
+pub const SNAPSHOT_RELEASE_EVIDENCE_EXTENSION: &str = "json.zst";
+/// Purpose-specific Calculation Bundle evidence content type.
+pub const SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE: &str =
+    "application/vnd.tiangong.snapshot-release-evidence+json+zstd";
+/// Content-addressed immutable source-closure format used by Calculation Bundles.
+pub const SNAPSHOT_SOURCE_CLOSURE_FORMAT: &str = "snapshot-source-closure-json-zstd:v1";
+/// Source-closure file extension.
+pub const SNAPSHOT_SOURCE_CLOSURE_EXTENSION: &str = "json.zst";
+/// Source-closure content type.
+pub const SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE: &str =
+    "application/vnd.tiangong.snapshot-source-closure+json+zstd";
 /// Snapshot coverage JSON schema identifier.
 pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v3";
 
@@ -369,6 +385,219 @@ struct SnapshotArtifactEnvelope {
     payload: ModelSparseData,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compiled_graph: Option<CompiledGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review_baseline: Option<SnapshotReviewBaseline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review_gate_evidence: Option<SnapshotReviewGateEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotArtifactEnvelopeRead {
+    version: u8,
+    format: String,
+    snapshot_id: Uuid,
+    config: SnapshotBuildConfig,
+    coverage: SnapshotCoverageReport,
+    payload: ModelSparseData,
+    #[serde(default)]
+    compiled_graph: Option<serde_json::Value>,
+    #[serde(default)]
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+    #[serde(default)]
+    review_baseline: Option<SnapshotReviewBaseline>,
+    #[serde(default)]
+    review_gate_evidence: Option<SnapshotReviewGateEvidence>,
+}
+
+/// Integrity-bound reference to a purpose-specific snapshot sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotLinkedArtifact {
+    pub format: String,
+    pub object_url: String,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub content_type: String,
+}
+
+/// Stable Review Submit baseline state. This is a consumer-owned projection rather than
+/// serialized compiler IR; release-only evidence is deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReviewBaseline {
+    pub processes: Vec<compiled_graph::CompiledProcess>,
+    pub flows: Vec<compiled_graph::CompiledFlow>,
+    pub reference_ports: Vec<compiled_graph::CompiledReferencePort>,
+    pub balance_resolutions: Vec<compiled_graph::CompiledBalanceResolution>,
+    pub unresolved_balances: Vec<compiled_graph::CompiledUnresolvedBalance>,
+    pub provider_outputs: Vec<compiled_graph::CompiledProviderOutput>,
+    pub provider_decisions: Vec<compiled_graph::CompiledProviderDecision>,
+    pub technosphere_edges: Vec<compiled_graph::CompiledTechnosphereEdge>,
+    pub biosphere_edges: Vec<compiled_graph::CompiledBiosphereEdge>,
+    pub reference_stats: compiled_graph::CompiledReferenceStats,
+    pub allocation_stats: compiled_graph::CompiledAllocationStats,
+    pub matching_stats: compiled_graph::CompiledMatchingStats,
+}
+
+impl From<&CompiledGraph> for SnapshotReviewBaseline {
+    fn from(graph: &CompiledGraph) -> Self {
+        Self {
+            processes: graph.processes.clone(),
+            flows: graph.flows.clone(),
+            reference_ports: graph.reference_ports.clone(),
+            balance_resolutions: graph.balance_resolutions.clone(),
+            unresolved_balances: graph.unresolved_balances.clone(),
+            provider_outputs: graph.provider_outputs.clone(),
+            provider_decisions: graph.provider_decisions.clone(),
+            technosphere_edges: graph.technosphere_edges.clone(),
+            biosphere_edges: graph.biosphere_edges.clone(),
+            reference_stats: graph.reference_stats,
+            allocation_stats: graph.allocation_stats,
+            matching_stats: graph.matching_stats,
+        }
+    }
+}
+
+impl SnapshotReviewBaseline {
+    /// Restores transient compiler state for one Review Submit overlay build.
+    #[must_use]
+    pub fn into_compiled_graph(self) -> CompiledGraph {
+        CompiledGraph {
+            processes: self.processes,
+            flows: self.flows,
+            reference_ports: self.reference_ports,
+            balance_resolutions: self.balance_resolutions,
+            unresolved_balances: self.unresolved_balances,
+            provider_outputs: self.provider_outputs,
+            provider_decisions: self.provider_decisions,
+            technosphere_edges: self.technosphere_edges,
+            biosphere_edges: self.biosphere_edges,
+            reference_stats: self.reference_stats,
+            allocation_stats: self.allocation_stats,
+            matching_stats: self.matching_stats,
+            release_evidence: None,
+        }
+    }
+}
+
+/// Minimal Review Submit fast-gate evidence persisted with an overlay snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReviewGateEvidence {
+    pub flows: Vec<compiled_graph::CompiledFlow>,
+    pub provider_decisions: Vec<compiled_graph::CompiledProviderDecision>,
+    pub technosphere_edges: Vec<compiled_graph::CompiledTechnosphereEdge>,
+    pub biosphere_edges: Vec<compiled_graph::CompiledBiosphereEdge>,
+}
+
+impl From<&CompiledGraph> for SnapshotReviewGateEvidence {
+    fn from(graph: &CompiledGraph) -> Self {
+        Self {
+            flows: graph.flows.clone(),
+            provider_decisions: graph.provider_decisions.clone(),
+            technosphere_edges: graph.technosphere_edges.clone(),
+            biosphere_edges: graph.biosphere_edges.clone(),
+        }
+    }
+}
+
+impl SnapshotReviewGateEvidence {
+    /// Adapts the stable projection to the legacy in-memory gate input without persisting IR.
+    #[must_use]
+    pub fn into_compiled_graph(self) -> CompiledGraph {
+        CompiledGraph {
+            processes: Vec::new(),
+            flows: self.flows,
+            reference_ports: Vec::new(),
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
+            provider_outputs: Vec::new(),
+            provider_decisions: self.provider_decisions,
+            technosphere_edges: self.technosphere_edges,
+            biosphere_edges: self.biosphere_edges,
+            reference_stats: compiled_graph::CompiledReferenceStats::default(),
+            allocation_stats: compiled_graph::CompiledAllocationStats::default(),
+            matching_stats: compiled_graph::CompiledMatchingStats::default(),
+            release_evidence: None,
+        }
+    }
+}
+
+/// Purpose-specific non-source metadata consumed by Calculation Bundle generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReleaseEvidence {
+    pub processes: Vec<compiled_graph::CompiledReleaseProcess>,
+    pub inventory_exchanges: Vec<compiled_graph::CompiledReleaseInventoryExchange>,
+    pub technosphere_edges: Vec<compiled_graph::CompiledReleaseTechnosphereEdge>,
+    pub biosphere_edges: Vec<compiled_graph::CompiledReleaseInventoryExchange>,
+    pub source_reference_provenance: Option<compiled_graph::CompiledSourceReferenceProvenance>,
+    pub source_dataset_count: u64,
+    pub source_closure_artifact: SnapshotLinkedArtifact,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotReleaseEvidenceRef<'a> {
+    processes: &'a [compiled_graph::CompiledReleaseProcess],
+    inventory_exchanges: &'a [compiled_graph::CompiledReleaseInventoryExchange],
+    technosphere_edges: &'a [compiled_graph::CompiledReleaseTechnosphereEdge],
+    biosphere_edges: &'a [compiled_graph::CompiledReleaseInventoryExchange],
+    source_reference_provenance: &'a Option<compiled_graph::CompiledSourceReferenceProvenance>,
+    source_dataset_count: u64,
+    source_closure_artifact: &'a SnapshotLinkedArtifact,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotReleaseEvidenceEnvelopeRef<'a> {
+    version: u8,
+    format: &'static str,
+    snapshot_id: Uuid,
+    release_evidence: SnapshotReleaseEvidenceRef<'a>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotReleaseEvidenceEnvelope {
+    version: u8,
+    format: String,
+    snapshot_id: Uuid,
+    release_evidence: SnapshotReleaseEvidence,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacySnapshotReleaseEvidenceEnvelope {
+    version: u8,
+    format: String,
+    snapshot_id: Uuid,
+    release_evidence: CompiledReleaseEvidence,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotSourceClosureEnvelopeRef<'a> {
+    version: u8,
+    format: &'static str,
+    source_datasets: &'a [compiled_graph::CompiledReleaseSourceDataset],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotSourceClosureEnvelope {
+    version: u8,
+    format: String,
+    source_datasets: Vec<compiled_graph::CompiledReleaseSourceDataset>,
+}
+
+/// Decoded release sidecar, including the temporary v1 compatibility shape.
+#[derive(Debug)]
+pub enum DecodedSnapshotReleaseEvidence {
+    Linked(SnapshotReleaseEvidence),
+    Legacy(CompiledReleaseEvidence),
 }
 
 /// Encoded snapshot artifact bytes and metadata.
@@ -390,6 +619,50 @@ pub struct DecodedSnapshotArtifact {
     pub coverage: SnapshotCoverageReport,
     pub payload: ModelSparseData,
     pub compiled_graph: Option<CompiledGraph>,
+    /// Legacy compiler metadata may be unreadable after schema evolution; numerical payload
+    /// decoding remains available and purpose-specific consumers fail with rebuild guidance.
+    pub compiled_graph_decode_error: Option<String>,
+    pub release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+    pub review_baseline: Option<SnapshotReviewBaseline>,
+    pub review_gate_evidence: Option<SnapshotReviewGateEvidence>,
+}
+
+/// File-backed, compressed Calculation Bundle evidence and its integrity metadata.
+#[derive(Debug)]
+pub struct EncodedSnapshotReleaseEvidenceArtifact {
+    file: NamedTempFile,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub format: &'static str,
+    pub content_type: &'static str,
+    pub extension: &'static str,
+}
+
+/// File-backed, content-addressed source closure and its integrity metadata.
+#[derive(Debug)]
+pub struct EncodedSnapshotSourceClosureArtifact {
+    file: NamedTempFile,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub format: &'static str,
+    pub content_type: &'static str,
+    pub extension: &'static str,
+}
+
+impl EncodedSnapshotSourceClosureArtifact {
+    /// Local file path retained until the encoded artifact is dropped.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+impl EncodedSnapshotReleaseEvidenceArtifact {
+    /// Local file path retained until the encoded artifact is dropped.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
 }
 
 /// Encodes one snapshot matrix payload into `HDF5`.
@@ -410,6 +683,49 @@ pub fn encode_snapshot_artifact_with_graph(
     payload: &ModelSparseData,
     compiled_graph: Option<CompiledGraph>,
 ) -> anyhow::Result<EncodedSnapshotArtifact> {
+    encode_snapshot_artifact_with_links(
+        snapshot_id,
+        config,
+        coverage,
+        payload,
+        compiled_graph,
+        None,
+    )
+}
+
+/// Encodes one numerical snapshot with optional legacy graph and linked business artifacts.
+pub fn encode_snapshot_artifact_with_links(
+    snapshot_id: Uuid,
+    config: SnapshotBuildConfig,
+    coverage: SnapshotCoverageReport,
+    payload: &ModelSparseData,
+    compiled_graph: Option<CompiledGraph>,
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+) -> anyhow::Result<EncodedSnapshotArtifact> {
+    encode_snapshot_artifact_with_purpose_artifacts(
+        snapshot_id,
+        config,
+        coverage,
+        payload,
+        compiled_graph,
+        release_evidence_artifact,
+        None,
+        None,
+    )
+}
+
+/// Encodes a numerical snapshot plus explicit purpose-specific projections.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_snapshot_artifact_with_purpose_artifacts(
+    snapshot_id: Uuid,
+    config: SnapshotBuildConfig,
+    coverage: SnapshotCoverageReport,
+    payload: &ModelSparseData,
+    compiled_graph: Option<CompiledGraph>,
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+    review_baseline: Option<SnapshotReviewBaseline>,
+    review_gate_evidence: Option<SnapshotReviewGateEvidence>,
+) -> anyhow::Result<EncodedSnapshotArtifact> {
     let envelope = SnapshotArtifactEnvelope {
         version: SCHEMA_VERSION,
         format: SNAPSHOT_ARTIFACT_FORMAT.to_owned(),
@@ -418,6 +734,9 @@ pub fn encode_snapshot_artifact_with_graph(
         coverage,
         payload: payload.clone(),
         compiled_graph,
+        release_evidence_artifact,
+        review_baseline,
+        review_gate_evidence,
     };
 
     let json = serde_json::to_vec(&envelope)?;
@@ -466,7 +785,14 @@ pub fn decode_snapshot_artifact(bytes: &[u8]) -> anyhow::Result<DecodedSnapshotA
         .dataset(DATASET_ENVELOPE_JSON)?
         .read_1d::<u8>()?
         .into_raw_vec();
-    let envelope: SnapshotArtifactEnvelope = serde_json::from_slice(&envelope_bytes)?;
+    let envelope: SnapshotArtifactEnvelopeRead = serde_json::from_slice(&envelope_bytes)?;
+    if envelope.version != SCHEMA_VERSION || envelope.format != SNAPSHOT_ARTIFACT_FORMAT {
+        return Err(anyhow::anyhow!(
+            "unsupported snapshot envelope: version={} format={}",
+            envelope.version,
+            envelope.format
+        ));
+    }
     if envelope.payload.model_version != envelope.snapshot_id {
         return Err(anyhow::anyhow!(
             "snapshot payload model_version mismatch: payload={} envelope={}",
@@ -475,13 +801,185 @@ pub fn decode_snapshot_artifact(bytes: &[u8]) -> anyhow::Result<DecodedSnapshotA
         ));
     }
 
+    let (compiled_graph, compiled_graph_decode_error) = match envelope.compiled_graph {
+        Some(value) => match serde_json::from_value(value) {
+            Ok(graph) => (Some(graph), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        None => (None, None),
+    };
+
     Ok(DecodedSnapshotArtifact {
         snapshot_id: envelope.snapshot_id,
         config: envelope.config,
         coverage: envelope.coverage,
         payload: envelope.payload,
-        compiled_graph: envelope.compiled_graph,
+        compiled_graph,
+        compiled_graph_decode_error,
+        release_evidence_artifact: envelope.release_evidence_artifact,
+        review_baseline: envelope.review_baseline,
+        review_gate_evidence: envelope.review_gate_evidence,
     })
+}
+
+/// Encodes Calculation Bundle release evidence directly to a compressed temporary file.
+pub fn encode_snapshot_release_evidence_artifact(
+    snapshot_id: Uuid,
+    release_evidence: &CompiledReleaseEvidence,
+    source_closure_artifact: &SnapshotLinkedArtifact,
+) -> anyhow::Result<EncodedSnapshotReleaseEvidenceArtifact> {
+    let source_dataset_count = u64::try_from(release_evidence.source_datasets.len())?;
+    let file = Builder::new()
+        .prefix("lca-snapshot-release-evidence-")
+        .suffix(".json.zst")
+        .tempfile()?;
+    let output = std::fs::File::create(file.path())?;
+    let buffered = BufWriter::new(output);
+    let mut encoder = zstd::stream::write::Encoder::new(buffered, 3)?;
+    serde_json::to_writer(
+        &mut encoder,
+        &SnapshotReleaseEvidenceEnvelopeRef {
+            version: SCHEMA_VERSION,
+            format: SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+            snapshot_id,
+            release_evidence: SnapshotReleaseEvidenceRef {
+                processes: &release_evidence.processes,
+                inventory_exchanges: &release_evidence.inventory_exchanges,
+                technosphere_edges: &release_evidence.technosphere_edges,
+                biosphere_edges: &release_evidence.biosphere_edges,
+                source_reference_provenance: &release_evidence.source_reference_provenance,
+                source_dataset_count,
+                source_closure_artifact,
+            },
+        },
+    )?;
+    let mut buffered = encoder.finish()?;
+    buffered.flush()?;
+
+    let (byte_size, sha256) = hash_file(file.path())?;
+    Ok(EncodedSnapshotReleaseEvidenceArtifact {
+        file,
+        sha256,
+        byte_size,
+        format: SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+        content_type: SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE,
+        extension: SNAPSHOT_RELEASE_EVIDENCE_EXTENSION,
+    })
+}
+
+/// Decodes and validates one file-backed Calculation Bundle evidence sidecar.
+pub fn decode_snapshot_release_evidence_artifact(
+    path: &Path,
+    expected_snapshot_id: Uuid,
+) -> anyhow::Result<DecodedSnapshotReleaseEvidence> {
+    let input = std::fs::File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
+    let value: serde_json::Value = serde_json::from_reader(decoder)?;
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if format == SNAPSHOT_RELEASE_EVIDENCE_LEGACY_FORMAT {
+        let envelope: LegacySnapshotReleaseEvidenceEnvelope = serde_json::from_value(value)?;
+        if envelope.version != SCHEMA_VERSION
+            || envelope.format != SNAPSHOT_RELEASE_EVIDENCE_LEGACY_FORMAT
+            || envelope.snapshot_id != expected_snapshot_id
+        {
+            return Err(anyhow::anyhow!(
+                "legacy snapshot release evidence mismatch: expected={} got={}",
+                expected_snapshot_id,
+                envelope.snapshot_id
+            ));
+        }
+        return Ok(DecodedSnapshotReleaseEvidence::Legacy(
+            envelope.release_evidence,
+        ));
+    }
+    let envelope: SnapshotReleaseEvidenceEnvelope = serde_json::from_value(value)?;
+    if envelope.version != SCHEMA_VERSION || envelope.format != SNAPSHOT_RELEASE_EVIDENCE_FORMAT {
+        return Err(anyhow::anyhow!(
+            "unsupported snapshot release evidence format: version={} format={}",
+            envelope.version,
+            envelope.format
+        ));
+    }
+    if envelope.snapshot_id != expected_snapshot_id {
+        return Err(anyhow::anyhow!(
+            "snapshot release evidence mismatch: expected={} got={}",
+            expected_snapshot_id,
+            envelope.snapshot_id
+        ));
+    }
+    Ok(DecodedSnapshotReleaseEvidence::Linked(
+        envelope.release_evidence,
+    ))
+}
+
+/// Encodes immutable source documents separately from Calculation Bundle metadata.
+pub fn encode_snapshot_source_closure_artifact(
+    source_datasets: &[compiled_graph::CompiledReleaseSourceDataset],
+) -> anyhow::Result<EncodedSnapshotSourceClosureArtifact> {
+    let file = Builder::new()
+        .prefix("lca-snapshot-source-closure-")
+        .suffix(".json.zst")
+        .tempfile()?;
+    let output = std::fs::File::create(file.path())?;
+    let buffered = BufWriter::new(output);
+    let mut encoder = zstd::stream::write::Encoder::new(buffered, 3)?;
+    serde_json::to_writer(
+        &mut encoder,
+        &SnapshotSourceClosureEnvelopeRef {
+            version: SCHEMA_VERSION,
+            format: SNAPSHOT_SOURCE_CLOSURE_FORMAT,
+            source_datasets,
+        },
+    )?;
+    let mut buffered = encoder.finish()?;
+    buffered.flush()?;
+    let (byte_size, sha256) = hash_file(file.path())?;
+    Ok(EncodedSnapshotSourceClosureArtifact {
+        file,
+        sha256,
+        byte_size,
+        format: SNAPSHOT_SOURCE_CLOSURE_FORMAT,
+        content_type: SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE,
+        extension: SNAPSHOT_SOURCE_CLOSURE_EXTENSION,
+    })
+}
+
+/// Decodes and validates a content-addressed source closure.
+pub fn decode_snapshot_source_closure_artifact(
+    path: &Path,
+) -> anyhow::Result<Vec<compiled_graph::CompiledReleaseSourceDataset>> {
+    let input = std::fs::File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
+    let envelope: SnapshotSourceClosureEnvelope = serde_json::from_reader(decoder)?;
+    if envelope.version != SCHEMA_VERSION || envelope.format != SNAPSHOT_SOURCE_CLOSURE_FORMAT {
+        return Err(anyhow::anyhow!(
+            "unsupported snapshot source closure format: version={} format={}",
+            envelope.version,
+            envelope.format
+        ));
+    }
+    Ok(envelope.source_datasets)
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
+    let mut input = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut byte_size = 0_u64;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        byte_size = byte_size
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("snapshot release evidence size overflow"))?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok((byte_size, format!("{:x}", hasher.finalize())))
 }
 
 fn write_hdf5_file(path: &Path, envelope_json: &[u8]) -> anyhow::Result<()> {
@@ -518,17 +1016,25 @@ mod tests {
 
     use crate::compiled_graph::{
         CompiledAllocationStats, CompiledFlow, CompiledFlowKind, CompiledGraph,
-        CompiledMatchingStats, CompiledReferenceStats,
+        CompiledMatchingStats, CompiledReferenceStats, CompiledReleaseEvidence,
+        CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
+        CompiledReleaseSourceDatasetType,
     };
 
     use super::{
-        DATASET_ENVELOPE_JSON, HDF5_DEFLATE_LEVEL, SNAPSHOT_ARTIFACT_FORMAT,
-        SNAPSHOT_COVERAGE_SCHEMA_VERSION, SnapshotAllocationCoverage, SnapshotBuildConfig,
+        DATASET_ENVELOPE_JSON, DecodedSnapshotReleaseEvidence, HDF5_DEFLATE_LEVEL,
+        SNAPSHOT_ARTIFACT_FORMAT, SNAPSHOT_COVERAGE_SCHEMA_VERSION,
+        SNAPSHOT_RELEASE_EVIDENCE_FORMAT, SnapshotAllocationCoverage, SnapshotBuildConfig,
         SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary,
-        SnapshotGeographySummary, SnapshotMatchingCoverage, SnapshotMatrixScale,
-        SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
+        SnapshotGeographySummary, SnapshotLinkedArtifact, SnapshotMatchingCoverage,
+        SnapshotMatrixScale, SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage,
+        SnapshotResolutionSummary, SnapshotReviewBaseline, SnapshotReviewGateEvidence,
         SnapshotSelectionMode, SnapshotSingularRisk, SnapshotVolumeWeightSummary,
-        decode_snapshot_artifact, encode_snapshot_artifact, encode_snapshot_artifact_with_graph,
+        decode_snapshot_artifact, decode_snapshot_release_evidence_artifact,
+        decode_snapshot_source_closure_artifact, encode_snapshot_artifact,
+        encode_snapshot_artifact_with_graph, encode_snapshot_artifact_with_links,
+        encode_snapshot_artifact_with_purpose_artifacts, encode_snapshot_release_evidence_artifact,
+        encode_snapshot_source_closure_artifact,
     };
 
     #[test]
@@ -723,10 +1229,10 @@ mod tests {
         };
         let encoded_with_graph = encode_snapshot_artifact_with_graph(
             snapshot_id,
-            config,
-            coverage,
+            config.clone(),
+            coverage.clone(),
             &payload,
-            Some(graph),
+            Some(graph.clone()),
         )
         .expect("encode with graph");
         let decoded_with_graph =
@@ -747,6 +1253,136 @@ mod tests {
                 .legacy_single_output_target_inferred_count,
             1
         );
+
+        let encoded_graph_file = Builder::new()
+            .suffix(".h5")
+            .tempfile()
+            .expect("legacy graph source tempfile");
+        std::fs::write(encoded_graph_file.path(), &encoded_with_graph.bytes)
+            .expect("write legacy graph source");
+        let file = File::open(encoded_graph_file.path()).expect("open legacy graph source");
+        let envelope_bytes = file
+            .dataset(DATASET_ENVELOPE_JSON)
+            .expect("legacy envelope dataset")
+            .read_1d::<u8>()
+            .expect("read legacy envelope")
+            .into_raw_vec();
+        let mut incompatible_envelope: serde_json::Value =
+            serde_json::from_slice(&envelope_bytes).expect("parse legacy envelope");
+        incompatible_envelope["compiled_graph"]["flows"][0]["kind"] =
+            json!("removed_legacy_variant");
+        let incompatible_file = Builder::new()
+            .suffix(".h5")
+            .tempfile()
+            .expect("incompatible graph tempfile");
+        super::write_hdf5_file(
+            incompatible_file.path(),
+            &serde_json::to_vec(&incompatible_envelope).expect("encode incompatible envelope"),
+        )
+        .expect("write incompatible graph artifact");
+        let incompatible = decode_snapshot_artifact(
+            &std::fs::read(incompatible_file.path()).expect("read incompatible graph artifact"),
+        )
+        .expect("numerical payload survives incompatible compiler metadata");
+        assert!(incompatible.compiled_graph.is_none());
+        assert!(incompatible.compiled_graph_decode_error.is_some());
+        assert_eq!(incompatible.payload.model_version, snapshot_id);
+
+        let encoded_review = encode_snapshot_artifact_with_purpose_artifacts(
+            snapshot_id,
+            config,
+            coverage,
+            &payload,
+            None,
+            None,
+            Some(SnapshotReviewBaseline::from(&graph)),
+            Some(SnapshotReviewGateEvidence::from(&graph)),
+        )
+        .expect("encode review projections");
+        let decoded_review =
+            decode_snapshot_artifact(&encoded_review.bytes).expect("decode review");
+        assert!(decoded_review.compiled_graph.is_none());
+        assert_eq!(decoded_review.review_baseline.unwrap().processes.len(), 0);
+        assert_eq!(decoded_review.review_gate_evidence.unwrap().flows.len(), 1);
+
+        let release_evidence = CompiledReleaseEvidence {
+            processes: Vec::new(),
+            inventory_exchanges: Vec::new(),
+            technosphere_edges: Vec::new(),
+            biosphere_edges: Vec::new(),
+            source_datasets: Vec::new(),
+            source_reference_provenance: None,
+        };
+        let source_closure_artifact = SnapshotLinkedArtifact {
+            format: super::SNAPSHOT_SOURCE_CLOSURE_FORMAT.to_owned(),
+            object_url: "s3://bucket/source.json.zst".to_owned(),
+            sha256: "a".repeat(64),
+            byte_size: 42,
+            content_type: super::SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE.to_owned(),
+        };
+        let encoded_evidence = encode_snapshot_release_evidence_artifact(
+            snapshot_id,
+            &release_evidence,
+            &source_closure_artifact,
+        )
+        .expect("encode release evidence");
+        assert_eq!(encoded_evidence.format, SNAPSHOT_RELEASE_EVIDENCE_FORMAT);
+        assert!(encoded_evidence.byte_size > 0);
+        assert_eq!(encoded_evidence.sha256.len(), 64);
+        let decoded_evidence =
+            decode_snapshot_release_evidence_artifact(encoded_evidence.path(), snapshot_id)
+                .expect("decode release evidence");
+        let DecodedSnapshotReleaseEvidence::Linked(decoded_evidence) = decoded_evidence else {
+            panic!("expected linked release evidence");
+        };
+        assert!(decoded_evidence.processes.is_empty());
+        assert_eq!(decoded_evidence.source_closure_artifact.byte_size, 42);
+
+        let legacy_file = Builder::new()
+            .suffix(".json.zst")
+            .tempfile()
+            .expect("legacy evidence tempfile");
+        let mut legacy_encoder = zstd::stream::write::Encoder::new(
+            std::fs::File::create(legacy_file.path()).expect("legacy evidence file"),
+            3,
+        )
+        .expect("legacy evidence encoder");
+        serde_json::to_writer(
+            &mut legacy_encoder,
+            &super::LegacySnapshotReleaseEvidenceEnvelope {
+                version: super::SCHEMA_VERSION,
+                format: super::SNAPSHOT_RELEASE_EVIDENCE_LEGACY_FORMAT.to_owned(),
+                snapshot_id,
+                release_evidence,
+            },
+        )
+        .expect("write legacy evidence");
+        legacy_encoder.finish().expect("finish legacy evidence");
+        assert!(matches!(
+            decode_snapshot_release_evidence_artifact(legacy_file.path(), snapshot_id)
+                .expect("decode legacy evidence"),
+            DecodedSnapshotReleaseEvidence::Legacy(_)
+        ));
+
+        let source_dataset = CompiledReleaseSourceDataset {
+            dataset_type: CompiledReleaseSourceDatasetType::Process,
+            role: CompiledReleaseSourceDatasetRole::UnitProcess,
+            dataset_id: uuid::Uuid::new_v4(),
+            dataset_version: "01.00.000".to_owned(),
+            document_sha256: "b".repeat(64),
+            document: json!({"marker": "stored-only-in-source-closure"}),
+        };
+        let encoded_source =
+            encode_snapshot_source_closure_artifact(std::slice::from_ref(&source_dataset))
+                .expect("encode source closure");
+        let encoded_source_again =
+            encode_snapshot_source_closure_artifact(std::slice::from_ref(&source_dataset))
+                .expect("encode source closure deterministically");
+        assert_eq!(encoded_source.sha256, encoded_source_again.sha256);
+        let decoded_source = decode_snapshot_source_closure_artifact(encoded_source.path())
+            .expect("decode source closure");
+        assert_eq!(decoded_source.len(), 1);
+        assert_eq!(decoded_source[0].document, source_dataset.document);
     }
 
     #[test]
@@ -776,6 +1412,108 @@ mod tests {
             SnapshotSelectionMode::FilteredLibrary
         );
         assert!(parsed.request_roots.is_empty());
+    }
+
+    #[test]
+    #[ignore = "qualification gate: requires SNAPSHOT_ARTIFACT_QUALIFICATION_PATH"]
+    fn qualified_legacy_snapshot_projection_sizes() {
+        let path = std::env::var("SNAPSHOT_ARTIFACT_QUALIFICATION_PATH")
+            .expect("set SNAPSHOT_ARTIFACT_QUALIFICATION_PATH to a read-only production artifact");
+        let legacy_bytes = std::fs::read(&path).expect("read qualification artifact");
+        let decoded = decode_snapshot_artifact(&legacy_bytes).expect("decode legacy snapshot");
+        let file = File::open(&path).expect("open qualification HDF5");
+        let envelope_bytes = file
+            .dataset(DATASET_ENVELOPE_JSON)
+            .expect("qualification envelope dataset")
+            .read_1d::<u8>()
+            .expect("read qualification envelope")
+            .into_raw_vec();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&envelope_bytes).expect("parse qualification envelope JSON");
+        let raw_compiled_graph_bytes = raw
+            .get("compiled_graph")
+            .map(|value| {
+                serde_json::to_vec(value)
+                    .expect("serialize raw compiled graph")
+                    .len()
+            })
+            .unwrap_or_default();
+        let raw_release_evidence_bytes = raw
+            .pointer("/compiled_graph/release_evidence")
+            .map(|value| {
+                serde_json::to_vec(value)
+                    .expect("serialize raw release evidence")
+                    .len()
+            })
+            .unwrap_or_default();
+        let source_dataset_count = raw
+            .pointer("/compiled_graph/release_evidence/source_datasets")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+
+        let (release_descriptor, release_bytes, source_bytes) = decoded
+            .compiled_graph
+            .as_ref()
+            .and_then(|graph| graph.release_evidence.as_ref())
+            .map_or((None, None, None), |release_evidence| {
+                let source =
+                    encode_snapshot_source_closure_artifact(&release_evidence.source_datasets)
+                        .expect("encode source closure");
+                let source_descriptor = SnapshotLinkedArtifact {
+                    format: source.format.to_owned(),
+                    object_url: format!("qualification://source-closure/{}", source.sha256),
+                    sha256: source.sha256.clone(),
+                    byte_size: source.byte_size,
+                    content_type: source.content_type.to_owned(),
+                };
+                let release = encode_snapshot_release_evidence_artifact(
+                    decoded.snapshot_id,
+                    release_evidence,
+                    &source_descriptor,
+                )
+                .expect("encode release metadata");
+                (
+                    Some(SnapshotLinkedArtifact {
+                        format: release.format.to_owned(),
+                        object_url: format!("qualification://release-evidence/{}", release.sha256),
+                        sha256: release.sha256.clone(),
+                        byte_size: release.byte_size,
+                        content_type: release.content_type.to_owned(),
+                    }),
+                    Some(release.byte_size),
+                    Some(source.byte_size),
+                )
+            });
+        let numerical = encode_snapshot_artifact_with_links(
+            decoded.snapshot_id,
+            decoded.config,
+            decoded.coverage,
+            &decoded.payload,
+            None,
+            release_descriptor,
+        )
+        .expect("encode numerical snapshot");
+
+        assert!(numerical.byte_size < legacy_bytes.len());
+        assert!(
+            decode_snapshot_artifact(&numerical.bytes)
+                .expect("decode projected numerical snapshot")
+                .compiled_graph
+                .is_none()
+        );
+        println!(
+            "{}",
+            json!({
+                "legacyHdf5Bytes": legacy_bytes.len(),
+                "numericalHdf5Bytes": numerical.byte_size,
+                "rawCompiledGraphJsonBytes": raw_compiled_graph_bytes,
+                "rawReleaseEvidenceJsonBytes": raw_release_evidence_bytes,
+                "releaseMetadataCompressedBytes": release_bytes,
+                "sourceClosureCompressedBytes": source_bytes,
+                "sourceDatasetCount": source_dataset_count,
+                "legacyCompilerDecodeError": decoded.compiled_graph_decode_error,
+            })
+        );
     }
 
     #[test]

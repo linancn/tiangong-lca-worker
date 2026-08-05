@@ -2,7 +2,7 @@ use std::{
     fs::File,
     future::Future,
     io::{BufReader, ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -36,12 +36,17 @@ use crate::{
         LcaCalculationEvidence, validate_calculation_evidence,
         validate_calculation_evidence_binding,
     },
+    compiled_graph::CompiledReleaseEvidence,
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
     graph_types::RequestRootProcess,
     snapshot_artifacts::{
-        DecodedSnapshotArtifact, ScopeClosureSnapshotBinding, decode_snapshot_artifact,
+        DecodedSnapshotArtifact, DecodedSnapshotReleaseEvidence,
+        SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE, SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+        SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE, SNAPSHOT_SOURCE_CLOSURE_FORMAT,
+        ScopeClosureSnapshotBinding, SnapshotReleaseEvidence, decode_snapshot_artifact,
+        decode_snapshot_release_evidence_artifact, decode_snapshot_source_closure_artifact,
     },
     snapshot_builder_protocol::{
         SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
@@ -945,6 +950,128 @@ async fn fetch_decoded_snapshot_artifact_from_meta(
     }
 
     Ok(decoded)
+}
+
+async fn fetch_snapshot_release_evidence(
+    state: &AppState,
+    snapshot_id: Uuid,
+    decoded: &DecodedSnapshotArtifact,
+) -> anyhow::Result<CompiledReleaseEvidence> {
+    if let Some(evidence) = decoded
+        .compiled_graph
+        .as_ref()
+        .and_then(|graph| graph.release_evidence.clone())
+    {
+        return Ok(evidence);
+    }
+
+    let artifact = decoded.release_evidence_artifact.as_ref().ok_or_else(|| {
+        decoded.compiled_graph_decode_error.as_ref().map_or_else(
+            || anyhow::anyhow!(
+                "snapshot {snapshot_id} lacks exact Calculation Bundle release evidence; rebuild the snapshot"
+            ),
+            |error| anyhow::anyhow!(
+                "snapshot {snapshot_id} contains incompatible legacy compiler evidence ({error}); rebuild the snapshot"
+            ),
+        )
+    })?;
+    if artifact.format != SNAPSHOT_RELEASE_EVIDENCE_FORMAT
+        && artifact.format != "snapshot-release-evidence-json-zstd:v1"
+    {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} has unsupported release evidence format: {}",
+            artifact.format
+        ));
+    }
+    if artifact.content_type != SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} has unsupported release evidence content type: {}",
+            artifact.content_type
+        ));
+    }
+    if artifact.byte_size == 0 {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} release evidence declares an empty artifact"
+        ));
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let destination = temp_dir.path().join("release-evidence-v1.json.zst");
+    let downloaded = state
+        .object_store
+        .download_object_url_to_file(
+            artifact.object_url.as_str(),
+            &destination,
+            ObjectTransferOptions::new(artifact.byte_size)
+                .with_expected_sha256(artifact.sha256.as_str()),
+        )
+        .await?;
+    if downloaded.byte_size != artifact.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} release evidence size mismatch: expected={} observed={}",
+            artifact.byte_size,
+            downloaded.byte_size
+        ));
+    }
+    match decode_snapshot_release_evidence_artifact(&destination, snapshot_id)? {
+        DecodedSnapshotReleaseEvidence::Legacy(evidence) => Ok(evidence),
+        DecodedSnapshotReleaseEvidence::Linked(evidence) => {
+            hydrate_snapshot_release_evidence(state, snapshot_id, temp_dir.path(), evidence).await
+        }
+    }
+}
+
+async fn hydrate_snapshot_release_evidence(
+    state: &AppState,
+    snapshot_id: Uuid,
+    temp_dir: &Path,
+    evidence: SnapshotReleaseEvidence,
+) -> anyhow::Result<CompiledReleaseEvidence> {
+    let source = &evidence.source_closure_artifact;
+    if source.format != SNAPSHOT_SOURCE_CLOSURE_FORMAT
+        || source.content_type != SNAPSHOT_SOURCE_CLOSURE_CONTENT_TYPE
+        || source.byte_size == 0
+    {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} has invalid source closure descriptor: format={} content_type={} byte_size={}",
+            source.format,
+            source.content_type,
+            source.byte_size
+        ));
+    }
+    let source_destination = temp_dir.join("source-closure-v1.json.zst");
+    let downloaded = state
+        .object_store
+        .download_object_url_to_file(
+            source.object_url.as_str(),
+            &source_destination,
+            ObjectTransferOptions::new(source.byte_size)
+                .with_expected_sha256(source.sha256.as_str()),
+        )
+        .await?;
+    if downloaded.byte_size != source.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} source closure size mismatch: expected={} observed={}",
+            source.byte_size,
+            downloaded.byte_size
+        ));
+    }
+    let source_datasets = decode_snapshot_source_closure_artifact(&source_destination)?;
+    if u64::try_from(source_datasets.len())? != evidence.source_dataset_count {
+        return Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} source closure dataset count mismatch: expected={} observed={}",
+            evidence.source_dataset_count,
+            source_datasets.len()
+        ));
+    }
+    Ok(CompiledReleaseEvidence {
+        processes: evidence.processes,
+        inventory_exchanges: evidence.inventory_exchanges,
+        technosphere_edges: evidence.technosphere_edges,
+        biosphere_edges: evidence.biosphere_edges,
+        source_datasets,
+        source_reference_provenance: evidence.source_reference_provenance,
+    })
 }
 
 pub(crate) async fn fetch_decoded_snapshot_artifact(
@@ -1920,15 +2047,7 @@ async fn solve_all_unit_with_calculation_bundle(
         .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} has no ready artifact"))?;
     let decoded =
         fetch_decoded_snapshot_artifact_from_meta(state, snapshot_id, &snapshot_meta).await?;
-    let release_evidence = decoded
-        .compiled_graph
-        .as_ref()
-        .and_then(|graph| graph.release_evidence.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "snapshot {snapshot_id} lacks exact Calculation Bundle release evidence; rebuild the snapshot"
-            )
-        })?;
+    let release_evidence = fetch_snapshot_release_evidence(state, snapshot_id, &decoded).await?;
     let snapshot_index = fetch_snapshot_index_document(state, snapshot_id).await?;
     if usize::try_from(decoded.payload.process_count)? != process_count {
         return Err(anyhow::anyhow!(
@@ -2985,21 +3104,12 @@ fn validate_certified_snapshot_contract(
     {
         return Err(anyhow::anyhow!("certified_snapshot_contract_mismatch"));
     }
-    let graph = decoded.compiled_graph.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("certified snapshot lacks compiled graph and exact process axis evidence")
-    })?;
-    let process_axis = graph
-        .processes
-        .iter()
-        .map(|process| {
-            (
-                process.process_idx,
-                process.process_id,
-                process.process_version.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    validate_certified_process_axis(&process_axis, decoded.payload.process_count, request_roots)
+    if decoded.payload.process_count != i32::try_from(request_roots.len())? {
+        return Err(anyhow::anyhow!(
+            "certified_snapshot_axis_mismatch: payload process count differs from requested scope"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_certified_process_axis(
@@ -3037,13 +3147,9 @@ fn validate_certified_snapshot_index(
     decoded: &DecodedSnapshotArtifact,
     expected_axis: &[RequestRootProcess],
 ) -> anyhow::Result<()> {
-    let graph = decoded.compiled_graph.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("certified snapshot lacks compiled graph and exact process axis evidence")
-    })?;
     if snapshot_index.process_count != decoded.payload.process_count
         || snapshot_index.impact_count != decoded.payload.impact_count
         || snapshot_index.process_map.len() != expected_axis.len()
-        || snapshot_index.process_map.len() != graph.processes.len()
         || usize::try_from(snapshot_index.impact_count)? != snapshot_index.impact_map.len()
     {
         return Err(anyhow::anyhow!("certified_snapshot_index_axis_mismatch"));

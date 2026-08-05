@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: administrative source-reference classification does not change readiness schema or numerical blocker semantics."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Reviewed for Worker Issue #223: replacing persisted compiler IR with purpose projections does not change readiness schema or numerical blocker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -29,9 +29,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Updated for Worker Issue #221: source-reference policy v4 makes administrative support optional while numerical dependencies remain strict."
+lastReviewedAt: 2026-08-06
+lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedNote: "Updated for Worker Issue #223: baseline and overlay snapshots persist bounded Review projections instead of compiler IR."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -141,7 +141,7 @@ Snapshot build config 记录 `allocation_semantics_version = tidas-reference-all
 
 DB runner 当前支持 `dataset_table = processes`。它使用 gate run 的 `dataset_id + dataset_version` 作为 request root，使用 `requested_by` 作为 snapshot builder 的 `include_user_id`，并以 gate run ID 作为请求 snapshot ID。runner 从 `processes.json_ordered` 计算稳定 SHA-256，与 gate run 的 `revision_checksum` 对比；不匹配会形成 `revision_report_stale` blocker。
 
-普通计算 snapshot artifact 仍以 `coverage + payload + config` 为主。review-submit baseline 和最终 overlay artifact 都必须额外持久化各自的 `compiled_graph`：baseline graph 用于 draft overlay 复用 reference ports、flow space 和 process metadata，overlay graph 与 coverage/payload 一起传给 gate。不得把 overlay graph 丢弃或降级，否则 signed balance 证据和 exact flow identity 无法验证。
+普通计算 snapshot artifact 只持久化 `coverage + payload + config` 和业务产物描述符，不持久化完整 `CompiledGraph`。review-submit 也不再把 compiler IR 作为 durable schema：baseline artifact 保存 `SnapshotReviewBaseline`，仅承载 draft overlay 继续编译所需的 process/flow/reference-port/balance/provider 状态；最终 overlay 保存更小的 `SnapshotReviewGateEvidence`，只含 gate 实际读取的 flows、provider decisions、technosphere edges 与 biosphere edges。读取端仍兼容旧 graph-bearing artifact，但新写入路径不得恢复完整 graph 持久化。
 
 DB runner 默认通过 snapshot_builder 的 no-LCIA baseline + draft overlay fast path 构造 review-submit snapshot。该路径不加载 `lciamethods` factors，不要求 `C` 矩阵非空，并把最终提交审核 artifact 标记为 `artifact_purpose = review_submit_overlay`，避免与普通计算 snapshot 共享 source hash 语义。
 
@@ -228,8 +228,8 @@ worker runtime 不调用 final submit，也不直接修改 review-submit domain 
 
 DB runner 生成两类 review-submit artifact：
 
-- `review_submit_baseline`：提交 root 以外的依赖 baseline，额外携带 compiled graph metadata，供后续 draft overlay 复用。
-- `review_submit_overlay`：本次提交 root draft 叠加到 baseline 后得到的最终 gate artifact，供 `review_submit_gate` 消费和诊断。
+- `review_submit_baseline`：提交 root 以外的依赖 baseline，额外携带 consumer-owned baseline projection，供后续 draft overlay 复用。
+- `review_submit_overlay`：本次提交 root draft 叠加到 baseline 后得到的最终 gate artifact，只携带最小 gate evidence 供 `review_submit_gate` 消费和诊断。
 
 生命周期语义：
 

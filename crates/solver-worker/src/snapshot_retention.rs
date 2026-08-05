@@ -551,14 +551,21 @@ mod tests {
                 "snapshot_directory",
                 Some(snapshot_id),
                 "91540000-0000-4000-8000-000000000001",
-                "a.json",
+                "sparse.h5",
                 true,
             ),
             candidate(
                 "snapshot_directory",
                 Some(snapshot_id),
                 "91540000-0000-4000-8000-000000000001",
-                "b.json",
+                "release-evidence-v2-abc.json.zst",
+                true,
+            ),
+            candidate(
+                "snapshot_directory",
+                Some(snapshot_id),
+                "91540000-0000-4000-8000-000000000001",
+                "source-closure-v1-def.json.zst",
                 true,
             ),
             candidate(
@@ -574,7 +581,7 @@ mod tests {
 
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].objects.len(), 1);
-        assert_eq!(grouped[1].objects.len(), 2);
+        assert_eq!(grouped[1].objects.len(), 3);
         assert!(grouped[1].delete_db_snapshot);
     }
 
@@ -654,8 +661,8 @@ mod tests {
             storage_bytes: 10,
             reason: "eligible_default_30d_snapshot".to_owned(),
             delete_db_snapshot,
-            object_count: 2,
-            snapshot_storage_bytes: 20,
+            object_count: 3,
+            snapshot_storage_bytes: 30,
             downstream_job_count: 0,
             downstream_result_count: 0,
             downstream_cache_count: 0,
