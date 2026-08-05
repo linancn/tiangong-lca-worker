@@ -104,9 +104,25 @@ const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
 const SOURCE_CLOSURE_FLOW_QUERY_BATCH_SIZE: usize = 1_024;
 const SOURCE_CLOSURE_SUPPORT_QUERY_BATCH_SIZE: usize = 512;
 const SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
-const SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES: usize = 1024 * 1024 * 1024;
+const SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES_ENV: &str = "SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES";
 const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
 const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn source_closure_total_document_bytes_limit() -> usize {
+    source_closure_total_document_bytes_limit_from(
+        std::env::var(SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn source_closure_total_document_bytes_limit_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES)
+}
 
 fn emit_snapshot_builder_succeeded(
     resolved_snapshot_id: Uuid,
@@ -7416,6 +7432,7 @@ async fn build_frozen_source_datasets(
     Vec<CompiledReleaseSourceDataset>,
     Option<CompiledSourceReferenceProvenance>,
 )> {
+    let source_closure_total_document_bytes = source_closure_total_document_bytes_limit();
     let mut datasets = BTreeMap::<
         (CompiledReleaseSourceDatasetType, Uuid, String),
         CompiledReleaseSourceDataset,
@@ -7520,10 +7537,10 @@ async fn build_frozen_source_datasets(
             .checked_add(serde_json::to_vec(&dataset.document)?.len())
             .ok_or_else(|| anyhow::anyhow!("source closure document bytes overflow"))
     })?;
-    if total_document_bytes > SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES {
+    if total_document_bytes > source_closure_total_document_bytes {
         return Err(SnapshotSourceClosureError::Operator {
             message: format!(
-                "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES}"
+                "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={source_closure_total_document_bytes}"
             ),
         }
         .into());
@@ -7718,10 +7735,10 @@ async fn build_frozen_source_datasets(
                                 .ok_or_else(|| {
                                     anyhow::anyhow!("source closure document bytes overflow")
                                 })?;
-                            if total_document_bytes > SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES {
+                            if total_document_bytes > source_closure_total_document_bytes {
                                 return Err(SnapshotSourceClosureError::Operator {
                                     message: format!(
-                                        "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES}"
+                                        "source_closure_document_bytes_exceeded: actual={total_document_bytes} limit={source_closure_total_document_bytes}"
                                     ),
                                 }
                                 .into());
@@ -9360,26 +9377,27 @@ fn write_provider_rule_replay_report_files(
 mod tests {
     use super::{
         AllocationFallbackState, AllocationFractionState, AllocationMode, Cli,
-        DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
-        LciaExchangeObservation, MethodSelection, MultiProviderDecision, NormalizationMode,
-        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, ResolvedLciaMethodIdentity,
-        ResolvedLciaMethodRow, SnapshotBuildConfig, SnapshotSelectionMode, SourceDatasetReference,
-        SourceSnapshotSummary, accumulate_finite_factor, add_technosphere_edge,
-        assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
-        build_compiled_release_evidence, build_lcia_factor_coverage,
-        build_review_submit_overlay_graph, candidate_count_bucket_label,
-        collect_lcia_factor_flow_references, compute_review_submit_overlay_source_hash,
-        compute_scope_hash, compute_source_fingerprint_from_summary,
-        flow_reference_requests_from_source_references, geo_score, insert_compiled_source_dataset,
-        load_impact_factor_sets, location_granularity_label, no_balancing_reference_failure_reason,
-        normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
-        parse_process_states, parse_provider_rule_list, parse_scope_closure_snapshot_args,
-        resolve_allocation_fraction, resolve_database_lcia_method_row,
-        resolve_database_lcia_method_rows, resolve_lcia_method_source_row,
-        resolve_lcia_support_flows, resolve_multi_provider, resolve_process_selection,
-        resolve_reference_normalization, review_submit_root_dependency_fingerprint,
-        reviewed_lcia_artifact_locator, scope_closure_boundary_policy,
-        scope_closure_candidate_process_axis, snapshot_db_statement_timeout,
+        DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES,
+        ExchangeDirection, FlowRow, ImpactFactorSet, LciaExchangeObservation, MethodSelection,
+        MultiProviderDecision, NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow,
+        ProviderRule, ResolvedLciaMethodIdentity, ResolvedLciaMethodRow, SnapshotBuildConfig,
+        SnapshotSelectionMode, SourceDatasetReference, SourceSnapshotSummary,
+        accumulate_finite_factor, add_technosphere_edge, assemble_sparse_payload,
+        attach_artifact_lifecycle, biosphere_gross_value, build_compiled_release_evidence,
+        build_lcia_factor_coverage, build_review_submit_overlay_graph,
+        candidate_count_bucket_label, collect_lcia_factor_flow_references,
+        compute_review_submit_overlay_source_hash, compute_scope_hash,
+        compute_source_fingerprint_from_summary, flow_reference_requests_from_source_references,
+        geo_score, insert_compiled_source_dataset, load_impact_factor_sets,
+        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
+        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, parse_scope_closure_snapshot_args, resolve_allocation_fraction,
+        resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
+        resolve_lcia_method_source_row, resolve_lcia_support_flows, resolve_multi_provider,
+        resolve_process_selection, resolve_reference_normalization,
+        review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
+        scope_closure_boundary_policy, scope_closure_candidate_process_axis,
+        snapshot_db_statement_timeout, source_closure_total_document_bytes_limit_from,
         source_dataset_document_id, source_reference_is_satisfied_index,
         summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
         validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
@@ -9392,6 +9410,33 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::io::Write;
     use uuid::Uuid;
+
+    #[test]
+    fn source_closure_total_document_bytes_limit_defaults_to_one_gib() {
+        assert_eq!(
+            source_closure_total_document_bytes_limit_from(None),
+            DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES
+        );
+        assert_eq!(
+            DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES,
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn source_closure_total_document_bytes_limit_accepts_positive_override_only() {
+        assert_eq!(
+            source_closure_total_document_bytes_limit_from(Some("657356743")),
+            657_356_743
+        );
+        for value in ["0", "-1", "invalid", "999999999999999999999999999999999999"] {
+            assert_eq!(
+                source_closure_total_document_bytes_limit_from(Some(value)),
+                DEFAULT_SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES,
+                "expected default for {value:?}"
+            );
+        }
+    }
 
     use solver_worker::compiled_graph::{
         CompiledAllocationStats, CompiledBiosphereEdge, CompiledFlow, CompiledFlowKind,

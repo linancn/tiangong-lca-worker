@@ -22,8 +22,8 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-28
-lastReviewedCommit: 833808c
+lastReviewedAt: 2026-08-05
+lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
 lastReviewedNote: "Issue #146 separates selected LCIA-factor Flow source evidence from the inventory-derived matrix and provider Flow universe."
 related:
   - AGENTS.md

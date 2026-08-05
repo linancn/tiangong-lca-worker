@@ -22,8 +22,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-01
-lastReviewedCommit: e5a7f769f4716266271eea53cb5233781635174f
+lastReviewedAt: 2026-08-05
+lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
 lastReviewedNote: "Reviewed for Issue #193: the active governed Rust tidas baseline is v0.1.3 while scope-closure v3 retains the 2048 MiB Linux RSS guard."
 related:
   - AGENTS.md
