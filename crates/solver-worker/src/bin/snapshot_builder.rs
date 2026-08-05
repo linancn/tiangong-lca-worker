@@ -71,11 +71,12 @@ use solver_worker::signed_flow::{
 use solver_worker::snapshot_artifacts::{
     EncodedSnapshotArtifact, SNAPSHOT_ARTIFACT_FORMAT, ScopeClosureSnapshotBinding,
     SnapshotAllocationCoverage, SnapshotBuildConfig, SnapshotCandidateSummary,
-    SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary, SnapshotMatchingCoverage,
-    SnapshotMatrixScale, SnapshotProcessGapEntry, SnapshotProviderDecisionDiagnostics,
-    SnapshotReferenceCoverage, SnapshotResolutionSummary, SnapshotSingularRisk,
-    SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
-    encode_snapshot_artifact_with_graph,
+    SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary, SnapshotLinkedArtifact,
+    SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProcessGapEntry,
+    SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
+    SnapshotSingularRisk, SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary,
+    decode_snapshot_artifact, encode_snapshot_artifact_with_graph,
+    encode_snapshot_artifact_with_links, encode_snapshot_release_evidence_artifact,
 };
 use solver_worker::snapshot_builder_protocol::{
     SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal,
@@ -1374,8 +1375,47 @@ async fn run_snapshot_builder() -> anyhow::Result<()> {
     }
 
     let encode_started = Instant::now();
-    let encoded = encode_regular_snapshot_artifact(snapshot_id, &build_config, &built)?;
+    let encoded_release_evidence = built
+        .compiled_graph
+        .release_evidence
+        .as_ref()
+        .map(|evidence| encode_snapshot_release_evidence_artifact(snapshot_id, evidence))
+        .transpose()?;
     build_timing.encode_artifact_sec = encode_started.elapsed().as_secs_f64();
+
+    let upload_started = Instant::now();
+    let release_evidence_artifact =
+        if let Some(encoded_evidence) = encoded_release_evidence.as_ref() {
+            let filename = format!("release-evidence-v1.{}", encoded_evidence.extension);
+            let uploaded = store
+                .upload_snapshot_sidecar_file(
+                    snapshot_id,
+                    filename.as_str(),
+                    encoded_evidence.content_type,
+                    encoded_evidence.path(),
+                    encoded_evidence.byte_size,
+                )
+                .await?;
+            Some(SnapshotLinkedArtifact {
+                format: encoded_evidence.format.to_owned(),
+                object_url: uploaded.object_url,
+                sha256: encoded_evidence.sha256.clone(),
+                byte_size: encoded_evidence.byte_size,
+                content_type: encoded_evidence.content_type.to_owned(),
+            })
+        } else {
+            None
+        };
+    build_timing.upload_artifact_sec = upload_started.elapsed().as_secs_f64();
+
+    let encode_started = Instant::now();
+    let encoded = encode_regular_snapshot_artifact(
+        snapshot_id,
+        &build_config,
+        &built,
+        release_evidence_artifact,
+    )?;
+    build_timing.encode_artifact_sec += encode_started.elapsed().as_secs_f64();
 
     let upload_started = Instant::now();
     let artifact_url = store
@@ -1386,7 +1426,7 @@ async fn run_snapshot_builder() -> anyhow::Result<()> {
             encoded.bytes,
         )
         .await?;
-    build_timing.upload_artifact_sec = upload_started.elapsed().as_secs_f64();
+    build_timing.upload_artifact_sec += upload_started.elapsed().as_secs_f64();
 
     attach_versioned_calculation_evidence(
         &store,
@@ -2215,13 +2255,15 @@ fn encode_regular_snapshot_artifact(
     snapshot_id: Uuid,
     config: &SnapshotBuildConfig,
     built: &BuildOutput,
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
 ) -> anyhow::Result<EncodedSnapshotArtifact> {
-    encode_snapshot_artifact_with_graph(
+    encode_snapshot_artifact_with_links(
         snapshot_id,
         config.clone(),
         built.coverage.clone(),
         &built.data,
-        Some(built.compiled_graph.clone()),
+        None,
+        release_evidence_artifact,
     )
 }
 
@@ -10855,7 +10897,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_snapshot_artifact_preserves_compiled_release_evidence() {
+    fn regular_snapshot_artifact_links_release_evidence_without_compiled_graph() {
         let snapshot_id = Uuid::new_v4();
         let mut graph = super::empty_compiled_graph();
         graph.release_evidence = Some(CompiledReleaseEvidence {
@@ -10892,15 +10934,27 @@ mod tests {
             snapshot_id,
             &test_snapshot_build_config("allocation_targeted_v1"),
             &built,
+            Some(solver_worker::snapshot_artifacts::SnapshotLinkedArtifact {
+                format: solver_worker::snapshot_artifacts::SNAPSHOT_RELEASE_EVIDENCE_FORMAT
+                    .to_owned(),
+                object_url: "https://objects.test/release-evidence-v1.json.zst".to_owned(),
+                sha256: "a".repeat(64),
+                byte_size: 123,
+                content_type:
+                    solver_worker::snapshot_artifacts::SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE
+                        .to_owned(),
+            }),
         )
         .expect("encode regular snapshot");
         let decoded = super::decode_snapshot_artifact(&encoded.bytes).expect("decode snapshot");
 
-        assert!(
+        assert!(decoded.compiled_graph.is_none());
+        assert_eq!(
             decoded
-                .compiled_graph
-                .and_then(|graph| graph.release_evidence)
-                .is_some()
+                .release_evidence_artifact
+                .expect("release evidence link")
+                .byte_size,
+            123
         );
     }
 

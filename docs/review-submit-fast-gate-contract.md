@@ -141,7 +141,7 @@ Snapshot build config 记录 `allocation_semantics_version = tidas-reference-all
 
 DB runner 当前支持 `dataset_table = processes`。它使用 gate run 的 `dataset_id + dataset_version` 作为 request root，使用 `requested_by` 作为 snapshot builder 的 `include_user_id`，并以 gate run ID 作为请求 snapshot ID。runner 从 `processes.json_ordered` 计算稳定 SHA-256，与 gate run 的 `revision_checksum` 对比；不匹配会形成 `revision_report_stale` blocker。
 
-普通计算 snapshot artifact 仍以 `coverage + payload + config` 为主。review-submit baseline 和最终 overlay artifact 都必须额外持久化各自的 `compiled_graph`：baseline graph 用于 draft overlay 复用 reference ports、flow space 和 process metadata，overlay graph 与 coverage/payload 一起传给 gate。不得把 overlay graph 丢弃或降级，否则 signed balance 证据和 exact flow identity 无法验证。
+普通计算 snapshot artifact 只持久化 `coverage + payload + config`，Calculation Bundle 所需 release evidence 使用独立的 integrity-bound sidecar，不持久化完整 `CompiledGraph`。review-submit baseline 和最终 overlay artifact 是用途隔离的例外，必须额外持久化各自的 `compiled_graph`：baseline graph 用于 draft overlay 复用 reference ports、flow space 和 process metadata，overlay graph 与 coverage/payload 一起传给 gate。不得把 overlay graph 丢弃或降级，否则 signed balance 证据和 exact flow identity 无法验证。
 
 DB runner 默认通过 snapshot_builder 的 no-LCIA baseline + draft overlay fast path 构造 review-submit snapshot。该路径不加载 `lciamethods` factors，不要求 `C` 矩阵非空，并把最终提交审核 artifact 标记为 `artifact_purpose = review_submit_overlay`，避免与普通计算 snapshot 共享 source hash 语义。
 

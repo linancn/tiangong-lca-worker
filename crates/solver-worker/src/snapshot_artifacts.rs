@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use hdf5::File;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solver_core::ModelSparseData;
-use tempfile::Builder;
+use tempfile::{Builder, NamedTempFile};
 use uuid::Uuid;
 
 use crate::calculation_evidence::LcaMethodFactorSourceSnapshot;
-use crate::compiled_graph::CompiledGraph;
+use crate::compiled_graph::{CompiledGraph, CompiledReleaseEvidence};
 use crate::graph_types::{RequestRootProcess, SnapshotSelectionMode};
 
 const SCHEMA_VERSION: u8 = 1;
@@ -25,6 +26,13 @@ pub const SNAPSHOT_ARTIFACT_FORMAT: &str = "snapshot-hdf5:v1";
 pub const SNAPSHOT_ARTIFACT_EXTENSION: &str = "h5";
 /// Snapshot artifact content type.
 pub const SNAPSHOT_ARTIFACT_CONTENT_TYPE: &str = "application/x-hdf5";
+/// Purpose-specific Calculation Bundle evidence format identifier.
+pub const SNAPSHOT_RELEASE_EVIDENCE_FORMAT: &str = "snapshot-release-evidence-json-zstd:v1";
+/// Purpose-specific Calculation Bundle evidence file extension.
+pub const SNAPSHOT_RELEASE_EVIDENCE_EXTENSION: &str = "json.zst";
+/// Purpose-specific Calculation Bundle evidence content type.
+pub const SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE: &str =
+    "application/vnd.tiangong.snapshot-release-evidence+json+zstd";
 /// Snapshot coverage JSON schema identifier.
 pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v3";
 
@@ -369,6 +377,37 @@ struct SnapshotArtifactEnvelope {
     payload: ModelSparseData,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compiled_graph: Option<CompiledGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+}
+
+/// Integrity-bound reference to a purpose-specific snapshot sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotLinkedArtifact {
+    pub format: String,
+    pub object_url: String,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub content_type: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotReleaseEvidenceEnvelopeRef<'a> {
+    version: u8,
+    format: &'static str,
+    snapshot_id: Uuid,
+    release_evidence: &'a CompiledReleaseEvidence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotReleaseEvidenceEnvelope {
+    version: u8,
+    format: String,
+    snapshot_id: Uuid,
+    release_evidence: CompiledReleaseEvidence,
 }
 
 /// Encoded snapshot artifact bytes and metadata.
@@ -390,6 +429,26 @@ pub struct DecodedSnapshotArtifact {
     pub coverage: SnapshotCoverageReport,
     pub payload: ModelSparseData,
     pub compiled_graph: Option<CompiledGraph>,
+    pub release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+}
+
+/// File-backed, compressed Calculation Bundle evidence and its integrity metadata.
+#[derive(Debug)]
+pub struct EncodedSnapshotReleaseEvidenceArtifact {
+    file: NamedTempFile,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub format: &'static str,
+    pub content_type: &'static str,
+    pub extension: &'static str,
+}
+
+impl EncodedSnapshotReleaseEvidenceArtifact {
+    /// Local file path retained until the encoded artifact is dropped.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
 }
 
 /// Encodes one snapshot matrix payload into `HDF5`.
@@ -410,6 +469,25 @@ pub fn encode_snapshot_artifact_with_graph(
     payload: &ModelSparseData,
     compiled_graph: Option<CompiledGraph>,
 ) -> anyhow::Result<EncodedSnapshotArtifact> {
+    encode_snapshot_artifact_with_links(
+        snapshot_id,
+        config,
+        coverage,
+        payload,
+        compiled_graph,
+        None,
+    )
+}
+
+/// Encodes one numerical snapshot with optional legacy graph and linked business artifacts.
+pub fn encode_snapshot_artifact_with_links(
+    snapshot_id: Uuid,
+    config: SnapshotBuildConfig,
+    coverage: SnapshotCoverageReport,
+    payload: &ModelSparseData,
+    compiled_graph: Option<CompiledGraph>,
+    release_evidence_artifact: Option<SnapshotLinkedArtifact>,
+) -> anyhow::Result<EncodedSnapshotArtifact> {
     let envelope = SnapshotArtifactEnvelope {
         version: SCHEMA_VERSION,
         format: SNAPSHOT_ARTIFACT_FORMAT.to_owned(),
@@ -418,6 +496,7 @@ pub fn encode_snapshot_artifact_with_graph(
         coverage,
         payload: payload.clone(),
         compiled_graph,
+        release_evidence_artifact,
     };
 
     let json = serde_json::to_vec(&envelope)?;
@@ -481,7 +560,86 @@ pub fn decode_snapshot_artifact(bytes: &[u8]) -> anyhow::Result<DecodedSnapshotA
         coverage: envelope.coverage,
         payload: envelope.payload,
         compiled_graph: envelope.compiled_graph,
+        release_evidence_artifact: envelope.release_evidence_artifact,
     })
+}
+
+/// Encodes Calculation Bundle release evidence directly to a compressed temporary file.
+pub fn encode_snapshot_release_evidence_artifact(
+    snapshot_id: Uuid,
+    release_evidence: &CompiledReleaseEvidence,
+) -> anyhow::Result<EncodedSnapshotReleaseEvidenceArtifact> {
+    let file = Builder::new()
+        .prefix("lca-snapshot-release-evidence-")
+        .suffix(".json.zst")
+        .tempfile()?;
+    let output = std::fs::File::create(file.path())?;
+    let buffered = BufWriter::new(output);
+    let mut encoder = zstd::stream::write::Encoder::new(buffered, 3)?;
+    serde_json::to_writer(
+        &mut encoder,
+        &SnapshotReleaseEvidenceEnvelopeRef {
+            version: SCHEMA_VERSION,
+            format: SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+            snapshot_id,
+            release_evidence,
+        },
+    )?;
+    let mut buffered = encoder.finish()?;
+    buffered.flush()?;
+
+    let (byte_size, sha256) = hash_file(file.path())?;
+    Ok(EncodedSnapshotReleaseEvidenceArtifact {
+        file,
+        sha256,
+        byte_size,
+        format: SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+        content_type: SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE,
+        extension: SNAPSHOT_RELEASE_EVIDENCE_EXTENSION,
+    })
+}
+
+/// Decodes and validates one file-backed Calculation Bundle evidence sidecar.
+pub fn decode_snapshot_release_evidence_artifact(
+    path: &Path,
+    expected_snapshot_id: Uuid,
+) -> anyhow::Result<CompiledReleaseEvidence> {
+    let input = std::fs::File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
+    let envelope: SnapshotReleaseEvidenceEnvelope = serde_json::from_reader(decoder)?;
+    if envelope.version != SCHEMA_VERSION || envelope.format != SNAPSHOT_RELEASE_EVIDENCE_FORMAT {
+        return Err(anyhow::anyhow!(
+            "unsupported snapshot release evidence format: version={} format={}",
+            envelope.version,
+            envelope.format
+        ));
+    }
+    if envelope.snapshot_id != expected_snapshot_id {
+        return Err(anyhow::anyhow!(
+            "snapshot release evidence mismatch: expected={} got={}",
+            expected_snapshot_id,
+            envelope.snapshot_id
+        ));
+    }
+    Ok(envelope.release_evidence)
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
+    let mut input = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut byte_size = 0_u64;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        byte_size = byte_size
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("snapshot release evidence size overflow"))?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok((byte_size, format!("{:x}", hasher.finalize())))
 }
 
 fn write_hdf5_file(path: &Path, envelope_json: &[u8]) -> anyhow::Result<()> {
@@ -518,17 +676,19 @@ mod tests {
 
     use crate::compiled_graph::{
         CompiledAllocationStats, CompiledFlow, CompiledFlowKind, CompiledGraph,
-        CompiledMatchingStats, CompiledReferenceStats,
+        CompiledMatchingStats, CompiledReferenceStats, CompiledReleaseEvidence,
     };
 
     use super::{
         DATASET_ENVELOPE_JSON, HDF5_DEFLATE_LEVEL, SNAPSHOT_ARTIFACT_FORMAT,
-        SNAPSHOT_COVERAGE_SCHEMA_VERSION, SnapshotAllocationCoverage, SnapshotBuildConfig,
-        SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary,
-        SnapshotGeographySummary, SnapshotMatchingCoverage, SnapshotMatrixScale,
-        SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
-        SnapshotSelectionMode, SnapshotSingularRisk, SnapshotVolumeWeightSummary,
-        decode_snapshot_artifact, encode_snapshot_artifact, encode_snapshot_artifact_with_graph,
+        SNAPSHOT_COVERAGE_SCHEMA_VERSION, SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
+        SnapshotAllocationCoverage, SnapshotBuildConfig, SnapshotCandidateSummary,
+        SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary,
+        SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProviderDecisionDiagnostics,
+        SnapshotReferenceCoverage, SnapshotResolutionSummary, SnapshotSelectionMode,
+        SnapshotSingularRisk, SnapshotVolumeWeightSummary, decode_snapshot_artifact,
+        decode_snapshot_release_evidence_artifact, encode_snapshot_artifact,
+        encode_snapshot_artifact_with_graph, encode_snapshot_release_evidence_artifact,
     };
 
     #[test]
@@ -747,6 +907,26 @@ mod tests {
                 .legacy_single_output_target_inferred_count,
             1
         );
+
+        let release_evidence = CompiledReleaseEvidence {
+            processes: Vec::new(),
+            inventory_exchanges: Vec::new(),
+            technosphere_edges: Vec::new(),
+            biosphere_edges: Vec::new(),
+            source_datasets: Vec::new(),
+            source_reference_provenance: None,
+        };
+        let encoded_evidence =
+            encode_snapshot_release_evidence_artifact(snapshot_id, &release_evidence)
+                .expect("encode release evidence");
+        assert_eq!(encoded_evidence.format, SNAPSHOT_RELEASE_EVIDENCE_FORMAT);
+        assert!(encoded_evidence.byte_size > 0);
+        assert_eq!(encoded_evidence.sha256.len(), 64);
+        let decoded_evidence =
+            decode_snapshot_release_evidence_artifact(encoded_evidence.path(), snapshot_id)
+                .expect("decode release evidence");
+        assert!(decoded_evidence.processes.is_empty());
+        assert!(decoded_evidence.source_datasets.is_empty());
     }
 
     #[test]
