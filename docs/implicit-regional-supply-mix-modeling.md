@@ -25,8 +25,8 @@ checkPaths:
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
-lastReviewedNote: "Reviewed for Issue #146: LCIA-factor source support is separate from implicit signed-flow routing and provider selection."
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedNote: "Reviewed for Worker Issue #217: external digital-file URI handling does not change signed-flow routing or provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

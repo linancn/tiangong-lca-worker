@@ -9657,11 +9657,14 @@ mod tests {
         config.source_reference_policy = "source-reference-policy.v2".to_owned();
         let v2_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
             .expect("v2 source-reference fingerprint");
-        assert_ne!(snapshot_hash, v2_snapshot_hash);
+        config.source_reference_policy = "source-reference-policy.v3".to_owned();
+        let v3_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("v3 source-reference fingerprint");
+        assert_ne!(v2_snapshot_hash, v3_snapshot_hash);
         assert_eq!(
-            v2_snapshot_hash,
+            v3_snapshot_hash,
             compute_source_fingerprint_from_summary(&summary, &config)
-                .expect("stable v2 source-reference fingerprint")
+                .expect("stable v3 source-reference fingerprint")
         );
     }
 

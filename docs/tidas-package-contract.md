@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
 lastReviewedAt: 2026-08-05
-lastReviewedNote: "Reviewed for rollback Issue #211 after Issue #212: removing the incremental schema qualification route does not change reusable state-code 100-200 import behavior, open-data export scope, or the package report schema."
+lastReviewedNote: "Reviewed for Worker Issue #217: the numerical source-reference policy correction does not change package import, export, or certificate binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml

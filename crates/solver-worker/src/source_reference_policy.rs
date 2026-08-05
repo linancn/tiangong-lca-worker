@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::scope_closure::ReferenceEdge;
 
-pub const SOURCE_REFERENCE_POLICY_VERSION: &str = "source-reference-policy.v2";
+pub const SOURCE_REFERENCE_POLICY_VERSION: &str = "source-reference-policy.v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

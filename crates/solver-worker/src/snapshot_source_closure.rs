@@ -103,6 +103,11 @@ pub fn classify_source_document(
         .issues
         .into_iter()
         .filter_map(|issue| {
+            if purpose != ArtifactPurpose::CertificateClosure
+                && is_external_digital_file_path(issue.json_path.as_str())
+            {
+                return None;
+            }
             let role = classify_malformed_reference_role(
                 issue.source_category.as_str(),
                 issue.json_path.as_str(),
@@ -155,6 +160,12 @@ pub fn classify_source_document(
         references,
         extraction_issues,
     })
+}
+
+fn is_external_digital_file_path(json_path: &str) -> bool {
+    json_path
+        .to_ascii_lowercase()
+        .ends_with("referencetodigitalfile")
 }
 
 pub fn validate_resource_limits(
@@ -427,5 +438,46 @@ mod tests {
             required.extraction_issues[0]["referenceRole"],
             "exchange_flow"
         );
+    }
+
+    #[test]
+    fn external_digital_file_uri_does_not_block_numeric_source_closure() {
+        let document = json!({
+            "sourceDataSet": {
+                "sourceInformation": {
+                    "dataSetInformation": {
+                        "referenceToDigitalFile": {
+                            "@uri": "http://lca.jrc.ec.europa.eu"
+                        }
+                    }
+                }
+            }
+        });
+
+        for purpose in [
+            ArtifactPurpose::ReviewSubmit,
+            ArtifactPurpose::CalculationBundle,
+        ] {
+            let classified = classify_source_document(
+                &source(CompiledReleaseSourceDatasetType::Source, document.clone()),
+                purpose,
+            )
+            .unwrap();
+            assert!(classified.references.is_empty());
+            assert!(classified.extraction_issues.is_empty());
+        }
+
+        let certificate = classify_source_document(
+            &source(CompiledReleaseSourceDatasetType::Source, document),
+            ArtifactPurpose::CertificateClosure,
+        )
+        .unwrap();
+        assert!(certificate.references.is_empty());
+        assert_eq!(certificate.extraction_issues.len(), 2);
+        assert!(certificate.extraction_issues.iter().all(|issue| {
+            issue["jsonPath"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("referenceToDigitalFile"))
+        }));
     }
 }

@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
-lastReviewedNote: "Issue #146 adds selected LCIA-factor Flow source-closure policy to build identity; readiness schema and blocker semantics are unchanged."
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedNote: "Reviewed for Worker Issue #217: source-reference policy v3 changes build identity without changing readiness schema or blocker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

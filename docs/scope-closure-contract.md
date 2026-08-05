@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-07-31
-lastReviewedCommit: e67971ff8624fe543f10d93abe88c11bf5e1a396
-lastReviewedNote: "Updated for Worker Issue #186: git-tracked external and isolated-provider executables emit the exact root qualification child contracts and fail closed on identity, payload, target, or cleanup drift."
+lastReviewedAt: 2026-08-05
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedNote: "Updated for Worker Issue #217: numerical source-reference policy v3 ignores external digital-file URI findings while certificate traversal stays strict."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -183,6 +183,10 @@ This numerical frontier does not replace certificate-grade administrative traver
 review-submit and ordinary Calculation Bundles, lineage and model-composition edges are evidence
 only and never probe their target. Certificate closure continues its full, non-fail-fast union
 traversal and issue aggregation under this document's frozen-release rules.
+Schema-defined `referenceToDigitalFile` URI values are external attachment locators rather than
+dataset references. The numerical source walk ignores their raw extraction findings for
+review-submit and ordinary Calculation Bundles; certificate-grade administrative traversal keeps
+its existing strict extraction and issue-aggregation behavior.
 
 Each fresh scan produces deterministic administrative artifacts:
 
