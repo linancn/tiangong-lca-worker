@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: optional administrative support and bounded blocker projection preserve memory and complete-result limits."
+lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
+lastReviewedNote: "Reviewed for Worker Issue #223: numerical snapshot separation does not change administrative closure result or memory limits."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

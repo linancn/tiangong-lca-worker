@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: administrative source-reference classification does not change readiness schema or numerical blocker semantics."
+lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
+lastReviewedNote: "Reviewed for Worker Issue #223: persistence separation does not change readiness schema or numerical blocker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

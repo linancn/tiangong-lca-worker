@@ -23,8 +23,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: optional administrative support does not change the provider Flow universe or linking decisions."
+lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
+lastReviewedNote: "Reviewed for Worker Issue #223: persistence separation does not change provider Flow universe or linking decisions."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

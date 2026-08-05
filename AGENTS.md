@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: purpose-aware source-reference handling, bounded blocker diagnostics, and read-only auditing remain Worker-owned."
+lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
+lastReviewedNote: "Updated for Worker Issue #223: ordinary numerical snapshots no longer persist the full compiler graph."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -170,6 +170,7 @@ Route those tasks to:
 ## Operational Invariants
 
 - solve result persistence is S3-only; `lca_results` stores artifact metadata and diagnostics, not inline payloads
+- ordinary numerical snapshots persist payload/config/coverage without the full `CompiledGraph`; Calculation Bundle release evidence is an integrity-bound, file-backed zstd sidecar loaded only by bundle materialization, while legacy graph-bearing snapshots remain readable
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful

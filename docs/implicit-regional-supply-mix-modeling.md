@@ -25,8 +25,8 @@ checkPaths:
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
-lastReviewedNote: "Reviewed for Worker Issue #221: optional administrative support does not change signed-flow routing or provider selection."
+lastReviewedCommit: b0d5bfb8f96a5b43b520ed56191123aa16f12026
+lastReviewedNote: "Reviewed for Worker Issue #223: artifact separation does not change signed-flow routing or provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
