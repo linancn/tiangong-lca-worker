@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
-lastReviewedNote: "Reviewed for Worker Issue #219: source-support read batching does not change readiness schema or blocker semantics."
+lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
+lastReviewedNote: "Reviewed for Worker Issue #221: administrative source-reference classification does not change readiness schema or numerical blocker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

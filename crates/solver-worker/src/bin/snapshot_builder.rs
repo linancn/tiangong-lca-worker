@@ -7748,7 +7748,7 @@ async fn build_frozen_source_datasets(
             .into());
         }
         let level_len = frontier.len();
-        let mut required_support = Vec::<ClassifiedSourceReference>::new();
+        let mut support_references = Vec::<ClassifiedSourceReference>::new();
         for _ in 0..level_len {
             let key = frontier
                 .pop_front()
@@ -7822,7 +7822,25 @@ async fn build_frozen_source_datasets(
                             &omitted_version_index,
                             &lookup,
                         ) {
-                            required_support.push(reference.clone());
+                            support_references.push(reference.clone());
+                        }
+                    }
+                    SourceReferenceAction::FetchOptionalSupport => {
+                        let Ok(id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
+                            classified_references.push(reference);
+                            continue;
+                        };
+                        let lookup = SourceDatasetReference {
+                            dataset_type: reference.target_type,
+                            id,
+                            version: reference.requested_version.clone(),
+                        };
+                        if !source_reference_is_satisfied_index(
+                            &exact_dataset_index,
+                            &omitted_version_index,
+                            &lookup,
+                        ) {
+                            support_references.push(reference.clone());
                         }
                     }
                     SourceReferenceAction::TraverseAdministrative => {
@@ -7847,7 +7865,7 @@ async fn build_frozen_source_datasets(
             CompiledReleaseSourceDatasetType::Source,
             CompiledReleaseSourceDatasetType::UnitGroup,
         ] {
-            let type_references = required_support
+            let type_references = support_references
                 .iter()
                 .filter(|reference| reference.target_type == dataset_type)
                 .collect::<Vec<_>>();
@@ -7859,10 +7877,12 @@ async fn build_frozen_source_datasets(
                 CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process
             ) {
                 for reference in type_references {
-                    preflight_issues.push(source_dependency_issue(
-                        reference,
-                        "Required exact Flow/Process dependency is outside the selected artifact axis.",
-                    ));
+                    if reference.action == SourceReferenceAction::FetchRequiredSupport {
+                        preflight_issues.push(source_dependency_issue(
+                            reference,
+                            "Required exact Flow/Process dependency is outside the selected artifact axis.",
+                        ));
+                    }
                 }
                 continue;
             }
@@ -7948,10 +7968,13 @@ async fn build_frozen_source_datasets(
                             frontier.push_back(key);
                         }
                     }
-                    Err(_) => preflight_issues.push(source_dependency_issue(
-                        reference,
-                        "Required support dependency could not be resolved.",
-                    )),
+                    Err(_) if reference.action == SourceReferenceAction::FetchRequiredSupport => {
+                        preflight_issues.push(source_dependency_issue(
+                            reference,
+                            "Required support dependency could not be resolved.",
+                        ));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -9608,6 +9631,7 @@ mod tests {
     use chrono::Utc;
     use clap::Parser;
     use serde_json::json;
+    use solver_worker::source_reference_policy::SOURCE_REFERENCE_POLICY_VERSION;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::io::Write;
     use uuid::Uuid;
@@ -9939,17 +9963,17 @@ mod tests {
             compute_review_submit_overlay_source_hash("baseline", &config)
                 .expect("LCIA factor Flow overlay fingerprint")
         );
-        config.source_reference_policy = "source-reference-policy.v2".to_owned();
-        let v2_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
-            .expect("v2 source-reference fingerprint");
         config.source_reference_policy = "source-reference-policy.v3".to_owned();
         let v3_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
             .expect("v3 source-reference fingerprint");
-        assert_ne!(v2_snapshot_hash, v3_snapshot_hash);
+        config.source_reference_policy = SOURCE_REFERENCE_POLICY_VERSION.to_owned();
+        let current_snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("current source-reference fingerprint");
+        assert_ne!(v3_snapshot_hash, current_snapshot_hash);
         assert_eq!(
-            v3_snapshot_hash,
+            current_snapshot_hash,
             compute_source_fingerprint_from_summary(&summary, &config)
-                .expect("stable v3 source-reference fingerprint")
+                .expect("stable current source-reference fingerprint")
         );
     }
 

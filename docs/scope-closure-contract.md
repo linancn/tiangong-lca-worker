@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
-lastReviewedNote: "Updated for Worker Issue #219: numerical source support reads are byte-planned before exact document fetches while preserving the 64 MiB per-read and 1 GiB cumulative ceilings."
+lastReviewedCommit: 7f6240a9e5e81797a16c5e948edc07c2423d1d05
+lastReviewedNote: "Updated for Worker Issue #221: numerical artifacts distinguish optional administrative support from fail-closed numerical dependencies."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -186,6 +186,12 @@ This numerical frontier does not replace certificate-grade administrative traver
 review-submit and ordinary Calculation Bundles, lineage and model-composition edges are evidence
 only and never probe their target. Certificate closure continues its full, non-fail-fast union
 traversal and issue aggregation under this document's frozen-release rules.
+Administrative-support references such as data-entry contacts, ownership, dataset formats,
+compliance systems, logos, and provenance sources are optional for numerical artifacts: valid
+targets are fetched when available, while malformed placeholders and unavailable targets are
+retained only in bounded provenance evidence. Numerical exchange/provider references and required
+Flow Property, Unit Group, and LCIA support remain fail-closed. This distinction is identified by
+`source-reference-policy.v4` and participates in snapshot/review fingerprints.
 Schema-defined `referenceToDigitalFile` URI values are external attachment locators rather than
 dataset references. The numerical source walk ignores their raw extraction findings for
 review-submit and ordinary Calculation Bundles; certificate-grade administrative traversal keeps

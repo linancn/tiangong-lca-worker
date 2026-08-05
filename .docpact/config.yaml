@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-05"
-lastReviewedCommit: "c9a16ab2b166b01e4d407b3b16f88dbde357d000"
-lastReviewedNote: "Reviewed for Worker Issue #219: existing routing and ownership cover bounded numerical source-support read planning."
+lastReviewedCommit: "7f6240a9e5e81797a16c5e948edc07c2423d1d05"
+lastReviewedNote: "Reviewed for Worker Issue #221: purpose-aware administrative support, bounded blocker diagnostics, and the read-only audit remain within existing Worker routing and ownership."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
