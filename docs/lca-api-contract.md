@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
-lastReviewedNote: "Reviewed for Worker Issue #193: the exact tidas v0.1.3 default does not change public Worker, Edge, or Next DTOs."
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedNote: "Updated for Worker Issue #217: source-reference policy v3 excludes external digital-file URI findings from numerical blockers without changing public DTOs."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -287,7 +287,7 @@ evidence/coverage.json
 - process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit、raw direction/amount/coefficient 与 signed normalized pivot；inventory axis逐 exchange 保存 raw/signed/normalized coefficient、allocation target 与 selected fraction。Snapshot flow axis 使用 `(Flow UUID, resolved version)`；同一 UUID 的多个实际引用 revision 可共存并获得独立连续 `flow_idx`，未被最终 process closure exchange 引用的 revision 不进入矩阵。Selected LCIA-factor-only Elementary Flow 不获得 `flow_idx`，但会作为 source-closure `support` 文档进入 bundle。
 - 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 及 `source_datasets` 写入 snapshot artifact。source closure 从本次 snapshot 精确选择的 Process/inventory Flow revision 和已审 LCIA Method identity 出发；另外一次扫描 selected Method 的全部 factor Flow reference（包括 zero factor），按 UUID/version 去重后 bounded-batch 解析为 Elementary Flow support root，再递归解析 Contact、Flow Property、Source、Unit Group 与 LCIA Method reference。显式版本只允许 exact match，省略的 support version 只确定一次并冻结，缺失、歧义、无效 UUID/version、非 Elementary factor target 或同 identity/version 内容漂移均 fail closed。这个 source-evidence 扩展不改变 B/C axis、compiled graph 或 provider lookup；support documents 不在 solve 时重新查询。
 - numerical source closure 复用 `scope_closure.rs` raw extractor，并通过
-  `source-reference-policy.v2` 决定 artifact-purpose action。lineage / model-composition 只进入
+  `source-reference-policy.v3` 决定 artifact-purpose action。lineage / model-composition 只进入
   additive `release_evidence.source_reference_provenance` 的 count/hash/bounded sample，不 probe
   target，也不改变 Process/Flow axis、A/B/C、sparse payload 或 Calculation Bundle 的 unit-process
   source validator。unknown Flow/Process path 是 operator error。
@@ -313,7 +313,7 @@ Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只�
 
 Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`。Legacy compatibility 只允许两个有界 fallback：scalar `{}` 按 undeclared 处理；单个 targetless full allocation 仅在 reference exchange 和 internal ID 唯一时推断。方向不参与 target validity；multiple-entry targetless、多个 quantitative reference、坏 ID 或其他无效声明均 fail closed。Reference pivot 本身不乘 allocation fraction。
 
-Build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy`、`flow_identity_policy = exact-flow-version-reference-unit-v2`、`source_closure_policy = path-aware-bounded-frontier-v2` 与 `source_reference_policy = source-reference-policy.v2`；所有字段进入 source/review fingerprint，solver contract 也显式记录两项 source policy。Flow identity v2 只查询和编译最终 process closure exchange 实际引用的 exact Flow identities；source-closure v2 只为 selected LCIA-factor-only Elementary Flow 增加 support evidence，不扩大稀疏矩阵轴。legacy artifact 仍可反序列化，但 `legacy-unclassified-v1` 不可作为 v2 reuse candidate；相同 v2 输入的 hash/reuse 必须稳定。
+Build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy`、`flow_identity_policy = exact-flow-version-reference-unit-v2`、`source_closure_policy = path-aware-bounded-frontier-v2` 与 `source_reference_policy = source-reference-policy.v3`；所有字段进入 source/review fingerprint，solver contract 也显式记录两项 source policy。Flow identity v2 只查询和编译最终 process closure exchange 实际引用的 exact Flow identities；source-closure v2 只为 selected LCIA-factor-only Elementary Flow 增加 support evidence，不扩大稀疏矩阵轴。`referenceToDigitalFile` 只是外部附件 URI，在 review-submit 和普通 Calculation Bundle 中不作为数据集引用校验。legacy artifact 仍可反序列化，但非 v3 policy artifact 不可作为 v3 reuse candidate；相同 v3 输入的 hash/reuse 必须稳定。
 
 显式零或稀疏零 allocation 得到的 Input 不展开 provider closure、不产生 provider-gap diagnostics，也不写入 `A`；零 attributed elementary exchange 也不写入 `B`，不参与 LCIA direction 与 factor-coverage evidence。它只表示该 exchange 对当前 quantitative reference 没有 attributed burden。
 

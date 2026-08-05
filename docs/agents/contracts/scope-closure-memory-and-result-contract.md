@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
-lastReviewedNote: "Reviewed for Worker Issue #193: tidas v0.1.3 evidence preserves the existing bounded memory, result, four-mode identity, and owner-evidence contracts."
+lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedNote: "Reviewed for Worker Issue #217: the numerical source-reference policy correction does not change bounded memory, result, or owner-evidence contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
