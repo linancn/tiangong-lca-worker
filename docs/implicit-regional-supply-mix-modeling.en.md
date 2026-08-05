@@ -25,8 +25,8 @@ checkPaths:
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
-lastReviewedNote: "Reviewed for Worker Issue #217: external digital-file URI handling does not change signed-flow routing or provider selection."
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
+lastReviewedNote: "Reviewed for Worker Issue #219: source-support read batching does not change signed-flow routing or provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

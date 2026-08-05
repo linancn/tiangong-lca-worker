@@ -317,6 +317,13 @@ struct MethodRow {
     json: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceDatasetReadIdentity {
+    id: Uuid,
+    version: String,
+    estimated_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedLciaMethodIdentity {
     method_id: Uuid,
@@ -7319,6 +7326,186 @@ fn source_dataset_query(
     }
 }
 
+fn source_dataset_metadata_query(
+    dataset_type: CompiledReleaseSourceDatasetType,
+) -> anyhow::Result<&'static str> {
+    match dataset_type {
+        CompiledReleaseSourceDatasetType::Contact => Ok(
+            "SELECT id, btrim(version::text) AS version, octet_length(COALESCE(json, json_ordered::jsonb)::text)::bigint AS document_bytes FROM public.contacts WHERE id = ANY($1) ORDER BY id, version",
+        ),
+        CompiledReleaseSourceDatasetType::FlowProperty => Ok(
+            "SELECT id, btrim(version::text) AS version, octet_length(COALESCE(json, json_ordered::jsonb)::text)::bigint AS document_bytes FROM public.flowproperties WHERE id = ANY($1) ORDER BY id, version",
+        ),
+        CompiledReleaseSourceDatasetType::LciaMethod => Ok(
+            "SELECT id, btrim(version::text) AS version, octet_length(COALESCE(json, json_ordered::jsonb)::text)::bigint AS document_bytes FROM public.lciamethods WHERE id = ANY($1) ORDER BY id, version",
+        ),
+        CompiledReleaseSourceDatasetType::Source => Ok(
+            "SELECT id, btrim(version::text) AS version, octet_length(COALESCE(json, json_ordered::jsonb)::text)::bigint AS document_bytes FROM public.sources WHERE id = ANY($1) ORDER BY id, version",
+        ),
+        CompiledReleaseSourceDatasetType::UnitGroup => Ok(
+            "SELECT id, btrim(version::text) AS version, octet_length(COALESCE(json, json_ordered::jsonb)::text)::bigint AS document_bytes FROM public.unitgroups WHERE id = ANY($1) ORDER BY id, version",
+        ),
+        CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process => {
+            Err(anyhow::anyhow!(
+                "{} closure rows must come from the exact snapshot selection",
+                dataset_type.as_str()
+            ))
+        }
+    }
+}
+
+fn source_dataset_exact_query(
+    dataset_type: CompiledReleaseSourceDatasetType,
+) -> anyhow::Result<&'static str> {
+    match dataset_type {
+        CompiledReleaseSourceDatasetType::Contact => Ok(
+            "WITH requested(id, version) AS (SELECT * FROM unnest($1::uuid[], $2::text[])) SELECT dataset.id, btrim(dataset.version::text) AS version, COALESCE(dataset.json, dataset.json_ordered::jsonb) AS json FROM public.contacts AS dataset JOIN requested ON requested.id = dataset.id AND requested.version = btrim(dataset.version::text) ORDER BY dataset.id, btrim(dataset.version::text)",
+        ),
+        CompiledReleaseSourceDatasetType::FlowProperty => Ok(
+            "WITH requested(id, version) AS (SELECT * FROM unnest($1::uuid[], $2::text[])) SELECT dataset.id, btrim(dataset.version::text) AS version, COALESCE(dataset.json, dataset.json_ordered::jsonb) AS json FROM public.flowproperties AS dataset JOIN requested ON requested.id = dataset.id AND requested.version = btrim(dataset.version::text) ORDER BY dataset.id, btrim(dataset.version::text)",
+        ),
+        CompiledReleaseSourceDatasetType::LciaMethod => Ok(
+            "WITH requested(id, version) AS (SELECT * FROM unnest($1::uuid[], $2::text[])) SELECT dataset.id, btrim(dataset.version::text) AS version, COALESCE(dataset.json, dataset.json_ordered::jsonb) AS json FROM public.lciamethods AS dataset JOIN requested ON requested.id = dataset.id AND requested.version = btrim(dataset.version::text) ORDER BY dataset.id, btrim(dataset.version::text)",
+        ),
+        CompiledReleaseSourceDatasetType::Source => Ok(
+            "WITH requested(id, version) AS (SELECT * FROM unnest($1::uuid[], $2::text[])) SELECT dataset.id, btrim(dataset.version::text) AS version, COALESCE(dataset.json, dataset.json_ordered::jsonb) AS json FROM public.sources AS dataset JOIN requested ON requested.id = dataset.id AND requested.version = btrim(dataset.version::text) ORDER BY dataset.id, btrim(dataset.version::text)",
+        ),
+        CompiledReleaseSourceDatasetType::UnitGroup => Ok(
+            "WITH requested(id, version) AS (SELECT * FROM unnest($1::uuid[], $2::text[])) SELECT dataset.id, btrim(dataset.version::text) AS version, COALESCE(dataset.json, dataset.json_ordered::jsonb) AS json FROM public.unitgroups AS dataset JOIN requested ON requested.id = dataset.id AND requested.version = btrim(dataset.version::text) ORDER BY dataset.id, btrim(dataset.version::text)",
+        ),
+        CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process => {
+            Err(anyhow::anyhow!(
+                "{} closure rows must come from the exact snapshot selection",
+                dataset_type.as_str()
+            ))
+        }
+    }
+}
+
+async fn fetch_source_dataset_metadata(
+    pool: &PgPool,
+    dataset_type: CompiledReleaseSourceDatasetType,
+    ids: &[Uuid],
+) -> anyhow::Result<Vec<SourceDatasetReadIdentity>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(source_dataset_metadata_query(dataset_type)?)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let document_bytes = row.try_get::<i64, _>("document_bytes")?;
+            Ok(SourceDatasetReadIdentity {
+                id: row.try_get("id")?,
+                version: row.try_get::<String, _>("version")?.trim().to_owned(),
+                estimated_bytes: usize::try_from(document_bytes).map_err(|_| {
+                    anyhow::anyhow!("source support document bytes are invalid: {document_bytes}")
+                })?,
+            })
+        })
+        .collect()
+}
+
+async fn fetch_exact_source_dataset_rows(
+    pool: &PgPool,
+    dataset_type: CompiledReleaseSourceDatasetType,
+    identities: &[SourceDatasetReadIdentity],
+) -> anyhow::Result<Vec<MethodRow>> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = identities
+        .iter()
+        .map(|identity| identity.id)
+        .collect::<Vec<_>>();
+    let versions = identities
+        .iter()
+        .map(|identity| identity.version.clone())
+        .collect::<Vec<_>>();
+    let rows = sqlx::query(source_dataset_exact_query(dataset_type)?)
+        .bind(ids)
+        .bind(versions)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(MethodRow {
+                id: row.try_get("id")?,
+                version: row.try_get::<String, _>("version")?.trim().to_owned(),
+                json: row.try_get("json")?,
+            })
+        })
+        .collect()
+}
+
+fn select_source_dataset_read_identities(
+    references: &[&ClassifiedSourceReference],
+    metadata: &[SourceDatasetReadIdentity],
+) -> Vec<SourceDatasetReadIdentity> {
+    let mut selected = BTreeSet::new();
+    for reference in references {
+        let Ok(target_id) = Uuid::parse_str(reference.target_uuid.as_str()) else {
+            continue;
+        };
+        let mut candidates = metadata
+            .iter()
+            .filter(|candidate| {
+                candidate.id == target_id
+                    && reference
+                        .requested_version
+                        .as_ref()
+                        .is_none_or(|version| candidate.version == *version)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.version.cmp(&left.version));
+        if let Some(candidate) = candidates.first() {
+            selected.insert((*candidate).clone());
+        }
+    }
+    selected.into_iter().collect()
+}
+
+fn plan_source_support_read_batches(
+    identities: &[SourceDatasetReadIdentity],
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<SourceDatasetReadIdentity>>, SnapshotSourceClosureError> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_usize;
+    for identity in identities {
+        if identity.estimated_bytes > max_bytes {
+            return Err(SnapshotSourceClosureError::Operator {
+                message: format!(
+                    "source_support_document_bytes_exceeded: id={} version={} actual={} limit={max_bytes}",
+                    identity.id, identity.version, identity.estimated_bytes
+                ),
+            });
+        }
+        let next_bytes = batch_bytes
+            .checked_add(identity.estimated_bytes)
+            .ok_or_else(|| SnapshotSourceClosureError::Operator {
+                message: "source support batch bytes overflow".to_owned(),
+            })?;
+        if !batch.is_empty() && (batch.len() >= max_count || next_bytes > max_bytes) {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes
+            .checked_add(identity.estimated_bytes)
+            .ok_or_else(|| SnapshotSourceClosureError::Operator {
+                message: "source support batch bytes overflow".to_owned(),
+            })?;
+        batch.push(identity.clone());
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
 async fn fetch_source_dataset_rows(
     pool: &PgPool,
     dataset_type: CompiledReleaseSourceDatasetType,
@@ -7688,10 +7875,23 @@ async fn build_frozen_source_datasets(
             if ids.is_empty() {
                 continue;
             }
-            let mut rows = Vec::new();
+            let mut metadata = Vec::new();
             for chunk in ids.chunks(SOURCE_CLOSURE_SUPPORT_QUERY_BATCH_SIZE) {
                 support_query_count += 1;
-                let batch_rows = fetch_source_dataset_rows(pool, dataset_type, chunk).await?;
+                metadata.extend(fetch_source_dataset_metadata(pool, dataset_type, chunk).await?);
+            }
+            let selected_identities =
+                select_source_dataset_read_identities(&type_references, &metadata);
+            let read_batches = plan_source_support_read_batches(
+                &selected_identities,
+                SOURCE_CLOSURE_SUPPORT_QUERY_BATCH_SIZE,
+                SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES,
+            )?;
+            let mut rows = Vec::new();
+            for batch in read_batches {
+                support_query_count += 1;
+                let batch_rows =
+                    fetch_exact_source_dataset_rows(pool, dataset_type, &batch).await?;
                 let batch_bytes = batch_rows.iter().try_fold(0_usize, |total, row| {
                     total
                         .checked_add(serde_json::to_vec(&row.json)?.len())
@@ -7700,7 +7900,7 @@ async fn build_frozen_source_datasets(
                 if batch_bytes > SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES {
                     return Err(SnapshotSourceClosureError::Operator {
                         message: format!(
-                            "source_support_batch_bytes_exceeded: actual={batch_bytes} limit={SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES}"
+                            "source_support_batch_estimate_drift: actual={batch_bytes} limit={SOURCE_CLOSURE_SUPPORT_BATCH_MAX_BYTES}"
                         ),
                     }
                     .into());
@@ -9381,28 +9581,29 @@ mod tests {
         ExchangeDirection, FlowRow, ImpactFactorSet, LciaExchangeObservation, MethodSelection,
         MultiProviderDecision, NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow,
         ProviderRule, ResolvedLciaMethodIdentity, ResolvedLciaMethodRow, SnapshotBuildConfig,
-        SnapshotSelectionMode, SourceDatasetReference, SourceSnapshotSummary,
-        accumulate_finite_factor, add_technosphere_edge, assemble_sparse_payload,
-        attach_artifact_lifecycle, biosphere_gross_value, build_compiled_release_evidence,
-        build_lcia_factor_coverage, build_review_submit_overlay_graph,
-        candidate_count_bucket_label, collect_lcia_factor_flow_references,
-        compute_review_submit_overlay_source_hash, compute_scope_hash,
-        compute_source_fingerprint_from_summary, flow_reference_requests_from_source_references,
-        geo_score, insert_compiled_source_dataset, load_impact_factor_sets,
-        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
-        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
-        parse_provider_rule_list, parse_scope_closure_snapshot_args, resolve_allocation_fraction,
+        SnapshotSelectionMode, SourceDatasetReadIdentity, SourceDatasetReference,
+        SourceSnapshotSummary, accumulate_finite_factor, add_technosphere_edge,
+        assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
+        build_compiled_release_evidence, build_lcia_factor_coverage,
+        build_review_submit_overlay_graph, candidate_count_bucket_label,
+        collect_lcia_factor_flow_references, compute_review_submit_overlay_source_hash,
+        compute_scope_hash, compute_source_fingerprint_from_summary,
+        flow_reference_requests_from_source_references, geo_score, insert_compiled_source_dataset,
+        load_impact_factor_sets, location_granularity_label, no_balancing_reference_failure_reason,
+        normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
+        parse_process_states, parse_provider_rule_list, parse_scope_closure_snapshot_args,
+        plan_source_support_read_batches, resolve_allocation_fraction,
         resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
         resolve_lcia_method_source_row, resolve_lcia_support_flows, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
         scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        snapshot_db_statement_timeout, source_closure_total_document_bytes_limit_from,
-        source_dataset_document_id, source_reference_is_satisfied_index,
-        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_quantitative_references,
-        validate_unique_database_lcia_method_identities,
+        select_source_dataset_read_identities, snapshot_db_statement_timeout,
+        source_closure_total_document_bytes_limit_from, source_dataset_document_id,
+        source_reference_is_satisfied_index, summarize_matching_diagnostics, time_score,
+        unique_supported_direction_by_flow, validate_compiled_sources_against_frozen_manifest,
+        validate_flow_row_visibility, validate_process_row_visibility,
+        validate_quantitative_references, validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -9436,6 +9637,90 @@ mod tests {
                 "expected default for {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn source_support_reads_are_packed_by_count_and_estimated_bytes() {
+        let identities = [40_usize, 30, 20, 10]
+            .into_iter()
+            .enumerate()
+            .map(|(index, estimated_bytes)| SourceDatasetReadIdentity {
+                id: Uuid::from_u128(u128::try_from(index + 1).expect("small fixture ordinal")),
+                version: "01.00.000".to_owned(),
+                estimated_bytes,
+            })
+            .collect::<Vec<_>>();
+
+        let batches = plan_source_support_read_batches(&identities, 2, 64)
+            .expect("valid support documents should be packed into bounded exact reads");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| {
+                    (
+                        batch.len(),
+                        batch.iter().map(|item| item.estimated_bytes).sum::<usize>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(1, 40), (2, 50), (1, 10)]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().collect::<Vec<_>>(),
+            identities,
+            "packing must preserve deterministic identity order"
+        );
+    }
+
+    #[test]
+    fn source_support_read_rejects_one_irreducibly_large_document() {
+        let identity = SourceDatasetReadIdentity {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            estimated_bytes: 65,
+        };
+
+        let error = plan_source_support_read_batches(&[identity], 512, 64)
+            .expect_err("one document above the read ceiling must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("source_support_document_bytes_exceeded")
+        );
+    }
+
+    #[test]
+    fn source_support_read_selection_freezes_omitted_and_exact_versions() {
+        use solver_worker::snapshot_source_closure::ClassifiedSourceReference;
+        use solver_worker::source_reference_policy::{SourceReferenceAction, SourceReferenceRole};
+
+        let source_id = Uuid::new_v4();
+        let metadata = vec![
+            SourceDatasetReadIdentity {
+                id: source_id,
+                version: "01.00.000".to_owned(),
+                estimated_bytes: 10,
+            },
+            SourceDatasetReadIdentity {
+                id: source_id,
+                version: "02.00.000".to_owned(),
+                estimated_bytes: 20,
+            },
+        ];
+        let reference = |version: Option<&str>| ClassifiedSourceReference {
+            source_identity: "process:test@01.00.000".to_owned(),
+            target_type: CompiledReleaseSourceDatasetType::Source,
+            target_uuid: source_id.to_string(),
+            requested_version: version.map(ToOwned::to_owned),
+            json_path: "$.referenceToDataSource".to_owned(),
+            role: SourceReferenceRole::RequiredSupport,
+            action: SourceReferenceAction::FetchRequiredSupport,
+        };
+        let references = [reference(None), reference(Some("01.00.000"))];
+        let reference_views = references.iter().collect::<Vec<_>>();
+
+        let selected = select_source_dataset_read_identities(&reference_views, &metadata);
+        assert_eq!(selected, metadata);
     }
 
     use solver_worker::compiled_graph::{

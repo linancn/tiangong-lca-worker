@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
-lastReviewedNote: "Updated for Worker Issue #217: source-reference policy v3 excludes external digital-file URI findings from numerical blockers without changing public DTOs."
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
+lastReviewedNote: "Reviewed for Worker Issue #219: byte-planned source-support reads preserve public jobs, results, and payload contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
 lastReviewedAt: 2026-08-05
-lastReviewedNote: "Reviewed for Worker Issue #217: the numerical source-reference policy correction does not change package import, export, or certificate binding."
+lastReviewedNote: "Reviewed for Worker Issue #219: numerical source-support read planning does not change package import, export, or certificate binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml

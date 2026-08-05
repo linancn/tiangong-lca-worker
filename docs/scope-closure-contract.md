@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-05
-lastReviewedCommit: f32cc8463b3ed2ed15d3046400ad981d7673477e
-lastReviewedNote: "Updated for Worker Issue #217: numerical source-reference policy v3 ignores external digital-file URI findings while certificate traversal stays strict."
+lastReviewedCommit: c9a16ab2b166b01e4d407b3b16f88dbde357d000
+lastReviewedNote: "Updated for Worker Issue #219: numerical source support reads are byte-planned before exact document fetches while preserving the 64 MiB per-read and 1 GiB cumulative ceilings."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -171,8 +171,11 @@ Administrative closure and numerical Flow selection remain distinct. During the 
 The numerical snapshot source walk is `path-aware-bounded-frontier-v2`. It consumes the same raw
 reference edges produced by `scope_closure.rs`, but applies a separate role × artifact-purpose
 policy. Each exact document identity/hash is processed once; exact and omitted-version indexes make
-satisfaction checks deterministic; support reads use fixed 512-identity batches with a 64 MiB
-returned-byte ceiling. The cumulative canonical source-document ceiling is configured by
+satisfaction checks deterministic. Support reads first obtain bounded identity/version/byte-size
+metadata, resolve the exact versions needed by the frontier, and deterministically pack exact-row
+queries to both a 512-identity and 64 MiB returned-byte ceiling. A single support document above
+64 MiB fails closed instead of weakening the query admission limit. The cumulative canonical
+source-document ceiling is configured by
 `SOURCE_CLOSURE_TOTAL_DOCUMENT_BYTES` and defaults to 1 GiB; zero, malformed, and overflow
 values fail back to that bounded default. The build separately enforces cumulative
 document/reference/edge/depth limits.
