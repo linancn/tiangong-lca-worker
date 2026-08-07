@@ -18,7 +18,7 @@ pub enum RunMode {
 pub enum QueueBackend {
     /// Legacy pgmq queue payloads.
     Pgmq,
-    /// Unified `public.worker_jobs` queue payloads.
+    /// Unified `private.worker_jobs` queue payloads.
     WorkerJobs,
 }
 
@@ -48,12 +48,10 @@ pub struct AppConfig {
     /// Queue name in pgmq.
     #[arg(long, env = "PGMQ_QUEUE", default_value = "lca_jobs")]
     pub pgmq_queue: String,
-    /// Explicitly allow legacy job-table + pgmq backends.
+    /// Acknowledges an explicit request for a retired legacy backend.
     ///
-    /// Keep this disabled in production. The legacy backends still depend on
-    /// retained `lca_jobs` / `lca_package_jobs` tables and are only intended
-    /// for compatibility/debug runs while the canonical `worker_jobs` path is
-    /// being completed.
+    /// The process still fails closed because the legacy lifecycle tables were
+    /// retired; this guard only makes accidental backend selection explicit.
     #[arg(long, env = "ALLOW_LEGACY_JOB_TABLE_BACKEND", default_value_t = false)]
     pub allow_legacy_job_table_backend: bool,
     /// Stable worker id recorded on claimed `worker_jobs` rows.

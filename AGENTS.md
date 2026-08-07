@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedAt: 2026-08-07
+lastReviewedCommit: 6830d36038d0f9ad7fd28f7391f7402d7566f79d
 lastReviewedNote: "Updated for Worker Issue #223: all fresh snapshot purposes use consumer-owned artifacts instead of persisted compiler IR."
 related:
   - .docpact/config.yaml

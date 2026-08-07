@@ -78,13 +78,13 @@ cargo run -p solver-worker --bin review_submit_gate_runner -- \
   --review-submit-gate-worker-id review_submit_gate_runner
 ```
 
-runner 读取 `DATABASE_URL` / `CONN` 与 S3 artifact 环境变量。legacy 模式直接访问 `public.dataset_review_submit_gate_runs`。它只领取：
+runner 读取 `DATABASE_URL` / `CONN` 与 S3 artifact 环境变量。legacy 模式直接访问 `private.dataset_review_submit_gate_runs`。它只领取：
 
 - `policy_profile = review_submit_fast.v1`
 - `report_schema_version = review_submit_gate_report.v1`
 - `status = queued`，以及超过 `REVIEW_SUBMIT_GATE_STALE_RUNNING_SECONDS` 的 stale `running` 记录
 
-领取后状态变为 `running`。执行完成后，runner 调用 `public.cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。`--once` 用于一次性处理一条或空转退出；常驻模式会按 `REVIEW_SUBMIT_GATE_POLL_MS` 轮询。
+领取后状态变为 `running`。执行完成后，runner 调用 `private.cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。`--once` 用于一次性处理一条或空转退出；常驻模式会按 `REVIEW_SUBMIT_GATE_POLL_MS` 轮询。
 
 worker_jobs 模式只领取 `worker_queue=review_submit_gate` 中的 `review_submit.gate` job。claim、heartbeat 和 result 写入都必须携带 `lease_token`；如果 lease 过期或被其他 worker reclaim，旧 worker 的 heartbeat/result 必须失败，不允许覆盖新 lease 的结果。`REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS` 默认 `900`，每次 heartbeat 会续租。
 
@@ -199,7 +199,7 @@ DB runner 写回数据库时：
 - `blocked`：`blockingReasons` 由 `report.blockers` 直接映射，`calculatorReport` 为完整 report。
 - `error`：表示 runner、snapshot builder、artifact、DB 可见性或暂不支持的数据集类型导致 calculator 没有产出 passed/blocked 结论；`blockingReasons` 至少包含一个 runtime blocker，`calculatorReport.status = error`。
 
-worker_jobs 模式写回 `public.worker_jobs` 时：
+worker_jobs 模式写回 `private.worker_jobs` 时：
 
 - gate passed：`status=completed`，`result.calculatorReport.status=passed`，`result.datasetRevision.revisionChecksum` 为权威 checksum。
 - gate blocked：`status=blocked`，`blocker_codes` 取自 `calculatorReport.blockers[].code`，`resolution_scope=user`，`retryable=true`，同时保留完整 `calculatorReport`。

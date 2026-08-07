@@ -38,61 +38,52 @@ related:
 ## 1. 目标
 
 - 将完整 ZIP 导入/导出从同步 edge function 挪到异步 worker。
-- 默认使用统一 `worker_jobs(worker_queue=package)` 生命周期，并保留 legacy `pgmq + object storage + job status` 作为显式兼容/debug 路径。
+- 统一使用 `private.worker_jobs(worker_queue=package)` 生命周期；旧 package job 表与其 PGMQ backend 已退役并 fail closed。
 - 避免把 `snapshot_id` 语义强行塞进 package 任务。
 
 ## 2. 为什么不复用 `lca_jobs`
 
-`lca_jobs` / `lca_results` 当前强绑定 `snapshot_id` 和数值求解语义，见：
+数值结果仍强绑定 `snapshot_id` 和数值求解语义，见：
 
-- `public.lca_jobs.snapshot_id uuid NOT NULL`
-- `public.lca_results.snapshot_id uuid NOT NULL`
-- `job_type` 与 `artifact_format` 也都围绕求解/快照设计
+- `private.lca_results.snapshot_id uuid NOT NULL`
+- `lca.*` job kind 与 `artifact_format` 也都围绕求解/快照设计
 
 因此 package worker 复用的是“异步模式”，不是“同一张运行时表”。
 
 ## 3. 关键表
 
-- `lca_package_jobs`
-  - optional retained package domain/history 表，用于 legacy pgmq/debug 路径、历史状态和诊断；统一 `worker_jobs` 路径不得要求该表存在
-- `lca_package_artifacts`
+- `private.lca_package_artifacts`
   - import 源 ZIP、export ZIP、import/export report 的 artifact 元数据
-- `lca_package_request_cache`
+- `private.lca_package_request_cache`
   - 按用户 + 操作 + request key 做去重与状态追踪
-- `worker_jobs`
+- `private.worker_jobs`
   - package worker 的 canonical 生命周期、lease、进度、错误和 result projection
 
 ## 4. 队列与 RPC
 
-legacy 路径：
-
-- `pgmq` queue: `lca_package_jobs`
-- enqueue RPC: `public.lca_package_enqueue_job(jsonb)`
-- 仅 `service_role` 可执行
-
-统一任务路径：
+任务路径：
 
 - `worker_jobs.worker_queue`: `package`
-- enqueue RPC: `public.worker_enqueue_job(...)`
-- claim RPC: `public.worker_claim_jobs('package', ...)`
-- result RPC: `public.worker_record_job_result(...)`
+- enqueue RPC: `private.worker_enqueue_job(...)`
+- claim RPC: `private.worker_claim_jobs('package', ...)`
+- result RPC: `private.worker_record_job_result(...)`
 - 仅 `service_role` 可 enqueue / claim / heartbeat / record result
 
 ## 5. 任务类型
 
-legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
+worker payload `type`：
 
 - `export_package`
 - `import_package`
 
 `worker_jobs` 路径使用 job kind 表达统一任务类型，并映射回同一组 package payload：
 
-| `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
+| `worker_jobs.job_kind` | `payload_schema_version` | payload `type` | result schema |
 | --- | --- | --- | --- |
 | `tidas.export_package` | `tidas.export_package.request.v1` | `export_package` | `tidas.export_package.result.v1` |
 | `tidas.import_package` | `tidas.import_package.request.v1` | `import_package` | `tidas.import_package.result.v1` |
 
-`package_worker` 默认走 `worker_jobs`；legacy `pgmq` 兼容/debug 路径必须同时使用 `--package-queue-backend pgmq` 或 `PACKAGE_QUEUE_BACKEND=pgmq`，并显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`。`worker_jobs` 模式领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
+`package_worker` 走 `worker_jobs` 并领取 `worker_queue=package`。显式选择 `--package-queue-backend pgmq` 会在启动时失败，不会消费消息。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
 
 ## 6. Payload 契约
 
@@ -197,7 +188,7 @@ worker 侧 GC 必须 object-aware：
 3. 先删除对象存储 payload；
 4. 对象删除成功后，才把 artifact 标记为 `deleted`；
 5. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
-6. 当 optional `lca_package_jobs` 仍存在时，一个 terminal package job 的 artifact 都已 `deleted`、且无 active/recent cache 引用后，才允许删除 legacy job metadata。`lca_package_export_items` 已不依赖该表 FK；新路径应以 `worker_job_id` 和 artifact/cache TTL 作为保护条件。
+6. 旧 package job metadata cleanup 已取消；retention 以 `worker_job_id`、artifact/cache TTL 和 canonical Worker 状态作为保护条件。
 
 当前 worker runtime 提供 `package_gc` CLI：
 
@@ -254,21 +245,6 @@ Fresh scope closure uses the bounded `lcia.scope-closure-bundle.v4` binding mani
 
 ## 8. 状态机
 
-legacy `lca_package_jobs.status`：
-
-- `queued`
-- `running`
-- `ready`
-- `completed`
-- `failed`
-- `stale`
-
-legacy pgmq/debug 路径语义：
-
-- `export_package`: `queued -> running -> ready`
-- `import_package`: `queued -> running -> completed`
-- 失败统一落 `failed`
-
 `worker_jobs` 路径外层生命周期：
 
 - `queued/stale -> running -> completed|failed|cancelled`
@@ -276,18 +252,15 @@ legacy pgmq/debug 路径语义：
 - `progress` 仅用于任务中心提示，不替代 package artifact 或 request-cache 状态
 - terminal `result_json` 包含 `workerJobId`、`packageJobId`、`payloadType`、`packageJobStatus`、`artifacts[]`
 - `result_ref` 使用 `{"domainSource":"worker_jobs","workerJobId":"<uuid>","packageJobId":"<uuid>"}`，并且 worker 会把 `lca_package_artifacts`、`lca_package_export_items`、`lca_package_request_cache` 中可关联的 rows 回填到同一个 `worker_job_id`
-- optional `lca_package_jobs` 存在时，worker 也会 best-effort 回填 `lca_package_jobs.worker_job_id`、状态和 diagnostics；该表不存在时不得影响任务完成
 
 重要差异：
 
-- legacy `export_package` 多 pass 通过重新写入 `pgmq.lca_package_jobs` 继续执行；
-- `worker_jobs` 模式下，worker runtime 不再把 continuation 写回 legacy pgmq，而是在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
-- `worker_jobs` 模式下，长导出的 seed-scan continuation state 以 `worker_jobs.diagnostics.seed_scan` 为 canonical resume source；当 optional `lca_package_jobs` 缺失或没有可用 seed-scan diagnostics 时，worker 必须从最新匹配 `tidas.export_package` worker job diagnostics 恢复游标；
+- worker runtime 在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
+- 长导出的 seed-scan continuation state 以 `worker_jobs.diagnostics.seed_scan` 为 canonical resume source；worker 从最新匹配 `tidas.export_package` worker job diagnostics 恢复游标；
 - 因此 `PACKAGE_WORKER_JOBS_LEASE_SECONDS` 必须大于正常单 pass 时间，长导出仍应依赖 pass 间 heartbeat 续租。
 
 ## 9. 权限边界
 
-- 前端不直接写 `lca_package_jobs`
 - 前端不直接写 `worker_jobs`
 - Edge Functions 负责鉴权、幂等和入队
 - worker 负责大包处理、对象存储写入、导入冲突规则执行

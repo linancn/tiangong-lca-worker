@@ -15,6 +15,7 @@ pub const APP_SNAPSHOT_GC: &str = "snapshot-gc";
 pub const APP_RESULT_GC: &str = "result-gc";
 pub const APP_MAINTENANCE_WORKER: &str = "maintenance-worker";
 pub const APP_MAINTENANCE_ENQUEUE: &str = "maintenance-enqueue";
+pub const APP_PROCESS_FLOW_GRAPH_CACHE_BUILDER: &str = "process-flow-graph-cache-builder";
 
 const POSTGRES_APPLICATION_NAME_MAX_BYTES: usize = 63;
 const DEFAULT_MAX_CONNECTIONS: u32 = 4;
@@ -32,6 +33,7 @@ pub struct WorkerDbPoolOptions {
     idle_timeout: Duration,
     max_lifetime: Duration,
     statement_timeout: Option<Duration>,
+    default_transaction_read_only: bool,
 }
 
 impl WorkerDbPoolOptions {
@@ -48,6 +50,7 @@ impl WorkerDbPoolOptions {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECONDS),
             max_lifetime: Duration::from_secs(DEFAULT_MAX_LIFETIME_SECONDS),
             statement_timeout: None,
+            default_transaction_read_only: false,
         }
     }
 
@@ -72,6 +75,12 @@ impl WorkerDbPoolOptions {
     #[must_use]
     pub fn statement_timeout(mut self, statement_timeout: Option<Duration>) -> Self {
         self.statement_timeout = statement_timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn default_transaction_read_only(mut self, enabled: bool) -> Self {
+        self.default_transaction_read_only = enabled;
         self
     }
 
@@ -113,6 +122,7 @@ impl WorkerDbPoolOptions {
     pub async fn connect(self, database_url: &str) -> anyhow::Result<PgPool> {
         let application_name = self.application_name.clone();
         let statement_timeout_ms = self.statement_timeout.map(duration_millis_text);
+        let default_transaction_read_only = self.default_transaction_read_only;
 
         Ok(PgPoolOptions::new()
             .max_connections(self.max_connections)
@@ -136,6 +146,10 @@ impl WorkerDbPoolOptions {
                             sql_string_literal(statement_timeout_ms)
                         );
                         conn.execute(statement_timeout_sql.as_str()).await?;
+                    }
+                    if default_transaction_read_only {
+                        conn.execute("SET default_transaction_read_only = on")
+                            .await?;
                     }
                     Ok(())
                 })

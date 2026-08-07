@@ -186,7 +186,7 @@ async fn enqueue_maintenance_job(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_enqueue_job(
+        SELECT private.worker_enqueue_job(
           p_job_kind => $1,
           p_payload_json => $2::jsonb,
           p_payload_schema_version => $3,

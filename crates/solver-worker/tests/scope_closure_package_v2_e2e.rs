@@ -157,7 +157,7 @@ async fn wait_for_job(pool: &PgPool, job_id: Uuid) -> anyhow::Result<String> {
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let row = sqlx::query(
-                "SELECT status, error_code, error_message FROM public.worker_jobs WHERE id=$1",
+                "SELECT status, error_code, error_message FROM private.worker_jobs WHERE id=$1",
             )
             .bind(job_id)
             .fetch_one(pool)
@@ -356,17 +356,17 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     .bind(format!("scope-closure-e2e-{}@example.com", fixture.actor))
     .execute(pool)
     .await?;
-    sqlx::query("INSERT INTO public.users(id,raw_user_meta_data,contact) VALUES($1,'{}',null)")
+    sqlx::query("INSERT INTO private.users(id,raw_user_meta_data,contact) VALUES($1,'{}',null)")
         .bind(fixture.actor)
         .execute(pool)
         .await?;
     sqlx::query(
-        "INSERT INTO public.teams(id,json,rank,is_public) VALUES('00000000-0000-0000-0000-000000000000','{\"name\":\"System\"}',0,false) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO private.teams(id,json,rank,is_public) VALUES('00000000-0000-0000-0000-000000000000','{\"name\":\"System\"}',0,false) ON CONFLICT(id) DO NOTHING",
     )
     .execute(pool)
     .await?;
     sqlx::query(
-        "INSERT INTO public.roles(user_id,team_id,role) VALUES($1,'00000000-0000-0000-0000-000000000000','data_product_manager')",
+        "INSERT INTO private.roles(user_id,team_id,role) VALUES($1,'00000000-0000-0000-0000-000000000000','data_product_manager')",
     )
     .bind(fixture.actor)
     .execute(pool)
@@ -505,7 +505,7 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
         .await?;
 
     sqlx::query(
-        r#"INSERT INTO public.lca_release_runs(
+        r#"INSERT INTO private.lca_release_runs(
              id,release_version,selection_manifest_hash,input_manifest_hash,calculation_bundle_hash,
              calculation_bundle_ref,profile_lock_hash,publish_plan_hash,publish_plan,artifact_set_hash,
              release_manifest_hash,release_manifest,status,idempotency_key,request_hash,created_by)
@@ -526,7 +526,7 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     .execute(pool)
     .await?;
     sqlx::query(
-        r#"INSERT INTO public.lca_release_approvals(
+        r#"INSERT INTO private.lca_release_approvals(
              id,release_run_id,publish_plan_hash,approval_hash,approved_by,approved_at,expires_at)
            VALUES($1,$2,$3,$4,$5,now(),now()+interval '1 day')"#,
     )
@@ -538,11 +538,11 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     .execute(pool)
     .await?;
     sqlx::query(
-        r#"INSERT INTO public.lca_release_publications(
+        r#"INSERT INTO private.lca_release_publications(
              release_run_id,release_version,approval_id,approval_hash,publish_plan_hash,
              release_manifest_hash,artifact_set_hash,approved_by,executed_by,credential_fingerprint,
              idempotency_key,published_at)
-           VALUES($1,(SELECT release_version FROM public.lca_release_runs WHERE id=$1),$2,$3,$4,$5,$6,$7,$7,$8,$9,now())"#,
+           VALUES($1,(SELECT release_version FROM private.lca_release_runs WHERE id=$1),$2,$3,$4,$5,$6,$7,$7,$8,$9,now())"#,
     )
     .bind(release_run)
     .bind(approval)
@@ -622,7 +622,7 @@ async fn setup_fixture_with(pool: &PgPool, fixture: Fixture) -> anyhow::Result<F
     for (dataset_type, role, id, document, source_process, version) in released.drain(..) {
         let canonical_hash = solver_worker::scope_closure::canonical_json_sha256(&document)?;
         sqlx::query(
-            r#"INSERT INTO public.lca_release_dataset_versions(
+            r#"INSERT INTO private.lca_release_dataset_versions(
                  release_run_id,dataset_type,dataset_role,dataset_uuid,dataset_version,
                  source_process_uuid,source_process_version,version_significant_hash,semantic_hash,
                  canonical_content_hash,artifact_ref)
@@ -676,7 +676,7 @@ async fn request_closure(pool: &PgPool, fixture: &Fixture) -> anyhow::Result<(Uu
              SELECT set_config('request.jwt.claim.role','authenticated',true),
                     set_config('request.jwt.claim.sub',$3,true)
            )
-           SELECT public.cmd_lcia_scope_closure_check_request_v2($1,$2,'{}'::jsonb) AS result
+           SELECT api.cmd_lcia_scope_closure_check_request_v2($1,$2,'{}'::jsonb) AS result
            FROM _claims"#,
     )
     .bind(scope)
@@ -701,8 +701,8 @@ async fn load_certificate(pool: &PgPool, check_id: Uuid) -> anyhow::Result<Certi
              c.snapshot_artifact_id,c.snapshot_index_sha256,c.snapshot_build_contract_hash,
              c.effective_scope_hash,c.data_snapshot_token,c.closure_bundle_hash,
              c.effective_scope_manifest,a.artifact_url
-           FROM public.lcia_scope_closure_checks c
-           JOIN public.lca_snapshot_artifacts a ON a.id=c.snapshot_artifact_id
+           FROM private.lcia_scope_closure_checks c
+           JOIN private.lca_snapshot_artifacts a ON a.id=c.snapshot_artifact_id
            WHERE c.id=$1 AND c.status='passed' AND c.certificate_status='valid'"#,
     )
     .bind(check_id)
@@ -737,7 +737,7 @@ async fn request_build(
              SELECT set_config('request.jwt.claim.role','authenticated',true),
                     set_config('request.jwt.claim.sub',$7,true)
            )
-           SELECT public.cmd_lcia_result_build_request_v2(
+           SELECT api.cmd_lcia_result_build_request_v2(
              $1,null::jsonb,'subset',null,$2,$3,$4,$5,$6,'{}'::jsonb) AS result
            FROM _claims"#,
     )
@@ -760,7 +760,7 @@ async fn request_build(
     );
     let build_id = serde_json::from_value(result["data"]["buildId"].clone())?;
     let worker_job_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM public.worker_jobs WHERE job_kind='lcia_result.package_build' AND subject_id=$1",
+        "SELECT id FROM private.worker_jobs WHERE job_kind='lcia_result.package_build' AND subject_id=$1",
     )
     .bind(build_id)
     .fetch_one(pool)
@@ -777,7 +777,7 @@ async fn assert_record_result_v3_wire(pool: &PgPool, check_id: Uuid) -> anyhow::
              c.evidence_hash
            FROM pg_proc p
            JOIN pg_namespace n ON n.oid=p.pronamespace AND n.nspname='public'
-           JOIN public.lcia_scope_closure_checks c ON c.id=$1
+           JOIN private.lcia_scope_closure_checks c ON c.id=$1
            WHERE p.proname='svc_lcia_scope_closure_check_record_result_v3'"#,
     )
     .bind(check_id)
@@ -816,7 +816,7 @@ async fn assert_build_binding_wire(
         r#"WITH _service_role AS (
              SELECT set_config('request.jwt.claim.role','service_role',true)
            )
-           SELECT public.svc_lcia_scope_closure_build_binding($1) AS result
+           SELECT private.svc_lcia_scope_closure_build_binding($1) AS result
            FROM _service_role"#,
     )
     .bind(job.id)
@@ -865,7 +865,7 @@ async fn assert_build_binding_wire(
     );
     anyhow::ensure!(data["inputManifest"]["selectionMode"] == "closure_certificate");
     let authoritative_input_hash =
-        sqlx::query_scalar::<_, String>("SELECT public.lcia_scope_closure_sha256($1::jsonb)")
+        sqlx::query_scalar::<_, String>("SELECT private.lcia_scope_closure_sha256($1::jsonb)")
             .bind(&data["inputManifest"])
             .fetch_one(&state.pool)
             .await?;
@@ -896,7 +896,7 @@ async fn assert_build_binding_wire(
 
 async fn assert_zero_package(pool: &PgPool, build: &Build) -> anyhow::Result<()> {
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lcia_result_packages WHERE build_id=$1",
+        "SELECT count(*) FROM private.lcia_result_packages WHERE build_id=$1",
     )
     .bind(build.build_id)
     .fetch_one(pool)
@@ -907,7 +907,7 @@ async fn assert_zero_package(pool: &PgPool, build: &Build) -> anyhow::Result<()>
 
 async fn package_projection(pool: &PgPool, build: &Build) -> anyhow::Result<Value> {
     let row = sqlx::query(
-        "SELECT to_jsonb(p) AS package FROM public.lcia_result_packages p WHERE build_id=$1 AND status='preview_ready'",
+        "SELECT to_jsonb(p) AS package FROM private.lcia_result_packages p WHERE build_id=$1 AND status='preview_ready'",
     )
     .bind(build.build_id)
     .fetch_one(pool)
@@ -922,7 +922,7 @@ async fn tamper_payload(
     value: Value,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE public.worker_jobs SET payload_json=jsonb_set(payload_json,$2,$3,true) WHERE id=$1",
+        "UPDATE private.worker_jobs SET payload_json=jsonb_set(payload_json,$2,$3,true) WHERE id=$1",
     )
     .bind(build.worker_job_id)
     .bind(path)
@@ -990,7 +990,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     let certificate = load_certificate(&state.pool, check_id).await?;
     assert_record_result_v3_wire(&state.pool, check_id).await?;
     let database_effective_scope_hash =
-        sqlx::query_scalar::<_, String>("SELECT public.lcia_scope_closure_sha256($1::jsonb)")
+        sqlx::query_scalar::<_, String>("SELECT private.lcia_scope_closure_sha256($1::jsonb)")
             .bind(&certificate.effective_scope)
             .fetch_one(&state.pool)
             .await?;
@@ -1002,14 +1002,14 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     );
 
     let artifact_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lca_snapshot_artifacts WHERE snapshot_id=$1 AND status='ready' AND artifact_format=$2",
+        "SELECT count(*) FROM private.lca_snapshot_artifacts WHERE snapshot_id=$1 AND status='ready' AND artifact_format=$2",
     )
     .bind(certificate.snapshot_id)
     .bind(SNAPSHOT_ARTIFACT_FORMAT)
     .fetch_one(&state.pool)
     .await?;
     let snapshot_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lca_network_snapshots WHERE id=$1 AND status='ready'",
+        "SELECT count(*) FROM private.lca_network_snapshots WHERE id=$1 AND status='ready'",
     )
     .bind(certificate.snapshot_id)
     .fetch_one(&state.pool)
@@ -1115,7 +1115,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     anyhow::ensure!(before_query.get("hMatrix").is_none());
     anyhow::ensure!(before_query["lciaChunks"] == after_query["lciaChunks"]);
     anyhow::ensure!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.lca_network_snapshots")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM private.lca_network_snapshots")
             .fetch_one(&state.pool)
             .await?
             == 1
@@ -1189,7 +1189,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
              SELECT set_config('request.jwt.claim.role','service_role',true),
                     set_config('request.jwt.claim.sub',$2,true)
            )
-           SELECT public.svc_lcia_scope_closure_certificate_event(
+           SELECT private.svc_lcia_scope_closure_certificate_event(
              $1,'revoked','e2e revocation fence') FROM _claims"#,
     )
     .bind(certificate.check_id)
@@ -1203,7 +1203,7 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     assert_zero_package(&state.pool, &revoked_build).await?;
 
     let ready_packages = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM public.lcia_result_packages WHERE closure_check_id=$1 AND status='preview_ready'",
+        "SELECT count(*) FROM private.lcia_result_packages WHERE closure_check_id=$1 AND status='preview_ready'",
     )
     .bind(certificate.check_id)
     .fetch_one(&state.pool)

@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedAt: 2026-08-07
+lastReviewedCommit: 6830d36038d0f9ad7fd28f7391f7402d7566f79d
 lastReviewedNote: "Updated for Worker Issue #223: snapshot purposes persist consumer-owned projections and a two-level release/source descriptor chain."
 related:
   - AGENTS.md
@@ -48,9 +48,9 @@ related:
 
 - 数值核心固定为 `M = I - A`，只解 `M x = y`。
 - `snapshot_builder` 对 elementary flow 的 `B` 采用 `gross` 口径（`Input/Output` 均按原始 `amount` 入模，不做方向符号翻转）。
-- 计算入口是异步任务；默认统一队列路径使用 `worker_jobs(worker_queue=solver)`，legacy `lca_jobs` + `pgmq` 仅保留为显式兼容/debug 路径。前端不直连队列。
+- 计算入口是异步任务；统一队列路径使用 `private.worker_jobs(worker_queue=solver)`。旧 `lca_jobs` + `pgmq` lifecycle 已退役并 fail closed。前端不直连队列。
 - worker 连接池可通过 `DB_MAX_CONNECTIONS`、`DB_MIN_CONNECTIONS` 和 `DB_ACQUIRE_TIMEOUT_SECONDS` 调整；默认采用 `max_connections = 8`、`min_connections = 1`、`acquire_timeout = 30s`、`idle_timeout = 5min` 与 `max_lifetime = 30min`，以保证长时求解与 artifact 落盘阶段有稳定连接窗口。
-- 主路径读取 `lca_snapshot_artifacts`（artifact-first），旧 `lca_*_entries` 仅兼容回退。
+- 主路径读取 `private.lca_snapshot_artifacts`（artifact-only）；artifact 缺失或不可读时 fail closed。
 - 所有写操作由服务端（Edge Function / worker，`service_role`）执行。
 
 ## 2. 关键表与职责
@@ -58,7 +58,7 @@ related:
 - `lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
 - `lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
 - `worker_jobs`: canonical worker 生命周期表；solver 队列任务使用 `worker_queue=solver`，用于服务端任务中心、operator 查询、lease fencing、状态、错误、进度和 result projection。
-- `lca_jobs`: optional retained LCA domain/history 兼容表，用于历史诊断和 legacy pgmq/debug 路径；统一 `worker_jobs` 路径不得要求该表存在。
+- retired `lca_jobs`: 不再是运行时依赖；显式选择旧 PGMQ backend 会 fail closed。
 - `lca_results`: 作业结果主表（仅 artifact 元数据 + diagnostics）。
 - `lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
 - `lca_result_cache`: 请求级缓存/去重状态。
@@ -66,7 +66,7 @@ related:
 
 ## 3. 作业类型与 payload
 
-legacy `lca_jobs.job_type` 与 worker payload `type` 必须一致。`worker_jobs` 路径使用 `job_kind` 表达统一队列类型，并在 worker runtime 内部映射回同一组 legacy payload `type`，从而复用既有求解和 artifact 持久化逻辑。
+`worker_jobs` 使用 `job_kind` 表达统一队列类型，并在 worker runtime 内部映射回求解 payload `type`，从而复用既有求解和 artifact 持久化逻辑。
 
 支持类型：
 
@@ -155,7 +155,7 @@ worker 反序列化时 `model_version` 仍可作为 `snapshot_id` 的别名（�
 
 ### 3.6 `worker_jobs` solver 队列映射
 
-solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs` 的 `public.worker_jobs` claim 模式。该模式只领取 `worker_queue=solver` 的 LCA solve jobs。`SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 或传入 `--allow-legacy-job-table-backend`；生产 worker 应保持关闭。
+solver worker 使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worker-jobs` 的 `private.worker_jobs` claim 模式，只领取 `worker_queue=solver` 的任务。选择 `SOLVER_QUEUE_BACKEND=pgmq` / `--queue-backend pgmq` 会 fail closed；legacy acknowledgement flag 不会重新启用该路径。
 
 | `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
 | --- | --- | --- | --- |
@@ -168,7 +168,7 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 | `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
 | `lcia.scope_closure_check` | `lcia.scope_closure_check.request.v1` | `scope_closure_check` | `lcia.scope_closure_check.result.v1` |
 
-`worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results` 或 `lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不再要求 `public.lca_jobs` FK 或 parent row。
+`worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `private.lca_results`、`private.lca_result_cache`、`private.lca_latest_all_unit_results` 或 `private.lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不要求 retired `lca_jobs` parent row。
 
 ### 3.7 `public_plus_owner_draft` versioned calculation contract
 
@@ -217,33 +217,17 @@ On success, the worker records a terminal `worker_jobs` result with:
 - `result_json.snapshotId`
 - `result_json.resultId` when a `lca_results` row was produced
 - `result_ref = {"domainSource":"worker_jobs","workerJobId":"<uuid>","lcaJobId":"<uuid>","result":{"table":"lca_results","id":"<uuid>"}}` for solve/result-producing jobs
-- `diagnostics.lcaJob = {"id":"<uuid>","projectionSkipped":true}` and `result_json.lcaJobStatus = null` are non-querying compatibility placeholders; canonical result diagnostics come from `worker_jobs` and domain result tables, and the `worker_jobs` runtime does not query optional `lca_jobs`
+- `diagnostics.lcaJob = {"id":"<uuid>","projectionSkipped":true}` and `result_json.lcaJobStatus = null` are non-querying compatibility placeholders; canonical result diagnostics come from `private.worker_jobs` and domain result tables
 
-`build_snapshot` is projected independently from `worker_jobs.diagnostics.build_snapshot_result`: it always returns the resolved snapshot ID (including reuse) and scoped calculation evidence without reading optional `lca_jobs`. Its `result_ref.snapshot` points at the resolved `lca_network_snapshots` row.
+`build_snapshot` is projected independently from `worker_jobs.diagnostics.build_snapshot_result`: it always returns the resolved snapshot ID (including reuse) and scoped calculation evidence. Its `result_ref.snapshot` points at the `private.lca_network_snapshots` row.
 
 Singular/factorization failure diagnostics load the exact `(process_id, process_version)` pairs from `snapshot-index.process_map`. Duplicate-exchange and service-loop scans join only those pairs; they do not reconstruct scope from broad owner/state filters.
 
-On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. The canonical path never probes or backfills optional `lca_jobs`. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists. Retained `lca_jobs.status/diagnostics` writes are limited to the explicitly enabled legacy pgmq/debug backend.
+On success or failure, the worker links `private.lca_results`, `private.lca_result_cache`, `private.lca_latest_all_unit_results`, and `private.lca_factorization_registry` rows back to the canonical `private.worker_jobs.id` where those rows exist. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `private.lca_result_cache` failed state where a cache row exists. The retired PGMQ lifecycle fails closed.
 
-For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `public.cmd_lcia_result_package_mark_ready(...)`. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `lca_result_cache` or optional legacy `lca_jobs`.
+For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `private.cmd_lcia_result_package_mark_ready(...)`. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `private.lca_result_cache`.
 
 ## 4. 作业状态机
-
-legacy `lca_jobs.status` 允许值：
-
-- `queued`
-- `running`
-- `ready`
-- `completed`
-- `failed`
-- `stale`
-
-legacy pgmq/debug 路径语义：
-
-- `prepare_factorization`: `queued -> running -> ready`。
-- `solve_one` / `solve_batch` / `solve_all_unit`: `queued -> running -> completed`。
-- `invalidate_factorization`: 通常直接 `completed`。
-- 失败路径统一落 `failed`，错误详情在 `lca_jobs.diagnostics`。
 
 `worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path`、`prepare_factorization` 或 `lcia_result_package_build`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
 
@@ -357,7 +341,7 @@ Provider-link 的运行时决策顺序、默认 provider rule、candidate eligib
 - `requested_location_granularity_counts`：目标供应区域粒度总计，例如 `subnational`、`country`、`region`、`global`、`unspecified`。
 - `requested_location_granularity_counts_by_strategy`：按 resolved strategy 拆分的目标供应区域粒度。
 
-`build_snapshot` job 运行和完成时，worker 会在 `worker_jobs.diagnostics/result_json` 中记录全局构建并发锁与构建耗时信息。Canonical `worker_jobs` execution never mirrors these diagnostics into optional `lca_jobs`; only the explicitly enabled legacy pgmq/debug backend writes legacy diagnostics. 这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
+`build_snapshot` job 运行和完成时，worker 会在 `worker_jobs.diagnostics/result_json` 中记录全局构建并发锁与构建耗时信息。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
 ### 5.1 Matrix-readiness verification report
 
@@ -476,23 +460,16 @@ Worker 重任务可使用共享 `worker.resource-profile.v1` primitive 声明并
 
 - `lca_*` 表已启用 RLS。
 - `anon` 无权限。
-- `authenticated` 仅可读“自己的 `lca_jobs` + 关联 `lca_results`”。
+- `authenticated` 仅通过 API façade 读取自己的任务投影与关联结果。
 - 任何 enqueue / insert / update 必须经服务端 `service_role`。
 
 ## 8. 最小 SQL 约定（服务端）
 
-legacy pgmq 路径：
-
-1. 插入 job 行（`status=queued`，带 payload）。
-2. 调 `public.lca_enqueue_job(text, jsonb)` RPC 投递消息（函数内部调用 `pgmq.send`）。
-3. 返回 `job_id` 给调用方。
-4. worker 消费后更新 `lca_jobs` 并写 `lca_results`。
-
-统一 `worker_jobs` 路径：
+`worker_jobs` 路径：
 
 1. 先创建或复用 `lca_result_cache` domain row，并生成 `lcaJobId` compatibility UUID；不要求创建 `lca_jobs` row。
-2. 调 `public.worker_enqueue_job(...)` 创建 `job_kind=lca.*`、`worker_queue=solver` 的 job，payload 带 `lcaJobId` 和标准化求解参数。
+2. 调 `private.worker_enqueue_job(...)` 创建 `job_kind=lca.*`、`worker_queue=solver` 的 job，payload 带 `lcaJobId` 和标准化求解参数。
 3. 返回 `workerJobId` 与 `lcaJobId` 给 Edge / Next projection。
-4. worker 使用 `worker_claim_jobs('solver', ...)` claim、heartbeat，并通过 `worker_record_job_result(...)` 写 canonical 终态；同时维护 `lca_results`、`lca_result_cache` domain/cache metadata，并回填 `worker_job_id`。Canonical path does not query or update optional `lca_jobs`; legacy table access is restricted to the explicitly enabled pgmq/debug backend。
+4. worker 使用 `private.worker_claim_jobs('solver', ...)` claim、heartbeat，并通过 `private.worker_record_job_result(...)` 写 canonical 终态；同时维护 `private.lca_results`、`private.lca_result_cache` domain/cache metadata，并回填 `worker_job_id`。旧 PGMQ backend 已 fail closed。
 
-不建议前端直接调用 `pgmq.send`、直接写 `lca_jobs` 或直接写 `worker_jobs`。
+前端不得直接调用 `pgmq.send` 或直接写 `private.worker_jobs`。

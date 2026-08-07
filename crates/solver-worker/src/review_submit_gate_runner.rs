@@ -559,7 +559,7 @@ async fn claim_next_review_submit_gate_run(
         r"
         WITH claimed AS (
             SELECT id
-            FROM public.dataset_review_submit_gate_runs
+            FROM private.dataset_review_submit_gate_runs
             WHERE policy_profile = $2
               AND report_schema_version = $3
               AND (
@@ -575,7 +575,7 @@ async fn claim_next_review_submit_gate_run(
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        UPDATE public.dataset_review_submit_gate_runs AS gate_run
+        UPDATE private.dataset_review_submit_gate_runs AS gate_run
         SET status = 'running',
             modified_at = now()
         FROM claimed
@@ -718,7 +718,7 @@ async fn record_review_submit_gate_result(
 ) -> anyhow::Result<Value> {
     let row = sqlx::query(
         r"
-        SELECT public.cmd_dataset_review_submit_gate_record_result(
+        SELECT private.cmd_dataset_review_submit_gate_record_result(
             $1,
             $2,
             $3::jsonb,

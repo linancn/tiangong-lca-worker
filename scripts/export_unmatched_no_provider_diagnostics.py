@@ -41,9 +41,9 @@ select
   coalesce((sa.coverage #>> '{matching,matched_multi_fallback_equal}')::bigint, 0) as matched_multi_fallback_equal,
   coalesce((sa.coverage #>> '{matching,unmatched_no_provider}')::bigint, 0) as unmatched_no_provider,
   coalesce((sa.coverage #>> '{matching,a_input_edges_written}')::bigint, 0) as a_input_edges_written
-from lca_active_snapshots act
-join lca_network_snapshots ns on ns.id = act.snapshot_id
-left join lca_snapshot_artifacts sa on sa.snapshot_id = act.snapshot_id
+from private.lca_active_snapshots act
+join private.lca_network_snapshots ns on ns.id = act.snapshot_id
+left join private.lca_snapshot_artifacts sa on sa.snapshot_id = act.snapshot_id
 order by act.activated_at desc
 limit 1
 """
@@ -60,8 +60,8 @@ with active_snapshot as (
     coalesce((ns.process_filter ->> 'all_states')::boolean, false) as all_states,
     ns.process_filter -> 'process_states' as process_states,
     nullif(ns.process_filter ->> 'include_user_id', '') as include_user_id
-  from lca_active_snapshots act
-  join lca_network_snapshots ns on ns.id = act.snapshot_id
+  from private.lca_active_snapshots act
+  join private.lca_network_snapshots ns on ns.id = act.snapshot_id
   order by act.activated_at desc
   limit 1
 ),
@@ -73,7 +73,7 @@ scope_processes as (
     p.user_id,
     p.model_id,
     p.json::jsonb as process_json
-  from processes p
+  from public.processes p
   cross join active_snapshot snap
   where p.json ? 'processDataSet'
     and (
@@ -234,7 +234,7 @@ latest_flows as (
     f.version,
     f.created_at,
     f.json::jsonb as flow_json
-  from flows f
+  from public.flows f
   join target_flows tf on tf.flow_id = f.id::text
   order by f.id, f.created_at desc
 )

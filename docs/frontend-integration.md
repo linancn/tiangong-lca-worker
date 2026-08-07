@@ -134,7 +134,7 @@ export type JobStatus =
 
 前端不要复制 worker runtime 的 provider、sparse factorization、targeted RHS solve 或 blocker 判定逻辑。
 
-切到 `worker_jobs` 后，前端仍然只消费 Edge 返回的服务端 projection，不直接读写 `public.worker_jobs`。状态映射为：
+切到 `worker_jobs` 后，前端仍然只消费 Edge 返回的服务端 projection，不直接读写 `private.worker_jobs`。状态映射为：
 
 - `queued` / `running`：进入任务中心并展示服务端任务状态，不需要在提交按钮上长时间 blocking loading。
 - `completed`：表示 worker-side gate passed；Edge / database coordinator 才能继续 final submit。前端应使用 result 中的 `datasetRevision.revisionChecksum` 作为权威 checksum 展示 / 传递依据。

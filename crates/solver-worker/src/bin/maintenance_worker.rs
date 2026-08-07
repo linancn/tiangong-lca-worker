@@ -576,7 +576,7 @@ async fn insert_maintenance_report_artifact(
 
     let row = sqlx::query(
         r"
-        INSERT INTO public.worker_job_artifacts (
+        INSERT INTO private.worker_job_artifacts (
             job_id,
             artifact_type,
             content_type,

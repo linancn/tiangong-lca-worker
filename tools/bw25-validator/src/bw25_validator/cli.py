@@ -377,14 +377,14 @@ def resolve_target_result(
                 r.id::text AS result_id,
                 r.job_id::text AS job_id,
                 r.snapshot_id::text AS snapshot_id,
-                j.job_type AS job_type,
+                substring(j.job_kind from 5) AS job_type,
                 r.diagnostics AS result_diagnostics,
                 r.artifact_url AS result_artifact_url,
                 r.artifact_format AS result_artifact_format,
-                j.payload AS job_payload,
+                j.payload_json AS job_payload,
                 to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at_utc
-            FROM public.lca_results r
-            JOIN public.lca_jobs j ON j.id = r.job_id
+            FROM private.lca_results r
+            JOIN private.worker_jobs j ON j.id = r.worker_job_id
             WHERE r.id = %s::uuid
             LIMIT 1
         """
@@ -395,14 +395,14 @@ def resolve_target_result(
                 r.id::text AS result_id,
                 r.job_id::text AS job_id,
                 r.snapshot_id::text AS snapshot_id,
-                j.job_type AS job_type,
+                substring(j.job_kind from 5) AS job_type,
                 r.diagnostics AS result_diagnostics,
                 r.artifact_url AS result_artifact_url,
                 r.artifact_format AS result_artifact_format,
-                j.payload AS job_payload,
+                j.payload_json AS job_payload,
                 to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at_utc
-            FROM public.lca_results r
-            JOIN public.lca_jobs j ON j.id = r.job_id
+            FROM private.lca_results r
+            JOIN private.worker_jobs j ON j.id = r.worker_job_id
             WHERE r.job_id = %s::uuid
             ORDER BY r.created_at DESC
             LIMIT 1
@@ -416,16 +416,16 @@ def resolve_target_result(
                     r.id::text AS result_id,
                     r.job_id::text AS job_id,
                     r.snapshot_id::text AS snapshot_id,
-                    j.job_type AS job_type,
+                    substring(j.job_kind from 5) AS job_type,
                     r.diagnostics AS result_diagnostics,
                     r.artifact_url AS result_artifact_url,
                     r.artifact_format AS result_artifact_format,
-                    j.payload AS job_payload,
+                    j.payload_json AS job_payload,
                     to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at_utc
-                FROM public.lca_results r
-                JOIN public.lca_jobs j ON j.id = r.job_id
+                FROM private.lca_results r
+                JOIN private.worker_jobs j ON j.id = r.worker_job_id
                 WHERE r.snapshot_id = %s::uuid
-                  AND j.job_type = %s
+                  AND substring(j.job_kind from 5) = %s
                 ORDER BY r.created_at DESC
                 LIMIT 1
             """
@@ -436,15 +436,15 @@ def resolve_target_result(
                     r.id::text AS result_id,
                     r.job_id::text AS job_id,
                     r.snapshot_id::text AS snapshot_id,
-                    j.job_type AS job_type,
+                    substring(j.job_kind from 5) AS job_type,
                     r.diagnostics AS result_diagnostics,
                     r.artifact_url AS result_artifact_url,
                     r.artifact_format AS result_artifact_format,
-                    j.payload AS job_payload,
+                    j.payload_json AS job_payload,
                     to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at_utc
-                FROM public.lca_results r
-                JOIN public.lca_jobs j ON j.id = r.job_id
-                WHERE j.job_type = %s
+                FROM private.lca_results r
+                JOIN private.worker_jobs j ON j.id = r.worker_job_id
+                WHERE substring(j.job_kind from 5) = %s
                 ORDER BY r.created_at DESC
                 LIMIT 1
             """
@@ -480,11 +480,12 @@ def fetch_rust_job_timing(conn: psycopg.Connection[Any], job_id: str) -> RustJob
             EXTRACT(EPOCH FROM (started_at - created_at)) AS queue_wait_sec,
             EXTRACT(EPOCH FROM (finished_at - started_at)) AS run_sec,
             EXTRACT(EPOCH FROM (finished_at - created_at)) AS end_to_end_sec
-        FROM public.lca_jobs
+        FROM private.worker_jobs
         WHERE id = %s::uuid
+           OR payload_json->>'job_id' = %s
         LIMIT 1
         """,
-        (job_id,),
+        (job_id, job_id),
     ).fetchone()
     if not row:
         return RustJobTiming(
@@ -591,7 +592,7 @@ def load_snapshot_payload(
     row = conn.execute(
         """
         SELECT artifact_url, artifact_format
-        FROM public.lca_snapshot_artifacts
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = %s::uuid
           AND status = 'ready'
         ORDER BY created_at DESC
