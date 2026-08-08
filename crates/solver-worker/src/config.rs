@@ -2,6 +2,8 @@ use std::{net::SocketAddr, str::FromStr, time::Duration};
 
 use clap::{Parser, ValueEnum};
 
+use crate::pgbouncer_sqlx::postgres::PgConnectOptions;
+
 /// Solver worker launch mode.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RunMode {
@@ -163,6 +165,31 @@ impl AppConfig {
             .as_deref()
             .or(self.queue_conn.as_deref())
             .map_or_else(|| self.resolved_database_url(), Ok)
+    }
+
+    /// Rejects the known Supabase transaction-pooler endpoint for the main pool.
+    ///
+    /// Main solver/package/snapshot paths use bound `SQLx` queries and therefore
+    /// require a direct or session-mode connection. The queue-only pool may use
+    /// Supabase's 6543 transaction endpoint because its hot RPCs use the simple
+    /// query protocol.
+    pub fn validate_database_pool_modes(&self) -> anyhow::Result<()> {
+        let database_url = self.resolved_database_url()?;
+        let options = PgConnectOptions::from_str(database_url)
+            .map_err(|err| anyhow::anyhow!("invalid DATABASE_URL/CONN: {err}"))?;
+
+        if options.get_port() == 6543
+            && options
+                .get_host()
+                .to_ascii_lowercase()
+                .ends_with(".pooler.supabase.com")
+        {
+            anyhow::bail!(
+                "DATABASE_URL/CONN points to Supabase's 6543 transaction pooler, but main Worker queries require a direct or session-mode connection; use the same Supabase pooler host on port 5432 for DATABASE_URL and keep port 6543 only in QUEUE_DATABASE_URL"
+            );
+        }
+
+        Ok(())
     }
 
     /// Returns whether queue DB URL was explicitly configured.
@@ -391,6 +418,34 @@ mod tests {
             "postgres://pooler.example.local/app"
         );
         assert!(config.has_explicit_queue_database_url());
+    }
+
+    #[test]
+    fn rejects_supabase_transaction_pooler_for_main_database_url() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://postgres.example:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            "--queue-database-url",
+            "postgres://postgres.example:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+        ]);
+
+        let err = config.validate_database_pool_modes().unwrap_err();
+        assert!(err.to_string().contains("main Worker queries require"));
+        assert!(!err.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn accepts_supabase_session_pooler_for_main_and_transaction_pooler_for_queue() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://postgres.example:secret@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+            "--queue-database-url",
+            "postgres://postgres.example:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+        ]);
+
+        config.validate_database_pool_modes().unwrap();
     }
 
     #[test]

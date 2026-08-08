@@ -353,7 +353,7 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 Supabase 连接说明：
 
 - worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；未配置 queue URL 时统一复用主连接池。
-- 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
+- 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler（Supabase 通常使用 `:5432`）；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。若主连接指向 Supabase `:6543`，进程会在启动时 fail fast，避免领取任务后才因 prepared-statement protocol 失败。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
 - worker 入口会设置明确的 PostgreSQL `application_name`，例如 `solver-worker`、`snapshot-builder`、`package-worker`、`package-gc`、`snapshot-gc`、`result-gc`、`maintenance-worker` 和 `maintenance-enqueue`，用于在 `pg_stat_activity` 中归因长连接或长事务。

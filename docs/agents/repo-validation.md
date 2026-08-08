@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-07
-lastReviewedCommit: 6830d36038d0f9ad7fd28f7391f7402d7566f79d
+lastReviewedAt: 2026-08-08
+lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
 lastReviewedNote: "Updated for Worker Issue #223: adds all-purpose projection, descriptor-chain, rollout, and GC proof requirements."
 related:
   - ../../AGENTS.md

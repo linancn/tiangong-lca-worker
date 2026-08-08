@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-07
-lastReviewedCommit: 6830d36038d0f9ad7fd28f7391f7402d7566f79d
+lastReviewedAt: 2026-08-08
+lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
 lastReviewedNote: "Updated for Worker Issue #223: snapshot purposes persist consumer-owned projections and a two-level release/source descriptor chain."
 related:
   - AGENTS.md

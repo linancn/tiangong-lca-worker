@@ -250,6 +250,8 @@ impl AppState {
         application_name: &str,
         queue_application_name: &str,
     ) -> anyhow::Result<Self> {
+        config.validate_database_pool_modes()?;
+
         let pool = connect_pool(
             application_name,
             config.resolved_database_url()?,
