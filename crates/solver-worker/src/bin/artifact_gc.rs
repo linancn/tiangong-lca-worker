@@ -227,7 +227,7 @@ async fn preview_candidates(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_gc_preview($1) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_gc_preview($1) AS result
         FROM _service_role
         ",
     )
@@ -253,7 +253,7 @@ async fn claim_candidates(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_gc_claim($1, $2) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_gc_claim($1, $2) AS result
         FROM _service_role
         ",
     )
@@ -286,7 +286,7 @@ async fn renew_claim(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_gc_renew($1, $2) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_gc_renew($1, $2) AS result
         FROM _service_role
         ",
     )
@@ -313,7 +313,7 @@ async fn claim_stale_write_sets(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_reconcile($1, $2) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_reconcile($1, $2) AS result
         FROM _service_role
         ",
     )
@@ -343,7 +343,7 @@ async fn complete_stale_write_set(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_reconcile_complete($1, $2) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_reconcile_complete($1, $2) AS result
         FROM _service_role
         ",
     )
@@ -370,7 +370,7 @@ async fn complete_candidate(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_gc_complete($1, $2, $3, $4) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_gc_complete($1, $2, $3, $4) AS result
         FROM _service_role
         ",
     )
@@ -401,7 +401,7 @@ async fn record_failure(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_gc_fail($1, $2, $3) AS result
+        SELECT private.svc_lcia_scope_closure_artifact_gc_fail($1, $2, $3) AS result
         FROM _service_role
         ",
     )

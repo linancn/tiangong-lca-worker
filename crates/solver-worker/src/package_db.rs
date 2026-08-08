@@ -1,7 +1,5 @@
-use std::time::Instant;
-
 use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
@@ -96,52 +94,17 @@ impl PackageArtifactInsert {
     }
 }
 
-/// Updates `lca_package_jobs` status and diagnostics.
-#[instrument(skip(pool, diagnostics))]
+/// Rejects the retired legacy package-job lifecycle explicitly.
+#[instrument(skip(_pool, _diagnostics))]
 pub async fn update_package_job_status(
-    pool: &PgPool,
+    _pool: &PgPool,
     job_id: Uuid,
     status: &str,
-    diagnostics: Value,
+    _diagnostics: Value,
 ) -> anyhow::Result<f64> {
-    let db_write_started = Instant::now();
-    let update_result = sqlx::query(
-        r"
-        UPDATE lca_package_jobs
-        SET status = $2,
-            diagnostics = $3::jsonb,
-            updated_at = NOW(),
-            started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN NOW() ELSE started_at END,
-            finished_at = CASE WHEN $2 IN ('ready','completed','failed','stale') AND finished_at IS NULL THEN NOW() ELSE finished_at END
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(status)
-    .bind(diagnostics.clone())
-    .execute(pool)
-    .await;
-    let db_write_sec = db_write_started.elapsed().as_secs_f64();
-    match update_result {
-        Ok(_) => {}
-        Err(err) if is_undefined_table(&err) => {
-            warn!(
-                job_id = %job_id,
-                status,
-                "skipping legacy lca_package_jobs status update because the table is not present"
-            );
-            return Ok(db_write_sec);
-        }
-        Err(err) => return Err(err.into()),
-    }
-
-    let diagnostics_with_timing =
-        merge_package_job_status_update_timing(diagnostics.clone(), status, db_write_sec);
-    if diagnostics_with_timing != diagnostics {
-        set_package_job_diagnostics(pool, job_id, diagnostics_with_timing).await?;
-    }
-
-    Ok(db_write_sec)
+    Err(anyhow::anyhow!(
+        "legacy lca_package_jobs lifecycle is retired by database schema cutover; package job {job_id} cannot transition to {status}; use the worker-jobs backend"
+    ))
 }
 
 /// Inserts one `lca_package_artifacts` row.
@@ -159,7 +122,7 @@ pub async fn insert_package_artifact(
 
     let row = sqlx::query(
         r"
-        INSERT INTO lca_package_artifacts (
+        INSERT INTO private.lca_package_artifacts (
             job_id,
             artifact_kind,
             status,
@@ -224,7 +187,7 @@ pub async fn insert_package_artifact(
 pub async fn mark_package_request_cache_running(pool: &PgPool, job_id: Uuid) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_package_request_cache
+        UPDATE private.lca_package_request_cache
         SET status = 'running',
             updated_at = NOW(),
             last_accessed_at = NOW()
@@ -252,7 +215,7 @@ pub async fn mark_package_request_cache_ready(
 ) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_package_request_cache
+        UPDATE private.lca_package_request_cache
         SET status = 'ready',
             export_artifact_id = $2,
             report_artifact_id = $3,
@@ -286,7 +249,7 @@ pub async fn mark_package_request_cache_failed(
 ) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_package_request_cache
+        UPDATE private.lca_package_request_cache
         SET status = 'failed',
             error_code = $2,
             error_message = $3,
@@ -362,59 +325,16 @@ pub fn is_retryable_package_job_error(err: &anyhow::Error) -> bool {
 }
 
 /// Re-enqueues one package payload after incrementing the retry attempt, if budget remains.
-#[instrument(skip(pool, payload))]
+#[instrument(skip(_pool, payload, _error_message))]
 pub async fn reschedule_retryable_package_job(
-    pool: &PgPool,
+    _pool: &PgPool,
     payload: &PackageJobPayload,
-    error_message: &str,
+    _error_message: &str,
 ) -> anyhow::Result<bool> {
     let job_id = extract_package_job_id(payload);
-    let mut tx = pool.begin().await?;
-    let retry_row = sqlx::query(
-        r"
-        UPDATE lca_package_jobs
-        SET attempt = attempt + 1,
-            status = 'queued',
-            diagnostics = COALESCE(diagnostics, '{}'::jsonb) || jsonb_build_object(
-                'message', 'Retrying after transient database error',
-                'last_retryable_error', $2,
-                'retry_count', attempt + 1,
-                'max_attempt', max_attempt,
-                'retry_scheduled', TRUE
-            ),
-            updated_at = NOW()
-        WHERE id = $1
-          AND attempt < max_attempt
-        RETURNING attempt, max_attempt
-        ",
-    )
-    .bind(job_id)
-    .bind(error_message)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(row) = retry_row else {
-        tx.rollback().await?;
-        return Ok(false);
-    };
-
-    let _ = sqlx::query("SELECT pgmq.send($1, $2::jsonb) AS msg_id")
-        .bind(PACKAGE_QUEUE_NAME)
-        .bind(serde_json::to_value(payload)?)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
-
-    warn!(
-        job_id = %job_id,
-        attempt = row.try_get::<i32, _>("attempt").unwrap_or_default(),
-        max_attempt = row.try_get::<i32, _>("max_attempt").unwrap_or_default(),
-        error = error_message,
-        "rescheduled package job after retryable database error"
-    );
-
-    Ok(true)
+    Err(anyhow::anyhow!(
+        "legacy lca_package_jobs retry lifecycle is retired by database schema cutover; package job {job_id} must be retried through worker_jobs"
+    ))
 }
 
 /// Executes one package queue payload end-to-end.
@@ -464,14 +384,6 @@ pub async fn handle_package_job_payload_once(
                         return Err(err);
                     }
                 };
-            let _ = update_package_job_status(
-                &state.pool,
-                job_id,
-                outcome.final_status,
-                outcome.diagnostics.clone(),
-            )
-            .await?;
-
             if outcome.final_status == "running" {
                 Ok(PackageJobContinuation::Continue {
                     next_payload: PackageJobPayload::ExportPackage {
@@ -507,17 +419,6 @@ pub async fn handle_package_job_payload_once(
             requested_by,
             source_artifact_id,
         } => {
-            let _ = update_package_job_status(
-                &state.pool,
-                job_id,
-                "running",
-                serde_json::json!({
-                    "phase": "import_package",
-                    "source_artifact_id": source_artifact_id
-                }),
-            )
-            .await?;
-
             if let Err(err) = mark_package_request_cache_running(&state.pool, job_id).await {
                 warn!(
                     error = %err,
@@ -528,13 +429,6 @@ pub async fn handle_package_job_payload_once(
 
             let outcome =
                 execute_import_package(state, job_id, requested_by, source_artifact_id).await?;
-            let _ = update_package_job_status(
-                &state.pool,
-                job_id,
-                outcome.final_status,
-                outcome.diagnostics,
-            )
-            .await?;
             if let Err(err) = refresh_import_source_retention(&state.pool, source_artifact_id).await
             {
                 warn!(
@@ -564,64 +458,6 @@ pub async fn handle_package_job_payload_once(
     }
 }
 
-fn merge_package_job_status_update_timing(
-    mut diagnostics: Value,
-    status: &str,
-    db_write_sec: f64,
-) -> Value {
-    let Value::Object(ref mut root) = diagnostics else {
-        return diagnostics;
-    };
-
-    let timing_value = root
-        .entry("job_status_update_timing_sec".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !timing_value.is_object() {
-        *timing_value = Value::Object(Map::new());
-    }
-
-    let Some(timing) = timing_value.as_object_mut() else {
-        return diagnostics;
-    };
-
-    timing.insert(format!("{status}_db_write_sec"), Value::from(db_write_sec));
-    timing.insert("last_status".to_owned(), Value::String(status.to_owned()));
-    timing.insert("last_db_write_sec".to_owned(), Value::from(db_write_sec));
-
-    diagnostics
-}
-
-#[instrument(skip(pool, diagnostics))]
-async fn set_package_job_diagnostics(
-    pool: &PgPool,
-    job_id: Uuid,
-    diagnostics: Value,
-) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        r"
-        UPDATE lca_package_jobs
-        SET diagnostics = $2::jsonb
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(diagnostics)
-    .execute(pool)
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_undefined_table(&err) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn is_undefined_table(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
-        _ => false,
-    }
-}
-
 fn is_retryable_sqlx_error(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Io(io_err) => matches!(
@@ -640,6 +476,13 @@ fn is_retryable_sqlx_error(err: &sqlx::Error) -> bool {
     }
 }
 
+fn is_undefined_table(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
@@ -648,7 +491,7 @@ mod tests {
 
     use super::{
         extract_package_job_id, extract_package_job_id_from_raw_payload,
-        is_retryable_package_job_error, merge_package_job_status_update_timing,
+        is_retryable_package_job_error,
     };
     use crate::package_types::{PackageExportScope, PackageJobPayload};
 
@@ -673,28 +516,6 @@ mod tests {
         assert_eq!(
             extract_package_job_id_from_raw_payload(&payload),
             Some(Uuid::nil())
-        );
-    }
-
-    #[test]
-    fn merge_job_status_update_timing_appends_fields() {
-        let merged = merge_package_job_status_update_timing(
-            json!({"phase": "export_package"}),
-            "running",
-            0.125,
-        );
-
-        assert_eq!(
-            merged["job_status_update_timing_sec"]["last_status"],
-            "running"
-        );
-        assert_eq!(
-            merged["job_status_update_timing_sec"]["running_db_write_sec"],
-            0.125
-        );
-        assert_eq!(
-            merged["job_status_update_timing_sec"]["last_db_write_sec"],
-            0.125
         );
     }
 

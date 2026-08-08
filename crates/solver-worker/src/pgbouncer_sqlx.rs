@@ -13,6 +13,14 @@
 
 pub use ::sqlx::*;
 
+/// Executes through `PostgreSQL`'s simple-query protocol. This is required for
+/// hot queue RPCs on Supabase's transaction pooler: even a non-persistent
+/// bound query still uses the extended prepared-statement protocol.
+#[must_use]
+pub fn raw_query(sql: &str) -> ::sqlx::RawSql<'_> {
+    ::sqlx::raw_sql(sql)
+}
+
 pub fn query(
     sql: &str,
 ) -> ::sqlx::query::Query<'_, ::sqlx::Postgres, ::sqlx::postgres::PgArguments> {
@@ -31,7 +39,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{query, query_scalar};
+    use super::{Execute, Postgres, RawSql, query, query_scalar, raw_query};
 
     #[test]
     fn query_helpers_disable_persistent_prepared_statements() {
@@ -40,5 +48,17 @@ mod tests {
 
         let scalar = query_scalar::<i64>("SELECT 1");
         assert!(!::sqlx::Execute::persistent(&scalar));
+    }
+
+    #[test]
+    fn raw_queue_queries_use_simple_protocol_without_statement_or_arguments() {
+        let mut query = raw_query("SELECT private.worker_claim_jobs('solver', 'test', 1, 1)");
+        assert!(!<RawSql<'_> as Execute<'_, Postgres>>::persistent(&query));
+        assert!(<RawSql<'_> as Execute<'_, Postgres>>::statement(&query).is_none());
+        assert!(
+            <RawSql<'_> as Execute<'_, Postgres>>::take_arguments(&mut query)
+                .unwrap()
+                .is_none()
+        );
     }
 }

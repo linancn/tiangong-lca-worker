@@ -27,8 +27,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedAt: 2026-08-08
+lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
 lastReviewedNote: "Updated for Worker Issue #223: numerical release metadata and immutable source documents have separate file-backed artifacts without an encoding-time document clone."
 related:
   - ../../../AGENTS.md

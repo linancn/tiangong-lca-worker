@@ -66,7 +66,7 @@ related:
 
 ## 1. 架构定位
 
-- Supabase: 业务数据、鉴权、Edge Functions 编排、`worker_jobs` 统一任务事实表与 legacy `pgmq` 兼容队列。
+- Supabase: 业务数据、鉴权、Edge Functions 编排与 `private.worker_jobs` 统一任务事实表；`pgmq` 扩展不再承载本 worker 的业务生命周期。
 - Rust Solver Worker: 构建稀疏矩阵、缓存分解、重复回代、写回结果。
 - SuiteSparse (UMFPACK): 稀疏线性系统求解核心。
 
@@ -141,7 +141,7 @@ worker 上传 artifact 到 S3 兼容存储，并在 `lca_results` 中写入：
 - `supabase/migrations/20260304120000_lca_drop_legacy_entry_tables.sql`（清理旧 `lca_*_entries/index` 表）
 - `supabase/migrations/20260305052000_lca_request_cache_and_factorization_registry.sql`（additive-only：active snapshot + cache + factorization registry + jobs 幂等列）
 - `supabase/migrations/20260305070000_lca_rls_lockdown.sql`（启用 RLS + 收紧 anon/authenticated 权限）
-- `supabase/migrations/20260305093000_lca_enqueue_job_rpc.sql`（新增 `public.lca_enqueue_job` RPC，供 Edge Functions 通过 supabase.rpc 入队）
+- `supabase/migrations/20260305093000_lca_enqueue_job_rpc.sql`（新增 `private.lca_enqueue_job` RPC，供 Edge Functions 通过 supabase.rpc 入队）
 - `supabase/migrations/20260305094000_lca_enqueue_job_rpc_acl.sql`（收紧 RPC 权限，仅 `service_role` 可执行）
 - `supabase/migrations/20260306090000_lca_results_s3_strict_and_retention.sql`（破坏性：清理旧结果并切换为 S3-only + retention 字段）
 - `supabase/migrations/20260308104000_lca_jobs_add_solve_all_unit.sql`（扩展 `lca_jobs.job_type` 约束，支持 `solve_all_unit`）
@@ -152,7 +152,7 @@ worker 上传 artifact 到 S3 兼容存储，并在 `lca_results` 中写入：
 其中 `20260304120000` 会删除旧的 `lca_*_entries/index` 中间表，只保留 artifact-first 所需表。
 其中 `20260305052000` 只新增缓存/幂等相关结构，运行时主路径暂未强依赖这些新表。
 其中 `20260305070000` 为安全基线：不再允许 `anon` 对 `lca_*` 表读写；`authenticated` 默认只可读取“自己的 jobs/results”。
-其中 `20260305093000` 增加 `public.lca_enqueue_job(text,jsonb)`（`security definer`），用于 Edge Functions 在不直连 postgres 客户端的前提下调用 `pgmq.send`。
+其中 `20260305093000` 历史上增加过 `private.lca_enqueue_job(text,jsonb)`；该入口随旧 LCA PGMQ lifecycle 一并退役，不得用于新任务。
 其中 `20260305094000` 收紧该 RPC 的执行权限，确保只有 `service_role` 可以调用。
 
 可先做静态检查：
@@ -312,11 +312,10 @@ dataset payload。`worker.source-reference-audit.v1` 分开统计空对象占位
 最小必需：
 
 - `DATABASE_URL` 或 `CONN`
-- `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅 legacy pgmq read/archive 需要，未设置时复用 `DATABASE_URL` / `CONN`）
-- `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
-- `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug，且必须显式设置 `ALLOW_LEGACY_JOB_TABLE_BACKEND=true`）
-- `ALLOW_LEGACY_JOB_TABLE_BACKEND`（默认 `false`；只允许显式兼容/debug 运行进入 retained `lca_jobs` / `lca_package_jobs` + pgmq 后端，生产保持关闭）
-- `PGMQ_QUEUE`（legacy pgmq 队列名，默认 `lca_jobs`）
+- `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；未设置时复用 `DATABASE_URL` / `CONN`）
+- `SOLVER_QUEUE_BACKEND`（必须使用默认值 `worker-jobs`；选择 `pgmq` 会 fail closed）
+- `PACKAGE_QUEUE_BACKEND`（必须使用默认值 `worker-jobs`；选择 `pgmq` 会 fail closed）
+- `ALLOW_LEGACY_JOB_TABLE_BACKEND`（deprecated acknowledgement；不会重新启用已退役 lifecycle）
 - `SOLVER_MODE`（`worker` / `http` / `both`）
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
 - `WORKER_POLL_MS`（默认 `1000`）
@@ -353,8 +352,8 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 
 Supabase 连接说明：
 
-- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
-- 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
+- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；未配置 queue URL 时统一复用主连接池。
+- 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler（Supabase 通常使用 `:5432`）；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。若主连接指向 Supabase `:6543`，进程会在启动时 fail fast，避免领取任务后才因 prepared-statement protocol 失败。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
 - worker 入口会设置明确的 PostgreSQL `application_name`，例如 `solver-worker`、`snapshot-builder`、`package-worker`、`package-gc`、`snapshot-gc`、`result-gc`、`maintenance-worker` 和 `maintenance-enqueue`，用于在 `pg_stat_activity` 中归因长连接或长事务。
@@ -511,8 +510,8 @@ cargo run -p solver-worker --bin review_submit_gate_runner --release --
 
 说明：
 
-- `solver-worker` 默认消费 `worker_queue=solver` 的 `worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；只有 `--queue-backend pgmq --allow-legacy-job-table-backend` 或 `SOLVER_QUEUE_BACKEND=pgmq ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 才进入 legacy `lca_jobs` 队列。
-- `package_worker` 默认消费 `worker_queue=package` 的 `worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；只有 `--package-queue-backend pgmq --pgmq-queue lca_package_jobs --allow-legacy-job-table-backend` 或 `PACKAGE_QUEUE_BACKEND=pgmq ALLOW_LEGACY_JOB_TABLE_BACKEND=true` 才进入 legacy package 队列。
+- `solver-worker` 消费 `worker_queue=solver` 的 `private.worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；旧 PGMQ backend 会在启动时失败。
+- `package_worker` 消费 `worker_queue=package` 的 `private.worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；旧 package PGMQ backend 会在启动时失败。
 - `review_submit_gate_runner` 消费数据库表 `dataset_review_submit_gate_runs` 中的 gate run，执行 request-root snapshot + calculator gate，并通过数据库 RPC 写回结果。
 
 ### 6.2 计算正确性基线流程（Expected 对比）
@@ -896,7 +895,7 @@ execute job 由 `maintenance_worker` 调用 `package_gc --execute`，仍会先�
 
 - CLI 默认 dry-run；实际删除必须显式传 `--execute`。
 - active snapshot 永远保护；执行前会再次检查 `lca_active_snapshots`。
-- 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `public.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
+- 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `private.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
 - orphan storage directory 只删除 Storage objects，不做 DB 操作。
 - 404 object delete 视为成功，便于重试幂等。
 - timer 只负责 enqueue `lca.snapshot_gc` worker job；`snapshot_gc` 仍使用 `solver_worker_snapshot_gc` PostgreSQL advisory lock，抢不到锁会写 `skipped` audit run 并退出 0。

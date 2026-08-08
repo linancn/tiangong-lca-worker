@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
-    SolveOptions, SolveResult, SolverService, SparseTriplet,
+    SolveOptions, SolveResult, SolverService,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -98,7 +98,7 @@ _lock AS (
 active_builds AS (
     SELECT count(active.id)::integer AS active_build_count
     FROM _lock
-    LEFT JOIN public.worker_jobs AS active
+    LEFT JOIN private.worker_jobs AS active
       ON active.worker_runtime = 'calculator'
      AND active.worker_queue = 'solver'
      AND active.job_kind = 'lca.build_snapshot'
@@ -108,7 +108,7 @@ active_builds AS (
      AND active.id <> $1
 ),
 updated AS (
-    UPDATE public.worker_jobs AS job
+    UPDATE private.worker_jobs AS job
        SET phase = 'build_snapshot',
            progress = GREATEST(COALESCE(job.progress, 0), 0.10),
            diagnostics = COALESCE(job.diagnostics, '{}'::jsonb) || $6::jsonb,
@@ -250,6 +250,8 @@ impl AppState {
         application_name: &str,
         queue_application_name: &str,
     ) -> anyhow::Result<Self> {
+        config.validate_database_pool_modes()?;
+
         let pool = connect_pool(
             application_name,
             config.resolved_database_url()?,
@@ -493,51 +495,16 @@ pub async fn archive_queue_message(
 }
 
 /// Updates `lca_jobs` status and diagnostics for the explicit legacy backend.
-#[instrument(skip(pool, diagnostics))]
+#[instrument(skip(_pool, _diagnostics))]
 pub async fn update_legacy_lca_job_status(
-    pool: &PgPool,
+    _pool: &PgPool,
     job_id: Uuid,
     status: &str,
-    diagnostics: Value,
+    _diagnostics: Value,
 ) -> anyhow::Result<f64> {
-    let db_write_started = Instant::now();
-    let update_result = sqlx::query(
-        r"
-        UPDATE lca_jobs
-        SET status = $2,
-            diagnostics = $3::jsonb,
-            updated_at = NOW(),
-            started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN NOW() ELSE started_at END,
-            finished_at = CASE WHEN $2 IN ('completed','failed') AND finished_at IS NULL THEN NOW() ELSE finished_at END
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(status)
-    .bind(diagnostics.clone())
-    .execute(pool)
-    .await;
-    let db_write_sec = db_write_started.elapsed().as_secs_f64();
-    match update_result {
-        Ok(_) => {}
-        Err(err) if is_undefined_table(&err) => {
-            warn!(
-                job_id = %job_id,
-                status,
-                "skipping legacy lca_jobs status update because the table is not present"
-            );
-            return Ok(db_write_sec);
-        }
-        Err(err) => return Err(err.into()),
-    }
-
-    let diagnostics_with_timing =
-        merge_job_status_update_timing(diagnostics.clone(), status, db_write_sec);
-    if diagnostics_with_timing != diagnostics {
-        set_job_diagnostics(pool, job_id, diagnostics_with_timing).await?;
-    }
-
-    Ok(db_write_sec)
+    Err(anyhow::anyhow!(
+        "legacy lca_jobs lifecycle is retired by database schema cutover; job {job_id} cannot transition to {status}; use the worker-jobs backend"
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -559,7 +526,7 @@ async fn insert_result(
 ) -> anyhow::Result<Uuid> {
     let row = sqlx::query(
         r"
-        INSERT INTO lca_results (
+        INSERT INTO private.lca_results (
             job_id,
             snapshot_id,
             diagnostics,
@@ -593,7 +560,7 @@ async fn update_result_diagnostics(
 ) -> anyhow::Result<()> {
     let _ = sqlx::query(
         r"
-        UPDATE lca_results
+        UPDATE private.lca_results
         SET diagnostics = $2::jsonb
         WHERE id = $1
         ",
@@ -605,36 +572,12 @@ async fn update_result_diagnostics(
     Ok(())
 }
 
-#[instrument(skip(pool, diagnostics))]
-async fn set_job_diagnostics(
-    pool: &PgPool,
-    job_id: Uuid,
-    diagnostics: Value,
-) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        r"
-        UPDATE lca_jobs
-        SET diagnostics = $2::jsonb
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(diagnostics)
-    .execute(pool)
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_undefined_table(&err) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
 /// Marks request cache row as running for a given job.
 #[instrument(skip(pool))]
 pub async fn mark_result_cache_running(pool: &PgPool, job_id: Uuid) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_result_cache
+        UPDATE private.lca_result_cache
         SET status = 'running',
             updated_at = NOW(),
             last_accessed_at = NOW()
@@ -661,7 +604,7 @@ pub async fn mark_result_cache_ready(
 ) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_result_cache
+        UPDATE private.lca_result_cache
         SET status = 'ready',
             result_id = $2,
             error_code = NULL,
@@ -693,7 +636,7 @@ pub async fn mark_result_cache_failed(
 ) -> anyhow::Result<()> {
     let result = sqlx::query(
         r"
-        UPDATE lca_result_cache
+        UPDATE private.lca_result_cache
         SET status = 'failed',
             error_code = $2,
             error_message = $3,
@@ -721,7 +664,7 @@ pub async fn latest_result_id_for_job(pool: &PgPool, job_id: Uuid) -> anyhow::Re
     let row = match sqlx::query(
         r"
         SELECT id
-        FROM lca_results
+        FROM private.lca_results
         WHERE job_id = $1
         ORDER BY created_at DESC
         LIMIT 1
@@ -771,7 +714,6 @@ fn merge_job_status_update_timing(
 #[derive(Debug, Clone)]
 struct SnapshotArtifactMeta {
     url: String,
-    format: String,
     sha256: String,
 }
 
@@ -781,104 +723,27 @@ pub async fn fetch_snapshot_sparse_data(
     state: &AppState,
     snapshot_id: Uuid,
 ) -> anyhow::Result<ModelSparseData> {
-    let mut artifact_error = None;
-    if let Some(meta) = fetch_snapshot_artifact_meta(&state.pool, snapshot_id).await? {
-        match fetch_snapshot_payload_from_artifact(state, snapshot_id, &meta).await {
-            Ok(payload) => return Ok(payload),
-            Err(err) => {
-                warn!(
-                    snapshot_id = %snapshot_id,
-                    artifact_format = %meta.format,
-                    error = %err,
-                    "failed to load snapshot artifact, falling back to table-backed sparse data"
-                );
-                artifact_error = Some(err);
-            }
-        }
-    }
-
-    match fetch_snapshot_sparse_data_from_tables(&state.pool, snapshot_id).await {
-        Ok(data) => Ok(data),
-        Err(err) => {
-            if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>()
-                && is_undefined_table(sqlx_err)
-            {
-                return Err(missing_legacy_tables_sparse_data_error(
-                    snapshot_id,
-                    artifact_error.as_ref(),
-                ));
-            }
-            Err(err)
-        }
-    }
+    let meta = fetch_snapshot_artifact_meta(&state.pool, snapshot_id)
+        .await?
+        .ok_or_else(|| retired_snapshot_fallback_error(snapshot_id, None))?;
+    fetch_snapshot_payload_from_artifact(state, snapshot_id, &meta)
+        .await
+        .map_err(|err| retired_snapshot_fallback_error(snapshot_id, Some(&err)))
 }
 
-fn missing_legacy_tables_sparse_data_error(
+fn retired_snapshot_fallback_error(
     snapshot_id: Uuid,
     artifact_error: Option<&anyhow::Error>,
 ) -> anyhow::Error {
     if let Some(artifact_error) = artifact_error {
         anyhow::anyhow!(
-            "snapshot {snapshot_id} has no readable artifact and legacy lca_* matrix tables are missing; original artifact read/decode error: {artifact_error:#}"
+            "snapshot {snapshot_id} artifact is unreadable and legacy matrix-table fallback is retired: {artifact_error:#}"
         )
     } else {
         anyhow::anyhow!(
-            "snapshot {snapshot_id} has no readable artifact and legacy lca_* matrix tables are missing"
+            "snapshot {snapshot_id} has no ready artifact; legacy matrix-table fallback was retired by database schema cutover"
         )
     }
-}
-
-#[instrument(skip(pool))]
-async fn fetch_snapshot_sparse_data_from_tables(
-    pool: &PgPool,
-    snapshot_id: Uuid,
-) -> anyhow::Result<ModelSparseData> {
-    let process_count = fetch_process_count(pool, snapshot_id).await?;
-    let flow_count = fetch_flow_count(pool, snapshot_id).await?;
-    let impact_count = fetch_impact_count(pool, snapshot_id).await?;
-
-    let technosphere_entries = fetch_triplets(
-        pool,
-        snapshot_id,
-        r#"
-        SELECT "row" AS row_idx, "col" AS col_idx, value
-        FROM lca_technosphere_entries
-        WHERE snapshot_id = $1
-        "#,
-    )
-    .await?;
-
-    let biosphere_entries = fetch_triplets(
-        pool,
-        snapshot_id,
-        r#"
-        SELECT "row" AS row_idx, "col" AS col_idx, value
-        FROM lca_biosphere_entries
-        WHERE snapshot_id = $1
-        "#,
-    )
-    .await?;
-
-    let characterization_factors = fetch_triplets(
-        pool,
-        snapshot_id,
-        r#"
-        SELECT "row" AS row_idx, "col" AS col_idx, value
-        FROM lca_characterization_factors
-        WHERE snapshot_id = $1
-        "#,
-    )
-    .await?;
-
-    Ok(ModelSparseData {
-        model_version: snapshot_id,
-        process_count,
-        flow_count,
-        impact_count,
-        technosphere_entries,
-        biosphere_entries,
-        characterization_factors,
-    })
 }
 
 async fn fetch_snapshot_artifact_meta(
@@ -887,8 +752,8 @@ async fn fetch_snapshot_artifact_meta(
 ) -> anyhow::Result<Option<SnapshotArtifactMeta>> {
     let row = match sqlx::query(
         r"
-        SELECT artifact_url, artifact_format, artifact_sha256
-        FROM lca_snapshot_artifacts
+        SELECT artifact_url, artifact_sha256
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = $1
           AND status = 'ready'
         ORDER BY created_at DESC
@@ -907,7 +772,6 @@ async fn fetch_snapshot_artifact_meta(
     row.map(|r| {
         Ok(SnapshotArtifactMeta {
             url: r.try_get::<String, _>("artifact_url")?,
-            format: r.try_get::<String, _>("artifact_format")?,
             sha256: r.try_get::<String, _>("artifact_sha256")?,
         })
     })
@@ -1900,8 +1764,7 @@ async fn handle_job_payload_with_worker_lease(
                     lifecycle_backend,
                     job_id,
                     resolved_snapshot_id,
-                )
-                .await?;
+                )?;
             }
 
             let source_hash = fetch_snapshot_source_hash(&state.pool, resolved_snapshot_id).await?;
@@ -2203,7 +2066,7 @@ async fn upsert_latest_all_unit_result(
 ) -> anyhow::Result<Uuid> {
     let row = sqlx::query(
         r"
-        INSERT INTO public.lca_latest_all_unit_results (
+        INSERT INTO private.lca_latest_all_unit_results (
             snapshot_id,
             job_id,
             result_id,
@@ -2848,7 +2711,7 @@ async fn verify_certified_closure_bundle_artifact(
         r"
         SELECT artifact_type, storage_path, content_type, byte_size,
                checksum_sha256, metadata
-        FROM public.worker_job_artifacts
+        FROM private.worker_job_artifacts
         WHERE id = $1
         ",
     )
@@ -2964,8 +2827,8 @@ async fn load_scope_closure_snapshot_facts(
                a.artifact_format, a.artifact_sha256,
                a.snapshot_index_sha256, a.snapshot_build_contract_hash,
                a.effective_scope_hash, a.data_snapshot_token, a.closure_bundle_hash
-        FROM public.lca_network_snapshots s
-        JOIN public.lca_snapshot_artifacts a
+        FROM private.lca_network_snapshots s
+        JOIN private.lca_snapshot_artifacts a
           ON a.snapshot_id = s.id AND a.status = 'ready'
         WHERE s.id = $1
           AND ($2::uuid IS NULL OR a.id = $2)
@@ -3001,7 +2864,6 @@ async fn load_scope_closure_snapshot_facts(
     }
     let meta = SnapshotArtifactMeta {
         url: row.try_get("artifact_url")?,
-        format: artifact_format.clone(),
         sha256: artifact_sha256.clone(),
     };
     let decoded = fetch_decoded_snapshot_artifact_from_meta(state, snapshot_id, &meta).await?;
@@ -3367,7 +3229,7 @@ async fn mark_lcia_result_package_ready(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.cmd_lcia_result_package_mark_ready(
+        SELECT private.cmd_lcia_result_package_mark_ready(
             $1,
             $2,
             $3,
@@ -3416,7 +3278,7 @@ async fn link_lcia_result_package_worker_job_domain_refs(
     execute_optional_lcia_result_package_worker_job_ref_update(
         pool,
         r"
-        UPDATE public.lca_results
+        UPDATE private.lca_results
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
@@ -3427,7 +3289,7 @@ async fn link_lcia_result_package_worker_job_domain_refs(
     execute_optional_lcia_result_package_worker_job_ref_update(
         pool,
         r"
-        UPDATE public.lca_latest_all_unit_results
+        UPDATE private.lca_latest_all_unit_results
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
@@ -4056,7 +3918,7 @@ async fn fetch_snapshot_source_hash(
     pool: &PgPool,
     snapshot_id: Uuid,
 ) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query("SELECT source_hash FROM public.lca_network_snapshots WHERE id = $1")
+    let row = sqlx::query("SELECT source_hash FROM private.lca_network_snapshots WHERE id = $1")
         .bind(snapshot_id)
         .fetch_optional(pool)
         .await?;
@@ -4066,31 +3928,17 @@ async fn fetch_snapshot_source_hash(
     }
 }
 
-async fn set_legacy_lca_job_snapshot_id(
-    pool: &PgPool,
+fn set_legacy_lca_job_snapshot_id(
+    _pool: &PgPool,
     job_id: Uuid,
     snapshot_id: Uuid,
 ) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        r"
-        UPDATE lca_jobs
-        SET snapshot_id = $2,
-            updated_at = NOW()
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(snapshot_id)
-    .execute(pool)
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_undefined_table(&err) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    Err(anyhow::anyhow!(
+        "legacy lca_jobs lifecycle is retired by database schema cutover; cannot bind job {job_id} to snapshot {snapshot_id}; use the worker-jobs backend"
+    ))
 }
 
-async fn set_legacy_lca_job_snapshot_id_for_backend(
+fn set_legacy_lca_job_snapshot_id_for_backend(
     pool: &PgPool,
     backend: JobLifecycleBackend,
     job_id: Uuid,
@@ -4099,7 +3947,7 @@ async fn set_legacy_lca_job_snapshot_id_for_backend(
     if !backend.writes_legacy_lca_jobs() {
         return Ok(());
     }
-    set_legacy_lca_job_snapshot_id(pool, job_id, snapshot_id).await
+    set_legacy_lca_job_snapshot_id(pool, job_id, snapshot_id)
 }
 
 async fn upsert_active_snapshot(
@@ -4112,7 +3960,7 @@ async fn upsert_active_snapshot(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r"
-        INSERT INTO public.lca_active_snapshots (
+        INSERT INTO private.lca_active_snapshots (
             scope,
             snapshot_id,
             source_hash,
@@ -4329,7 +4177,7 @@ async fn fetch_snapshot_process_count(pool: &PgPool, snapshot_id: Uuid) -> anyho
     let row = sqlx::query(
         r"
         SELECT process_count
-        FROM lca_snapshot_artifacts
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = $1
           AND status = 'ready'
         ORDER BY created_at DESC
@@ -4342,74 +4190,11 @@ async fn fetch_snapshot_process_count(pool: &PgPool, snapshot_id: Uuid) -> anyho
 
     match row {
         Ok(Some(row)) => Ok(row.try_get::<i32, _>("process_count")?),
-        Ok(None) => fetch_process_count(pool, snapshot_id).await,
-        Err(err) if is_undefined_table(&err) => fetch_process_count(pool, snapshot_id).await,
+        Ok(None) => Err(anyhow::anyhow!(
+            "snapshot {snapshot_id} has no ready artifact metadata; legacy process-index fallback is retired"
+        )),
         Err(err) => Err(err.into()),
     }
-}
-
-async fn fetch_process_count(pool: &PgPool, snapshot_id: Uuid) -> anyhow::Result<i32> {
-    let count: i64 = sqlx::query_scalar(
-        r"
-        SELECT COUNT(*)::bigint
-        FROM lca_process_index
-        WHERE snapshot_id = $1
-        ",
-    )
-    .bind(snapshot_id)
-    .fetch_one(pool)
-    .await?;
-
-    i32::try_from(count).map_err(|_| anyhow::anyhow!("process count overflow: {count}"))
-}
-
-async fn fetch_flow_count(pool: &PgPool, snapshot_id: Uuid) -> anyhow::Result<i32> {
-    let count: i64 = sqlx::query_scalar(
-        r"
-        SELECT COUNT(*)::bigint
-        FROM lca_flow_index
-        WHERE snapshot_id = $1
-        ",
-    )
-    .bind(snapshot_id)
-    .fetch_one(pool)
-    .await?;
-
-    i32::try_from(count).map_err(|_| anyhow::anyhow!("flow count overflow: {count}"))
-}
-
-async fn fetch_impact_count(pool: &PgPool, snapshot_id: Uuid) -> anyhow::Result<i32> {
-    let count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(MAX("row"), -1)::bigint + 1
-        FROM lca_characterization_factors
-        WHERE snapshot_id = $1
-        "#,
-    )
-    .bind(snapshot_id)
-    .fetch_one(pool)
-    .await?;
-
-    i32::try_from(count).map_err(|_| anyhow::anyhow!("impact count overflow: {count}"))
-}
-
-async fn fetch_triplets(
-    pool: &PgPool,
-    snapshot_id: Uuid,
-    sql: &str,
-) -> anyhow::Result<Vec<SparseTriplet>> {
-    let rows = sqlx::query(sql).bind(snapshot_id).fetch_all(pool).await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(SparseTriplet {
-            row: row.try_get::<i32, _>("row_idx")?,
-            col: row.try_get::<i32, _>("col_idx")?,
-            value: row.try_get::<f64, _>("value")?,
-        });
-    }
-
-    Ok(out)
 }
 
 #[allow(dead_code)]
@@ -4425,10 +4210,10 @@ mod tests {
         acquire_build_snapshot_worker_jobs_slot_sql, append_scope_closure_snapshot_args,
         build_all_unit_rhs_batch, build_snapshot_heartbeat_interval,
         lcia_result_package_request_roots, lcia_result_package_version,
-        missing_legacy_tables_sparse_data_error, normalize_all_unit_batch_size,
-        package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
-        parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
-        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
+        normalize_all_unit_batch_size, package_snapshot_execution_mode,
+        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
+        read_certified_closure_bundle_binding, redact_sensitive_diagnostics,
+        redacted_builder_command, resolve_solve_all_unit_options, retired_snapshot_fallback_error,
         run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
         snapshot_builder_process_failure_code, snapshot_builder_wall_timeout_seconds_from,
         tail_text, utf8_safe_tail, validate_certified_process_axis,
@@ -5012,18 +4797,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_legacy_tables_error_preserves_artifact_failure_context() {
+    fn retired_matrix_table_fallback_fails_closed_with_artifact_context() {
         let snapshot_id =
             Uuid::parse_str("3d620e54-2b83-47f6-9809-0b65ab00bfd9").expect("valid uuid");
         let artifact_error = anyhow::anyhow!(
             "decode snapshot artifact failed: No space left on device (os error 28)"
         );
 
-        let err = missing_legacy_tables_sparse_data_error(snapshot_id, Some(&artifact_error));
+        let err = retired_snapshot_fallback_error(snapshot_id, Some(&artifact_error));
         let message = err.to_string();
 
-        assert!(message.contains("no readable artifact"));
-        assert!(message.contains("legacy lca_* matrix tables are missing"));
+        assert!(message.contains("artifact is unreadable"));
+        assert!(message.contains("legacy matrix-table fallback is retired"));
         assert!(message.contains("No space left on device"));
     }
 

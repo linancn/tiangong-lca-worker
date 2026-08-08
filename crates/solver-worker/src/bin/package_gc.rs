@@ -271,8 +271,7 @@ async fn run_package_gc(
             cli.batch_size,
             job_retention_days,
             request_cache_retention_days,
-        )
-        .await?;
+        )?;
 
         totals.request_cache_deleted += request_cache_deleted;
         totals.jobs_deleted += jobs_deleted;

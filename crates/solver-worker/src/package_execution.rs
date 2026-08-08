@@ -550,7 +550,6 @@ async fn ensure_export_seed_items(
 ) -> anyhow::Result<usize> {
     if has_export_items(pool, job_id).await? {
         let root_count = count_seed_export_items(pool, job_id).await?;
-        update_package_job_root_count(pool, job_id, root_count).await?;
         return Ok(usize::try_from(root_count).unwrap_or_default());
     }
 
@@ -577,12 +576,6 @@ async fn ensure_export_seed_items(
 
     let seed_refs_done = !matches!(scope, PackageExportScope::SelectedRoots);
     insert_export_items(pool, job_id, seed_roots.as_slice(), true, seed_refs_done).await?;
-    update_package_job_root_count(
-        pool,
-        job_id,
-        i64::try_from(seed_roots.len()).unwrap_or(i64::MAX),
-    )
-    .await?;
     Ok(seed_roots.len())
 }
 
@@ -655,44 +648,8 @@ pub fn clear_runtime_export_traversal_cache(job_id: Uuid) {
 }
 
 async fn fetch_package_job_diagnostics(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let legacy_diagnostics = fetch_legacy_package_job_diagnostics(pool, job_id).await?;
-    if legacy_diagnostics
-        .as_ref()
-        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
-    {
-        return Ok(legacy_diagnostics.unwrap_or_else(|| json!({})));
-    }
-
     let worker_jobs_diagnostics = fetch_worker_package_job_diagnostics(pool, job_id).await?;
-    Ok(select_package_job_diagnostics_for_resume(
-        legacy_diagnostics,
-        worker_jobs_diagnostics,
-    ))
-}
-
-async fn fetch_legacy_package_job_diagnostics(
-    pool: &PgPool,
-    job_id: Uuid,
-) -> anyhow::Result<Option<Value>> {
-    let result = sqlx::query(
-        r"
-        SELECT diagnostics
-        FROM public.lca_package_jobs
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await;
-    match result {
-        Ok(Some(row)) => Ok(Some(
-            row.try_get::<Option<Value>, _>("diagnostics")?
-                .unwrap_or_else(|| json!({})),
-        )),
-        Ok(None) => Ok(None),
-        Err(err) if is_undefined_table(&err) => Ok(None),
-        Err(err) => Err(err.into()),
-    }
+    Ok(worker_jobs_diagnostics.unwrap_or_else(|| json!({})))
 }
 
 async fn fetch_worker_package_job_diagnostics(
@@ -703,7 +660,7 @@ async fn fetch_worker_package_job_diagnostics(
     let result = sqlx::query(
         r"
         SELECT diagnostics
-        FROM public.worker_jobs
+        FROM private.worker_jobs
         WHERE worker_queue = $1
           AND job_kind = $2
           AND (
@@ -734,45 +691,6 @@ async fn fetch_worker_package_job_diagnostics(
     }
 }
 
-fn select_package_job_diagnostics_for_resume(
-    legacy_diagnostics: Option<Value>,
-    worker_jobs_diagnostics: Option<Value>,
-) -> Value {
-    if legacy_diagnostics
-        .as_ref()
-        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
-    {
-        return legacy_diagnostics.unwrap_or_else(|| json!({}));
-    }
-
-    if worker_jobs_diagnostics
-        .as_ref()
-        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
-    {
-        return worker_jobs_diagnostics.unwrap_or_else(|| json!({}));
-    }
-
-    legacy_diagnostics
-        .or(worker_jobs_diagnostics)
-        .unwrap_or_else(|| json!({}))
-}
-
-fn diagnostics_has_export_seed_scan_resume_state(diagnostics: &Value) -> bool {
-    if diagnostics
-        .get("seed_scan_complete")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    diagnostics
-        .get("seed_scan")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ExportSeedScanState>(value).ok())
-        .is_some()
-}
-
 fn load_export_seed_scan_state(diagnostics: &Value) -> ExportSeedScanState {
     if diagnostics
         .get("seed_scan_complete")
@@ -795,7 +713,7 @@ fn load_export_seed_scan_state(diagnostics: &Value) -> ExportSeedScanState {
 async fn mark_seed_export_items_refs_done(pool: &PgPool, job_id: Uuid) -> anyhow::Result<()> {
     let _ = sqlx::query(
         r"
-        UPDATE lca_package_export_items
+        UPDATE private.lca_package_export_items
         SET refs_done = TRUE,
             updated_at = NOW()
         WHERE job_id = $1
@@ -814,7 +732,7 @@ async fn has_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Result<bool> {
         r"
         SELECT EXISTS (
             SELECT 1
-            FROM lca_package_export_items
+            FROM private.lca_package_export_items
             WHERE job_id = $1
         ) AS exists
         ",
@@ -829,7 +747,7 @@ async fn count_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Result<i64> 
     let row = sqlx::query(
         r"
         SELECT COUNT(*)::bigint AS count
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
         ",
     )
@@ -843,7 +761,7 @@ async fn count_seed_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Result<
     let row = sqlx::query(
         r"
         SELECT COUNT(*)::bigint AS count
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND is_seed = TRUE
         ",
@@ -858,7 +776,7 @@ async fn count_pending_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Resu
     let row = sqlx::query(
         r"
         SELECT COUNT(*)::bigint AS count
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND refs_done = FALSE
         ",
@@ -867,30 +785,6 @@ async fn count_pending_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Resu
     .fetch_one(pool)
     .await?;
     Ok(row.try_get::<i64, _>("count")?)
-}
-
-async fn update_package_job_root_count(
-    pool: &PgPool,
-    job_id: Uuid,
-    root_count: i64,
-) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        r"
-        UPDATE lca_package_jobs
-        SET root_count = $2,
-            updated_at = NOW()
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(root_count.max(0))
-    .execute(pool)
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_undefined_table(&err) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 async fn fetch_scope_root_refs(
@@ -1123,7 +1017,7 @@ async fn insert_export_items(
     let items = deduped.into_values().collect::<Vec<_>>();
     for chunk in items.chunks(EXPORT_ITEM_INSERT_CHUNK_SIZE) {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO lca_package_export_items (job_id, table_name, dataset_id, version, is_seed, refs_done) ",
+            "INSERT INTO private.lca_package_export_items (job_id, table_name, dataset_id, version, is_seed, refs_done) ",
         );
         builder.push_values(chunk, |mut row, item| {
             row.push_bind(job_id)
@@ -1135,8 +1029,8 @@ async fn insert_export_items(
         });
         builder.push(
             " ON CONFLICT (job_id, table_name, dataset_id, version) DO UPDATE \
-              SET is_seed = lca_package_export_items.is_seed OR EXCLUDED.is_seed, \
-                  refs_done = lca_package_export_items.refs_done OR EXCLUDED.refs_done, \
+              SET is_seed = private.lca_package_export_items.is_seed OR EXCLUDED.is_seed, \
+                  refs_done = private.lca_package_export_items.refs_done OR EXCLUDED.refs_done, \
                   updated_at = NOW()",
         );
         builder.build().persistent(false).execute(pool).await?;
@@ -1153,7 +1047,7 @@ async fn fetch_pending_export_items(
     let rows = sqlx::query(
         r"
         SELECT table_name, dataset_id::text AS dataset_id, version
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND refs_done = FALSE
         ORDER BY created_at ASC, table_name ASC, dataset_id ASC, version ASC
@@ -1607,7 +1501,7 @@ async fn filter_missing_reference_targets(
         let rows = sqlx::query(
             r"
             SELECT dataset_id::text AS dataset_id, version
-            FROM lca_package_export_items
+            FROM private.lca_package_export_items
             WHERE job_id = $1
               AND table_name = $2
               AND dataset_id = ANY($3::uuid[])
@@ -1653,7 +1547,7 @@ async fn mark_export_items_refs_done(
     for item in items {
         let _ = sqlx::query(
             r"
-            UPDATE lca_package_export_items
+            UPDATE private.lca_package_export_items
             SET refs_done = TRUE,
                 updated_at = NOW()
             WHERE job_id = $1
@@ -1680,7 +1574,7 @@ async fn list_export_seed_roots(
     let rows = sqlx::query(
         r"
         SELECT table_name, dataset_id::text AS dataset_id, version
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND is_seed = TRUE
         ORDER BY table_name ASC, dataset_id ASC, version ASC
@@ -1709,7 +1603,7 @@ async fn list_seed_export_items_for_cache(
     let rows = sqlx::query(
         r"
         SELECT table_name, dataset_id::text AS dataset_id, version
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND is_seed = TRUE
         ",
@@ -1734,7 +1628,7 @@ async fn list_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Vec<Pa
     let rows = sqlx::query(
         r"
         SELECT table_name, dataset_id::text AS dataset_id, version
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
         ORDER BY table_name ASC, dataset_id ASC, version ASC
         ",
@@ -1755,7 +1649,7 @@ async fn list_non_seed_export_items(
     let rows = sqlx::query(
         r"
         SELECT table_name, dataset_id::text AS dataset_id, version
-        FROM lca_package_export_items
+        FROM private.lca_package_export_items
         WHERE job_id = $1
           AND is_seed = FALSE
         ",
@@ -1771,9 +1665,9 @@ async fn list_non_seed_export_items(
 
 async fn fetch_export_entries_by_items(
     state: &AppState,
-    job_id: Uuid,
-    scope: PackageExportScope,
-    root_count: usize,
+    _job_id: Uuid,
+    _scope: PackageExportScope,
+    _root_count: usize,
     items: &[PackageExportItem],
 ) -> anyhow::Result<Vec<PackageEntry>> {
     let mut entries = Vec::new();
@@ -1788,38 +1682,6 @@ async fn fetch_export_entries_by_items(
             .collect::<Vec<_>>();
         let mut fetched = fetch_rows_by_exact_roots(&state.pool, roots.as_slice()).await?;
         entries.append(&mut fetched);
-    }
-
-    let total_items = i64::try_from(items.len()).unwrap_or(i64::MAX);
-    let diagnostics = export_progress_diagnostics(
-        "finalize_zip",
-        scope,
-        root_count,
-        total_items,
-        total_items,
-        0,
-        json!({
-            "message": "Materializing ZIP package",
-            "fetched_entry_count": entries.len(),
-        }),
-    );
-    let result = sqlx::query(
-        r"
-        UPDATE lca_package_jobs
-        SET status = 'running',
-            diagnostics = $2::jsonb,
-            updated_at = NOW()
-        WHERE id = $1
-        ",
-    )
-    .bind(job_id)
-    .bind(diagnostics)
-    .execute(&state.pool)
-    .await;
-    match result {
-        Ok(_) => {}
-        Err(err) if is_undefined_table(&err) => {}
-        Err(err) => return Err(err.into()),
     }
 
     Ok(sort_entries(entries))
@@ -2523,7 +2385,7 @@ async fn insert_entries(
                 PackageRootTable::Contacts => {
                     sqlx::query(
                         r"
-                        INSERT INTO contacts (id, version, json_ordered, rule_verification, user_id)
+                        INSERT INTO public.contacts (id, version, json_ordered, rule_verification, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)
                         ",
                     )
@@ -2538,7 +2400,7 @@ async fn insert_entries(
                 PackageRootTable::Sources => {
                     sqlx::query(
                         r"
-                        INSERT INTO sources (id, version, json_ordered, rule_verification, user_id)
+                        INSERT INTO public.sources (id, version, json_ordered, rule_verification, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)
                         ",
                     )
@@ -2553,7 +2415,7 @@ async fn insert_entries(
                 PackageRootTable::Unitgroups => {
                     sqlx::query(
                         r"
-                        INSERT INTO unitgroups (id, version, json_ordered, rule_verification, user_id)
+                        INSERT INTO public.unitgroups (id, version, json_ordered, rule_verification, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)
                         ",
                     )
@@ -2568,7 +2430,7 @@ async fn insert_entries(
                 PackageRootTable::Flowproperties => {
                     sqlx::query(
                         r"
-                        INSERT INTO flowproperties (id, version, json_ordered, rule_verification, user_id)
+                        INSERT INTO public.flowproperties (id, version, json_ordered, rule_verification, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)
                         ",
                     )
@@ -2583,7 +2445,7 @@ async fn insert_entries(
                 PackageRootTable::Flows => {
                     sqlx::query(
                         r"
-                        INSERT INTO flows (id, version, json_ordered, rule_verification, user_id)
+                        INSERT INTO public.flows (id, version, json_ordered, rule_verification, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)
                         ",
                     )
@@ -2598,7 +2460,7 @@ async fn insert_entries(
                 PackageRootTable::Lifecyclemodels => {
                     sqlx::query(
                         r"
-                        INSERT INTO lifecyclemodels (id, version, json_ordered, rule_verification, json_tg, user_id)
+                        INSERT INTO public.lifecyclemodels (id, version, json_ordered, rule_verification, json_tg, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6)
                         ",
                     )
@@ -2614,7 +2476,7 @@ async fn insert_entries(
                 PackageRootTable::Processes => {
                     sqlx::query(
                         r"
-                        INSERT INTO processes (id, version, json_ordered, rule_verification, model_id, user_id)
+                        INSERT INTO public.processes (id, version, json_ordered, rule_verification, model_id, user_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5, $6)
                         ",
                     )
@@ -2852,7 +2714,7 @@ async fn fetch_model_processes(
             rule_verification,
             NULL::jsonb AS json_tg,
             model_id::text AS model_id
-        FROM processes
+        FROM public.processes
         WHERE model_id = $1
           AND version = $2
         ",
@@ -2878,7 +2740,7 @@ async fn fetch_model_process_roots(
         SELECT
             id::text AS id,
             version::text AS version
-        FROM processes
+        FROM public.processes
         WHERE model_id = $1
           AND version = $2
         ",
@@ -2921,7 +2783,7 @@ async fn fetch_process_model(
             rule_verification,
             json_tg,
             NULL::text AS model_id
-        FROM lifecyclemodels
+        FROM public.lifecyclemodels
         WHERE id = $1
         ",
     )
@@ -2984,7 +2846,7 @@ async fn fetch_package_artifact(
     let row = sqlx::query(
         r"
         SELECT artifact_kind, status, artifact_url, artifact_format
-        FROM lca_package_artifacts
+        FROM private.lca_package_artifacts
         WHERE id = $1
         ",
     )
@@ -3879,7 +3741,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM contacts
+            FROM public.contacts
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3892,7 +3754,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM sources
+            FROM public.sources
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3905,7 +3767,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM unitgroups
+            FROM public.unitgroups
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3918,7 +3780,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flowproperties
+            FROM public.flowproperties
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3931,7 +3793,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flows
+            FROM public.flows
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3944,7 +3806,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 model_id::text AS model_id
-            FROM processes
+            FROM public.processes
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3957,7 +3819,7 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 json_tg,
                 NULL::text AS model_id
-            FROM lifecyclemodels
+            FROM public.lifecyclemodels
             WHERE id = ANY($1::uuid[])
             "
         }
@@ -3981,7 +3843,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 NULL::text AS model_id
-            FROM contacts
+            FROM public.contacts
             "#
         }
         PackageRootTable::Sources => {
@@ -3998,7 +3860,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 NULL::text AS model_id
-            FROM sources
+            FROM public.sources
             "#
         }
         PackageRootTable::Unitgroups => {
@@ -4015,7 +3877,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 NULL::text AS model_id
-            FROM unitgroups
+            FROM public.unitgroups
             "#
         }
         PackageRootTable::Flowproperties => {
@@ -4032,7 +3894,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 NULL::text AS model_id
-            FROM flowproperties
+            FROM public.flowproperties
             "#
         }
         PackageRootTable::Flows => {
@@ -4049,7 +3911,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 NULL::text AS model_id
-            FROM flows
+            FROM public.flows
             "#
         }
         PackageRootTable::Processes => {
@@ -4066,7 +3928,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 '[]'::jsonb AS submodels,
                 model_id::text AS model_id
-            FROM processes
+            FROM public.processes
             "#
         }
         PackageRootTable::Lifecyclemodels => {
@@ -4083,7 +3945,7 @@ fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
                 ) AS ref_candidates,
                 COALESCE((json_tg::jsonb)->'submodels', '[]'::jsonb) AS submodels,
                 NULL::text AS model_id
-            FROM lifecyclemodels
+            FROM public.lifecyclemodels
             "#
         }
     }
@@ -4101,7 +3963,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM contacts
+            FROM public.contacts
             WHERE user_id = $1
             "
         }
@@ -4114,7 +3976,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM sources
+            FROM public.sources
             WHERE user_id = $1
             "
         }
@@ -4127,7 +3989,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM unitgroups
+            FROM public.unitgroups
             WHERE user_id = $1
             "
         }
@@ -4140,7 +4002,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flowproperties
+            FROM public.flowproperties
             WHERE user_id = $1
             "
         }
@@ -4153,7 +4015,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flows
+            FROM public.flows
             WHERE user_id = $1
             "
         }
@@ -4166,7 +4028,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 model_id::text AS model_id
-            FROM processes
+            FROM public.processes
             WHERE user_id = $1
             "
         }
@@ -4179,7 +4041,7 @@ fn select_by_user_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 json_tg,
                 NULL::text AS model_id
-            FROM lifecyclemodels
+            FROM public.lifecyclemodels
             WHERE user_id = $1
             "
         }
@@ -4198,7 +4060,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM contacts
+            FROM public.contacts
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4211,7 +4073,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM sources
+            FROM public.sources
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4224,7 +4086,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM unitgroups
+            FROM public.unitgroups
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4237,7 +4099,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flowproperties
+            FROM public.flowproperties
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4250,7 +4112,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 NULL::text AS model_id
-            FROM flows
+            FROM public.flows
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4263,7 +4125,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 NULL::jsonb AS json_tg,
                 model_id::text AS model_id
-            FROM processes
+            FROM public.processes
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4276,7 +4138,7 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
                 rule_verification,
                 json_tg,
                 NULL::text AS model_id
-            FROM lifecyclemodels
+            FROM public.lifecyclemodels
             WHERE state_code = ANY($1::int[])
             "
         }
@@ -4286,25 +4148,25 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
 fn conflict_select_sql(table: PackageRootTable) -> &'static str {
     match table {
         PackageRootTable::Contacts => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM contacts WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.contacts WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Sources => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM sources WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.sources WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Unitgroups => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM unitgroups WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.unitgroups WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Flowproperties => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flowproperties WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.flowproperties WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Flows => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flows WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.flows WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Processes => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM processes WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.processes WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Lifecyclemodels => {
-            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM lifecyclemodels WHERE id = ANY($1::uuid[])"
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM public.lifecyclemodels WHERE id = ANY($1::uuid[])"
         }
     }
 }
@@ -4408,7 +4270,7 @@ mod tests {
         partition_conflicts_from_rows, plan_reference_resolution, preflight_import_validation,
         remember_root_in_traversal_cache, report_from_validation_failure,
         resolve_exact_or_latest_roots, resolve_referenced_entries_from_rows,
-        select_package_job_diagnostics_for_resume, store_runtime_export_traversal_cache,
+        store_runtime_export_traversal_cache,
     };
     use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
 
@@ -4876,7 +4738,7 @@ mod tests {
     }
 
     #[test]
-    fn package_diagnostics_falls_back_to_worker_jobs_seed_scan_when_legacy_missing() {
+    fn worker_jobs_diagnostics_preserve_seed_scan_resume_state() {
         let last_id = Uuid::from_u128(16);
         let worker_jobs_diagnostics = json!({
             "phase": "export_package",
@@ -4892,9 +4754,7 @@ mod tests {
             }
         });
 
-        let selected =
-            select_package_job_diagnostics_for_resume(None, Some(worker_jobs_diagnostics));
-        let state = super::load_export_seed_scan_state(&selected);
+        let state = super::load_export_seed_scan_state(&worker_jobs_diagnostics);
 
         assert_eq!(state.table_index, 2);
         assert_eq!(state.last_id, Some(last_id));

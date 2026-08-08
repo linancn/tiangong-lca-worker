@@ -198,11 +198,11 @@ def resolve_target_result(
               r.snapshot_id::text AS snapshot_id,
               r.artifact_url AS result_artifact_url,
               r.artifact_format AS result_artifact_format,
-              j.job_type AS job_type,
+              substring(j.job_kind from 5) AS job_type,
               to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                 AS result_created_at_utc
-            FROM public.lca_results r
-            JOIN public.lca_jobs j ON j.id = r.job_id
+            FROM private.lca_results r
+            JOIN private.worker_jobs j ON j.id = r.worker_job_id
             WHERE r.id = %s::uuid
             LIMIT 1
             """,
@@ -216,13 +216,13 @@ def resolve_target_result(
               r.snapshot_id::text AS snapshot_id,
               r.artifact_url AS result_artifact_url,
               r.artifact_format AS result_artifact_format,
-              j.job_type AS job_type,
+              substring(j.job_kind from 5) AS job_type,
               to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                 AS result_created_at_utc
-            FROM public.lca_results r
-            JOIN public.lca_jobs j ON j.id = r.job_id
+            FROM private.lca_results r
+            JOIN private.worker_jobs j ON j.id = r.worker_job_id
             WHERE r.snapshot_id = %s::uuid
-              AND j.job_type = 'solve_all_unit'
+              AND substring(j.job_kind from 5) = 'solve_all_unit'
             ORDER BY r.created_at DESC
             LIMIT 1
             """,
@@ -236,12 +236,12 @@ def resolve_target_result(
               r.snapshot_id::text AS snapshot_id,
               r.artifact_url AS result_artifact_url,
               r.artifact_format AS result_artifact_format,
-              j.job_type AS job_type,
+              substring(j.job_kind from 5) AS job_type,
               to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                 AS result_created_at_utc
-            FROM public.lca_results r
-            JOIN public.lca_jobs j ON j.id = r.job_id
-            WHERE j.job_type = 'solve_all_unit'
+            FROM private.lca_results r
+            JOIN private.worker_jobs j ON j.id = r.worker_job_id
+            WHERE substring(j.job_kind from 5) = 'solve_all_unit'
             ORDER BY r.created_at DESC
             LIMIT 1
             """
@@ -276,7 +276,7 @@ def fetch_snapshot_artifact_url(conn: psycopg.Connection[Any], snapshot_id: str)
     row = conn.execute(
         """
         SELECT artifact_url
-        FROM public.lca_snapshot_artifacts
+        FROM private.lca_snapshot_artifacts
         WHERE snapshot_id = %s::uuid
           AND status = 'ready'
         ORDER BY created_at DESC
