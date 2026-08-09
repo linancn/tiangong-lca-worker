@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-07
-lastReviewedCommit: 4ad69a90a943da4b758182f2576e6e86018a0c95
-lastReviewedNote: "Reviewed for Worker Issue #223: Review/release/source projections do not change signed-flow routing or provider selection."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedNote: "Reviewed for Worker PR #225: schema cutover and scope-closure transport changes do not alter signed-flow routing or provider-selection semantics."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -162,7 +162,7 @@ Allocation fraction 与 routing weight 不可混用：前者改变 residual magn
 
 Snapshot/release/readiness 至少保留：flow UUID/version/reference unit、flow space/source type、raw direction/amount/coefficient、normalized reference/residual coefficient、候选 eligibility、routing strategy/weight、activity requirement、closure residual、boundary policy 和 unresolved reason。
 
-Build identity 使用 `tidas-reference-allocation-v3`、`signed-flow-balance-v1`、`exact-flow-version-reference-unit-v2` 和 `selected-lcia-factor-flow-support-v1`。Exact Flow identity 是 `(UUID, resolved version)`；只把最终 Process closure exchange 实际引用的 revisions 编译进矩阵和 provider routing。Selected LCIA-factor-only Elementary Flow 只进入 frozen source closure，不参与 implicit mix。Coverage 为 `snapshot_coverage.v3`；readiness input/report 为 v2；calculation bundle 为 v2。
+Build identity 使用 `tidas-reference-allocation-v3`、`signed-flow-balance-v1`、`exact-flow-version-reference-unit-v2` 和 `selected-lcia-factor-flow-support-v1`。Exact Flow identity 是 `(UUID, resolved version)`；只把最终 Process closure exchange 实际引用的 revisions 编译进矩阵和 provider routing。LCIA factor 只有与 biosphere/C axis 相交时才成为数值 source-closure 依赖；无论是否 active，都不参与 implicit mix 或 technosphere routing。Coverage 为 `snapshot_coverage.v3`；readiness input/report 为 v2；calculation bundle 为 v2。
 
 ## 限制
 

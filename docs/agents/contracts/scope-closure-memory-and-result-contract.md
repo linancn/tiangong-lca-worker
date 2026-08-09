@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-08
-lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
-lastReviewedNote: "Updated for Worker Issue #223: numerical release metadata and immutable source documents have separate file-backed artifacts without an encoding-time document clone."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedNote: "Reviewed for Worker PR #225: schema cutover preserves the current bounded, file-backed scope-closure result and memory contract."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -48,9 +48,10 @@ related:
 - exact-reference, missing-reference, frozen-release, and source-drift issues;
 - process-provider and provider-universe issues;
 - requested-scope and reference-graph issues;
-- matrix construction, signed-flow/provider, factorization, and LCIA-readiness blockers.
+- matrix construction, signed-flow/provider, factorization, and LCIA-readiness blockers;
+- typed snapshot source-preflight blockers from discovery or the final numerical build preflight.
 
-Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Its stable semantic fields are `issueKey`, `source`, `code`, `path`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and a bounded sample of occurrences and affected roots. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and XLSX views are bounded projections and are never completeness authorities.
+Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Snapshot source blockers coalesce by error code plus requested target identity (or raw malformed-target fingerprint plus extraction code); source/path/role remain occurrence evidence. A multi-source grouped issue omits a misleading single top-level source/path. Stable semantic fields include `issueKey`, `code`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and bounded occurrence/root samples; source/path remain present for single-source issues. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and general XLSX views are bounded projections and are never completeness authorities. The exception is the dedicated snapshot-blocker worksheets: they stream every record from the verified canonical NDJSON sidecar and split instead of truncating.
 
 Issue identity and order are deterministic:
 
@@ -65,7 +66,7 @@ The raw TIDAS issue-event NDJSON is preserved exactly once as `tidas/issues.ndjs
 
 Production must not materialize or publish the Cartesian physical relation `issue × affected root × full witness path`.
 
-Root impact uses stable zero-based root ordinals and `lcia.scope-closure-root-impact-index.v1`. A source-level impact record is written once and referenced by every issue from that source. Source-less issues use an issue-level impact record only when an explicit partial root set is required. Each impact has one explicit mode:
+Root impact uses stable zero-based root ordinals and `lcia.scope-closure-root-impact-index.v1`. Records are issue-level and globally ordered by issue key. For a grouped issue, Worker walks source occurrences in stable order, computes one source reachability window at a time, and ORs those results into one current-issue root bitset. Each impact has one explicit mode:
 
 - `none`;
 - `allRoots`;
@@ -104,8 +105,10 @@ Next and Edge continue to expose the existing XLSX and manifest download selecto
 The implementation is window-bounded rather than relation-cardinality-bounded:
 
 - raw TIDAS events retain their existing 2 GiB and 5,000,000-event validation-input caps;
-- issue coalescing uses bounded external sort runs and one current coalesced issue;
-- reverse reachability keeps one source's compact visited/parent/ordinal state at a time and is reused for adjacent issues with the same source;
+- snapshot builder stdout retains at most 16 blocker samples; the full set is written to a parent-owned canonical NDJSON sidecar, bound by count/size/SHA-256/completeness metadata under the unchanged terminal V1 schema, verified before conversion, streamed into sorted issue runs and XLSX, and removed with its owning temporary file on every exit path;
+- successful snapshot discovery writes the complete `processAxis` and only the readiness fields consumed by Scope Closure (`schema_version`, `status`, `next_action`, and `blockers`) to one parent-owned bounded JSON file; captured stdout contains only a small terminal V1 size/SHA-256 descriptor, and the parent verifies the file before parsing and removes it on every exit path;
+- issue coalescing uses bounded external sort runs ordered by issue/source/occurrence and one current coalesced issue;
+- reverse reachability keeps one source's compact visited/parent/ordinal state plus one current-issue root bitset; it never retains the issue-by-source or issue-by-root Cartesian relation;
 - one active issue partition writer, root-impact writer, frozen-graph writer, and TIDAS compression buffer is retained per stage;
 - residual sort records contain the compact issue key and coalesced record, not repeated affected-root identities or JSON witness paths;
 - temporary-space admission uses observed input and measured intermediate bytes plus the configured reserve, never `issue count × global root count`.

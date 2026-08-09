@@ -851,6 +851,7 @@ fn snapshot_builder_blocked_outcome(
         blocking_reason_count,
         blocking_reasons_sha256,
         blocking_reasons_truncated,
+        ..
     }) = error.downcast_ref::<db::SnapshotBuilderProcessFailure>()
     else {
         return None;
@@ -1529,6 +1530,7 @@ mod tests {
             blocking_reason_count: 1,
             blocking_reasons_sha256: "a".repeat(64),
             blocking_reasons_truncated: false,
+            blocking_reasons_spool: None,
         })
         .context("failed to build review-submit gate snapshot");
         let outcome = super::snapshot_builder_blocked_outcome(&run, &error).expect("typed blocker");

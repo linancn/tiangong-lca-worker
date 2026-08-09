@@ -27,13 +27,14 @@ use crate::{
     calculation_evidence::RELEASE_METHOD_IDENTITIES,
     db::{
         AppState, ScopeClosureSnapshotBuilderArgs, ScopeClosureSnapshotBuilderMode,
-        ScopeClosureSnapshotFacts, fetch_scope_closure_snapshot_facts,
+        ScopeClosureSnapshotFacts, SnapshotBuilderBlockingReasonsSpool,
+        SnapshotBuilderProcessFailure, fetch_scope_closure_snapshot_facts,
         run_scope_closure_snapshot_builder, scope_closure_evidence_hash,
     },
     file_cache::{advise_sequential_access, release_file_cache},
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
-    readiness::{MatrixReadinessReport, ReadinessStatus},
+    readiness::{ReadinessFinding, ReadinessStatus},
     resource::{CancellationToken, ResourceCounters, ResourceMeasurement},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
@@ -78,7 +79,6 @@ const XLSX_OCCURRENCE_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_MAX_WORKSHEET_ROWS: usize = 1_048_576;
 const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
@@ -1901,7 +1901,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
                 }
                 continue;
             };
-            let extraction = extract_references(
+            let extraction = extract_scope_closure_references(
                 document.identity.document_key().as_str(),
                 document.identity.category,
                 &document.payload,
@@ -2288,6 +2288,24 @@ pub fn extract_references(
     category: DatasetCategory,
     payload: &Value,
 ) -> ReferenceExtractionResult {
+    extract_references_with_profile(document_key, category, payload, true)
+}
+
+#[must_use]
+pub fn extract_scope_closure_references(
+    document_key: &str,
+    category: DatasetCategory,
+    payload: &Value,
+) -> ReferenceExtractionResult {
+    extract_references_with_profile(document_key, category, payload, false)
+}
+
+fn extract_references_with_profile(
+    document_key: &str,
+    category: DatasetCategory,
+    payload: &Value,
+    include_process_lcia_results: bool,
+) -> ReferenceExtractionResult {
     let mut result = ReferenceExtractionResult {
         schema_version: "tidas.reference-extraction-result.v1".to_owned(),
         document_key: document_key.to_owned(),
@@ -2295,7 +2313,14 @@ pub fn extract_references(
         edges: Vec::new(),
         issues: Vec::new(),
     };
-    walk_references(payload, "$", None, category, &mut result);
+    walk_references(
+        payload,
+        "$",
+        None,
+        category,
+        include_process_lcia_results,
+        &mut result,
+    );
     result
 }
 
@@ -2304,8 +2329,15 @@ fn walk_references(
     path: &str,
     parent_key: Option<&str>,
     source_category: DatasetCategory,
+    include_process_lcia_results: bool,
     result: &mut ReferenceExtractionResult,
 ) {
+    if !include_process_lcia_results
+        && source_category == DatasetCategory::Processes
+        && path.eq_ignore_ascii_case("$.processDataSet.LCIAResults")
+    {
+        return;
+    }
     match node {
         Value::Object(object) => {
             if looks_like_reference(object, parent_key) {
@@ -2317,6 +2349,7 @@ fn walk_references(
                     format!("{path}.{key}").as_str(),
                     Some(key),
                     source_category,
+                    include_process_lcia_results,
                     result,
                 );
             }
@@ -2328,6 +2361,7 @@ fn walk_references(
                     format!("{path}[{index}]").as_str(),
                     parent_key,
                     source_category,
+                    include_process_lcia_results,
                     result,
                 );
             }
@@ -3867,7 +3901,15 @@ struct ScopeClosureDiscoveredProcess {
 struct ScopeClosureSnapshotDiscovery {
     schema_version: String,
     process_axis: Vec<ScopeClosureDiscoveredProcess>,
-    readiness: MatrixReadinessReport,
+    readiness: ScopeClosureSnapshotReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ScopeClosureSnapshotReadiness {
+    schema_version: String,
+    status: ReadinessStatus,
+    next_action: String,
+    blockers: Vec<ReadinessFinding>,
 }
 
 async fn scan_and_validate_scope<P: ScopeClosureProvider>(
@@ -4323,7 +4365,7 @@ fn add_process_axis_drift_issue(
 
 fn merge_matrix_readiness_blockers(
     scan: &mut ScopeClosureScan,
-    readiness: &MatrixReadinessReport,
+    readiness: &ScopeClosureSnapshotReadiness,
 ) -> anyhow::Result<()> {
     if readiness.status == ReadinessStatus::Passed && readiness.blockers.is_empty() {
         return Ok(());
@@ -4596,6 +4638,7 @@ pub async fn execute_scope_closure_job(
     let mut effective_scope =
         build_effective_scope_manifest(&input.requested_scope, &scan.documents);
     let mut frozen_process_axis = scope_process_axis(&effective_scope);
+    let mut snapshot_blocking_reasons = None::<SnapshotBuilderBlockingReasonsSpool>;
 
     if closure_scan_allows_numerical_snapshot(&scan) {
         let input_for_administrative_bundle = input.clone();
@@ -4608,7 +4651,7 @@ pub async fn execute_scope_closure_job(
                 &scan,
                 &resolution_map,
             )?;
-            Ok::<_, anyhow::Error>(bundle.sha256)
+            Ok::<_, anyhow::Error>((bundle.sha256, scan, validation))
         });
         tokio::pin!(prepare_administrative_bundle);
         let mut administrative_bundle_heartbeat =
@@ -4616,7 +4659,7 @@ pub async fn execute_scope_closure_job(
         administrative_bundle_heartbeat
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         administrative_bundle_heartbeat.tick().await;
-        let administrative_bundle_hash = loop {
+        let (administrative_bundle_hash, returned_scan, returned_validation) = loop {
             tokio::select! {
                 result = &mut prepare_administrative_bundle => {
                     break result??;
@@ -4635,6 +4678,8 @@ pub async fn execute_scope_closure_job(
                 }
             }
         };
+        scan = returned_scan;
+        validation = returned_validation;
         let discovery_binding = scope_closure_snapshot_binding(
             &state.pool,
             &effective_scope,
@@ -4666,18 +4711,111 @@ pub async fn execute_scope_closure_job(
                 data_snapshot: input.data_snapshot_manifest.clone(),
             },
         )
-        .await?;
-        let discovery = parse_scope_closure_snapshot_discovery(
-            discovery_execution.scope_closure_discovery.as_ref(),
-        )?;
-        let final_requested_scope =
-            freeze_discovered_process_axis(&input.requested_scope, &discovery.process_axis)?;
-        frozen_process_axis = scope_process_axis(&final_requested_scope);
+        .await;
+        match discovery_execution {
+            Ok(discovery_execution) => {
+                let discovery = parse_scope_closure_snapshot_discovery(
+                    discovery_execution.scope_closure_discovery.as_ref(),
+                )?;
+                let final_requested_scope = freeze_discovered_process_axis(
+                    &input.requested_scope,
+                    &discovery.process_axis,
+                )?;
+                frozen_process_axis = scope_process_axis(&final_requested_scope);
 
+                progress
+                    .heartbeat(
+                        "scan_discovered_provider_processes",
+                        0.79,
+                        Some(json!({
+                            "closureCheckId": closure_check_id,
+                            "progressCounters": {
+                                "scanned": 0,
+                                "total": frozen_process_axis.len(),
+                                "unit": "frozenProcessAxis"
+                            },
+                        })),
+                    )
+                    .await?;
+                (scan, validation) = scan_and_validate_scope_with_heartbeat(
+                    &provider,
+                    &state.pool,
+                    worker_job_id,
+                    &final_requested_scope,
+                    &progress,
+                    closure_check_id,
+                    lease_seconds,
+                )
+                .await?;
+                effective_scope =
+                    build_effective_scope_manifest(&final_requested_scope, &scan.documents);
+                add_process_axis_drift_issue(
+                    &mut scan,
+                    frozen_process_axis.as_slice(),
+                    &effective_scope,
+                )?;
+                merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
+                scan.issues
+                    .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+            }
+            Err(error) => {
+                snapshot_blocking_reasons = Some(snapshot_builder_blocking_reasons(error)?);
+            }
+        }
+    }
+
+    let mut prebuilt_numerical_snapshot = None::<(ScopeClosureSnapshotBinding, Uuid, String)>;
+    if snapshot_blocking_reasons.is_none()
+        && validation.issue_events.event_count == 0
+        && closure_scan_allows_numerical_snapshot(&scan)
+    {
+        let input_for_prebuild_bundle = input.clone();
+        let prepare_prebuild_bundle = tokio::task::spawn_blocking(move || {
+            let resolution_map =
+                build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
+            let bundle = build_closure_bundle(
+                &input_for_prebuild_bundle,
+                &validation,
+                &scan,
+                &resolution_map,
+            )?;
+            Ok::<_, anyhow::Error>((bundle.sha256, scan, validation))
+        });
+        tokio::pin!(prepare_prebuild_bundle);
+        let mut prebuild_bundle_heartbeat =
+            tokio::time::interval(lease_heartbeat_period(lease_seconds));
+        prebuild_bundle_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        prebuild_bundle_heartbeat.tick().await;
+        let (prebuild_bundle_hash, returned_scan, returned_validation) = loop {
+            tokio::select! {
+                result = &mut prepare_prebuild_bundle => break result??,
+                _ = prebuild_bundle_heartbeat.tick() => {
+                    progress
+                        .heartbeat(
+                            "prepare_bound_numerical_snapshot",
+                            0.8,
+                            Some(json!({
+                                "closureCheckId": closure_check_id,
+                                "longRunningOperation": true,
+                            })),
+                        )
+                        .await?;
+                }
+            }
+        };
+        scan = returned_scan;
+        validation = returned_validation;
+        let binding = scope_closure_snapshot_binding(
+            &state.pool,
+            &effective_scope,
+            input.data_snapshot_token.as_str(),
+            prebuild_bundle_hash.as_str(),
+        )
+        .await?;
         progress
             .heartbeat(
-                "scan_discovered_provider_processes",
-                0.79,
+                "build_bound_numerical_snapshot",
+                0.81,
                 Some(json!({
                     "closureCheckId": closure_check_id,
                     "progressCounters": {
@@ -4688,21 +4826,30 @@ pub async fn execute_scope_closure_job(
                 })),
             )
             .await?;
-        (scan, validation) = scan_and_validate_scope_with_heartbeat(
-            &provider,
-            &state.pool,
-            worker_job_id,
-            &final_requested_scope,
-            &progress,
-            closure_check_id,
-            lease_seconds,
+        match run_scope_closure_snapshot_builder(
+            state,
+            input.numerical_snapshot_id,
+            frozen_process_axis.as_slice(),
+            &ScopeClosureSnapshotBuilderArgs {
+                mode: ScopeClosureSnapshotBuilderMode::Build,
+                binding: serde_json::to_value(&binding)?,
+                data_snapshot: input.data_snapshot_manifest.clone(),
+            },
         )
-        .await?;
-        effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
-        add_process_axis_drift_issue(&mut scan, frozen_process_axis.as_slice(), &effective_scope)?;
-        merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
-        scan.issues
-            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+        .await
+        {
+            Ok(built) => {
+                ensure_preallocated_snapshot_identity(
+                    input.numerical_snapshot_id,
+                    built.resolved_snapshot_id,
+                )?;
+                prebuilt_numerical_snapshot =
+                    Some((binding, built.resolved_snapshot_id, prebuild_bundle_hash));
+            }
+            Err(error) => {
+                snapshot_blocking_reasons = Some(snapshot_builder_blocking_reasons(error)?);
+            }
+        }
     }
 
     let input_for_artifacts = input.clone();
@@ -4714,6 +4861,7 @@ pub async fn execute_scope_closure_job(
         build_issue_relation_spools_with_cancellation_and_progress(
             &mut scan,
             &validation.issue_events,
+            snapshot_blocking_reasons.as_ref(),
             &blocking_cancellation,
             Some(&blocking_progress),
         )?;
@@ -4733,6 +4881,7 @@ pub async fn execute_scope_closure_job(
             &scan,
             &validation,
             &resolution_map,
+            snapshot_blocking_reasons.as_ref(),
             &blocking_cancellation,
             Some(&blocking_progress),
         )?;
@@ -4857,45 +5006,18 @@ pub async fn execute_scope_closure_job(
         "incomplete"
     };
     let (evidence, snapshot_artifact_id) = if status == "passed" {
-        progress
-            .heartbeat(
-                "build_bound_numerical_snapshot",
-                0.9,
-                Some(json!({
-                    "closureCheckId": closure_check_id,
-                    "progressCounters": {
-                        "scanned": 0,
-                        "total": frozen_process_axis.len(),
-                        "unit": "frozenProcessAxis"
-                    },
-                })),
-            )
-            .await?;
-        let binding = scope_closure_snapshot_binding(
-            &state.pool,
-            &effective_scope,
-            input.data_snapshot_token.as_str(),
-            closure_bundle_hash.as_str(),
-        )
-        .await?;
-        let built = run_scope_closure_snapshot_builder(
-            state,
-            input.numerical_snapshot_id,
-            frozen_process_axis.as_slice(),
-            &ScopeClosureSnapshotBuilderArgs {
-                mode: ScopeClosureSnapshotBuilderMode::Build,
-                binding: serde_json::to_value(&binding)?,
-                data_snapshot: input.data_snapshot_manifest.clone(),
-            },
-        )
-        .await?;
-        ensure_preallocated_snapshot_identity(
-            input.numerical_snapshot_id,
-            built.resolved_snapshot_id,
-        )?;
+        let (binding, resolved_snapshot_id, prebuild_bundle_hash) = prebuilt_numerical_snapshot
+            .ok_or_else(|| {
+                anyhow::anyhow!("passed scope closure omitted prebuilt numerical snapshot")
+            })?;
+        if prebuild_bundle_hash != closure_bundle_hash {
+            return Err(anyhow::anyhow!(
+                "scope_closure_bundle_hash_drift: prebuild={prebuild_bundle_hash} final={closure_bundle_hash}"
+            ));
+        }
         let facts = fetch_scope_closure_snapshot_facts(
             state,
-            built.resolved_snapshot_id,
+            resolved_snapshot_id,
             &binding,
             frozen_process_axis.as_slice(),
         )
@@ -6439,17 +6561,20 @@ fn prepare_closure_content_artifacts(
         scan,
         validation,
         resolution_map,
+        None,
         &CancellationToken::default(),
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_closure_content_artifacts_with_cancellation(
     closure_bundle: ClosureBundleFile,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
     resolution_map: &JsonlValueSpool,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
@@ -6461,7 +6586,12 @@ fn prepare_closure_content_artifacts_with_cancellation(
     } = closure_bundle;
     cancellation.check("scope_closure_xlsx_report")?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
-    build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
+    build_scan_xlsx_report_file(
+        &xlsx_path,
+        closure_check_id,
+        scan,
+        snapshot_blocking_reasons,
+    )?;
 
     let mut artifacts = vec![
         PreparedArtifact {
@@ -8090,6 +8220,116 @@ fn tidas_event_issue(
     })
 }
 
+fn snapshot_builder_blocking_reasons(
+    error: anyhow::Error,
+) -> anyhow::Result<SnapshotBuilderBlockingReasonsSpool> {
+    match error.downcast::<SnapshotBuilderProcessFailure>() {
+        Ok(SnapshotBuilderProcessFailure::Blocked {
+            blocking_reasons_spool: Some(spool),
+            ..
+        }) => Ok(spool),
+        Ok(SnapshotBuilderProcessFailure::Blocked { .. }) => Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_file_missing"
+        )),
+        Ok(failure) => Err(anyhow::Error::new(failure)),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_snapshot_source_identity(raw: &str) -> Option<ExactDatasetIdentity> {
+    let (dataset_type, identity) = raw.split_once(':')?;
+    let (id, version) = identity.rsplit_once('@')?;
+    Some(ExactDatasetIdentity {
+        category: DatasetCategory::from_uri(dataset_type)?,
+        id: Uuid::parse_str(id).ok()?,
+        version: version.to_owned(),
+    })
+}
+
+fn snapshot_blocking_reason_issue(reason: Value) -> anyhow::Result<ClosureIssue> {
+    let issue_code = reason
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("source_reference_invalid")
+        .to_owned();
+    let source = reason
+        .get("sourceIdentity")
+        .and_then(Value::as_str)
+        .and_then(parse_snapshot_source_identity);
+    let json_path = reason
+        .get("jsonPath")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reference_role = reason
+        .get("referenceRole")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let requested_target_type = reason
+        .get("targetType")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let raw_target_id = reason
+        .get("targetId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            reason
+                .get("details")
+                .and_then(|details| details.get("raw_ref_object_id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned);
+    let requested_target_id = reason
+        .get("targetId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let requested_target_version = reason
+        .get("targetVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let message = reason
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Snapshot source dependency is invalid or unavailable.")
+        .to_owned();
+    let issue_key = canonical_json_sha256(&json!({
+        "code": issue_code,
+        "targetType": requested_target_type,
+        "targetId": raw_target_id,
+        "targetVersion": requested_target_version,
+        "extractionIssueCode": reason.get("extractionIssueCode"),
+    }))?;
+    let occurrence_key = canonical_json_sha256(&reason)?;
+    Ok(ClosureIssue {
+        issue_key,
+        severity: "blocker".to_owned(),
+        blocking: true,
+        issue_code,
+        source: source.clone(),
+        json_path: json_path.clone(),
+        reference_role: reference_role.clone(),
+        requested_target_type,
+        requested_target_id,
+        requested_target_version,
+        message,
+        suggested_action: Some(
+            "Repair the invalid or unavailable source dependency and rerun closure preflight."
+                .to_owned(),
+        ),
+        occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key,
+            source,
+            json_path,
+            reference_role,
+            details: reason,
+        }],
+        affected_root_count: 0,
+        affected_roots: Vec::new(),
+        affected_root_witness_paths: Vec::new(),
+        witness_path: Vec::new(),
+    })
+}
+
 fn issue_source_sort_key(source: Option<&ExactDatasetIdentity>) -> anyhow::Result<String> {
     source.map_or_else(|| Ok(String::new()), canonical_json_sha256)
 }
@@ -8103,8 +8343,8 @@ fn append_issue_merge_records(
     issue.occurrence_count = 0;
     if occurrences.is_empty() {
         writer.append(&json!([
-            source_key,
             issue.issue_key,
+            source_key,
             "",
             issue,
             Value::Null
@@ -8113,8 +8353,8 @@ fn append_issue_merge_records(
     }
     for occurrence in occurrences {
         writer.append(&json!([
-            source_key,
             issue.issue_key,
+            source_key,
             occurrence.occurrence_key,
             issue,
             occurrence
@@ -8148,7 +8388,7 @@ fn issue_merge_record(
     }
     let issue = serde_json::from_value(fields.pop().expect("field count checked"))?;
     let source_key = fields
-        .first()
+        .get(1)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("issue merge record source key must be text"))?
         .to_owned();
@@ -8157,6 +8397,10 @@ fn issue_merge_record(
 
 struct CoalescedIssueState {
     source_key: String,
+    last_source_key: String,
+    source_count: u64,
+    root_union: Vec<bool>,
+    root_witnesses: BTreeMap<u32, Vec<ExactDatasetIdentity>>,
     issue: ClosureIssue,
     last_occurrence_key: Option<String>,
 }
@@ -8166,10 +8410,81 @@ impl CoalescedIssueState {
         issue.occurrence_count = 0;
         issue.occurrences.clear();
         Self {
-            source_key,
+            source_key: source_key.clone(),
+            last_source_key: source_key,
+            source_count: 0,
+            root_union: Vec::new(),
+            root_witnesses: BTreeMap::new(),
             issue,
             last_occurrence_key: None,
         }
+    }
+
+    fn observe_source(
+        &mut self,
+        source_key: &str,
+        source: Option<&ExactDatasetIdentity>,
+        reachability: &mut SourceReachability,
+        graph: &CompactReferenceGraph,
+        roots: &StableRootOrdinals,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        if self.source_count == 0 {
+            self.source_count = 1;
+            source_key.clone_into(&mut self.last_source_key);
+            return Ok(());
+        }
+        if self.last_source_key == source_key {
+            return Ok(());
+        }
+        if self.source_count == 1 {
+            load_source_reachability(
+                reachability,
+                &self.source_key,
+                self.issue.source.as_ref(),
+                graph,
+                roots,
+                cancellation,
+            )?;
+            self.merge_reachability(reachability, graph, roots)?;
+        }
+        source_key.clone_into(&mut self.last_source_key);
+        self.source_count = self.source_count.saturating_add(1);
+        load_source_reachability(reachability, source_key, source, graph, roots, cancellation)?;
+        self.merge_reachability(reachability, graph, roots)?;
+        self.issue.source = None;
+        self.issue.json_path = None;
+        self.issue.reference_role = None;
+        Ok(())
+    }
+
+    fn merge_reachability(
+        &mut self,
+        reachability: &SourceReachability,
+        graph: &CompactReferenceGraph,
+        roots: &StableRootOrdinals,
+    ) -> anyhow::Result<()> {
+        if self.root_union.is_empty() {
+            self.root_union.resize(roots.roots.len(), false);
+        }
+        for &root_ordinal in &reachability.affected_root_ordinals {
+            let root_index = usize::try_from(root_ordinal)?;
+            self.root_union[root_index] = true;
+            if self.root_witnesses.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT
+                && !self.root_witnesses.contains_key(&root_ordinal)
+            {
+                let root_node_ordinal = roots.graph_node_ordinals[root_index];
+                self.root_witnesses.insert(
+                    root_ordinal,
+                    reconstruct_witness_path(
+                        root_node_ordinal,
+                        &reachability.parent,
+                        &graph.identities,
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn push_occurrence(
@@ -8276,33 +8591,56 @@ fn finalize_coalesced_issue(
     cancellation: &CancellationToken,
     relation_stats: &mut IssueRelationStats,
 ) -> anyhow::Result<()> {
-    let changed_source = load_source_reachability(
-        reachability,
-        &pending.source_key,
-        pending.issue.source.as_ref(),
-        graph,
-        roots,
-        cancellation,
-    )?;
-    let root_impact = if pending.issue.source.is_some() {
-        let impact_key = format!("source:{}", pending.source_key);
+    let root_impact = if pending.source_count <= 1 && pending.issue.source.is_some() {
+        load_source_reachability(
+            reachability,
+            &pending.source_key,
+            pending.issue.source.as_ref(),
+            graph,
+            roots,
+            cancellation,
+        )?;
+        let impact_key = format!("issue:{}", pending.issue.issue_key);
         let mode = reachability
             .impact_mode
             .ok_or_else(|| anyhow::anyhow!("source impact omitted compact encoding"))?;
-        if changed_source {
-            root_impact_writer.append(
-                &impact_key,
-                1,
-                reachability.source_node_ordinal,
-                mode,
-                u32::try_from(reachability.affected_root_ordinals.len())?,
-                &reachability.encoded_ordinals,
-            )?;
-        }
+        root_impact_writer.append(
+            &impact_key,
+            2,
+            reachability.source_node_ordinal,
+            mode,
+            u32::try_from(reachability.affected_root_ordinals.len())?,
+            &reachability.encoded_ordinals,
+        )?;
         RootImpactReference {
             mode,
             impact_key: Some(impact_key),
             source_node_ordinal: reachability.source_node_ordinal,
+            evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
+        }
+    } else if pending.source_count > 1 {
+        let included_ordinals = pending
+            .root_union
+            .iter()
+            .enumerate()
+            .filter(|(_, included)| **included)
+            .map(|(ordinal, _)| u32::try_from(ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mode, encoded_ordinals) =
+            compact_root_impact_encoding(&included_ordinals, roots.roots.len())?;
+        let impact_key = format!("issue:{}", pending.issue.issue_key);
+        root_impact_writer.append(
+            &impact_key,
+            2,
+            None,
+            mode,
+            u32::try_from(included_ordinals.len())?,
+            &encoded_ordinals,
+        )?;
+        RootImpactReference {
+            mode,
+            impact_key: Some(impact_key),
+            source_node_ordinal: None,
             evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
         }
     } else {
@@ -8368,7 +8706,32 @@ fn finalize_coalesced_issue(
         }
     };
 
-    if !reachability.visited.is_empty() {
+    if pending.source_count > 1 {
+        pending.issue.affected_root_count = u32::try_from(
+            pending
+                .root_union
+                .iter()
+                .filter(|included| **included)
+                .count(),
+        )?;
+        pending.issue.affected_roots.clear();
+        pending.issue.affected_root_witness_paths.clear();
+        pending.issue.witness_path.clear();
+        for (&root_ordinal, witness) in &pending.root_witnesses {
+            let root = roots
+                .roots
+                .get(usize::try_from(root_ordinal)?)
+                .ok_or_else(|| anyhow::anyhow!("root ordinal is out of bounds"))?;
+            pending.issue.affected_roots.push(root.clone());
+            pending
+                .issue
+                .affected_root_witness_paths
+                .push(witness.clone());
+            if pending.issue.witness_path.is_empty() {
+                pending.issue.witness_path = witness.clone();
+            }
+        }
+    } else if !reachability.visited.is_empty() {
         pending.issue.affected_root_count =
             u32::try_from(reachability.affected_root_ordinals.len())?;
         pending.issue.affected_roots.clear();
@@ -8453,13 +8816,20 @@ fn build_issue_relation_spools_with_cancellation(
     events: &JsonlValueSpool,
     cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
-    build_issue_relation_spools_with_cancellation_and_progress(scan, events, cancellation, None)
+    build_issue_relation_spools_with_cancellation_and_progress(
+        scan,
+        events,
+        None,
+        cancellation,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 fn build_issue_relation_spools_with_cancellation_and_progress(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<()> {
@@ -8496,6 +8866,24 @@ fn build_issue_relation_spools_with_cancellation_and_progress(
             tidas_event_issue(&scan.documents, &event)?,
         )
     })?;
+    if let Some(snapshot_blocking_reasons) = snapshot_blocking_reasons {
+        let initial_event_count = event_count;
+        snapshot_blocking_reasons.visit(|reason| {
+            event_count = event_count.saturating_add(1);
+            if event_count.is_multiple_of(4_096) {
+                cancellation.check("scope_closure_snapshot_blocker_merge_input")?;
+                enforce_scope_closure_memory_budget("prepare_snapshot_blocker_merge_runs")?;
+            }
+            append_issue_merge_records(&mut merge_input, snapshot_blocking_reason_issue(reason)?)
+        })?;
+        let converted_count = event_count.saturating_sub(initial_event_count);
+        if converted_count != snapshot_blocking_reasons.record_count() {
+            return Err(anyhow::anyhow!(
+                "snapshot_builder_blocking_reasons_conversion_count_mismatch: expected={} actual={converted_count}",
+                snapshot_blocking_reasons.record_count()
+            ));
+        }
+    }
     let sorted_input = merge_input.finish()?;
     let stable_roots = StableRootOrdinals::new(&scan.roots, &scan.reference_graph)?;
     let mut canonical_issue_writer = SortedJsonlRunWriter::new("canonical-issues-v3")?;
@@ -8532,7 +8920,17 @@ fn build_issue_relation_spools_with_cancellation_and_progress(
                 &mut stats,
             )?;
         }
-        let pending = current.get_or_insert_with(|| CoalescedIssueState::new(source_key, issue));
+        let source = issue.source.clone();
+        let pending =
+            current.get_or_insert_with(|| CoalescedIssueState::new(source_key.clone(), issue));
+        pending.observe_source(
+            &source_key,
+            source.as_ref(),
+            &mut reachability,
+            &scan.reference_graph,
+            &stable_roots,
+            cancellation,
+        )?;
         pending.push_occurrence(occurrence, &mut stats);
         Ok(())
     })?;
@@ -8685,7 +9083,7 @@ fn find_document_identity(
 #[cfg(test)]
 fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(Vec::new());
-    Ok(write_xlsx_report(cursor, closure_check_id, issues, None)?.into_inner())
+    Ok(write_xlsx_report(cursor, closure_check_id, issues, None, None)?.into_inner())
 }
 
 fn build_xlsx_report_file(
@@ -8693,7 +9091,7 @@ fn build_xlsx_report_file(
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
 ) -> anyhow::Result<()> {
-    write_xlsx_report(File::create(path)?, closure_check_id, issues, None)?;
+    write_xlsx_report(File::create(path)?, closure_check_id, issues, None, None)?;
     Ok(())
 }
 
@@ -8701,12 +9099,19 @@ fn build_scan_xlsx_report_file(
     path: &Path,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
 ) -> anyhow::Result<()> {
     let stats = scan
         .issue_relations
         .as_ref()
         .map(|relations| &relations.stats);
-    write_xlsx_report(File::create(path)?, closure_check_id, &scan.issues, stats)?;
+    write_xlsx_report(
+        File::create(path)?,
+        closure_check_id,
+        &scan.issues,
+        stats,
+        snapshot_blocking_reasons,
+    )?;
     Ok(())
 }
 
@@ -8716,6 +9121,7 @@ fn write_xlsx_report<W: Write + Seek>(
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
     stats: Option<&IssueRelationStats>,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
 ) -> anyhow::Result<W> {
     let issue_count = stats.map_or_else(
         || u64::try_from(issues.len()).unwrap_or(u64::MAX),
@@ -8894,21 +9300,60 @@ fn write_xlsx_report<W: Write + Seek>(
         affected_rows.as_slice(),
     ];
     preflight_xlsx_worksheets(&worksheets)?;
+    let blocker_sheet_plans = snapshot_blocking_reasons
+        .map(plan_snapshot_blocker_worksheets)
+        .transpose()?
+        .unwrap_or_default();
+    let sheet_count = 4_usize.saturating_add(blocker_sheet_plans.len());
 
     let mut zip = ZipWriter::new(writer);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("[Content_Types].xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
+    write!(
+        zip,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+    )?;
+    for sheet_number in 1..=sheet_count {
+        write!(
+            zip,
+            "<Override PartName=\"/xl/worksheets/sheet{sheet_number}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        )?;
+    }
+    zip.write_all(b"</Types>")?;
     zip.start_file("_rels/.rels", options)?;
     zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     zip.start_file("xl/workbook.xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Closure Issues" sheetId="2" r:id="rId2"/><sheet name="Occurrences" sheetId="3" r:id="rId3"/><sheet name="Affected Datasets" sheetId="4" r:id="rId4"/></sheets></workbook>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Closure Issues" sheetId="2" r:id="rId2"/><sheet name="Occurrences" sheetId="3" r:id="rId3"/><sheet name="Affected Datasets" sheetId="4" r:id="rId4"/>"#)?;
+    for (index, _) in blocker_sheet_plans.iter().enumerate() {
+        let sheet_number = index + 5;
+        write!(
+            zip,
+            "<sheet name=\"Snapshot Blockers {}\" sheetId=\"{sheet_number}\" r:id=\"rId{sheet_number}\"/>",
+            index + 1
+        )?;
+    }
+    zip.write_all(b"</sheets></workbook>")?;
     zip.start_file("xl/_rels/workbook.xml.rels", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet4.xml"/></Relationships>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#)?;
+    for sheet_number in 1..=sheet_count {
+        write!(
+            zip,
+            "<Relationship Id=\"rId{sheet_number}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{sheet_number}.xml\"/>"
+        )?;
+    }
+    zip.write_all(b"</Relationships>")?;
     write_xlsx_worksheet(&mut zip, options, 1, summary_rows)?;
     write_xlsx_worksheet(&mut zip, options, 2, issue_rows)?;
     write_xlsx_worksheet(&mut zip, options, 3, occurrence_rows)?;
     write_xlsx_worksheet(&mut zip, options, 4, affected_rows)?;
+    if let Some(snapshot_blocking_reasons) = snapshot_blocking_reasons {
+        write_snapshot_blocker_worksheets(
+            &mut zip,
+            options,
+            snapshot_blocking_reasons,
+            &blocker_sheet_plans,
+        )?;
+    }
     writer = zip.finish()?;
     let archive_bytes = writer.stream_position()?;
     if archive_bytes > XLSX_MAX_ARCHIVE_BYTES {
@@ -8920,7 +9365,6 @@ fn write_xlsx_report<W: Write + Seek>(
 }
 
 fn preflight_xlsx_worksheets(worksheets: &[&[Vec<String>]]) -> anyhow::Result<()> {
-    let mut total_bytes = 0_u64;
     for (index, rows) in worksheets.iter().enumerate() {
         if rows.len() > XLSX_MAX_WORKSHEET_ROWS {
             return Err(anyhow::anyhow!(
@@ -8939,14 +9383,6 @@ fn preflight_xlsx_worksheets(worksheets: &[&[Vec<String>]]) -> anyhow::Result<()
                 XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES
             ));
         }
-        total_bytes = total_bytes
-            .checked_add(worksheet_bytes)
-            .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))?;
-    }
-    if total_bytes > XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES {
-        return Err(anyhow::anyhow!(
-            "artifact_limit_exceeded: xlsx total worksheet bytes {total_bytes} exceed {XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES}"
-        ));
     }
     Ok(())
 }
@@ -8971,6 +9407,150 @@ fn estimate_xlsx_worksheet_bytes(rows: &[Vec<String>]) -> anyhow::Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotBlockerWorksheetPlan {
+    data_rows: usize,
+}
+
+fn snapshot_blocker_xlsx_header() -> Vec<String> {
+    [
+        "Code",
+        "Source identity",
+        "JSON path",
+        "Reference role",
+        "Target type",
+        "Target id",
+        "Target version",
+        "Message",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn snapshot_blocker_xlsx_row(reason: &Value) -> Vec<String> {
+    let text = |key| {
+        reason
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    vec![
+        text("code"),
+        text("sourceIdentity"),
+        text("jsonPath"),
+        text("referenceRole"),
+        text("targetType"),
+        text("targetId"),
+        text("targetVersion"),
+        text("message"),
+    ]
+}
+
+fn xlsx_worksheet_envelope_bytes() -> u64 {
+    u64::try_from(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData></sheetData></worksheet>"
+            .len(),
+    )
+    .expect("worksheet envelope length fits u64")
+}
+
+fn estimate_xlsx_row_bytes(row_index: usize, row: &[String]) -> anyhow::Result<u64> {
+    let mut bytes = u64::try_from(format!("<row r=\"{row_index}\"></row>").len())?;
+    for (column_index, value) in row.iter().enumerate() {
+        let reference = format!("{}{}", xlsx_column_name(column_index), row_index);
+        bytes = bytes.saturating_add(u64::try_from(
+            format!(
+                "<c r=\"{reference}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                xml_escape(value)
+            )
+            .len(),
+        )?);
+    }
+    Ok(bytes)
+}
+
+fn plan_snapshot_blocker_worksheets(
+    spool: &SnapshotBuilderBlockingReasonsSpool,
+) -> anyhow::Result<Vec<SnapshotBlockerWorksheetPlan>> {
+    let header = snapshot_blocker_xlsx_header();
+    let initial_bytes = xlsx_worksheet_envelope_bytes() + estimate_xlsx_row_bytes(1, &header)?;
+    let mut plans = Vec::new();
+    let mut data_rows = 0_usize;
+    let mut estimated_bytes = initial_bytes;
+    spool.visit(|reason| {
+        let row = snapshot_blocker_xlsx_row(&reason);
+        let row_bytes = estimate_xlsx_row_bytes(data_rows.saturating_add(2), &row)?;
+        let row_limit_reached = data_rows.saturating_add(1) >= XLSX_MAX_WORKSHEET_ROWS;
+        let byte_limit_reached =
+            estimated_bytes.saturating_add(row_bytes) > XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES;
+        if data_rows > 0 && (row_limit_reached || byte_limit_reached) {
+            plans.push(SnapshotBlockerWorksheetPlan { data_rows });
+            data_rows = 0;
+            estimated_bytes = initial_bytes;
+        }
+        let row_bytes = estimate_xlsx_row_bytes(data_rows.saturating_add(2), &row)?;
+        if estimated_bytes.saturating_add(row_bytes) > XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES {
+            return Err(anyhow::anyhow!(
+                "artifact_limit_exceeded: snapshot blocker XLSX row exceeds worksheet byte limit"
+            ));
+        }
+        data_rows = data_rows.saturating_add(1);
+        estimated_bytes = estimated_bytes.saturating_add(row_bytes);
+        Ok(())
+    })?;
+    if data_rows > 0 {
+        plans.push(SnapshotBlockerWorksheetPlan { data_rows });
+    }
+    Ok(plans)
+}
+
+fn write_snapshot_blocker_worksheets<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    options: SimpleFileOptions,
+    spool: &SnapshotBuilderBlockingReasonsSpool,
+    plans: &[SnapshotBlockerWorksheetPlan],
+) -> anyhow::Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let header = snapshot_blocker_xlsx_header();
+    let mut plan_index = 0_usize;
+    let mut data_rows = 0_usize;
+    start_snapshot_blocker_worksheet(zip, options, plan_index + 5, &header)?;
+    spool.visit(|reason| {
+        if data_rows == plans[plan_index].data_rows {
+            zip.write_all(b"</sheetData></worksheet>")?;
+            plan_index = plan_index.saturating_add(1);
+            data_rows = 0;
+            start_snapshot_blocker_worksheet(zip, options, plan_index + 5, &header)?;
+        }
+        data_rows = data_rows.saturating_add(1);
+        write_xlsx_row(zip, data_rows + 1, snapshot_blocker_xlsx_row(&reason))
+    })?;
+    zip.write_all(b"</sheetData></worksheet>")?;
+    if plan_index + 1 != plans.len() || data_rows != plans[plan_index].data_rows {
+        return Err(anyhow::anyhow!(
+            "snapshot blocker XLSX worksheet plan diverged during write"
+        ));
+    }
+    Ok(())
+}
+
+fn start_snapshot_blocker_worksheet<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    options: SimpleFileOptions,
+    sheet_number: usize,
+    header: &[String],
+) -> anyhow::Result<()> {
+    zip.start_file(format!("xl/worksheets/sheet{sheet_number}.xml"), options)?;
+    zip.write_all(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+    )?;
+    write_xlsx_row(zip, 1, header.iter().cloned())
 }
 
 fn write_xlsx_worksheet<W, I>(
@@ -9410,6 +9990,188 @@ mod tests {
                 assert_eq!(targets, expected);
             }
         }
+    }
+
+    #[test]
+    fn scope_closure_reference_extraction_excludes_process_lcia_results() {
+        let exchange_flow = id("10101010-1010-4010-8010-101010101010");
+        let historical_method = id("20202020-2020-4020-8020-202020202020");
+        let payload = json!({
+            "processDataSet": {
+                "exchanges": {
+                    "exchange": {
+                        "referenceToFlowDataSet": reference(
+                            "flow",
+                            exchange_flow,
+                            Some("01.00.000")
+                        )
+                    }
+                },
+                "LCIAResults": {
+                    "LCIAResult": [
+                        {
+                            "referenceToLCIAMethodDataSet": {
+                                "@type": "LCIA method data set",
+                                "@refObjectId": historical_method,
+                                "@version": "01.00.000",
+                                "@uri": format!("../lciamethods/{historical_method}.json")
+                            },
+                            "meanAmount": 1.0
+                        },
+                        {
+                            "referenceToLCIAMethodDataSet": {
+                                "@type": "LCIA method data set",
+                                "@version": "invalid"
+                            },
+                            "meanAmount": 2.0
+                        }
+                    ]
+                }
+            }
+        });
+
+        let generic = extract_references("process-fixture", DatasetCategory::Processes, &payload);
+        assert_eq!(generic.edges.len(), 2);
+        assert!(!generic.issues.is_empty());
+
+        let closure = extract_scope_closure_references(
+            "process-fixture",
+            DatasetCategory::Processes,
+            &payload,
+        );
+        assert!(closure.issues.is_empty());
+        assert_eq!(closure.edges.len(), 1);
+        assert_eq!(closure.edges[0].target_uuid, exchange_flow.to_string());
+        assert_eq!(closure.edges[0].reference_role, "process_exchange_flow");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scope_closure_does_not_fetch_historical_lcia_result_dependencies() {
+        let process = identity(
+            DatasetCategory::Processes,
+            "30303030-3030-4030-8030-303030303030",
+        );
+        let selected_method = identity(
+            DatasetCategory::Lciamethods,
+            "40404040-4040-4040-8040-404040404040",
+        );
+        let historical_method = identity(
+            DatasetCategory::Lciamethods,
+            "50505050-5050-4050-8050-505050505050",
+        );
+        let exchange_flow = identity(
+            DatasetCategory::Flows,
+            "60606060-6060-4060-8060-606060606060",
+        );
+        let selected_factor_flow = identity(
+            DatasetCategory::Flows,
+            "70707070-7070-4070-8070-707070707070",
+        );
+        let historical_factor_flow = identity(
+            DatasetCategory::Flows,
+            "80808080-8080-4080-8080-808080808080",
+        );
+        let lcia_reference = |target: &ExactDatasetIdentity| {
+            json!({
+                "@type": "LCIA method data set",
+                "@refObjectId": target.id,
+                "@version": target.version,
+                "@uri": format!("../lciamethods/{}.json", target.id)
+            })
+        };
+        let method_payload = |factor: &ExactDatasetIdentity| {
+            json!({
+                "LCIAMethodDataSet": {
+                    "characterisationFactors": {
+                        "factor": {
+                            "referenceToFlowDataSet": reference(
+                                "flow",
+                                factor.id,
+                                Some(factor.version.as_str())
+                            )
+                        }
+                    }
+                }
+            })
+        };
+        let documents = [
+            ClosureDocument {
+                identity: process.clone(),
+                payload: json!({
+                    "processDataSet": {
+                        "exchanges": {
+                            "exchange": {
+                                "referenceToFlowDataSet": reference(
+                                    "flow",
+                                    exchange_flow.id,
+                                    Some(exchange_flow.version.as_str())
+                                )
+                            }
+                        },
+                        "LCIAResults": {
+                            "LCIAResult": {
+                                "referenceToLCIAMethodDataSet": lcia_reference(&historical_method),
+                                "meanAmount": 1.0
+                            }
+                        }
+                    }
+                }),
+            },
+            ClosureDocument {
+                identity: selected_method.clone(),
+                payload: method_payload(&selected_factor_flow),
+            },
+            ClosureDocument {
+                identity: historical_method.clone(),
+                payload: method_payload(&historical_factor_flow),
+            },
+            ClosureDocument {
+                identity: exchange_flow.clone(),
+                payload: json!({}),
+            },
+            ClosureDocument {
+                identity: selected_factor_flow.clone(),
+                payload: json!({}),
+            },
+            ClosureDocument {
+                identity: historical_factor_flow.clone(),
+                payload: json!({}),
+            },
+        ]
+        .into_iter()
+        .map(|document| (document.identity.clone(), document))
+        .collect();
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+        let mut requested_scope = manifest(vec![process]);
+        requested_scope.lcia_methods.push(RequestedIdentity {
+            id: selected_method.id,
+            version: selected_method.version.clone(),
+        });
+
+        let scan = collect_scope_closure(&provider, &requested_scope)
+            .await
+            .unwrap();
+
+        assert!(scan.complete);
+        assert!(scan.issues.is_empty());
+        assert_eq!(scan.documents.len(), 4);
+        assert_eq!(scan.edges.len(), 2);
+        let fetched = provider
+            .fetches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(fetched.contains(&selected_method));
+        assert!(fetched.contains(&selected_factor_flow));
+        assert!(!fetched.contains(&historical_method));
+        assert!(!fetched.contains(&historical_factor_flow));
     }
 
     #[tokio::test]
@@ -12549,6 +13311,165 @@ mod tests {
         assert_eq!(rebuilt.sha256, bundle.sha256);
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn snapshot_builder_blocker_sidecar_populates_complete_issue_and_xlsx_relations() {
+        let reasons = (0..39)
+            .map(|index| {
+                json!({
+                    "code": if index % 2 == 0 {
+                        "source_reference_invalid"
+                    } else {
+                        "source_dependency_unavailable"
+                    },
+                    "sourceIdentity": format!("source:{}@01.00.000", Uuid::from_u128(index + 1)),
+                    "targetType": "flow",
+                    "targetId": Uuid::from_u128(100 + (index % 2)).to_string(),
+                    "targetVersion": "01.00.000",
+                    "jsonPath": format!("$.exchanges.exchange[{index}].referenceToFlowDataSet"),
+                    "referenceRole": "exchangeFlow",
+                    "message": "fixture blocker",
+                })
+            })
+            .collect::<Vec<_>>();
+        let blocker_spool = SnapshotBuilderBlockingReasonsSpool::from_reasons(&reasons).unwrap();
+        let root = ExactDatasetIdentity {
+            category: DatasetCategory::Processes,
+            id: Uuid::from_u128(10_000),
+            version: "01.00.000".to_owned(),
+        };
+        let references = (0..39)
+            .map(|index| ResolvedReference {
+                source: root.clone(),
+                target: ExactDatasetIdentity {
+                    category: DatasetCategory::Sources,
+                    id: Uuid::from_u128(index + 1),
+                    version: "01.00.000".to_owned(),
+                },
+                json_path: format!("$.sources[{index}]"),
+                reference_role: "source".to_owned(),
+                requested_version_state: "explicit".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let reference_graph =
+            CompactReferenceGraph::from_references(&references, std::slice::from_ref(&root))
+                .unwrap();
+        let mut scan = ScopeClosureScan {
+            schema_version: "lcia.scope-closure-scan.v1".to_owned(),
+            complete: true,
+            roots: vec![root],
+            documents: ClosureDocumentSpool::empty().unwrap(),
+            edges: JsonlValueSpool::empty("empty-edges.jsonl").unwrap(),
+            resolved_references: JsonlValueSpool::empty("empty-resolved.jsonl").unwrap(),
+            omitted_version_resolutions: Vec::new(),
+            issues: Vec::new(),
+            frontier: Vec::new(),
+            provider_universe: Vec::new(),
+            reference_graph,
+            tidas_issue_event_count: 0,
+            issue_relations: None,
+        };
+        let events = JsonlValueSpool::empty("empty-validation-issues.jsonl").unwrap();
+        build_issue_relation_spools_with_cancellation_and_progress(
+            &mut scan,
+            &events,
+            Some(&blocker_spool),
+            &CancellationToken::default(),
+            None,
+        )
+        .unwrap();
+
+        let relations = scan.issue_relations.as_ref().unwrap();
+        assert_eq!(relations.stats.issue_count, 2);
+        assert_eq!(relations.stats.occurrence_count, 39);
+        assert_eq!(relations.stats.blocker_count, 2);
+        assert_eq!(relations.stats.affected_root_count, 2);
+        assert_eq!(scan.issues.len(), 2);
+        assert_eq!(
+            scan.issues
+                .iter()
+                .map(|issue| u64::from(issue.occurrence_count))
+                .sum::<u64>(),
+            39
+        );
+        assert!(scan.issues.iter().all(|issue| issue.source.is_none()));
+        assert_eq!(scan.blocker_codes().len(), 2);
+
+        let closure_check_id = Uuid::new_v4();
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "fixture"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: JsonlValueSpool::empty("empty-tidas-issues.jsonl").unwrap(),
+        };
+        let machine_artifacts = prepare_issue_partition_artifacts(
+            closure_check_id,
+            &scan,
+            &validation,
+            Arc::new(TempDir::new().unwrap()),
+        )
+        .unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&machine_artifacts, closure_check_id).unwrap();
+        assert_eq!(reconstructed.issue_count, 2);
+        assert_eq!(reconstructed.occurrence_count, 39);
+        assert_eq!(reconstructed.affected_root_count, 2);
+
+        let bytes = write_xlsx_report(
+            Cursor::new(Vec::new()),
+            closure_check_id,
+            &scan.issues,
+            Some(&relations.stats),
+            Some(&blocker_spool),
+        )
+        .unwrap()
+        .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut issues_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet2.xml").unwrap(),
+            &mut issues_xml,
+        )
+        .unwrap();
+        assert_eq!(issues_xml.matches("<row r=").count(), 3);
+        let mut occurrences_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet3.xml").unwrap(),
+            &mut occurrences_xml,
+        )
+        .unwrap();
+        assert_eq!(occurrences_xml.matches("<row r=").count(), 40);
+        let mut blockers_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet5.xml").unwrap(),
+            &mut blockers_xml,
+        )
+        .unwrap();
+        assert_eq!(blockers_xml.matches("<row r=").count(), 40);
+        assert!(blockers_xml.contains("source_reference_invalid"));
+        assert!(blockers_xml.contains("source_dependency_unavailable"));
+    }
+
+    #[test]
+    fn discovery_and_build_typed_blockers_use_the_same_verified_spool_conversion() {
+        for phase in ["discovery", "build"] {
+            let reasons = vec![json!({
+                "code": "source_reference_invalid",
+                "phase": phase,
+            })];
+            let spool = SnapshotBuilderBlockingReasonsSpool::from_reasons(&reasons).unwrap();
+            let error = anyhow::Error::new(SnapshotBuilderProcessFailure::Blocked {
+                code: "source_reference_invalid".to_owned(),
+                blocking_reasons: reasons,
+                blocking_reason_count: 1,
+                blocking_reasons_sha256: "a".repeat(64),
+                blocking_reasons_truncated: false,
+                blocking_reasons_spool: Some(spool),
+            });
+            let converted = snapshot_builder_blocking_reasons(error).unwrap();
+            assert_eq!(converted.record_count(), 1, "phase={phase}");
+        }
+    }
+
     #[tokio::test]
     async fn traversal_is_batched_bounded_and_cooperatively_cancelled() {
         let roots = (0..200_u128)
@@ -14458,7 +15379,7 @@ mod tests {
         assert_eq!(reconstructed.occurrence_count, 7);
         assert_eq!(reconstructed.affected_root_count, 49);
         assert_eq!(reconstructed.expanded_affected_root_record_count, 0);
-        assert_eq!(reconstructed.root_impact_record_count, 1);
+        assert_eq!(reconstructed.root_impact_record_count, 4);
         assert!(!artifacts.iter().any(|artifact| {
             artifact.descriptor.file_name.starts_with("occurrences/")
                 || artifact.descriptor.file_name.starts_with("affected-roots/")

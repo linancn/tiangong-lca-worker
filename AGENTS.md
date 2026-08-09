@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-08
-lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
-lastReviewedNote: "Updated for Worker Issue #223: all fresh snapshot purposes use consumer-owned artifacts instead of persisted compiler IR."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedNote: "Reviewed for Worker PR #225: runtime SQL schema cutover, dual-pool boundaries, and current scope-closure behavior remain within Worker ownership."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

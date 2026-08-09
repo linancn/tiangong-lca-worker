@@ -1,3 +1,7 @@
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -7,9 +11,27 @@ pub const SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION: &str = "snapshot_builder_ter
 pub const SNAPSHOT_BUILDER_TERMINAL_PREFIX: &str = "[snapshot_builder_terminal] ";
 pub const SNAPSHOT_BUILDER_TERMINAL_MAX_BYTES: usize = 32 * 1024;
 pub const SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE: i32 = 42;
+pub const SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_COUNT: usize = 16;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_BYTES: usize = 1024;
 const SNAPSHOT_BUILDER_BLOCKING_SAMPLE_MAX_BYTES: usize = 16 * 1024;
+pub const SNAPSHOT_BUILDER_BLOCKING_REASONS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBuilderBlockingReasonsFile {
+    pub record_count: u64,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub collection_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBuilderDiscoveryFile {
+    pub byte_size: u64,
+    pub sha256: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -20,7 +42,7 @@ pub enum SnapshotBuilderTerminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_timing_sec: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scope_closure_discovery: Option<Value>,
+        scope_closure_discovery_file: Option<SnapshotBuilderDiscoveryFile>,
     },
     Blocked {
         schema_version: String,
@@ -29,6 +51,8 @@ pub enum SnapshotBuilderTerminal {
         blocking_reason_count: u64,
         blocking_reasons_sha256: String,
         blocking_reasons_truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_reasons_file: Option<SnapshotBuilderBlockingReasonsFile>,
     },
 }
 
@@ -37,18 +61,27 @@ impl SnapshotBuilderTerminal {
     pub fn succeeded(
         resolved_snapshot_id: Uuid,
         build_timing_sec: Option<Value>,
-        scope_closure_discovery: Option<Value>,
+        scope_closure_discovery_file: Option<SnapshotBuilderDiscoveryFile>,
     ) -> Self {
         Self::Succeeded {
             schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
             resolved_snapshot_id,
             build_timing_sec,
-            scope_closure_discovery,
+            scope_closure_discovery_file,
         }
     }
 
     #[must_use]
     pub fn blocked(code: impl Into<String>, blocking_reasons: Vec<Value>) -> Self {
+        Self::blocked_with_file(code, blocking_reasons, None)
+    }
+
+    #[must_use]
+    pub fn blocked_with_file(
+        code: impl Into<String>,
+        blocking_reasons: Vec<Value>,
+        blocking_reasons_file: Option<SnapshotBuilderBlockingReasonsFile>,
+    ) -> Self {
         let canonical_reasons = canonicalize_value(Value::Array(blocking_reasons));
         let canonical_bytes =
             serde_json::to_vec(&canonical_reasons).expect("JSON value serialization cannot fail");
@@ -94,6 +127,7 @@ impl SnapshotBuilderTerminal {
             blocking_reasons: sample,
             blocking_reason_count,
             blocking_reasons_sha256,
+            blocking_reasons_file,
         }
     }
 
@@ -118,6 +152,159 @@ impl SnapshotBuilderTerminal {
             }
         }
     }
+}
+
+pub fn write_discovery_file(
+    path: &Path,
+    discovery: &Value,
+) -> anyhow::Result<SnapshotBuilderDiscoveryFile> {
+    let bytes = serde_json::to_vec(discovery)?;
+    let byte_size = u64::try_from(bytes.len())?;
+    if byte_size == 0 || byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_too_large: actual={byte_size} limit={SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES}"
+        ));
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let mut writer = BufWriter::new(File::create(path)?);
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(SnapshotBuilderDiscoveryFile { byte_size, sha256 })
+}
+
+pub fn read_verified_discovery_file(
+    path: &Path,
+    descriptor: &SnapshotBuilderDiscoveryFile,
+) -> anyhow::Result<Value> {
+    if descriptor.byte_size == 0 || descriptor.byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_too_large: actual={} limit={SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES}",
+            descriptor.byte_size
+        ));
+    }
+    let actual_size = fs::metadata(path)?.len();
+    if actual_size != descriptor.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_size_mismatch: expected={} actual={actual_size}",
+            descriptor.byte_size
+        ));
+    }
+    let bytes = fs::read(path)?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_sha256 != descriptor.sha256 {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_sha256_mismatch: expected={} actual={actual_sha256}",
+            descriptor.sha256
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("snapshot_builder_discovery_invalid_json: {error}"))
+}
+
+pub fn write_blocking_reasons_file(
+    path: &Path,
+    blocking_reasons: &[Value],
+) -> anyhow::Result<SnapshotBuilderBlockingReasonsFile> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    for reason in blocking_reasons {
+        let bytes = serde_json::to_vec(&canonicalize_value(reason.clone()))?;
+        let record_bytes = u64::try_from(bytes.len().saturating_add(1))?;
+        byte_size = byte_size
+            .checked_add(record_bytes)
+            .ok_or_else(|| anyhow::anyhow!("snapshot_builder_blocking_reasons_size_overflow"))?;
+        if byte_size > SNAPSHOT_BUILDER_BLOCKING_REASONS_MAX_BYTES {
+            return Err(anyhow::anyhow!(
+                "snapshot_builder_blocking_reasons_too_large: actual={byte_size} limit={SNAPSHOT_BUILDER_BLOCKING_REASONS_MAX_BYTES}"
+            ));
+        }
+        writer.write_all(&bytes)?;
+        writer.write_all(b"\n")?;
+        digest.update(&bytes);
+        digest.update(b"\n");
+    }
+    writer.flush()?;
+    Ok(SnapshotBuilderBlockingReasonsFile {
+        record_count: u64::try_from(blocking_reasons.len())?,
+        byte_size,
+        sha256: format!("{:x}", digest.finalize()),
+        collection_complete: true,
+    })
+}
+
+pub fn validate_blocking_reasons_file(
+    path: &Path,
+    descriptor: &SnapshotBuilderBlockingReasonsFile,
+    expected_array_sha256: &str,
+) -> anyhow::Result<()> {
+    if !descriptor.collection_complete {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_collection_incomplete"
+        ));
+    }
+    if descriptor.byte_size > SNAPSHOT_BUILDER_BLOCKING_REASONS_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_too_large: actual={} limit={SNAPSHOT_BUILDER_BLOCKING_REASONS_MAX_BYTES}",
+            descriptor.byte_size
+        ));
+    }
+    let actual_size = fs::metadata(path)?.len();
+    if actual_size != descriptor.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_size_mismatch: expected={} actual={actual_size}",
+            descriptor.byte_size
+        ));
+    }
+    let mut file_digest = Sha256::new();
+    let mut array_digest = Sha256::new();
+    array_digest.update(b"[");
+    let mut record_count = 0_u64;
+    for line in BufReader::new(File::open(path)?).split(b'\n') {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&line).map_err(|error| {
+            anyhow::anyhow!("snapshot_builder_blocking_reasons_invalid_json: {error}")
+        })?;
+        let canonical = serde_json::to_vec(&canonicalize_value(value))?;
+        if canonical != line {
+            return Err(anyhow::anyhow!(
+                "snapshot_builder_blocking_reasons_noncanonical_json"
+            ));
+        }
+        if record_count > 0 {
+            array_digest.update(b",");
+        }
+        array_digest.update(&canonical);
+        file_digest.update(&canonical);
+        file_digest.update(b"\n");
+        record_count = record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("snapshot_builder_blocking_reasons_count_overflow"))?;
+    }
+    array_digest.update(b"]");
+    let actual_file_sha256 = format!("{:x}", file_digest.finalize());
+    if actual_file_sha256 != descriptor.sha256 {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_sha256_mismatch: expected={} actual={actual_file_sha256}",
+            descriptor.sha256
+        ));
+    }
+    if record_count != descriptor.record_count {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_count_mismatch: expected={} actual={record_count}",
+            descriptor.record_count
+        ));
+    }
+    let actual_array_sha256 = format!("{:x}", array_digest.finalize());
+    if actual_array_sha256 != expected_array_sha256 {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_array_sha256_mismatch: expected={expected_array_sha256} actual={actual_array_sha256}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_terminal(stdout: &str) -> anyhow::Result<SnapshotBuilderTerminal> {
@@ -153,6 +340,21 @@ pub fn parse_terminal(stdout: &str) -> anyhow::Result<SnapshotBuilderTerminal> {
             ..
         } if resolved_snapshot_id.is_nil() => {
             Err(anyhow::anyhow!("snapshot_builder_protocol_snapshot_id_nil"))
+        }
+        SnapshotBuilderTerminal::Succeeded {
+            scope_closure_discovery_file: Some(descriptor),
+            ..
+        } if descriptor.byte_size == 0
+            || descriptor.byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES
+            || descriptor.sha256.len() != 64
+            || !descriptor
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Err(anyhow::anyhow!(
+                "snapshot_builder_protocol_discovery_file_invalid"
+            ))
         }
         SnapshotBuilderTerminal::Blocked {
             code,
@@ -234,6 +436,68 @@ mod tests {
         );
         assert!(parse_terminal("").is_err());
         assert!(parse_terminal(format!("{line}\n{line}").as_str()).is_err());
+    }
+
+    #[test]
+    fn large_discovery_uses_verified_file_while_terminal_stays_bounded() {
+        let process_axis = (1_u128..=5_612)
+            .map(|index| {
+                json!({
+                    "id": Uuid::from_u128(index),
+                    "version": "01.01.000",
+                })
+            })
+            .collect::<Vec<_>>();
+        let discovery = json!({
+            "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
+            "processAxis": process_axis,
+            "readiness": {
+                "schema_version": "matrix_readiness_report.v2",
+                "status": "failed",
+                "next_action": "repair_provider_closure_then_recheck",
+                "blockers": [{
+                    "code": "provider_closure_unmatched",
+                    "severity": "blocker",
+                    "message": "repair provider closure",
+                    "details": {"count": 39},
+                }],
+            },
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let descriptor = write_discovery_file(file.path(), &discovery).unwrap();
+        assert!(descriptor.byte_size > u64::try_from(SNAPSHOT_BUILDER_TERMINAL_MAX_BYTES).unwrap());
+
+        let terminal =
+            SnapshotBuilderTerminal::succeeded(Uuid::new_v4(), None, Some(descriptor.clone()));
+        let line = terminal.to_line().unwrap();
+        assert!(line.len() < 2 * 1024);
+        assert_eq!(parse_terminal(&line).unwrap(), terminal);
+        assert_eq!(
+            read_verified_discovery_file(file.path(), &descriptor).unwrap(),
+            discovery
+        );
+    }
+
+    #[test]
+    fn discovery_file_rejects_size_hash_and_json_corruption() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let discovery = json!({"schemaVersion": "lcia.scope-closure-snapshot-discovery.v1"});
+        let descriptor = write_discovery_file(file.path(), &discovery).unwrap();
+
+        let mut wrong_size = descriptor.clone();
+        wrong_size.byte_size += 1;
+        assert!(read_verified_discovery_file(file.path(), &wrong_size).is_err());
+
+        let mut wrong_hash = descriptor.clone();
+        wrong_hash.sha256 = "0".repeat(64);
+        assert!(read_verified_discovery_file(file.path(), &wrong_hash).is_err());
+
+        fs::write(file.path(), b"{invalid json}").unwrap();
+        let invalid_descriptor = SnapshotBuilderDiscoveryFile {
+            byte_size: fs::metadata(file.path()).unwrap().len(),
+            sha256: format!("{:x}", Sha256::digest(fs::read(file.path()).unwrap())),
+        };
+        assert!(read_verified_discovery_file(file.path(), &invalid_descriptor).is_err());
     }
 
     #[test]
@@ -328,6 +592,7 @@ mod tests {
                 blocking_reason_count: 2,
                 blocking_reasons_sha256: hash.clone(),
                 blocking_reasons_truncated: false,
+                blocking_reasons_file: None,
             },
             SnapshotBuilderTerminal::Blocked {
                 schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
@@ -339,6 +604,7 @@ mod tests {
                 blocking_reason_count: 1,
                 blocking_reasons_sha256: hash.clone(),
                 blocking_reasons_truncated: false,
+                blocking_reasons_file: None,
             },
             SnapshotBuilderTerminal::Blocked {
                 schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
@@ -347,6 +613,7 @@ mod tests {
                 blocking_reason_count: 1,
                 blocking_reasons_sha256: hash,
                 blocking_reasons_truncated: true,
+                blocking_reasons_file: None,
             },
         ] {
             let error = parse_terminal(&terminal.to_line().unwrap())
@@ -354,5 +621,71 @@ mod tests {
                 .to_string();
             assert!(error.contains("snapshot_builder_protocol_blocked_payload_invalid"));
         }
+    }
+
+    #[test]
+    fn blocked_sidecar_preserves_all_records_while_terminal_stays_bounded() {
+        let reasons = (0..39)
+            .map(|index| {
+                json!({
+                    "code": "source_reference_invalid",
+                    "sourceIdentity": format!("process:{}@01.00.000", Uuid::from_u128(index + 1)),
+                    "jsonPath": format!("$.exchanges.exchange[{index}].referenceToFlowDataSet"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let descriptor = write_blocking_reasons_file(file.path(), &reasons).unwrap();
+        let terminal = SnapshotBuilderTerminal::blocked_with_file(
+            "source_reference_invalid",
+            reasons,
+            Some(descriptor.clone()),
+        );
+        let SnapshotBuilderTerminal::Blocked {
+            blocking_reasons,
+            blocking_reason_count,
+            blocking_reasons_sha256,
+            blocking_reasons_file,
+            ..
+        } = &terminal
+        else {
+            unreachable!()
+        };
+        assert!(blocking_reasons.len() <= 16);
+        assert_eq!(*blocking_reason_count, 39);
+        assert_eq!(blocking_reasons_file.as_ref(), Some(&descriptor));
+        validate_blocking_reasons_file(file.path(), &descriptor, blocking_reasons_sha256).unwrap();
+        assert_eq!(
+            parse_terminal(&terminal.to_line().unwrap()).unwrap(),
+            terminal
+        );
+    }
+
+    #[test]
+    fn blocked_sidecar_rejects_incomplete_or_tampered_collections() {
+        let reasons = vec![json!({"code": "source_dependency_unavailable", "n": 1})];
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let descriptor = write_blocking_reasons_file(file.path(), &reasons).unwrap();
+        let array_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&canonicalize_value(Value::Array(reasons))).unwrap())
+        );
+
+        let mut incomplete = descriptor.clone();
+        incomplete.collection_complete = false;
+        assert!(validate_blocking_reasons_file(file.path(), &incomplete, &array_sha256).is_err());
+
+        let mut wrong_count = descriptor.clone();
+        wrong_count.record_count += 1;
+        assert!(validate_blocking_reasons_file(file.path(), &wrong_count, &array_sha256).is_err());
+
+        let mut wrong_hash = descriptor.clone();
+        wrong_hash.sha256 = "0".repeat(64);
+        assert!(validate_blocking_reasons_file(file.path(), &wrong_hash, &array_sha256).is_err());
+
+        std::fs::write(file.path(), b"{invalid json}\n").unwrap();
+        let mut invalid_json = descriptor;
+        invalid_json.byte_size = std::fs::metadata(file.path()).unwrap().len();
+        assert!(validate_blocking_reasons_file(file.path(), &invalid_json, &array_sha256).is_err());
     }
 }

@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 347da82d53fece5eaf825f434ddd934bc2c89022
-lastReviewedAt: 2026-08-08
-lastReviewedNote: "Updated for Worker Issue #223: certificate-bound builds load release metadata and source closure through a verified descriptor chain."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedNote: "Reviewed for Worker PR #225: package-worker schema cutover and current certificate-binding/discovery contracts remain aligned."
 related:
   - AGENTS.md
   - .docpact/config.yaml
