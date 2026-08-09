@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
 lastReviewedNote: "Reviewed for Worker Issue #233: the discovery transport fix stays within Worker runtime and contract ownership boundaries."
 related:
   - .docpact/config.yaml

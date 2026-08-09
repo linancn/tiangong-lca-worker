@@ -1901,7 +1901,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
                 }
                 continue;
             };
-            let extraction = extract_references(
+            let extraction = extract_scope_closure_references(
                 document.identity.document_key().as_str(),
                 document.identity.category,
                 &document.payload,
@@ -2288,6 +2288,24 @@ pub fn extract_references(
     category: DatasetCategory,
     payload: &Value,
 ) -> ReferenceExtractionResult {
+    extract_references_with_profile(document_key, category, payload, true)
+}
+
+#[must_use]
+pub fn extract_scope_closure_references(
+    document_key: &str,
+    category: DatasetCategory,
+    payload: &Value,
+) -> ReferenceExtractionResult {
+    extract_references_with_profile(document_key, category, payload, false)
+}
+
+fn extract_references_with_profile(
+    document_key: &str,
+    category: DatasetCategory,
+    payload: &Value,
+    include_process_lcia_results: bool,
+) -> ReferenceExtractionResult {
     let mut result = ReferenceExtractionResult {
         schema_version: "tidas.reference-extraction-result.v1".to_owned(),
         document_key: document_key.to_owned(),
@@ -2295,7 +2313,14 @@ pub fn extract_references(
         edges: Vec::new(),
         issues: Vec::new(),
     };
-    walk_references(payload, "$", None, category, &mut result);
+    walk_references(
+        payload,
+        "$",
+        None,
+        category,
+        include_process_lcia_results,
+        &mut result,
+    );
     result
 }
 
@@ -2304,8 +2329,15 @@ fn walk_references(
     path: &str,
     parent_key: Option<&str>,
     source_category: DatasetCategory,
+    include_process_lcia_results: bool,
     result: &mut ReferenceExtractionResult,
 ) {
+    if !include_process_lcia_results
+        && source_category == DatasetCategory::Processes
+        && path.eq_ignore_ascii_case("$.processDataSet.LCIAResults")
+    {
+        return;
+    }
     match node {
         Value::Object(object) => {
             if looks_like_reference(object, parent_key) {
@@ -2317,6 +2349,7 @@ fn walk_references(
                     format!("{path}.{key}").as_str(),
                     Some(key),
                     source_category,
+                    include_process_lcia_results,
                     result,
                 );
             }
@@ -2328,6 +2361,7 @@ fn walk_references(
                     format!("{path}[{index}]").as_str(),
                     parent_key,
                     source_category,
+                    include_process_lcia_results,
                     result,
                 );
             }
@@ -9956,6 +9990,188 @@ mod tests {
                 assert_eq!(targets, expected);
             }
         }
+    }
+
+    #[test]
+    fn scope_closure_reference_extraction_excludes_process_lcia_results() {
+        let exchange_flow = id("10101010-1010-4010-8010-101010101010");
+        let historical_method = id("20202020-2020-4020-8020-202020202020");
+        let payload = json!({
+            "processDataSet": {
+                "exchanges": {
+                    "exchange": {
+                        "referenceToFlowDataSet": reference(
+                            "flow",
+                            exchange_flow,
+                            Some("01.00.000")
+                        )
+                    }
+                },
+                "LCIAResults": {
+                    "LCIAResult": [
+                        {
+                            "referenceToLCIAMethodDataSet": {
+                                "@type": "LCIA method data set",
+                                "@refObjectId": historical_method,
+                                "@version": "01.00.000",
+                                "@uri": format!("../lciamethods/{historical_method}.json")
+                            },
+                            "meanAmount": 1.0
+                        },
+                        {
+                            "referenceToLCIAMethodDataSet": {
+                                "@type": "LCIA method data set",
+                                "@version": "invalid"
+                            },
+                            "meanAmount": 2.0
+                        }
+                    ]
+                }
+            }
+        });
+
+        let generic = extract_references("process-fixture", DatasetCategory::Processes, &payload);
+        assert_eq!(generic.edges.len(), 2);
+        assert!(!generic.issues.is_empty());
+
+        let closure = extract_scope_closure_references(
+            "process-fixture",
+            DatasetCategory::Processes,
+            &payload,
+        );
+        assert!(closure.issues.is_empty());
+        assert_eq!(closure.edges.len(), 1);
+        assert_eq!(closure.edges[0].target_uuid, exchange_flow.to_string());
+        assert_eq!(closure.edges[0].reference_role, "process_exchange_flow");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scope_closure_does_not_fetch_historical_lcia_result_dependencies() {
+        let process = identity(
+            DatasetCategory::Processes,
+            "30303030-3030-4030-8030-303030303030",
+        );
+        let selected_method = identity(
+            DatasetCategory::Lciamethods,
+            "40404040-4040-4040-8040-404040404040",
+        );
+        let historical_method = identity(
+            DatasetCategory::Lciamethods,
+            "50505050-5050-4050-8050-505050505050",
+        );
+        let exchange_flow = identity(
+            DatasetCategory::Flows,
+            "60606060-6060-4060-8060-606060606060",
+        );
+        let selected_factor_flow = identity(
+            DatasetCategory::Flows,
+            "70707070-7070-4070-8070-707070707070",
+        );
+        let historical_factor_flow = identity(
+            DatasetCategory::Flows,
+            "80808080-8080-4080-8080-808080808080",
+        );
+        let lcia_reference = |target: &ExactDatasetIdentity| {
+            json!({
+                "@type": "LCIA method data set",
+                "@refObjectId": target.id,
+                "@version": target.version,
+                "@uri": format!("../lciamethods/{}.json", target.id)
+            })
+        };
+        let method_payload = |factor: &ExactDatasetIdentity| {
+            json!({
+                "LCIAMethodDataSet": {
+                    "characterisationFactors": {
+                        "factor": {
+                            "referenceToFlowDataSet": reference(
+                                "flow",
+                                factor.id,
+                                Some(factor.version.as_str())
+                            )
+                        }
+                    }
+                }
+            })
+        };
+        let documents = [
+            ClosureDocument {
+                identity: process.clone(),
+                payload: json!({
+                    "processDataSet": {
+                        "exchanges": {
+                            "exchange": {
+                                "referenceToFlowDataSet": reference(
+                                    "flow",
+                                    exchange_flow.id,
+                                    Some(exchange_flow.version.as_str())
+                                )
+                            }
+                        },
+                        "LCIAResults": {
+                            "LCIAResult": {
+                                "referenceToLCIAMethodDataSet": lcia_reference(&historical_method),
+                                "meanAmount": 1.0
+                            }
+                        }
+                    }
+                }),
+            },
+            ClosureDocument {
+                identity: selected_method.clone(),
+                payload: method_payload(&selected_factor_flow),
+            },
+            ClosureDocument {
+                identity: historical_method.clone(),
+                payload: method_payload(&historical_factor_flow),
+            },
+            ClosureDocument {
+                identity: exchange_flow.clone(),
+                payload: json!({}),
+            },
+            ClosureDocument {
+                identity: selected_factor_flow.clone(),
+                payload: json!({}),
+            },
+            ClosureDocument {
+                identity: historical_factor_flow.clone(),
+                payload: json!({}),
+            },
+        ]
+        .into_iter()
+        .map(|document| (document.identity.clone(), document))
+        .collect();
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+        let mut requested_scope = manifest(vec![process]);
+        requested_scope.lcia_methods.push(RequestedIdentity {
+            id: selected_method.id,
+            version: selected_method.version.clone(),
+        });
+
+        let scan = collect_scope_closure(&provider, &requested_scope)
+            .await
+            .unwrap();
+
+        assert!(scan.complete);
+        assert!(scan.issues.is_empty());
+        assert_eq!(scan.documents.len(), 4);
+        assert_eq!(scan.edges.len(), 2);
+        let fetched = provider
+            .fetches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(fetched.contains(&selected_method));
+        assert!(fetched.contains(&selected_factor_flow));
+        assert!(!fetched.contains(&historical_method));
+        assert!(!fetched.contains(&historical_factor_flow));
     }
 
     #[tokio::test]

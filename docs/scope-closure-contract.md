@@ -32,7 +32,7 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
 lastReviewedNote: "Updated for Worker Issue #233: successful snapshot discovery uses a verified parent-owned temporary JSON file and bounded terminal descriptor."
 related:
   - AGENTS.md
@@ -81,6 +81,13 @@ Traversal is a union traversal over all exact process and LCIA-method roots. It 
 - non-fail-fast for domain findings;
 - checkpointed through the active Worker lease between batches.
 
+Process `LCIAResults` is a historical output subtree, not a current calculation input. Worker
+preserves it unchanged inside the canonical Process document used for hashing, storage, and TIDAS
+document validation, but the Scope Closure reference-extraction profile does not descend into that
+subtree. References below `$.processDataSet.LCIAResults` therefore produce no closure edge,
+reference issue, omitted-version resolution, or traversal target. Process exchanges and the exact
+LCIA methods requested by the frozen manifest remain ordinary closure inputs.
+
 CPU-heavy graph finalization runs through Tokio's blocking pool so sorting, coalescing, and affected-root analysis cannot occupy a lease-heartbeat runtime thread. Canonical ordering materializes each serialized sort key once per collection, and the Worker emits phase durations and collection counts for capacity diagnosis without changing the evidence payload.
 
 Fetched document payloads are canonicalized and appended to a temporary random-access spool during traversal, then released after reference extraction. The retained document index contains only exact identity, canonical content hash, file offset, and byte size. Reference-edge and resolved-reference evidence is likewise file-backed; affected-root analysis uses numeric identity IDs and compact adjacency lists rather than repeated full identity objects per graph edge. Cache hits never reload document payloads, while each uncached TIDAS execution reloads at most its fixed 64-document window.
@@ -97,7 +104,11 @@ An exact reference never falls back to another version. A missing exact identity
 
 ## TIDAS validation
 
-Reference extraction in `scope_closure.rs` mirrors the public `tidas.reference-extraction-result.v1` contract and is locked by the shared golden fixture under `crates/solver-worker/tests/fixtures/reference_extraction_v1/`.
+Generic reference extraction in `scope_closure.rs` mirrors the public
+`tidas.reference-extraction-result.v1` contract and is locked by the shared golden fixture under
+`crates/solver-worker/tests/fixtures/reference_extraction_v1/`. Scope Closure applies the explicit
+historical-`LCIAResults` subtree exclusion above before constructing its dependency graph; this
+does not change generic TIDAS reference extraction or document validation.
 
 Document validation uses only the published unified Rust `tidas` CLI selected by `TIDAS_BIN` (default `tidas`). No Python entrypoint, legacy binary name, or ordered command-candidate fallback is permitted:
 
