@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
-lastReviewedNote: "Updated for Worker Issue #231: target-based blocker aggregation uses an exact bounded root union and complete streamed blocker worksheets."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Updated for Worker Issue #233: successful discovery uses a bounded verified temporary JSON result instead of captured stdout."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -106,6 +106,7 @@ The implementation is window-bounded rather than relation-cardinality-bounded:
 
 - raw TIDAS events retain their existing 2 GiB and 5,000,000-event validation-input caps;
 - snapshot builder stdout retains at most 16 blocker samples; the full set is written to a parent-owned canonical NDJSON sidecar, bound by count/size/SHA-256/completeness metadata under the unchanged terminal V1 schema, verified before conversion, streamed into sorted issue runs and XLSX, and removed with its owning temporary file on every exit path;
+- successful snapshot discovery writes the complete `processAxis` and only the readiness fields consumed by Scope Closure (`schema_version`, `status`, `next_action`, and `blockers`) to one parent-owned bounded JSON file; captured stdout contains only a small terminal V1 size/SHA-256 descriptor, and the parent verifies the file before parsing and removes it on every exit path;
 - issue coalescing uses bounded external sort runs ordered by issue/source/occurrence and one current coalesced issue;
 - reverse reachability keeps one source's compact visited/parent/ordinal state plus one current-issue root bitset; it never retains the issue-by-source or issue-by-root Cartesian relation;
 - one active issue partition writer, root-impact writer, frozen-graph writer, and TIDAS compression buffer is retained per stage;

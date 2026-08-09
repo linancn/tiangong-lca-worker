@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
-lastReviewedNote: "Updated for Worker Issue #231: numerical source closure follows the exact requested method and active C-factor axes."
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Reviewed for Worker Issue #233: internal discovery transport does not change public job, result, artifact, or download contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
