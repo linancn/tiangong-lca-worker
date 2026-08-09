@@ -20,7 +20,7 @@ use crate::{
     },
     scope_closure::{
         SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION, execute_scope_closure_job,
-        record_scope_closure_failure,
+        record_scope_closure_failure, scope_closure_input_failure_code,
     },
     types::JobPayload,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
@@ -449,7 +449,8 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 );
             }
             Err(err) => {
-                let error_code = snapshot_builder_process_failure_code(&err)
+                let error_code = scope_closure_input_failure_code(&err)
+                    .or_else(|| snapshot_builder_process_failure_code(&err))
                     .unwrap_or("scope_closure_execution_failed");
                 let message = err.to_string();
                 error!(

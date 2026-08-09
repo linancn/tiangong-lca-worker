@@ -53,6 +53,8 @@ related:
 
 Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Snapshot source blockers coalesce by error code plus requested target identity (or raw malformed-target fingerprint plus extraction code); source/path/role remain occurrence evidence. A multi-source grouped issue omits a misleading single top-level source/path. Stable semantic fields include `issueKey`, `code`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and bounded occurrence/root samples; source/path remain present for single-source issues. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and general XLSX views are bounded projections and are never completeness authorities. The exception is the dedicated snapshot-blocker worksheets: they stream every record from the verified canonical NDJSON sidecar and split instead of truncating.
 
+Certificate-grade Scope Closure binds the frozen technosphere boundary to `cutoff`. Provider gaps, unresolved balances, and A-write coverage stay in the unified evidence and warning findings, but they do not contribute blocker codes or invalidate a certificate by themselves. A non-cutoff frozen manifest is an input-contract failure before canonical issue/result production, not a rewritten result and not a domain blocker.
+
 Issue identity and order are deterministic:
 
 - `issueKey` is the coalescing identity and partitions are globally ordered by UTF-8 ascending `issueKey`;

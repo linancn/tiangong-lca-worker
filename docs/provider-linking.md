@@ -172,6 +172,8 @@ closure = c_r + sum(c_i * activity_requirement_i) = 0
 
 未知策略 fail closed。`open/cutoff` 不是“没有找到 provider 时静默跳过”的别名。
 
+这三个值是 generic snapshot/readiness 的显式策略面。Certificate-grade Scope Closure 不使用 generic 默认值：数据库先把省略值以及兼容的 `closed/open/cutoff` 输入统一规范化为 `cutoff`，Worker 只接受冻结后的 `cutoff`。因此该工作流中的 unmatched provider、A-write coverage 和 unresolved balance 必须保留完整诊断与逐边证据，但不能升级为 certificate blocker；非 `cutoff` 冻结输入属于合同错误，Worker 不静默改写。
+
 ## 当前默认 rule
 
 `snapshot_builder` 当前默认：

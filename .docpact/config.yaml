@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-09"
-lastReviewedCommit: "05bcf3443490c37629689796695fbbf9cf16f38a"
-lastReviewedNote: "Reviewed for Worker Issue #233: bounded snapshot discovery transport remains within Worker runtime ownership and existing public contracts."
+lastReviewedAt: "2026-08-10"
+lastReviewedCommit: "63dac07d858a14427f663a03c69f17db9ed26419"
+lastReviewedNote: "Reviewed for Worker Issue #237: cutoff-only certificate-grade Scope Closure remains within Worker runtime ownership and existing public contracts; no routing rule change is required."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

@@ -137,6 +137,8 @@ The same module invokes TIDAS `document-validation-batch.v1` through `tidas_cli.
 
 Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limited to process/flow rows and load LCIA methods from the reviewed, release-pinned static cache through `crates/solver-worker/src/static_lcia_cache.rs`. That module owns trusted-base retrieval, byte/decompression limits, raw and canonical hash verification, method/locator alias validation, and streaming factor normalization. `calculation_evidence.rs` owns the v2 source/bundle/25-method coverage binding. Gap evidence is deterministically spooled as JSONL rather than retained as an exchange-by-method object graph. Build-snapshot terminal projection comes from canonical `worker_jobs` diagnostics, including reuse-resolved snapshot ID and evidence, so optional `lca_jobs` is never required. Singular/factorization diagnostics use only the exact process/version pairs in the snapshot index.
 
+Certificate-grade Scope Closure accepts only a frozen `cutoff` technosphere boundary. Provider gaps and A-write coverage remain auditable warnings, while any non-cutoff frozen input is rejected before scan publication. This binding is specific to Scope Closure; generic snapshot and readiness diagnostics retain their explicit `closed/open/cutoff` surface.
+
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
