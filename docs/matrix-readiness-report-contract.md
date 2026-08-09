@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Reviewed for Worker Issue #231: active LCIA source dependencies use the same C axis without changing readiness report semantics."
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Reviewed for Worker Issue #233: compact discovery projection does not change matrix-readiness report v2 semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

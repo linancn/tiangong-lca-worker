@@ -23,8 +23,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Updated for Worker Issue #231: active LCIA factors follow the biosphere/C axis without changing provider routing."
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change provider eligibility, routing, or evidence semantics."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

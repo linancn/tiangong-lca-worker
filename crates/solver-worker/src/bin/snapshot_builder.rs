@@ -60,7 +60,8 @@ use solver_worker::local_reports::{
 };
 use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use solver_worker::readiness::{
-    MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
+    MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, ReadinessFinding,
+    ReadinessStatus, verify_matrix_readiness,
 };
 use solver_worker::scope_closure::{DataSnapshotManifest, DatasetCategory};
 use solver_worker::signed_flow::{
@@ -80,7 +81,8 @@ use solver_worker::snapshot_artifacts::{
     encode_snapshot_release_evidence_artifact, encode_snapshot_source_closure_artifact,
 };
 use solver_worker::snapshot_builder_protocol::{
-    SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, write_blocking_reasons_file,
+    SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderDiscoveryFile, SnapshotBuilderTerminal,
+    write_blocking_reasons_file, write_discovery_file,
 };
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
@@ -129,7 +131,7 @@ fn source_closure_total_document_bytes_limit_from(value: Option<&str>) -> usize 
 fn emit_snapshot_builder_succeeded(
     resolved_snapshot_id: Uuid,
     build_timing: Option<&BuildTimingSec>,
-    scope_closure_discovery: Option<Value>,
+    scope_closure_discovery_file: Option<SnapshotBuilderDiscoveryFile>,
 ) -> anyhow::Result<()> {
     let build_timing_sec = build_timing.map(serde_json::to_value).transpose()?;
     println!(
@@ -137,11 +139,30 @@ fn emit_snapshot_builder_succeeded(
         SnapshotBuilderTerminal::succeeded(
             resolved_snapshot_id,
             build_timing_sec,
-            scope_closure_discovery,
+            scope_closure_discovery_file,
         )
         .to_line()?
     );
     Ok(())
+}
+
+fn scope_closure_discovery_value(
+    process_axis: &[Value],
+    readiness_schema_version: &str,
+    readiness_status: ReadinessStatus,
+    next_action: &str,
+    blockers: &[ReadinessFinding],
+) -> Value {
+    serde_json::json!({
+        "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
+        "processAxis": process_axis,
+        "readiness": {
+            "schema_version": readiness_schema_version,
+            "status": readiness_status,
+            "next_action": next_action,
+            "blockers": blockers,
+        },
+    })
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -217,6 +238,8 @@ struct Cli {
     scope_closure_mode: Option<String>,
     #[arg(long)]
     scope_closure_blocking_reasons_file: Option<PathBuf>,
+    #[arg(long)]
+    scope_closure_discovery_result_file: Option<PathBuf>,
     #[arg(long, env = "LCIA_STATIC_CACHE_DIR")]
     lcia_static_cache_dir: Option<PathBuf>,
     #[arg(long, env = "LCIA_STATIC_CACHE_BASE_URL")]
@@ -1382,16 +1405,33 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
                 })
             })
             .collect::<Vec<_>>();
-        let discovery = serde_json::json!({
-            "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
-            "processAxis": process_axis,
-            "readiness": built.readiness,
-        });
-        println!(
-            "[scope_closure_discovery] {}",
-            serde_json::to_string(&discovery)?
+        let readiness_status = built.readiness.status;
+        let readiness_blocker_count = built.readiness.blockers.len();
+        let discovery = scope_closure_discovery_value(
+            &process_axis,
+            &built.readiness.schema_version,
+            readiness_status,
+            &built.readiness.next_action,
+            &built.readiness.blockers,
         );
-        emit_snapshot_builder_succeeded(snapshot_id, Some(&build_timing), Some(discovery))?;
+        let discovery_path = cli
+            .scope_closure_discovery_result_file
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scope closure discovery requires --scope-closure-discovery-result-file"
+                )
+            })?;
+        let descriptor = write_discovery_file(discovery_path, &discovery)?;
+        println!(
+            "[scope_closure_discovery] process_count={} readiness_status={:?} blocker_count={} byte_size={} sha256={}",
+            discovery["processAxis"].as_array().map_or(0, Vec::len),
+            readiness_status,
+            readiness_blocker_count,
+            descriptor.byte_size,
+            descriptor.sha256,
+        );
+        emit_snapshot_builder_succeeded(snapshot_id, Some(&build_timing), Some(descriptor))?;
         return Ok(());
     }
 
@@ -9868,21 +9908,59 @@ mod tests {
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
         scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        select_active_lcia_factors, select_source_dataset_read_identities,
-        snapshot_db_statement_timeout, source_closure_total_document_bytes_limit_from,
-        source_dataset_document_id, source_reference_is_satisfied_index,
-        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_quantitative_references,
-        validate_unique_database_lcia_method_identities,
+        scope_closure_discovery_value, select_active_lcia_factors,
+        select_source_dataset_read_identities, snapshot_db_statement_timeout,
+        source_closure_total_document_bytes_limit_from, source_dataset_document_id,
+        source_reference_is_satisfied_index, summarize_matching_diagnostics, time_score,
+        unique_supported_direction_by_flow, validate_compiled_sources_against_frozen_manifest,
+        validate_flow_row_visibility, validate_process_row_visibility,
+        validate_quantitative_references, validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
     use serde_json::json;
+    use solver_worker::readiness::{FindingSeverity, ReadinessFinding, ReadinessStatus};
     use solver_worker::source_reference_policy::SOURCE_REFERENCE_POLICY_VERSION;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::io::Write;
     use uuid::Uuid;
+
+    #[test]
+    fn scope_closure_discovery_contains_only_consumed_readiness_fields() {
+        let blocker = ReadinessFinding {
+            code: "provider_closure_unmatched".to_owned(),
+            severity: FindingSeverity::Blocker,
+            message: "repair provider closure".to_owned(),
+            details: json!({"count": 39}),
+        };
+        let discovery = scope_closure_discovery_value(
+            &[json!({
+                "id": Uuid::from_u128(1),
+                "version": "01.01.000",
+            })],
+            "matrix_readiness_report.v2",
+            ReadinessStatus::Failed,
+            "repair_provider_closure_then_recheck",
+            &[blocker],
+        );
+
+        let readiness = discovery["readiness"].as_object().unwrap();
+        let keys = readiness
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["blockers", "next_action", "schema_version", "status"])
+        );
+        assert!(discovery["processAxis"].is_array());
+        assert!(readiness.get("provider_evidence").is_none());
+        assert!(readiness.get("balance_evidence").is_none());
+        assert!(readiness.get("unresolved_balances").is_none());
+        assert!(readiness.get("metrics").is_none());
+        assert!(readiness.get("findings").is_none());
+        assert!(readiness.get("policy").is_none());
+    }
 
     #[test]
     fn source_closure_total_document_bytes_limit_defaults_to_one_gib() {

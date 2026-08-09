@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Updated for Worker Issue #231: Scope Closure shares its active LCIA factor axis across C and source closure and aggregates blockers by target."
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Updated for Worker Issue #233: snapshot discovery crosses the child boundary through verified compact temporary JSON."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -123,7 +123,7 @@ The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND
 
 ### Scope closure and certificate-bound build
 
-`crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope.
+`crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope. Successful snapshot discovery crosses the child-process boundary through a parent-owned, size/SHA-256-verified temporary JSON file containing the process axis and compact readiness projection; captured stdout carries only its bounded terminal descriptor.
 
 Qualification preserves the same ownership boundary. Worker owns real payload
 collection, TIDAS/spool verification, four-mode capacity replay, resource

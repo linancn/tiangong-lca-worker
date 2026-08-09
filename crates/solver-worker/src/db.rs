@@ -50,7 +50,8 @@ use crate::{
     },
     snapshot_builder_protocol::{
         SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderBlockingReasonsFile,
-        SnapshotBuilderTerminal, parse_terminal, validate_blocking_reasons_file,
+        SnapshotBuilderTerminal, parse_terminal, read_verified_discovery_file,
+        validate_blocking_reasons_file,
     },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::{ObjectStoreClient, ObjectTransferOptions},
@@ -2384,6 +2385,7 @@ struct ScopeClosureSnapshotTempFiles {
     #[allow(dead_code)]
     data_snapshot: tempfile::NamedTempFile,
     blocking_reasons: tempfile::NamedTempFile,
+    discovery_result: Option<tempfile::NamedTempFile>,
 }
 
 pub(crate) fn snapshot_builder_process_failure_code(error: &anyhow::Error) -> Option<&'static str> {
@@ -3739,19 +3741,19 @@ async fn run_snapshot_builder_job(
                 message: error.to_string(),
             })?;
 
-        let (resolved_snapshot_id, terminal_timing, discovery) = match (exit_code, terminal) {
+        let (resolved_snapshot_id, terminal_timing, discovery_file) = match (exit_code, terminal) {
             (
                 0,
                 SnapshotBuilderTerminal::Succeeded {
                     resolved_snapshot_id,
                     build_timing_sec,
-                    scope_closure_discovery,
+                    scope_closure_discovery_file,
                     ..
                 },
             ) => (
                 resolved_snapshot_id,
                 build_timing_sec,
-                scope_closure_discovery,
+                scope_closure_discovery_file,
             ),
             (
                 SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
@@ -3854,8 +3856,43 @@ async fn run_snapshot_builder_job(
                     "snapshot_builder_protocol_exit_mismatch: terminal={resolved_snapshot_id} legacy={legacy_id}"
                 ),
             }
-            .into());
+                .into());
         }
+
+        let discovery = match (scope_closure.map(|scope| scope.mode), discovery_file) {
+            (Some(ScopeClosureSnapshotBuilderMode::Discovery), Some(descriptor)) => {
+                let discovery_path = scope_closure_snapshot_files
+                    .as_ref()
+                    .and_then(|files| files.discovery_result.as_ref())
+                    .ok_or_else(|| SnapshotBuilderProcessFailure::Protocol {
+                        command: command_diagnostics.clone(),
+                        message: "snapshot_builder_discovery_file_unavailable".to_owned(),
+                    })?;
+                Some(
+                    read_verified_discovery_file(discovery_path.path(), &descriptor).map_err(
+                        |error| SnapshotBuilderProcessFailure::Protocol {
+                            command: command_diagnostics.clone(),
+                            message: error.to_string(),
+                        },
+                    )?,
+                )
+            }
+            (Some(ScopeClosureSnapshotBuilderMode::Discovery), None) => {
+                return Err(SnapshotBuilderProcessFailure::Protocol {
+                    command: command_diagnostics,
+                    message: "snapshot_builder_discovery_file_missing".to_owned(),
+                }
+                .into());
+            }
+            (_, Some(_)) => {
+                return Err(SnapshotBuilderProcessFailure::Protocol {
+                    command: command_diagnostics,
+                    message: "snapshot_builder_discovery_file_unexpected".to_owned(),
+                }
+                .into());
+            }
+            (_, None) => None,
+        };
 
         return Ok(SnapshotBuilderExecution {
             requested_snapshot_id: snapshot_id,
@@ -3917,9 +3954,24 @@ fn append_scope_closure_snapshot_args(
         })?;
     builder_args.push("--scope-closure-blocking-reasons-file".to_owned());
     builder_args.push(blocking_reasons_file.path().to_string_lossy().into_owned());
+    let discovery_result = if scope.mode == ScopeClosureSnapshotBuilderMode::Discovery {
+        let file = tempfile::Builder::new()
+            .prefix("scope-closure-discovery-result-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|error| {
+                anyhow::anyhow!("create scope-closure snapshot_builder discovery file: {error}")
+            })?;
+        builder_args.push("--scope-closure-discovery-result-file".to_owned());
+        builder_args.push(file.path().to_string_lossy().into_owned());
+        Some(file)
+    } else {
+        None
+    };
     Ok(Some(ScopeClosureSnapshotTempFiles {
         data_snapshot: snapshot_file,
         blocking_reasons: blocking_reasons_file,
+        discovery_result,
     }))
 }
 
@@ -4745,6 +4797,12 @@ mod tests {
             .expect("snapshot input file");
         let input_path = input.data_snapshot.path().to_path_buf();
         let blocker_path = input.blocking_reasons.path().to_path_buf();
+        let discovery_path = input
+            .discovery_result
+            .as_ref()
+            .expect("discovery result file")
+            .path()
+            .to_path_buf();
 
         assert!(
             args.iter()
@@ -4758,6 +4816,10 @@ mod tests {
         assert!(
             args.iter()
                 .any(|arg| arg == "--scope-closure-blocking-reasons-file")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--scope-closure-discovery-result-file")
         );
         assert!(!args.iter().any(|arg| arg.contains(marker)));
         assert!(fs::metadata(&input_path).expect("snapshot metadata").len() > 4 * 1024 * 1024);
@@ -4779,6 +4841,10 @@ mod tests {
         drop(input);
         assert!(!input_path.exists(), "snapshot input must be cleaned up");
         assert!(!blocker_path.exists(), "blocker sidecar must be cleaned up");
+        assert!(
+            !discovery_path.exists(),
+            "discovery result file must be cleaned up"
+        );
     }
 
     #[test]

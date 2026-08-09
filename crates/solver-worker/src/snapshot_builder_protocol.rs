@@ -11,6 +11,7 @@ pub const SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION: &str = "snapshot_builder_ter
 pub const SNAPSHOT_BUILDER_TERMINAL_PREFIX: &str = "[snapshot_builder_terminal] ";
 pub const SNAPSHOT_BUILDER_TERMINAL_MAX_BYTES: usize = 32 * 1024;
 pub const SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE: i32 = 42;
+pub const SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_COUNT: usize = 16;
 const SNAPSHOT_BUILDER_BLOCKING_REASON_MAX_BYTES: usize = 1024;
 const SNAPSHOT_BUILDER_BLOCKING_SAMPLE_MAX_BYTES: usize = 16 * 1024;
@@ -25,6 +26,13 @@ pub struct SnapshotBuilderBlockingReasonsFile {
     pub collection_complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBuilderDiscoveryFile {
+    pub byte_size: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SnapshotBuilderTerminal {
@@ -34,7 +42,7 @@ pub enum SnapshotBuilderTerminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_timing_sec: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scope_closure_discovery: Option<Value>,
+        scope_closure_discovery_file: Option<SnapshotBuilderDiscoveryFile>,
     },
     Blocked {
         schema_version: String,
@@ -53,13 +61,13 @@ impl SnapshotBuilderTerminal {
     pub fn succeeded(
         resolved_snapshot_id: Uuid,
         build_timing_sec: Option<Value>,
-        scope_closure_discovery: Option<Value>,
+        scope_closure_discovery_file: Option<SnapshotBuilderDiscoveryFile>,
     ) -> Self {
         Self::Succeeded {
             schema_version: SNAPSHOT_BUILDER_TERMINAL_SCHEMA_VERSION.to_owned(),
             resolved_snapshot_id,
             build_timing_sec,
-            scope_closure_discovery,
+            scope_closure_discovery_file,
         }
     }
 
@@ -144,6 +152,53 @@ impl SnapshotBuilderTerminal {
             }
         }
     }
+}
+
+pub fn write_discovery_file(
+    path: &Path,
+    discovery: &Value,
+) -> anyhow::Result<SnapshotBuilderDiscoveryFile> {
+    let bytes = serde_json::to_vec(discovery)?;
+    let byte_size = u64::try_from(bytes.len())?;
+    if byte_size == 0 || byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_too_large: actual={byte_size} limit={SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES}"
+        ));
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let mut writer = BufWriter::new(File::create(path)?);
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(SnapshotBuilderDiscoveryFile { byte_size, sha256 })
+}
+
+pub fn read_verified_discovery_file(
+    path: &Path,
+    descriptor: &SnapshotBuilderDiscoveryFile,
+) -> anyhow::Result<Value> {
+    if descriptor.byte_size == 0 || descriptor.byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_too_large: actual={} limit={SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES}",
+            descriptor.byte_size
+        ));
+    }
+    let actual_size = fs::metadata(path)?.len();
+    if actual_size != descriptor.byte_size {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_size_mismatch: expected={} actual={actual_size}",
+            descriptor.byte_size
+        ));
+    }
+    let bytes = fs::read(path)?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_sha256 != descriptor.sha256 {
+        return Err(anyhow::anyhow!(
+            "snapshot_builder_discovery_sha256_mismatch: expected={} actual={actual_sha256}",
+            descriptor.sha256
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("snapshot_builder_discovery_invalid_json: {error}"))
 }
 
 pub fn write_blocking_reasons_file(
@@ -286,6 +341,21 @@ pub fn parse_terminal(stdout: &str) -> anyhow::Result<SnapshotBuilderTerminal> {
         } if resolved_snapshot_id.is_nil() => {
             Err(anyhow::anyhow!("snapshot_builder_protocol_snapshot_id_nil"))
         }
+        SnapshotBuilderTerminal::Succeeded {
+            scope_closure_discovery_file: Some(descriptor),
+            ..
+        } if descriptor.byte_size == 0
+            || descriptor.byte_size > SNAPSHOT_BUILDER_DISCOVERY_MAX_BYTES
+            || descriptor.sha256.len() != 64
+            || !descriptor
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Err(anyhow::anyhow!(
+                "snapshot_builder_protocol_discovery_file_invalid"
+            ))
+        }
         SnapshotBuilderTerminal::Blocked {
             code,
             blocking_reasons,
@@ -366,6 +436,68 @@ mod tests {
         );
         assert!(parse_terminal("").is_err());
         assert!(parse_terminal(format!("{line}\n{line}").as_str()).is_err());
+    }
+
+    #[test]
+    fn large_discovery_uses_verified_file_while_terminal_stays_bounded() {
+        let process_axis = (1_u128..=5_612)
+            .map(|index| {
+                json!({
+                    "id": Uuid::from_u128(index),
+                    "version": "01.01.000",
+                })
+            })
+            .collect::<Vec<_>>();
+        let discovery = json!({
+            "schemaVersion": "lcia.scope-closure-snapshot-discovery.v1",
+            "processAxis": process_axis,
+            "readiness": {
+                "schema_version": "matrix_readiness_report.v2",
+                "status": "failed",
+                "next_action": "repair_provider_closure_then_recheck",
+                "blockers": [{
+                    "code": "provider_closure_unmatched",
+                    "severity": "blocker",
+                    "message": "repair provider closure",
+                    "details": {"count": 39},
+                }],
+            },
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let descriptor = write_discovery_file(file.path(), &discovery).unwrap();
+        assert!(descriptor.byte_size > u64::try_from(SNAPSHOT_BUILDER_TERMINAL_MAX_BYTES).unwrap());
+
+        let terminal =
+            SnapshotBuilderTerminal::succeeded(Uuid::new_v4(), None, Some(descriptor.clone()));
+        let line = terminal.to_line().unwrap();
+        assert!(line.len() < 2 * 1024);
+        assert_eq!(parse_terminal(&line).unwrap(), terminal);
+        assert_eq!(
+            read_verified_discovery_file(file.path(), &descriptor).unwrap(),
+            discovery
+        );
+    }
+
+    #[test]
+    fn discovery_file_rejects_size_hash_and_json_corruption() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let discovery = json!({"schemaVersion": "lcia.scope-closure-snapshot-discovery.v1"});
+        let descriptor = write_discovery_file(file.path(), &discovery).unwrap();
+
+        let mut wrong_size = descriptor.clone();
+        wrong_size.byte_size += 1;
+        assert!(read_verified_discovery_file(file.path(), &wrong_size).is_err());
+
+        let mut wrong_hash = descriptor.clone();
+        wrong_hash.sha256 = "0".repeat(64);
+        assert!(read_verified_discovery_file(file.path(), &wrong_hash).is_err());
+
+        fs::write(file.path(), b"{invalid json}").unwrap();
+        let invalid_descriptor = SnapshotBuilderDiscoveryFile {
+            byte_size: fs::metadata(file.path()).unwrap().len(),
+            sha256: format!("{:x}", Sha256::digest(fs::read(file.path()).unwrap())),
+        };
+        assert!(read_verified_discovery_file(file.path(), &invalid_descriptor).is_err());
     }
 
     #[test]

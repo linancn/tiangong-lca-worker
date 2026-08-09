@@ -34,7 +34,7 @@ use crate::{
     file_cache::{advise_sequential_access, release_file_cache},
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
-    readiness::{MatrixReadinessReport, ReadinessStatus},
+    readiness::{ReadinessFinding, ReadinessStatus},
     resource::{CancellationToken, ResourceCounters, ResourceMeasurement},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     storage::ObjectTransferOptions,
@@ -3867,7 +3867,15 @@ struct ScopeClosureDiscoveredProcess {
 struct ScopeClosureSnapshotDiscovery {
     schema_version: String,
     process_axis: Vec<ScopeClosureDiscoveredProcess>,
-    readiness: MatrixReadinessReport,
+    readiness: ScopeClosureSnapshotReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ScopeClosureSnapshotReadiness {
+    schema_version: String,
+    status: ReadinessStatus,
+    next_action: String,
+    blockers: Vec<ReadinessFinding>,
 }
 
 async fn scan_and_validate_scope<P: ScopeClosureProvider>(
@@ -4323,7 +4331,7 @@ fn add_process_axis_drift_issue(
 
 fn merge_matrix_readiness_blockers(
     scan: &mut ScopeClosureScan,
-    readiness: &MatrixReadinessReport,
+    readiness: &ScopeClosureSnapshotReadiness,
 ) -> anyhow::Result<()> {
     if readiness.status == ReadinessStatus::Passed && readiness.blockers.is_empty() {
         return Ok(());

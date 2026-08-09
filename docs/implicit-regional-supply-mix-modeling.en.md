@@ -25,8 +25,8 @@ checkPaths:
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Reviewed for Worker Issue #231: active LCIA factor filtering does not change signed-flow routing or provider selection."
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change signed-flow routing or provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 88535d3db9cfd76d0ca412ba299564cf2d137baf
+lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
 lastReviewedAt: 2026-08-09
-lastReviewedNote: "Reviewed for Worker Issue #231: active LCIA dependency filtering does not change package task or certificate-binding contracts."
+lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change package tasks or certificate-binding contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
