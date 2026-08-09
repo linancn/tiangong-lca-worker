@@ -80,7 +80,7 @@ use solver_worker::snapshot_artifacts::{
     encode_snapshot_release_evidence_artifact, encode_snapshot_source_closure_artifact,
 };
 use solver_worker::snapshot_builder_protocol::{
-    SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal,
+    SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, write_blocking_reasons_file,
 };
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
@@ -215,6 +215,8 @@ struct Cli {
     scope_closure_data_snapshot_file: Option<PathBuf>,
     #[arg(long)]
     scope_closure_mode: Option<String>,
+    #[arg(long)]
+    scope_closure_blocking_reasons_file: Option<PathBuf>,
     #[arg(long, env = "LCIA_STATIC_CACHE_DIR")]
     lcia_static_cache_dir: Option<PathBuf>,
     #[arg(long, env = "LCIA_STATIC_CACHE_BASE_URL")]
@@ -898,15 +900,26 @@ fn scope_closure_boundary_policy(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    match Box::pin(run_snapshot_builder()).await {
+    let cli = Cli::parse();
+    let blocking_reasons_path = cli.scope_closure_blocking_reasons_file.clone();
+    match Box::pin(run_snapshot_builder(cli)).await {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) => {
             if let Some(SnapshotSourceClosureError::Blocked { code, issues }) =
                 error.downcast_ref::<SnapshotSourceClosureError>()
             {
+                let descriptor = blocking_reasons_path
+                    .as_deref()
+                    .map(|path| write_blocking_reasons_file(path, issues))
+                    .transpose()?;
                 println!(
                     "{}",
-                    SnapshotBuilderTerminal::blocked(code.clone(), issues.clone()).to_line()?
+                    SnapshotBuilderTerminal::blocked_with_file(
+                        code.clone(),
+                        issues.clone(),
+                        descriptor,
+                    )
+                    .to_line()?
                 );
                 return Ok(ExitCode::from(
                     u8::try_from(SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE)
@@ -918,9 +931,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 }
 
-async fn run_snapshot_builder() -> anyhow::Result<()> {
+async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
     let total_started = Instant::now();
-    let cli = Cli::parse();
     let versioned_scope = validate_versioned_scope_cli(&cli)?;
     let scope_closure_snapshot = parse_scope_closure_snapshot_args(&cli)?;
     if versioned_scope.is_some() && scope_closure_snapshot.is_some() {
