@@ -49,10 +49,12 @@ use crate::{
         decode_snapshot_release_evidence_artifact, decode_snapshot_source_closure_artifact,
     },
     snapshot_builder_protocol::{
-        SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderTerminal, parse_terminal,
+        SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, SnapshotBuilderBlockingReasonsFile,
+        SnapshotBuilderTerminal, parse_terminal, validate_blocking_reasons_file,
     },
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::{ObjectStoreClient, ObjectTransferOptions},
+    tidas_cli,
     types::{JobPayload, SolveOptionsPayload},
 };
 
@@ -2346,7 +2348,42 @@ pub(crate) enum SnapshotBuilderProcessFailure {
         blocking_reason_count: u64,
         blocking_reasons_sha256: String,
         blocking_reasons_truncated: bool,
+        blocking_reasons_spool: Option<SnapshotBuilderBlockingReasonsSpool>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotBuilderBlockingReasonsSpool {
+    file: tempfile::NamedTempFile,
+    pub(crate) descriptor: SnapshotBuilderBlockingReasonsFile,
+}
+
+impl SnapshotBuilderBlockingReasonsSpool {
+    #[cfg(test)]
+    pub(crate) fn from_reasons(reasons: &[Value]) -> anyhow::Result<Self> {
+        let file = tempfile::NamedTempFile::new()?;
+        let descriptor =
+            crate::snapshot_builder_protocol::write_blocking_reasons_file(file.path(), reasons)?;
+        Ok(Self { file, descriptor })
+    }
+
+    pub(crate) fn record_count(&self) -> u64 {
+        self.descriptor.record_count
+    }
+
+    pub(crate) fn visit(
+        &self,
+        visit: impl FnMut(Value) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        tidas_cli::visit_jsonl(self.file.path(), visit)
+    }
+}
+
+#[derive(Debug)]
+struct ScopeClosureSnapshotTempFiles {
+    #[allow(dead_code)]
+    data_snapshot: tempfile::NamedTempFile,
+    blocking_reasons: tempfile::NamedTempFile,
 }
 
 pub(crate) fn snapshot_builder_process_failure_code(error: &anyhow::Error) -> Option<&'static str> {
@@ -3615,7 +3652,7 @@ async fn run_snapshot_builder_job(
         builder_args.push("--lcia-factor-coverage-contract-json".to_owned());
         builder_args.push(serde_json::to_string(&scope.lcia_factor_coverage_contract)?);
     }
-    let _scope_closure_snapshot_file =
+    let mut scope_closure_snapshot_files =
         append_scope_closure_snapshot_args(&mut builder_args, scope_closure)?;
 
     let candidates = snapshot_builder_candidates(builder_args);
@@ -3724,15 +3761,67 @@ async fn run_snapshot_builder_job(
                     blocking_reason_count,
                     blocking_reasons_sha256,
                     blocking_reasons_truncated,
+                    blocking_reasons_file,
                     ..
                 },
             ) => {
+                let blocking_reasons_spool = match (
+                    scope_closure_snapshot_files.as_ref(),
+                    blocking_reasons_file,
+                ) {
+                    (Some(files), Some(descriptor)) => {
+                        if descriptor.record_count != blocking_reason_count {
+                            return Err(SnapshotBuilderProcessFailure::Protocol {
+                                command: command_diagnostics,
+                                message: format!(
+                                    "snapshot_builder_blocking_reasons_count_mismatch: terminal={blocking_reason_count} sidecar={}",
+                                    descriptor.record_count
+                                ),
+                            }
+                            .into());
+                        }
+                        validate_blocking_reasons_file(
+                            files.blocking_reasons.path(),
+                            &descriptor,
+                            blocking_reasons_sha256.as_str(),
+                        )
+                        .map_err(|error| {
+                            SnapshotBuilderProcessFailure::Protocol {
+                                command: command_diagnostics.clone(),
+                                message: error.to_string(),
+                            }
+                        })?;
+                        let files = scope_closure_snapshot_files
+                            .take()
+                            .expect("scope closure files remain available");
+                        Some(SnapshotBuilderBlockingReasonsSpool {
+                            file: files.blocking_reasons,
+                            descriptor,
+                        })
+                    }
+                    (Some(_), None) => {
+                        return Err(SnapshotBuilderProcessFailure::Protocol {
+                            command: command_diagnostics,
+                            message: "snapshot_builder_blocking_reasons_file_missing".to_owned(),
+                        }
+                        .into());
+                    }
+                    (None, Some(_)) => {
+                        return Err(SnapshotBuilderProcessFailure::Protocol {
+                            command: command_diagnostics,
+                            message: "snapshot_builder_blocking_reasons_file_unexpected".to_owned(),
+                        }
+                        .into());
+                    }
+                    (None, None) => None,
+                };
                 return Err(SnapshotBuilderProcessFailure::Blocked {
                     code,
                     blocking_reasons,
                     blocking_reason_count,
                     blocking_reasons_sha256,
                     blocking_reasons_truncated,
+                    blocking_reasons_spool,
                 }
                 .into());
             }
@@ -3795,7 +3884,7 @@ async fn run_snapshot_builder_job(
 fn append_scope_closure_snapshot_args(
     builder_args: &mut Vec<String>,
     scope_closure: Option<&ScopeClosureSnapshotBuilderArgs>,
-) -> anyhow::Result<Option<tempfile::NamedTempFile>> {
+) -> anyhow::Result<Option<ScopeClosureSnapshotTempFiles>> {
     let Some(scope) = scope_closure else {
         return Ok(None);
     };
@@ -3819,7 +3908,19 @@ fn append_scope_closure_snapshot_args(
     builder_args.push(serde_json::to_string(&scope.binding)?);
     builder_args.push("--scope-closure-data-snapshot-file".to_owned());
     builder_args.push(snapshot_file.path().to_string_lossy().into_owned());
-    Ok(Some(snapshot_file))
+    let blocking_reasons_file = tempfile::Builder::new()
+        .prefix("scope-closure-blocking-reasons-")
+        .suffix(".ndjson")
+        .tempfile()
+        .map_err(|error| {
+            anyhow::anyhow!("create scope-closure snapshot_builder blocker file: {error}")
+        })?;
+    builder_args.push("--scope-closure-blocking-reasons-file".to_owned());
+    builder_args.push(blocking_reasons_file.path().to_string_lossy().into_owned());
+    Ok(Some(ScopeClosureSnapshotTempFiles {
+        data_snapshot: snapshot_file,
+        blocking_reasons: blocking_reasons_file,
+    }))
 }
 
 fn snapshot_builder_candidates(builder_args: Vec<String>) -> Vec<BuilderCommandCandidate> {
@@ -4642,7 +4743,8 @@ mod tests {
         let input = append_scope_closure_snapshot_args(&mut args, Some(&scope))
             .expect("prepare snapshot transport")
             .expect("snapshot input file");
-        let input_path = input.path().to_path_buf();
+        let input_path = input.data_snapshot.path().to_path_buf();
+        let blocker_path = input.blocking_reasons.path().to_path_buf();
 
         assert!(
             args.iter()
@@ -4652,6 +4754,10 @@ mod tests {
             !args
                 .iter()
                 .any(|arg| arg == "--scope-closure-data-snapshot-json")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--scope-closure-blocking-reasons-file")
         );
         assert!(!args.iter().any(|arg| arg.contains(marker)));
         assert!(fs::metadata(&input_path).expect("snapshot metadata").len() > 4 * 1024 * 1024);
@@ -4672,6 +4778,7 @@ mod tests {
 
         drop(input);
         assert!(!input_path.exists(), "snapshot input must be cleaned up");
+        assert!(!blocker_path.exists(), "blocker sidecar must be cleaned up");
     }
 
     #[test]

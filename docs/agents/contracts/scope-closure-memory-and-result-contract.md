@@ -48,9 +48,10 @@ related:
 - exact-reference, missing-reference, frozen-release, and source-drift issues;
 - process-provider and provider-universe issues;
 - requested-scope and reference-graph issues;
-- matrix construction, signed-flow/provider, factorization, and LCIA-readiness blockers.
+- matrix construction, signed-flow/provider, factorization, and LCIA-readiness blockers;
+- typed snapshot source-preflight blockers from discovery or the final numerical build preflight.
 
-Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Its stable semantic fields are `issueKey`, `source`, `code`, `path`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and a bounded sample of occurrences and affected roots. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and XLSX views are bounded projections and are never completeness authorities.
+Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Its stable semantic fields are `issueKey`, `source`, `code`, `path`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and a bounded sample of occurrences and affected roots. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and general XLSX views are bounded projections and are never completeness authorities. The exception is the dedicated snapshot-blocker worksheets: they stream every record from the verified canonical NDJSON sidecar and split instead of truncating.
 
 Issue identity and order are deterministic:
 
@@ -104,6 +105,7 @@ Next and Edge continue to expose the existing XLSX and manifest download selecto
 The implementation is window-bounded rather than relation-cardinality-bounded:
 
 - raw TIDAS events retain their existing 2 GiB and 5,000,000-event validation-input caps;
+- snapshot builder stdout retains at most 16 blocker samples; the full set is written to a parent-owned canonical NDJSON sidecar, bound by count/size/SHA-256/completeness metadata under the unchanged terminal V1 schema, verified before conversion, streamed into sorted issue runs and XLSX, and removed with its owning temporary file on every exit path;
 - issue coalescing uses bounded external sort runs and one current coalesced issue;
 - reverse reachability keeps one source's compact visited/parent/ordinal state at a time and is reused for adjacent issues with the same source;
 - one active issue partition writer, root-impact writer, frozen-graph writer, and TIDAS compression buffer is retained per stage;

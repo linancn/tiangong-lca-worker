@@ -27,7 +27,8 @@ use crate::{
     calculation_evidence::RELEASE_METHOD_IDENTITIES,
     db::{
         AppState, ScopeClosureSnapshotBuilderArgs, ScopeClosureSnapshotBuilderMode,
-        ScopeClosureSnapshotFacts, fetch_scope_closure_snapshot_facts,
+        ScopeClosureSnapshotFacts, SnapshotBuilderBlockingReasonsSpool,
+        SnapshotBuilderProcessFailure, fetch_scope_closure_snapshot_facts,
         run_scope_closure_snapshot_builder, scope_closure_evidence_hash,
     },
     file_cache::{advise_sequential_access, release_file_cache},
@@ -4596,6 +4597,7 @@ pub async fn execute_scope_closure_job(
     let mut effective_scope =
         build_effective_scope_manifest(&input.requested_scope, &scan.documents);
     let mut frozen_process_axis = scope_process_axis(&effective_scope);
+    let mut snapshot_blocking_reasons = None::<SnapshotBuilderBlockingReasonsSpool>;
 
     if closure_scan_allows_numerical_snapshot(&scan) {
         let input_for_administrative_bundle = input.clone();
@@ -4608,7 +4610,7 @@ pub async fn execute_scope_closure_job(
                 &scan,
                 &resolution_map,
             )?;
-            Ok::<_, anyhow::Error>(bundle.sha256)
+            Ok::<_, anyhow::Error>((bundle.sha256, scan, validation))
         });
         tokio::pin!(prepare_administrative_bundle);
         let mut administrative_bundle_heartbeat =
@@ -4616,7 +4618,7 @@ pub async fn execute_scope_closure_job(
         administrative_bundle_heartbeat
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         administrative_bundle_heartbeat.tick().await;
-        let administrative_bundle_hash = loop {
+        let (administrative_bundle_hash, returned_scan, returned_validation) = loop {
             tokio::select! {
                 result = &mut prepare_administrative_bundle => {
                     break result??;
@@ -4635,6 +4637,8 @@ pub async fn execute_scope_closure_job(
                 }
             }
         };
+        scan = returned_scan;
+        validation = returned_validation;
         let discovery_binding = scope_closure_snapshot_binding(
             &state.pool,
             &effective_scope,
@@ -4666,18 +4670,111 @@ pub async fn execute_scope_closure_job(
                 data_snapshot: input.data_snapshot_manifest.clone(),
             },
         )
-        .await?;
-        let discovery = parse_scope_closure_snapshot_discovery(
-            discovery_execution.scope_closure_discovery.as_ref(),
-        )?;
-        let final_requested_scope =
-            freeze_discovered_process_axis(&input.requested_scope, &discovery.process_axis)?;
-        frozen_process_axis = scope_process_axis(&final_requested_scope);
+        .await;
+        match discovery_execution {
+            Ok(discovery_execution) => {
+                let discovery = parse_scope_closure_snapshot_discovery(
+                    discovery_execution.scope_closure_discovery.as_ref(),
+                )?;
+                let final_requested_scope = freeze_discovered_process_axis(
+                    &input.requested_scope,
+                    &discovery.process_axis,
+                )?;
+                frozen_process_axis = scope_process_axis(&final_requested_scope);
 
+                progress
+                    .heartbeat(
+                        "scan_discovered_provider_processes",
+                        0.79,
+                        Some(json!({
+                            "closureCheckId": closure_check_id,
+                            "progressCounters": {
+                                "scanned": 0,
+                                "total": frozen_process_axis.len(),
+                                "unit": "frozenProcessAxis"
+                            },
+                        })),
+                    )
+                    .await?;
+                (scan, validation) = scan_and_validate_scope_with_heartbeat(
+                    &provider,
+                    &state.pool,
+                    worker_job_id,
+                    &final_requested_scope,
+                    &progress,
+                    closure_check_id,
+                    lease_seconds,
+                )
+                .await?;
+                effective_scope =
+                    build_effective_scope_manifest(&final_requested_scope, &scan.documents);
+                add_process_axis_drift_issue(
+                    &mut scan,
+                    frozen_process_axis.as_slice(),
+                    &effective_scope,
+                )?;
+                merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
+                scan.issues
+                    .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+            }
+            Err(error) => {
+                snapshot_blocking_reasons = Some(snapshot_builder_blocking_reasons(error)?);
+            }
+        }
+    }
+
+    let mut prebuilt_numerical_snapshot = None::<(ScopeClosureSnapshotBinding, Uuid, String)>;
+    if snapshot_blocking_reasons.is_none()
+        && validation.issue_events.event_count == 0
+        && closure_scan_allows_numerical_snapshot(&scan)
+    {
+        let input_for_prebuild_bundle = input.clone();
+        let prepare_prebuild_bundle = tokio::task::spawn_blocking(move || {
+            let resolution_map =
+                build_resolution_map_spool(&scan.edges, &scan.omitted_version_resolutions)?;
+            let bundle = build_closure_bundle(
+                &input_for_prebuild_bundle,
+                &validation,
+                &scan,
+                &resolution_map,
+            )?;
+            Ok::<_, anyhow::Error>((bundle.sha256, scan, validation))
+        });
+        tokio::pin!(prepare_prebuild_bundle);
+        let mut prebuild_bundle_heartbeat =
+            tokio::time::interval(lease_heartbeat_period(lease_seconds));
+        prebuild_bundle_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        prebuild_bundle_heartbeat.tick().await;
+        let (prebuild_bundle_hash, returned_scan, returned_validation) = loop {
+            tokio::select! {
+                result = &mut prepare_prebuild_bundle => break result??,
+                _ = prebuild_bundle_heartbeat.tick() => {
+                    progress
+                        .heartbeat(
+                            "prepare_bound_numerical_snapshot",
+                            0.8,
+                            Some(json!({
+                                "closureCheckId": closure_check_id,
+                                "longRunningOperation": true,
+                            })),
+                        )
+                        .await?;
+                }
+            }
+        };
+        scan = returned_scan;
+        validation = returned_validation;
+        let binding = scope_closure_snapshot_binding(
+            &state.pool,
+            &effective_scope,
+            input.data_snapshot_token.as_str(),
+            prebuild_bundle_hash.as_str(),
+        )
+        .await?;
         progress
             .heartbeat(
-                "scan_discovered_provider_processes",
-                0.79,
+                "build_bound_numerical_snapshot",
+                0.81,
                 Some(json!({
                     "closureCheckId": closure_check_id,
                     "progressCounters": {
@@ -4688,21 +4785,30 @@ pub async fn execute_scope_closure_job(
                 })),
             )
             .await?;
-        (scan, validation) = scan_and_validate_scope_with_heartbeat(
-            &provider,
-            &state.pool,
-            worker_job_id,
-            &final_requested_scope,
-            &progress,
-            closure_check_id,
-            lease_seconds,
+        match run_scope_closure_snapshot_builder(
+            state,
+            input.numerical_snapshot_id,
+            frozen_process_axis.as_slice(),
+            &ScopeClosureSnapshotBuilderArgs {
+                mode: ScopeClosureSnapshotBuilderMode::Build,
+                binding: serde_json::to_value(&binding)?,
+                data_snapshot: input.data_snapshot_manifest.clone(),
+            },
         )
-        .await?;
-        effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
-        add_process_axis_drift_issue(&mut scan, frozen_process_axis.as_slice(), &effective_scope)?;
-        merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
-        scan.issues
-            .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
+        .await
+        {
+            Ok(built) => {
+                ensure_preallocated_snapshot_identity(
+                    input.numerical_snapshot_id,
+                    built.resolved_snapshot_id,
+                )?;
+                prebuilt_numerical_snapshot =
+                    Some((binding, built.resolved_snapshot_id, prebuild_bundle_hash));
+            }
+            Err(error) => {
+                snapshot_blocking_reasons = Some(snapshot_builder_blocking_reasons(error)?);
+            }
+        }
     }
 
     let input_for_artifacts = input.clone();
@@ -4714,6 +4820,7 @@ pub async fn execute_scope_closure_job(
         build_issue_relation_spools_with_cancellation_and_progress(
             &mut scan,
             &validation.issue_events,
+            snapshot_blocking_reasons.as_ref(),
             &blocking_cancellation,
             Some(&blocking_progress),
         )?;
@@ -4733,6 +4840,7 @@ pub async fn execute_scope_closure_job(
             &scan,
             &validation,
             &resolution_map,
+            snapshot_blocking_reasons.as_ref(),
             &blocking_cancellation,
             Some(&blocking_progress),
         )?;
@@ -4857,45 +4965,18 @@ pub async fn execute_scope_closure_job(
         "incomplete"
     };
     let (evidence, snapshot_artifact_id) = if status == "passed" {
-        progress
-            .heartbeat(
-                "build_bound_numerical_snapshot",
-                0.9,
-                Some(json!({
-                    "closureCheckId": closure_check_id,
-                    "progressCounters": {
-                        "scanned": 0,
-                        "total": frozen_process_axis.len(),
-                        "unit": "frozenProcessAxis"
-                    },
-                })),
-            )
-            .await?;
-        let binding = scope_closure_snapshot_binding(
-            &state.pool,
-            &effective_scope,
-            input.data_snapshot_token.as_str(),
-            closure_bundle_hash.as_str(),
-        )
-        .await?;
-        let built = run_scope_closure_snapshot_builder(
-            state,
-            input.numerical_snapshot_id,
-            frozen_process_axis.as_slice(),
-            &ScopeClosureSnapshotBuilderArgs {
-                mode: ScopeClosureSnapshotBuilderMode::Build,
-                binding: serde_json::to_value(&binding)?,
-                data_snapshot: input.data_snapshot_manifest.clone(),
-            },
-        )
-        .await?;
-        ensure_preallocated_snapshot_identity(
-            input.numerical_snapshot_id,
-            built.resolved_snapshot_id,
-        )?;
+        let (binding, resolved_snapshot_id, prebuild_bundle_hash) = prebuilt_numerical_snapshot
+            .ok_or_else(|| {
+                anyhow::anyhow!("passed scope closure omitted prebuilt numerical snapshot")
+            })?;
+        if prebuild_bundle_hash != closure_bundle_hash {
+            return Err(anyhow::anyhow!(
+                "scope_closure_bundle_hash_drift: prebuild={prebuild_bundle_hash} final={closure_bundle_hash}"
+            ));
+        }
         let facts = fetch_scope_closure_snapshot_facts(
             state,
-            built.resolved_snapshot_id,
+            resolved_snapshot_id,
             &binding,
             frozen_process_axis.as_slice(),
         )
@@ -6439,17 +6520,20 @@ fn prepare_closure_content_artifacts(
         scan,
         validation,
         resolution_map,
+        None,
         &CancellationToken::default(),
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_closure_content_artifacts_with_cancellation(
     closure_bundle: ClosureBundleFile,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
     validation: &TidasBatchValidation,
     resolution_map: &JsonlValueSpool,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<Vec<PreparedArtifact>> {
@@ -6461,7 +6545,12 @@ fn prepare_closure_content_artifacts_with_cancellation(
     } = closure_bundle;
     cancellation.check("scope_closure_xlsx_report")?;
     let xlsx_path = temp.path().join("closure-report-v1.xlsx");
-    build_scan_xlsx_report_file(&xlsx_path, closure_check_id, scan)?;
+    build_scan_xlsx_report_file(
+        &xlsx_path,
+        closure_check_id,
+        scan,
+        snapshot_blocking_reasons,
+    )?;
 
     let mut artifacts = vec![
         PreparedArtifact {
@@ -8090,6 +8179,109 @@ fn tidas_event_issue(
     })
 }
 
+fn snapshot_builder_blocking_reasons(
+    error: anyhow::Error,
+) -> anyhow::Result<SnapshotBuilderBlockingReasonsSpool> {
+    match error.downcast::<SnapshotBuilderProcessFailure>() {
+        Ok(SnapshotBuilderProcessFailure::Blocked {
+            blocking_reasons_spool: Some(spool),
+            ..
+        }) => Ok(spool),
+        Ok(SnapshotBuilderProcessFailure::Blocked { .. }) => Err(anyhow::anyhow!(
+            "snapshot_builder_blocking_reasons_file_missing"
+        )),
+        Ok(failure) => Err(anyhow::Error::new(failure)),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_snapshot_source_identity(raw: &str) -> Option<ExactDatasetIdentity> {
+    let (dataset_type, identity) = raw.split_once(':')?;
+    let (id, version) = identity.rsplit_once('@')?;
+    Some(ExactDatasetIdentity {
+        category: DatasetCategory::from_uri(dataset_type)?,
+        id: Uuid::parse_str(id).ok()?,
+        version: version.to_owned(),
+    })
+}
+
+fn snapshot_blocking_reason_issue(reason: Value) -> anyhow::Result<ClosureIssue> {
+    let issue_code = reason
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("source_reference_invalid")
+        .to_owned();
+    let source = reason
+        .get("sourceIdentity")
+        .and_then(Value::as_str)
+        .and_then(parse_snapshot_source_identity);
+    let json_path = reason
+        .get("jsonPath")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reference_role = reason
+        .get("referenceRole")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let requested_target_type = reason
+        .get("targetType")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let requested_target_id = reason
+        .get("targetId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let requested_target_version = reason
+        .get("targetVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let message = reason
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Snapshot source dependency is invalid or unavailable.")
+        .to_owned();
+    let issue_key = canonical_json_sha256(&json!({
+        "code": issue_code,
+        "source": source,
+        "path": json_path,
+        "referenceRole": reference_role,
+        "targetType": requested_target_type,
+        "targetId": requested_target_id,
+        "targetVersion": requested_target_version,
+        "message": message,
+    }))?;
+    let occurrence_key = canonical_json_sha256(&reason)?;
+    Ok(ClosureIssue {
+        issue_key,
+        severity: "blocker".to_owned(),
+        blocking: true,
+        issue_code,
+        source: source.clone(),
+        json_path: json_path.clone(),
+        reference_role: reference_role.clone(),
+        requested_target_type,
+        requested_target_id,
+        requested_target_version,
+        message,
+        suggested_action: Some(
+            "Repair the invalid or unavailable source dependency and rerun closure preflight."
+                .to_owned(),
+        ),
+        occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key,
+            source,
+            json_path,
+            reference_role,
+            details: reason,
+        }],
+        affected_root_count: 0,
+        affected_roots: Vec::new(),
+        affected_root_witness_paths: Vec::new(),
+        witness_path: Vec::new(),
+    })
+}
+
 fn issue_source_sort_key(source: Option<&ExactDatasetIdentity>) -> anyhow::Result<String> {
     source.map_or_else(|| Ok(String::new()), canonical_json_sha256)
 }
@@ -8453,13 +8645,20 @@ fn build_issue_relation_spools_with_cancellation(
     events: &JsonlValueSpool,
     cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
-    build_issue_relation_spools_with_cancellation_and_progress(scan, events, cancellation, None)
+    build_issue_relation_spools_with_cancellation_and_progress(
+        scan,
+        events,
+        None,
+        cancellation,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 fn build_issue_relation_spools_with_cancellation_and_progress(
     scan: &mut ScopeClosureScan,
     events: &JsonlValueSpool,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
     cancellation: &CancellationToken,
     progress: Option<&ScopeClosureArtifactProgress>,
 ) -> anyhow::Result<()> {
@@ -8496,6 +8695,24 @@ fn build_issue_relation_spools_with_cancellation_and_progress(
             tidas_event_issue(&scan.documents, &event)?,
         )
     })?;
+    if let Some(snapshot_blocking_reasons) = snapshot_blocking_reasons {
+        let initial_event_count = event_count;
+        snapshot_blocking_reasons.visit(|reason| {
+            event_count = event_count.saturating_add(1);
+            if event_count.is_multiple_of(4_096) {
+                cancellation.check("scope_closure_snapshot_blocker_merge_input")?;
+                enforce_scope_closure_memory_budget("prepare_snapshot_blocker_merge_runs")?;
+            }
+            append_issue_merge_records(&mut merge_input, snapshot_blocking_reason_issue(reason)?)
+        })?;
+        let converted_count = event_count.saturating_sub(initial_event_count);
+        if converted_count != snapshot_blocking_reasons.record_count() {
+            return Err(anyhow::anyhow!(
+                "snapshot_builder_blocking_reasons_conversion_count_mismatch: expected={} actual={converted_count}",
+                snapshot_blocking_reasons.record_count()
+            ));
+        }
+    }
     let sorted_input = merge_input.finish()?;
     let stable_roots = StableRootOrdinals::new(&scan.roots, &scan.reference_graph)?;
     let mut canonical_issue_writer = SortedJsonlRunWriter::new("canonical-issues-v3")?;
@@ -8685,7 +8902,7 @@ fn find_document_identity(
 #[cfg(test)]
 fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(Vec::new());
-    Ok(write_xlsx_report(cursor, closure_check_id, issues, None)?.into_inner())
+    Ok(write_xlsx_report(cursor, closure_check_id, issues, None, None)?.into_inner())
 }
 
 fn build_xlsx_report_file(
@@ -8693,7 +8910,7 @@ fn build_xlsx_report_file(
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
 ) -> anyhow::Result<()> {
-    write_xlsx_report(File::create(path)?, closure_check_id, issues, None)?;
+    write_xlsx_report(File::create(path)?, closure_check_id, issues, None, None)?;
     Ok(())
 }
 
@@ -8701,12 +8918,19 @@ fn build_scan_xlsx_report_file(
     path: &Path,
     closure_check_id: Uuid,
     scan: &ScopeClosureScan,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
 ) -> anyhow::Result<()> {
     let stats = scan
         .issue_relations
         .as_ref()
         .map(|relations| &relations.stats);
-    write_xlsx_report(File::create(path)?, closure_check_id, &scan.issues, stats)?;
+    write_xlsx_report(
+        File::create(path)?,
+        closure_check_id,
+        &scan.issues,
+        stats,
+        snapshot_blocking_reasons,
+    )?;
     Ok(())
 }
 
@@ -8716,6 +8940,7 @@ fn write_xlsx_report<W: Write + Seek>(
     closure_check_id: Uuid,
     issues: &[ClosureIssue],
     stats: Option<&IssueRelationStats>,
+    snapshot_blocking_reasons: Option<&SnapshotBuilderBlockingReasonsSpool>,
 ) -> anyhow::Result<W> {
     let issue_count = stats.map_or_else(
         || u64::try_from(issues.len()).unwrap_or(u64::MAX),
@@ -8894,21 +9119,78 @@ fn write_xlsx_report<W: Write + Seek>(
         affected_rows.as_slice(),
     ];
     preflight_xlsx_worksheets(&worksheets)?;
+    let blocker_sheet_plans = snapshot_blocking_reasons
+        .map(plan_snapshot_blocker_worksheets)
+        .transpose()?
+        .unwrap_or_default();
+    let existing_worksheet_bytes = worksheets.iter().try_fold(0_u64, |total, rows| {
+        total
+            .checked_add(estimate_xlsx_worksheet_bytes(rows)?)
+            .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))
+    })?;
+    let blocker_worksheet_bytes = blocker_sheet_plans.iter().try_fold(0_u64, |total, plan| {
+        total
+            .checked_add(plan.estimated_bytes)
+            .ok_or_else(|| anyhow::anyhow!("xlsx blocker byte estimate overflow"))
+    })?;
+    let total_worksheet_bytes = existing_worksheet_bytes
+        .checked_add(blocker_worksheet_bytes)
+        .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))?;
+    if total_worksheet_bytes > XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES {
+        return Err(anyhow::anyhow!(
+            "artifact_limit_exceeded: xlsx total worksheet bytes {total_worksheet_bytes} exceed {XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES}"
+        ));
+    }
+    let sheet_count = 4_usize.saturating_add(blocker_sheet_plans.len());
 
     let mut zip = ZipWriter::new(writer);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("[Content_Types].xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
+    write!(
+        zip,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+    )?;
+    for sheet_number in 1..=sheet_count {
+        write!(
+            zip,
+            "<Override PartName=\"/xl/worksheets/sheet{sheet_number}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        )?;
+    }
+    zip.write_all(b"</Types>")?;
     zip.start_file("_rels/.rels", options)?;
     zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     zip.start_file("xl/workbook.xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Closure Issues" sheetId="2" r:id="rId2"/><sheet name="Occurrences" sheetId="3" r:id="rId3"/><sheet name="Affected Datasets" sheetId="4" r:id="rId4"/></sheets></workbook>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Closure Issues" sheetId="2" r:id="rId2"/><sheet name="Occurrences" sheetId="3" r:id="rId3"/><sheet name="Affected Datasets" sheetId="4" r:id="rId4"/>"#)?;
+    for (index, _) in blocker_sheet_plans.iter().enumerate() {
+        let sheet_number = index + 5;
+        write!(
+            zip,
+            "<sheet name=\"Snapshot Blockers {}\" sheetId=\"{sheet_number}\" r:id=\"rId{sheet_number}\"/>",
+            index + 1
+        )?;
+    }
+    zip.write_all(b"</sheets></workbook>")?;
     zip.start_file("xl/_rels/workbook.xml.rels", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet4.xml"/></Relationships>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#)?;
+    for sheet_number in 1..=sheet_count {
+        write!(
+            zip,
+            "<Relationship Id=\"rId{sheet_number}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{sheet_number}.xml\"/>"
+        )?;
+    }
+    zip.write_all(b"</Relationships>")?;
     write_xlsx_worksheet(&mut zip, options, 1, summary_rows)?;
     write_xlsx_worksheet(&mut zip, options, 2, issue_rows)?;
     write_xlsx_worksheet(&mut zip, options, 3, occurrence_rows)?;
     write_xlsx_worksheet(&mut zip, options, 4, affected_rows)?;
+    if let Some(snapshot_blocking_reasons) = snapshot_blocking_reasons {
+        write_snapshot_blocker_worksheets(
+            &mut zip,
+            options,
+            snapshot_blocking_reasons,
+            &blocker_sheet_plans,
+        )?;
+    }
     writer = zip.finish()?;
     let archive_bytes = writer.stream_position()?;
     if archive_bytes > XLSX_MAX_ARCHIVE_BYTES {
@@ -8971,6 +9253,159 @@ fn estimate_xlsx_worksheet_bytes(rows: &[Vec<String>]) -> anyhow::Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotBlockerWorksheetPlan {
+    data_rows: usize,
+    estimated_bytes: u64,
+}
+
+fn snapshot_blocker_xlsx_header() -> Vec<String> {
+    [
+        "Code",
+        "Source identity",
+        "JSON path",
+        "Reference role",
+        "Target type",
+        "Target id",
+        "Target version",
+        "Message",
+        "Complete details",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn snapshot_blocker_xlsx_row(reason: &Value) -> Vec<String> {
+    let text = |key| {
+        reason
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    vec![
+        text("code"),
+        text("sourceIdentity"),
+        text("jsonPath"),
+        text("referenceRole"),
+        text("targetType"),
+        text("targetId"),
+        text("targetVersion"),
+        text("message"),
+        canonical_value(reason),
+    ]
+}
+
+fn xlsx_worksheet_envelope_bytes() -> u64 {
+    u64::try_from(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData></sheetData></worksheet>"
+            .len(),
+    )
+    .expect("worksheet envelope length fits u64")
+}
+
+fn estimate_xlsx_row_bytes(row_index: usize, row: &[String]) -> anyhow::Result<u64> {
+    let mut bytes = u64::try_from(format!("<row r=\"{row_index}\"></row>").len())?;
+    for (column_index, value) in row.iter().enumerate() {
+        let reference = format!("{}{}", xlsx_column_name(column_index), row_index);
+        bytes = bytes.saturating_add(u64::try_from(
+            format!(
+                "<c r=\"{reference}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                xml_escape(value)
+            )
+            .len(),
+        )?);
+    }
+    Ok(bytes)
+}
+
+fn plan_snapshot_blocker_worksheets(
+    spool: &SnapshotBuilderBlockingReasonsSpool,
+) -> anyhow::Result<Vec<SnapshotBlockerWorksheetPlan>> {
+    let header = snapshot_blocker_xlsx_header();
+    let initial_bytes = xlsx_worksheet_envelope_bytes() + estimate_xlsx_row_bytes(1, &header)?;
+    let mut plans = Vec::new();
+    let mut data_rows = 0_usize;
+    let mut estimated_bytes = initial_bytes;
+    spool.visit(|reason| {
+        let row = snapshot_blocker_xlsx_row(&reason);
+        let row_bytes = estimate_xlsx_row_bytes(data_rows.saturating_add(2), &row)?;
+        let row_limit_reached = data_rows.saturating_add(1) >= XLSX_MAX_WORKSHEET_ROWS;
+        let byte_limit_reached =
+            estimated_bytes.saturating_add(row_bytes) > XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES;
+        if data_rows > 0 && (row_limit_reached || byte_limit_reached) {
+            plans.push(SnapshotBlockerWorksheetPlan {
+                data_rows,
+                estimated_bytes,
+            });
+            data_rows = 0;
+            estimated_bytes = initial_bytes;
+        }
+        let row_bytes = estimate_xlsx_row_bytes(data_rows.saturating_add(2), &row)?;
+        if estimated_bytes.saturating_add(row_bytes) > XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES {
+            return Err(anyhow::anyhow!(
+                "artifact_limit_exceeded: snapshot blocker XLSX row exceeds worksheet byte limit"
+            ));
+        }
+        data_rows = data_rows.saturating_add(1);
+        estimated_bytes = estimated_bytes.saturating_add(row_bytes);
+        Ok(())
+    })?;
+    if data_rows > 0 {
+        plans.push(SnapshotBlockerWorksheetPlan {
+            data_rows,
+            estimated_bytes,
+        });
+    }
+    Ok(plans)
+}
+
+fn write_snapshot_blocker_worksheets<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    options: SimpleFileOptions,
+    spool: &SnapshotBuilderBlockingReasonsSpool,
+    plans: &[SnapshotBlockerWorksheetPlan],
+) -> anyhow::Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let header = snapshot_blocker_xlsx_header();
+    let mut plan_index = 0_usize;
+    let mut data_rows = 0_usize;
+    start_snapshot_blocker_worksheet(zip, options, plan_index + 5, &header)?;
+    spool.visit(|reason| {
+        if data_rows == plans[plan_index].data_rows {
+            zip.write_all(b"</sheetData></worksheet>")?;
+            plan_index = plan_index.saturating_add(1);
+            data_rows = 0;
+            start_snapshot_blocker_worksheet(zip, options, plan_index + 5, &header)?;
+        }
+        data_rows = data_rows.saturating_add(1);
+        write_xlsx_row(zip, data_rows + 1, snapshot_blocker_xlsx_row(&reason))
+    })?;
+    zip.write_all(b"</sheetData></worksheet>")?;
+    if plan_index + 1 != plans.len() || data_rows != plans[plan_index].data_rows {
+        return Err(anyhow::anyhow!(
+            "snapshot blocker XLSX worksheet plan diverged during write"
+        ));
+    }
+    Ok(())
+}
+
+fn start_snapshot_blocker_worksheet<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    options: SimpleFileOptions,
+    sheet_number: usize,
+    header: &[String],
+) -> anyhow::Result<()> {
+    zip.start_file(format!("xl/worksheets/sheet{sheet_number}.xml"), options)?;
+    zip.write_all(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+    )?;
+    write_xlsx_row(zip, 1, header.iter().cloned())
 }
 
 fn write_xlsx_worksheet<W, I>(
@@ -12547,6 +12982,157 @@ mod tests {
         build_issue_relation_spools(&mut scan, &validation.issue_events).unwrap();
         let rebuilt = build_closure_bundle(&input, &validation, &scan, &resolution_map).unwrap();
         assert_eq!(rebuilt.sha256, bundle.sha256);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn snapshot_builder_blocker_sidecar_populates_complete_issue_and_xlsx_relations() {
+        let reasons = (0..39)
+            .map(|index| {
+                json!({
+                    "code": if index % 2 == 0 {
+                        "source_reference_invalid"
+                    } else {
+                        "source_dependency_unavailable"
+                    },
+                    "sourceIdentity": format!("source:{}@01.00.000", Uuid::from_u128(index + 1)),
+                    "targetType": "flow",
+                    "targetId": Uuid::from_u128(index + 100).to_string(),
+                    "targetVersion": "01.00.000",
+                    "jsonPath": format!("$.exchanges.exchange[{index}].referenceToFlowDataSet"),
+                    "referenceRole": "exchangeFlow",
+                    "message": "fixture blocker",
+                })
+            })
+            .collect::<Vec<_>>();
+        let blocker_spool = SnapshotBuilderBlockingReasonsSpool::from_reasons(&reasons).unwrap();
+        let root = ExactDatasetIdentity {
+            category: DatasetCategory::Processes,
+            id: Uuid::from_u128(10_000),
+            version: "01.00.000".to_owned(),
+        };
+        let references = (0..39)
+            .map(|index| ResolvedReference {
+                source: root.clone(),
+                target: ExactDatasetIdentity {
+                    category: DatasetCategory::Sources,
+                    id: Uuid::from_u128(index + 1),
+                    version: "01.00.000".to_owned(),
+                },
+                json_path: format!("$.sources[{index}]"),
+                reference_role: "source".to_owned(),
+                requested_version_state: "explicit".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let reference_graph =
+            CompactReferenceGraph::from_references(&references, std::slice::from_ref(&root))
+                .unwrap();
+        let mut scan = ScopeClosureScan {
+            schema_version: "lcia.scope-closure-scan.v1".to_owned(),
+            complete: true,
+            roots: vec![root],
+            documents: ClosureDocumentSpool::empty().unwrap(),
+            edges: JsonlValueSpool::empty("empty-edges.jsonl").unwrap(),
+            resolved_references: JsonlValueSpool::empty("empty-resolved.jsonl").unwrap(),
+            omitted_version_resolutions: Vec::new(),
+            issues: Vec::new(),
+            frontier: Vec::new(),
+            provider_universe: Vec::new(),
+            reference_graph,
+            tidas_issue_event_count: 0,
+            issue_relations: None,
+        };
+        let events = JsonlValueSpool::empty("empty-validation-issues.jsonl").unwrap();
+        build_issue_relation_spools_with_cancellation_and_progress(
+            &mut scan,
+            &events,
+            Some(&blocker_spool),
+            &CancellationToken::default(),
+            None,
+        )
+        .unwrap();
+
+        let relations = scan.issue_relations.as_ref().unwrap();
+        assert_eq!(relations.stats.issue_count, 39);
+        assert_eq!(relations.stats.occurrence_count, 39);
+        assert_eq!(relations.stats.blocker_count, 39);
+        assert_eq!(relations.stats.affected_root_count, 39);
+        assert_eq!(scan.issues.len(), 39);
+        assert_eq!(scan.blocker_codes().len(), 2);
+
+        let closure_check_id = Uuid::new_v4();
+        let validation = TidasBatchValidation {
+            describe: json!({"asset_fingerprint": "fixture"}),
+            final_event: json!({"type": "final", "completed": true}),
+            issue_events: JsonlValueSpool::empty("empty-tidas-issues.jsonl").unwrap(),
+        };
+        let machine_artifacts = prepare_issue_partition_artifacts(
+            closure_check_id,
+            &scan,
+            &validation,
+            Arc::new(TempDir::new().unwrap()),
+        )
+        .unwrap();
+        let reconstructed =
+            reconstruct_complete_machine_result(&machine_artifacts, closure_check_id).unwrap();
+        assert_eq!(reconstructed.issue_count, 39);
+        assert_eq!(reconstructed.occurrence_count, 39);
+        assert_eq!(reconstructed.affected_root_count, 39);
+
+        let bytes = write_xlsx_report(
+            Cursor::new(Vec::new()),
+            closure_check_id,
+            &scan.issues,
+            Some(&relations.stats),
+            Some(&blocker_spool),
+        )
+        .unwrap()
+        .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut issues_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet2.xml").unwrap(),
+            &mut issues_xml,
+        )
+        .unwrap();
+        assert_eq!(issues_xml.matches("<row r=").count(), 40);
+        let mut occurrences_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet3.xml").unwrap(),
+            &mut occurrences_xml,
+        )
+        .unwrap();
+        assert_eq!(occurrences_xml.matches("<row r=").count(), 40);
+        let mut blockers_xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet5.xml").unwrap(),
+            &mut blockers_xml,
+        )
+        .unwrap();
+        assert_eq!(blockers_xml.matches("<row r=").count(), 40);
+        assert!(blockers_xml.contains("source_reference_invalid"));
+        assert!(blockers_xml.contains("source_dependency_unavailable"));
+    }
+
+    #[test]
+    fn discovery_and_build_typed_blockers_use_the_same_verified_spool_conversion() {
+        for phase in ["discovery", "build"] {
+            let reasons = vec![json!({
+                "code": "source_reference_invalid",
+                "phase": phase,
+            })];
+            let spool = SnapshotBuilderBlockingReasonsSpool::from_reasons(&reasons).unwrap();
+            let error = anyhow::Error::new(SnapshotBuilderProcessFailure::Blocked {
+                code: "source_reference_invalid".to_owned(),
+                blocking_reasons: reasons,
+                blocking_reason_count: 1,
+                blocking_reasons_sha256: "a".repeat(64),
+                blocking_reasons_truncated: false,
+                blocking_reasons_spool: Some(spool),
+            });
+            let converted = snapshot_builder_blocking_reasons(error).unwrap();
+            assert_eq!(converted.record_count(), 1, "phase={phase}");
+        }
     }
 
     #[tokio::test]

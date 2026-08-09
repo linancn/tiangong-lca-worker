@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
-lastReviewedAt: 2026-08-06
+lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
+lastReviewedAt: 2026-08-09
 lastReviewedNote: "Updated for Worker Issue #223: certificate-bound builds load release metadata and source closure through a verified descriptor chain."
 related:
   - AGENTS.md

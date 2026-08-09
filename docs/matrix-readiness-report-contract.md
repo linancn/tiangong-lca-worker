@@ -24,8 +24,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-06
-lastReviewedCommit: 5a463eed331aeacd64b9762db81ce9061d41afdb
+lastReviewedAt: 2026-08-09
+lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
 lastReviewedNote: "Reviewed for Worker Issue #223: replacing persisted compiler IR with purpose projections does not change readiness schema or numerical blocker semantics."
 related:
   - AGENTS.md

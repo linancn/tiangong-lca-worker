@@ -306,6 +306,7 @@ fn snapshot_builder_blocked_diagnostics(error: &anyhow::Error) -> Option<Value> 
         blocking_reason_count,
         blocking_reasons_sha256,
         blocking_reasons_truncated,
+        ..
     } = error.downcast_ref::<crate::db::SnapshotBuilderProcessFailure>()?
     else {
         return None;
@@ -2650,6 +2651,7 @@ mod tests {
             blocking_reason_count: 5_849,
             blocking_reasons_sha256: "a".repeat(64),
             blocking_reasons_truncated: true,
+            blocking_reasons_spool: None,
         });
 
         assert_eq!(
