@@ -41,7 +41,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-09
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
 lastReviewedNote: "Updated for Worker Issue #233: validates large discovery transport, integrity failures, bounded terminal output, and cleanup."
 related:
   - ../../AGENTS.md

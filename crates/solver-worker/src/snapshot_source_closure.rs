@@ -9,7 +9,7 @@ use crate::{
         CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetType,
         CompiledSourceReferenceProvenance, CompiledSourceReferenceSample,
     },
-    scope_closure::{DatasetCategory, extract_references},
+    scope_closure::{DatasetCategory, extract_scope_closure_references},
     source_reference_policy::{
         ArtifactPurpose, SOURCE_REFERENCE_POLICY_VERSION, SourceReferenceAction,
         SourceReferenceRole, classify_malformed_reference_role, classify_reference,
@@ -82,7 +82,8 @@ pub fn classify_source_document_with_lcia_flow_axis(
         source.dataset_id,
         source.dataset_version
     );
-    let extraction = extract_references(&source_identity, source_category, &source.document);
+    let extraction =
+        extract_scope_closure_references(&source_identity, source_category, &source.document);
     let mut references = Vec::with_capacity(extraction.edges.len());
     for edge in extraction.edges {
         if !lcia_factor_reference_is_active(
@@ -498,6 +499,51 @@ mod tests {
         assert_eq!(
             classified.references[0].target_uuid,
             active_flow.to_string()
+        );
+    }
+
+    #[test]
+    fn certificate_closure_ignores_historical_process_lcia_results() {
+        let exchange_flow = Uuid::new_v4();
+        let classified = classify_source_document(
+            &source(
+                CompiledReleaseSourceDatasetType::Process,
+                json!({
+                    "processDataSet": {
+                        "exchanges": {
+                            "exchange": {
+                                "referenceToFlowDataSet": {
+                                    "@type": "flow data set",
+                                    "@refObjectId": exchange_flow,
+                                    "@version": "01.00.000"
+                                }
+                            }
+                        },
+                        "LCIAResults": {
+                            "LCIAResult": {
+                                "referenceToLCIAMethodDataSet": {
+                                    "@type": "LCIA method data set",
+                                    "@version": "invalid"
+                                },
+                                "meanAmount": 1.0
+                            }
+                        }
+                    }
+                }),
+            ),
+            ArtifactPurpose::CertificateClosure,
+        )
+        .unwrap();
+
+        assert!(classified.extraction_issues.is_empty());
+        assert_eq!(classified.references.len(), 1);
+        assert_eq!(
+            classified.references[0].target_uuid,
+            exchange_flow.to_string()
+        );
+        assert_eq!(
+            classified.references[0].role,
+            SourceReferenceRole::ExchangeFlow
         );
     }
 

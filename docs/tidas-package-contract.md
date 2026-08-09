@@ -19,7 +19,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
+lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
 lastReviewedAt: 2026-08-09
 lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change package tasks or certificate-binding contracts."
 related:
