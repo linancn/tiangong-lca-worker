@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
+lastReviewedCommit: 88535d3db9cfd76d0ca412ba299564cf2d137baf
 lastReviewedAt: 2026-08-09
-lastReviewedNote: "Updated for Worker Issue #223: certificate-bound builds load release metadata and source closure through a verified descriptor chain."
+lastReviewedNote: "Reviewed for Worker Issue #231: active LCIA dependency filtering does not change package task or certificate-binding contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

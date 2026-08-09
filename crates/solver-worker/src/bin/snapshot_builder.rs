@@ -87,8 +87,8 @@ use solver_worker::snapshot_index::{
 };
 use solver_worker::snapshot_source_closure::{
     ClassifiedSourceReference, SnapshotSourceClosureError, SourceClosureLimits,
-    classify_source_document, parse_target_uuid, provenance_summary, source_dependency_issue,
-    validate_resource_limits,
+    classify_source_document_with_lcia_flow_axis, parse_target_uuid, provenance_summary,
+    source_dependency_issue, validate_resource_limits,
 };
 use solver_worker::source_reference_policy::{ArtifactPurpose, SourceReferenceAction};
 use solver_worker::static_lcia_cache::{
@@ -534,6 +534,14 @@ struct BuildOutput {
 struct CompiledScopeGraph {
     graph: CompiledGraph,
     lcia_exchange_observations: Vec<LciaExchangeObservation>,
+    active_lcia_factors: ActiveLciaFactorSelection,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActiveLciaFactorSelection {
+    factors_by_impact: Vec<BTreeMap<Uuid, f64>>,
+    active_flow_ids: BTreeSet<Uuid>,
+    direction_by_flow: HashMap<Uuid, Option<ExchangeDirection>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2961,19 +2969,16 @@ async fn fetch_selected_method_rows(
                 "scope-closure snapshot build takes its exact method set from the frozen manifest"
             ));
         }
-        let methods = &snapshot.requested_scope.lcia_methods;
-        let ids = methods
+        let method_axis = exact_scope_closure_method_axis(snapshot)?;
+        let ids = method_axis
             .iter()
-            .map(|method| {
-                reviewed_lcia_artifact_locator(method.id, method.version.as_str())
-                    .map(|locator| locator.unwrap_or(method.id))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let versions = methods
-            .iter()
-            .map(|method| method.version.clone())
+            .map(|(_, _, locator_id)| *locator_id)
             .collect::<Vec<_>>();
-        sqlx::query(
+        let versions = method_axis
+            .iter()
+            .map(|(_, version, _)| version.clone())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(
             r#"
             SELECT m.id, btrim(m.version::text) AS version, m.json
             FROM public.lciamethods m
@@ -2986,7 +2991,13 @@ async fn fetch_selected_method_rows(
         .bind(&ids)
         .bind(&versions)
         .fetch_all(pool)
-        .await?
+        .await?;
+        tracing::info!(
+            requested_method_count = method_axis.len(),
+            loaded_method_count = rows.len(),
+            "scope closure snapshot builder loaded the exact frozen LCIA method axis"
+        );
+        rows
     } else {
         match cli.method_id {
         Some(method_id) => {
@@ -3027,6 +3038,30 @@ async fn fetch_selected_method_rows(
                 version: row.try_get::<String, _>("version")?.trim().to_owned(),
                 json: row.try_get("json")?,
             })
+        })
+        .collect()
+}
+
+fn exact_scope_closure_method_axis(
+    snapshot: &DataSnapshotManifest,
+) -> anyhow::Result<Vec<(Uuid, String, Uuid)>> {
+    let mut seen = BTreeSet::new();
+    snapshot
+        .requested_scope
+        .lcia_methods
+        .iter()
+        .map(|method| {
+            let identity = (method.id, method.version.clone());
+            if !seen.insert(identity.clone()) {
+                return Err(anyhow::anyhow!(
+                    "scope-closure method axis contains duplicate identity: {}@{}",
+                    identity.0,
+                    identity.1
+                ));
+            }
+            let locator = reviewed_lcia_artifact_locator(method.id, method.version.as_str())?
+                .unwrap_or(method.id);
+            Ok((method.id, method.version.clone(), locator))
         })
         .collect()
 }
@@ -3637,10 +3672,11 @@ async fn build_sparse_payload(
         allocation_mode,
         impact_factor_sets,
         artifact_purpose,
+        versioned_scope.is_some(),
     )
     .await?;
 
-    assemble_sparse_payload(
+    assemble_sparse_payload_with_selection(
         snapshot_id,
         method,
         &compiled_graph.graph,
@@ -3650,6 +3686,7 @@ async fn build_sparse_payload(
         impact_factor_sets,
         &compiled_graph.lcia_exchange_observations,
         versioned_scope.is_some(),
+        &compiled_graph.active_lcia_factors,
     )
 }
 
@@ -4183,6 +4220,7 @@ async fn compile_scope_graph(
     allocation_mode: AllocationMode,
     impact_factor_sets: &[ImpactFactorSet],
     artifact_purpose: ArtifactPurpose,
+    directional_lcia: bool,
 ) -> anyhow::Result<CompiledScopeGraph> {
     let process_count_i32 =
         i32::try_from(processes.len()).map_err(|_| anyhow::anyhow!("process overflow"))?;
@@ -4253,15 +4291,6 @@ async fn compile_scope_graph(
     let flow_meta = fetch_flow_meta(pool, &flow_requests, versioned_scope).await?;
     resolve_requested_flow_versions(&mut exchanges, &flow_meta)?;
     let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta.by_identity).await?;
-    let (source_datasets, source_reference_provenance) = build_frozen_source_datasets(
-        pool,
-        &processes,
-        &flow_meta.by_identity,
-        impact_factor_sets,
-        versioned_scope,
-        artifact_purpose,
-    )
-    .await?;
     for exchange in &exchanges {
         let identity = flow_link_identity(exchange);
         if !flow_meta.by_identity.contains_key(&identity) {
@@ -4395,7 +4424,28 @@ async fn compile_scope_graph(
                 &elementary_flow_idx,
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let biosphere_flow_ids = flows
+        .iter()
+        .filter(|flow| flow.space == CompiledFlowSpace::Biosphere)
+        .map(|flow| flow.flow_id)
+        .collect::<BTreeSet<_>>();
+    let active_lcia_factors = select_active_lcia_factors(
+        impact_factor_sets,
+        &biosphere_flow_ids,
+        &lcia_exchange_observations,
+        directional_lcia,
+    );
+    let (source_datasets, source_reference_provenance) = build_frozen_source_datasets(
+        pool,
+        &processes,
+        &flow_meta.by_identity,
+        impact_factor_sets,
+        &active_lcia_factors.active_flow_ids,
+        versioned_scope,
+        artifact_purpose,
+    )
+    .await?;
 
     let release_evidence = build_compiled_release_evidence(
         &process_meta,
@@ -4438,6 +4488,7 @@ async fn compile_scope_graph(
             release_evidence: Some(release_evidence),
         },
         lcia_exchange_observations,
+        active_lcia_factors,
     })
 }
 
@@ -4612,6 +4663,55 @@ fn compiled_exchange_direction(direction: ExchangeDirection) -> CompiledExchange
     }
 }
 
+fn select_active_lcia_factors(
+    impact_factor_sets: &[ImpactFactorSet],
+    biosphere_flow_ids: &BTreeSet<Uuid>,
+    observations: &[LciaExchangeObservation],
+    directional_lcia: bool,
+) -> ActiveLciaFactorSelection {
+    let direction_by_flow = if directional_lcia {
+        unique_supported_direction_by_flow(observations)
+    } else {
+        HashMap::new()
+    };
+    let mut selection = ActiveLciaFactorSelection {
+        factors_by_impact: Vec::with_capacity(impact_factor_sets.len()),
+        active_flow_ids: BTreeSet::new(),
+        direction_by_flow,
+    };
+    for impact in impact_factor_sets {
+        let mut active = BTreeMap::new();
+        if directional_lcia {
+            for (flow_id, direction) in &selection.direction_by_flow {
+                let Some(direction) = direction else {
+                    continue;
+                };
+                let Some(value) = impact
+                    .factors_by_flow_direction
+                    .get(&(*flow_id, *direction))
+                else {
+                    continue;
+                };
+                if retain_sparse_value(*value, true) {
+                    active.insert(*flow_id, *value);
+                }
+            }
+        } else {
+            for flow_id in biosphere_flow_ids {
+                let Some(value) = impact.factors_by_flow.get(flow_id) else {
+                    continue;
+                };
+                if value.abs() > f64::EPSILON {
+                    active.insert(*flow_id, *value);
+                }
+            }
+        }
+        selection.active_flow_ids.extend(active.keys().copied());
+        selection.factors_by_impact.push(active);
+    }
+    selection
+}
+
 fn assemble_sparse_payload(
     snapshot_id: Uuid,
     method: &MethodSelection,
@@ -4622,6 +4722,44 @@ fn assemble_sparse_payload(
     impact_factor_sets: &[ImpactFactorSet],
     lcia_exchange_observations: &[LciaExchangeObservation],
     directional_lcia: bool,
+) -> anyhow::Result<BuildOutput> {
+    let active_lcia_factors = select_active_lcia_factors(
+        impact_factor_sets,
+        &compiled_graph
+            .flows
+            .iter()
+            .filter(|flow| flow.space == CompiledFlowSpace::Biosphere)
+            .map(|flow| flow.flow_id)
+            .collect(),
+        lcia_exchange_observations,
+        directional_lcia,
+    );
+    assemble_sparse_payload_with_selection(
+        snapshot_id,
+        method,
+        compiled_graph,
+        self_loop_cutoff,
+        singular_eps,
+        has_lcia,
+        impact_factor_sets,
+        lcia_exchange_observations,
+        directional_lcia,
+        &active_lcia_factors,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_sparse_payload_with_selection(
+    snapshot_id: Uuid,
+    method: &MethodSelection,
+    compiled_graph: &CompiledGraph,
+    self_loop_cutoff: f64,
+    singular_eps: f64,
+    has_lcia: bool,
+    impact_factor_sets: &[ImpactFactorSet],
+    lcia_exchange_observations: &[LciaExchangeObservation],
+    directional_lcia: bool,
+    active_lcia_factors: &ActiveLciaFactorSelection,
 ) -> anyhow::Result<BuildOutput> {
     let process_count_i32 = i32::try_from(compiled_graph.processes.len())
         .map_err(|_| anyhow::anyhow!("process overflow"))?;
@@ -4720,54 +4858,26 @@ fn assemble_sparse_payload(
         biosphere_entries.push(SparseTriplet { row, col, value });
     }
 
-    let direction_by_flow = if directional_lcia {
-        unique_supported_direction_by_flow(lcia_exchange_observations)
-    } else {
-        HashMap::new()
-    };
+    let direction_by_flow = &active_lcia_factors.direction_by_flow;
     let mut characterization_factors = Vec::new();
     if has_lcia {
         for (impact_idx, impact) in impact_factor_sets.iter().enumerate() {
             let impact_row =
                 i32::try_from(impact_idx).map_err(|_| anyhow::anyhow!("impact idx overflow"))?;
             let mut c_map = HashMap::<i32, f64>::new();
-            if directional_lcia {
-                for (flow_id, direction) in &direction_by_flow {
-                    let Some(direction) = direction else {
-                        continue;
-                    };
-                    let Some(cf_value) = impact
-                        .factors_by_flow_direction
-                        .get(&(*flow_id, *direction))
-                    else {
-                        continue;
-                    };
-                    if retain_sparse_value(*cf_value, true)
-                        && let Some(flow_indices) = flow_indices_by_id.get(flow_id)
-                    {
-                        for flow_idx in flow_indices {
-                            accumulate_finite_factor(
-                                &mut c_map,
-                                *flow_idx,
-                                *cf_value,
-                                impact.impact_id,
-                            )?;
-                        }
-                    }
-                }
-            } else {
-                for (flow_id, cf_value) in &impact.factors_by_flow {
-                    if cf_value.abs() > f64::EPSILON
-                        && let Some(flow_indices) = flow_indices_by_id.get(flow_id)
-                    {
-                        for flow_idx in flow_indices {
-                            accumulate_finite_factor(
-                                &mut c_map,
-                                *flow_idx,
-                                *cf_value,
-                                impact.impact_id,
-                            )?;
-                        }
+            let factors = active_lcia_factors
+                .factors_by_impact
+                .get(impact_idx)
+                .ok_or_else(|| anyhow::anyhow!("active LCIA factor axis omitted impact index"))?;
+            for (flow_id, cf_value) in factors {
+                if let Some(flow_indices) = flow_indices_by_id.get(flow_id) {
+                    for flow_idx in flow_indices {
+                        accumulate_finite_factor(
+                            &mut c_map,
+                            *flow_idx,
+                            *cf_value,
+                            impact.impact_id,
+                        )?;
                     }
                 }
             }
@@ -4952,7 +5062,7 @@ fn assemble_sparse_payload(
             build_lcia_factor_coverage(
                 lcia_exchange_observations,
                 impact_factor_sets,
-                &direction_by_flow,
+                direction_by_flow,
             )
         })
         .transpose()?;
@@ -7739,6 +7849,7 @@ async fn build_frozen_source_datasets(
     processes: &[ProcessRow],
     flows: &HashMap<FlowLinkIdentity, FlowRow>,
     impact_factor_sets: &[ImpactFactorSet],
+    active_lcia_flow_ids: &BTreeSet<Uuid>,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     artifact_purpose: ArtifactPurpose,
 ) -> anyhow::Result<(
@@ -7824,6 +7935,10 @@ async fn build_frozen_source_datasets(
     {
         collect_lcia_factor_flow_references(&dataset.document, &mut lcia_factor_flow_references)?;
     }
+    lcia_factor_flow_references.retain(|reference| {
+        reference.dataset_type != CompiledReleaseSourceDatasetType::Flow
+            || active_lcia_flow_ids.contains(&reference.id)
+    });
     let lcia_flow_requests =
         flow_reference_requests_from_source_references(&lcia_factor_flow_references);
     let lcia_flow_meta =
@@ -7898,7 +8013,11 @@ async fn build_frozen_source_datasets(
                 }
                 continue;
             }
-            let classification = classify_source_document(dataset, artifact_purpose)?;
+            let classification = classify_source_document_with_lcia_flow_axis(
+                dataset,
+                artifact_purpose,
+                Some(active_lcia_flow_ids),
+            )?;
             preflight_issues.extend(classification.extraction_issues);
             for reference in classification.references {
                 match reference.action {
@@ -9583,6 +9702,7 @@ async fn run_provider_rule_replay(
             allocation_mode,
             &[],
             ArtifactPurpose::CalculationBundle,
+            versioned_scope.is_some(),
         )
         .await?;
         out.push(build_provider_rule_replay_row(*rule, &compiled_graph.graph));
@@ -9737,22 +9857,24 @@ mod tests {
         build_review_submit_overlay_graph, candidate_count_bucket_label,
         collect_lcia_factor_flow_references, compute_review_submit_overlay_source_hash,
         compute_scope_hash, compute_source_fingerprint_from_summary,
-        flow_reference_requests_from_source_references, geo_score, insert_compiled_source_dataset,
-        load_impact_factor_sets, location_granularity_label, no_balancing_reference_failure_reason,
-        normalize_request_roots, parse_number, parse_process_annual_supply_or_production_volume,
-        parse_process_states, parse_provider_rule_list, parse_scope_closure_snapshot_args,
+        exact_scope_closure_method_axis, flow_reference_requests_from_source_references, geo_score,
+        insert_compiled_source_dataset, load_impact_factor_sets, location_granularity_label,
+        no_balancing_reference_failure_reason, normalize_request_roots, parse_number,
+        parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, parse_scope_closure_snapshot_args,
         plan_source_support_read_batches, resolve_allocation_fraction,
         resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
         resolve_lcia_method_source_row, resolve_lcia_support_flows, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, reviewed_lcia_artifact_locator,
         scope_closure_boundary_policy, scope_closure_candidate_process_axis,
-        select_source_dataset_read_identities, snapshot_db_statement_timeout,
-        source_closure_total_document_bytes_limit_from, source_dataset_document_id,
-        source_reference_is_satisfied_index, summarize_matching_diagnostics, time_score,
-        unique_supported_direction_by_flow, validate_compiled_sources_against_frozen_manifest,
-        validate_flow_row_visibility, validate_process_row_visibility,
-        validate_quantitative_references, validate_unique_database_lcia_method_identities,
+        select_active_lcia_factors, select_source_dataset_read_identities,
+        snapshot_db_statement_timeout, source_closure_total_document_bytes_limit_from,
+        source_dataset_document_id, source_reference_is_satisfied_index,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        validate_compiled_sources_against_frozen_manifest, validate_flow_row_visibility,
+        validate_process_row_visibility, validate_quantitative_references,
+        validate_unique_database_lcia_method_identities,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -10477,6 +10599,27 @@ mod tests {
         assert_eq!(parsed_binding, binding);
         assert_eq!(parsed_snapshot, snapshot);
         assert_eq!(parsed_mode, "discovery");
+    }
+
+    #[test]
+    fn one_method_scope_closure_axis_never_expands_to_the_reviewed_catalog() {
+        let (_, snapshot, _) = frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let method_id = Uuid::new_v4();
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["requestedScope"]["lciaMethods"] = json!([{
+            "id": method_id,
+            "version": "01.00.000"
+        }]);
+        let snapshot: DataSnapshotManifest = serde_json::from_value(value.clone()).unwrap();
+        let axis = exact_scope_closure_method_axis(&snapshot).unwrap();
+        assert_eq!(axis, vec![(method_id, "01.00.000".to_owned(), method_id)]);
+
+        value["requestedScope"]["lciaMethods"] = json!([
+            {"id": method_id, "version": "01.00.000"},
+            {"id": method_id, "version": "01.00.000"}
+        ]);
+        let duplicate_snapshot: DataSnapshotManifest = serde_json::from_value(value).unwrap();
+        assert!(exact_scope_closure_method_axis(&duplicate_snapshot).is_err());
     }
 
     #[test]
@@ -13880,6 +14023,45 @@ mod tests {
             .expect("first finite factor");
         assert!(accumulate_finite_factor(&mut factors, Uuid::nil(), f64::MAX, method_id).is_err());
         assert!(factors[&Uuid::nil()].is_finite());
+    }
+
+    #[test]
+    fn active_lcia_factor_selection_matches_the_actual_c_matrix_axis() {
+        let active_flow = Uuid::new_v4();
+        let unrelated_flow = Uuid::new_v4();
+        let impact = ImpactFactorSet {
+            impact_id: Uuid::new_v4(),
+            method_version: "01.00.000".to_owned(),
+            artifact_locator_id: Uuid::new_v4(),
+            impact_key: "impact".to_owned(),
+            impact_name: "Impact".to_owned(),
+            unit: "kg".to_owned(),
+            factors_by_flow: HashMap::from([(active_flow, 2.0), (unrelated_flow, 99.0)]),
+            factors_by_flow_direction: HashMap::from([
+                ((active_flow, ExchangeDirection::Output), 2.0),
+                ((unrelated_flow, ExchangeDirection::Output), 99.0),
+            ]),
+        };
+        let observations = vec![LciaExchangeObservation {
+            flow_id: active_flow,
+            flow_version: "01.00.000".to_owned(),
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "output".to_owned(),
+            exchange_id: "1".to_owned(),
+            amount: Some(1.0),
+        }];
+
+        for directional in [false, true] {
+            let selected = select_active_lcia_factors(
+                std::slice::from_ref(&impact),
+                &BTreeSet::from([active_flow]),
+                &observations,
+                directional,
+            );
+            assert_eq!(selected.active_flow_ids, BTreeSet::from([active_flow]));
+            assert_eq!(selected.factors_by_impact[0].len(), 1);
+            assert_close(selected.factors_by_impact[0][&active_flow], 2.0);
+        }
     }
 
     #[test]

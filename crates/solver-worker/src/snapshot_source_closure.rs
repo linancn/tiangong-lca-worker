@@ -66,6 +66,15 @@ pub fn classify_source_document(
     source: &CompiledReleaseSourceDataset,
     purpose: ArtifactPurpose,
 ) -> Result<SourceClosureClassification, SnapshotSourceClosureError> {
+    classify_source_document_with_lcia_flow_axis(source, purpose, None)
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn classify_source_document_with_lcia_flow_axis(
+    source: &CompiledReleaseSourceDataset,
+    purpose: ArtifactPurpose,
+    active_lcia_flow_ids: Option<&BTreeSet<Uuid>>,
+) -> Result<SourceClosureClassification, SnapshotSourceClosureError> {
     let source_category = dataset_category(source.dataset_type);
     let source_identity = format!(
         "{}:{}@{}",
@@ -76,6 +85,14 @@ pub fn classify_source_document(
     let extraction = extract_references(&source_identity, source_category, &source.document);
     let mut references = Vec::with_capacity(extraction.edges.len());
     for edge in extraction.edges {
+        if !lcia_factor_reference_is_active(
+            source.dataset_type,
+            edge.json_path.as_str(),
+            edge.target_uuid.as_str(),
+            active_lcia_flow_ids,
+        ) {
+            continue;
+        }
         let classified = classify_reference(&edge, purpose).map_err(|error| {
             SnapshotSourceClosureError::Operator {
                 message: error.to_string(),
@@ -103,6 +120,18 @@ pub fn classify_source_document(
         .issues
         .into_iter()
         .filter_map(|issue| {
+            if !lcia_factor_reference_is_active(
+                source.dataset_type,
+                issue.json_path.as_str(),
+                issue
+                    .details
+                    .get("raw_ref_object_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                active_lcia_flow_ids,
+            ) {
+                return None;
+            }
             if purpose != ArtifactPurpose::CertificateClosure
                 && is_external_digital_file_path(issue.json_path.as_str())
             {
@@ -163,6 +192,27 @@ pub fn classify_source_document(
         references,
         extraction_issues,
     })
+}
+
+fn lcia_factor_reference_is_active(
+    source_type: CompiledReleaseSourceDatasetType,
+    json_path: &str,
+    target_uuid: &str,
+    active_lcia_flow_ids: Option<&BTreeSet<Uuid>>,
+) -> bool {
+    let Some(active_lcia_flow_ids) = active_lcia_flow_ids else {
+        return true;
+    };
+    if source_type != CompiledReleaseSourceDatasetType::LciaMethod
+        || !json_path
+            .to_ascii_lowercase()
+            .contains("characterisationfactors")
+    {
+        return true;
+    }
+    Uuid::parse_str(target_uuid)
+        .ok()
+        .is_some_and(|flow_id| active_lcia_flow_ids.contains(&flow_id))
 }
 
 fn is_external_digital_file_path(json_path: &str) -> bool {
@@ -406,6 +456,48 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn calculation_bundle_ignores_lcia_factor_references_outside_the_active_c_axis() {
+        let active_flow = Uuid::new_v4();
+        let unrelated_flow = Uuid::new_v4();
+        let document = json!({
+            "LCIAMethodDataSet": {
+                "characterisationFactors": {
+                    "factor": [
+                        {"referenceToFlowDataSet": {
+                            "@type": "flow data set",
+                            "@refObjectId": active_flow,
+                            "@version": "01.00.000"
+                        }},
+                        {"referenceToFlowDataSet": {
+                            "@type": "flow data set",
+                            "@refObjectId": unrelated_flow,
+                            "@version": "01.00.000"
+                        }},
+                        {"referenceToFlowDataSet": {
+                            "@type": "flow data set",
+                            "@refObjectId": "not-a-uuid",
+                            "@version": "01.00.000"
+                        }}
+                    ]
+                }
+            }
+        });
+        let classified = classify_source_document_with_lcia_flow_axis(
+            &source(CompiledReleaseSourceDatasetType::LciaMethod, document),
+            ArtifactPurpose::CalculationBundle,
+            Some(&BTreeSet::from([active_flow])),
+        )
+        .unwrap();
+
+        assert!(classified.extraction_issues.is_empty());
+        assert_eq!(classified.references.len(), 1);
+        assert_eq!(
+            classified.references[0].target_uuid,
+            active_flow.to_string()
         );
     }
 

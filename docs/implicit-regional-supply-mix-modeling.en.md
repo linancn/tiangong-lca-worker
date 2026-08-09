@@ -26,7 +26,7 @@ checkPaths:
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-09
 lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Reviewed for Worker Issue #223: Review/release/source projections do not change signed-flow routing or provider selection."
+lastReviewedNote: "Reviewed for Worker Issue #231: active LCIA factor filtering does not change signed-flow routing or provider selection."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -156,7 +156,7 @@ Allocation fraction and routing weight are different: the former changes residua
 
 Snapshot, release, and readiness evidence retain flow UUID/version/reference unit, flow space/source type, raw direction/amount/coefficient, normalized reference/residual coefficient, candidate eligibility, routing strategy/weight, activity requirement, closure residual, boundary policy, and unresolved reason.
 
-Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, `exact-flow-version-reference-unit-v2`, and `selected-lcia-factor-flow-support-v1`. Exact Flow identity is `(UUID, resolved version)`, and matrix/provider compilation retains only revisions referenced by final Process-closure exchanges. Selected LCIA-factor-only Elementary Flows enter frozen source closure only and do not participate in the implicit mix. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
+Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, `exact-flow-version-reference-unit-v2`, and `selected-lcia-factor-flow-support-v1`. Exact Flow identity is `(UUID, resolved version)`, and matrix/provider compilation retains only revisions referenced by final Process-closure exchanges. An LCIA factor becomes a numerical source-closure dependency only when it intersects the biosphere/C axis; active and inactive factors alike never participate in implicit-mix or technosphere routing. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
 
 ## Limitation
 

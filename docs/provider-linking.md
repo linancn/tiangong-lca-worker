@@ -24,7 +24,7 @@ checkPaths:
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-09
 lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
-lastReviewedNote: "Reviewed for Worker Issue #223: consumer-owned artifact projections do not change provider Flow universe or linking decisions."
+lastReviewedNote: "Updated for Worker Issue #231: active LCIA factors follow the biosphere/C axis without changing provider routing."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md
@@ -114,9 +114,9 @@ Flow 的 ILCD/TIDAS source type 先映射到计算空间：
 
 Technosphere 候选集合按 exact flow identity `(Flow UUID, resolved version)` 建立。Exchange 显式给出 `@version` 时只查询并绑定该 revision；省略版本时才按 snapshot visibility 规则确定一个版本，并在后续 compilation、artifact 与 release evidence 中冻结。一个 snapshot 可以同时包含同一 UUID 的多个被引用 revision，reference-port lookup、flow metadata、flow axis 和 diagnostics 都不得退化为 UUID-only key，也禁止跨 revision 或不兼容单位链接。
 
-Exact identity 不表示加载数据库中的全部历史版本。Worker 先按 request/process closure 收集 exchange 实际引用的 inventory identity；显式版本使用精确 `(UUID, version)` 查询，省略版本只查询一次 deterministic selected revision。最终 closure 确定后，仅对 distinct inventory identities 分配连续 `flow_idx`。未被 exchange 引用的历史 revision 不进入任何集合；只有 selected LCIA Method factor 引用、没有 inventory exchange 的 Elementary Flow 则只进入 frozen source closure 与 Calculation Bundle 的 `support` 文档，不进入 `B/C` axis、compiled graph、reference-port/provider lookup。
+Exact identity 不表示加载数据库中的全部历史版本。Worker 先按 request/process closure 收集 exchange 实际引用的 inventory identity；显式版本使用精确 `(UUID, version)` 查询，省略版本只查询一次 deterministic selected revision。最终 closure 确定后，仅对 distinct inventory identities 分配连续 `flow_idx`。未被 exchange 引用的历史 revision 不进入矩阵、provider universe 或数值 source closure；LCIA Method 中 off-axis 的 factor 只保留在已哈希方法文档中作为证据。
 
-LCIA support Flow 收集与矩阵 Flow 收集是两条独立路径。Worker 一次扫描 selected LCIA Method 的全部 `referenceToFlowDataSet`（包括数值为零的 factor），按 exact UUID/version 去重，并以 bounded batches 读取；省略版本只解析一次并冻结。目标必须解析为 Elementary Flow；Product、Waste 或 Other factor target 会 fail closed，绝不能借 LCIA factor 扩大 technosphere/provider universe。每个已选 support Flow 继续递归闭合它引用的 Flow Property、Unit Group、Source 与 Contact。
+LCIA support Flow 与 C 使用同一个 active factor selection。非方向模式按编译后的 biosphere Flow axis 取交集；方向模式还要求该 Flow 的 exchange direction 唯一且受对应 factor 支持。只有实际进入 C 的 factor target 才按 exact UUID/version 去重并以 bounded batches 校验；省略版本只解析一次并冻结。active target 必须解析为 Elementary Flow，Product、Waste 或 Other active target 会 fail closed；off-axis、zero 或方向不适用的 factor 不 probe target，也不能扩大 technosphere/provider universe。每个 active support Flow 继续递归闭合它引用的 Flow Property、Unit Group、Source 与 Contact。
 
 Reference ports 使用 `HashMap<(UUID, version), candidates>` 分桶。每条 residual 只访问同 identity 的候选列表，避免逐 residual 扫描所有 Process；矩阵 `A` 仍是 Process × Process 的稀疏矩阵，其存储与 assembly 由实际 non-zero balance edge 决定，而不是由 Flow 历史版本数决定。
 
