@@ -79,7 +79,6 @@ const XLSX_OCCURRENCE_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_AFFECTED_ROOT_SAMPLE_LIMIT: usize = 10_000;
 const XLSX_MAX_WORKSHEET_ROWS: usize = 1_048_576;
 const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-const XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
@@ -8227,6 +8226,16 @@ fn snapshot_blocking_reason_issue(reason: Value) -> anyhow::Result<ClosureIssue>
         .get("targetType")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let raw_target_id = reason
+        .get("targetId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            reason
+                .get("details")
+                .and_then(|details| details.get("raw_ref_object_id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned);
     let requested_target_id = reason
         .get("targetId")
         .and_then(Value::as_str)
@@ -8242,13 +8251,10 @@ fn snapshot_blocking_reason_issue(reason: Value) -> anyhow::Result<ClosureIssue>
         .to_owned();
     let issue_key = canonical_json_sha256(&json!({
         "code": issue_code,
-        "source": source,
-        "path": json_path,
-        "referenceRole": reference_role,
         "targetType": requested_target_type,
-        "targetId": requested_target_id,
+        "targetId": raw_target_id,
         "targetVersion": requested_target_version,
-        "message": message,
+        "extractionIssueCode": reason.get("extractionIssueCode"),
     }))?;
     let occurrence_key = canonical_json_sha256(&reason)?;
     Ok(ClosureIssue {
@@ -8295,8 +8301,8 @@ fn append_issue_merge_records(
     issue.occurrence_count = 0;
     if occurrences.is_empty() {
         writer.append(&json!([
-            source_key,
             issue.issue_key,
+            source_key,
             "",
             issue,
             Value::Null
@@ -8305,8 +8311,8 @@ fn append_issue_merge_records(
     }
     for occurrence in occurrences {
         writer.append(&json!([
-            source_key,
             issue.issue_key,
+            source_key,
             occurrence.occurrence_key,
             issue,
             occurrence
@@ -8340,7 +8346,7 @@ fn issue_merge_record(
     }
     let issue = serde_json::from_value(fields.pop().expect("field count checked"))?;
     let source_key = fields
-        .first()
+        .get(1)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("issue merge record source key must be text"))?
         .to_owned();
@@ -8349,6 +8355,10 @@ fn issue_merge_record(
 
 struct CoalescedIssueState {
     source_key: String,
+    last_source_key: String,
+    source_count: u64,
+    root_union: Vec<bool>,
+    root_witnesses: BTreeMap<u32, Vec<ExactDatasetIdentity>>,
     issue: ClosureIssue,
     last_occurrence_key: Option<String>,
 }
@@ -8358,10 +8368,81 @@ impl CoalescedIssueState {
         issue.occurrence_count = 0;
         issue.occurrences.clear();
         Self {
-            source_key,
+            source_key: source_key.clone(),
+            last_source_key: source_key,
+            source_count: 0,
+            root_union: Vec::new(),
+            root_witnesses: BTreeMap::new(),
             issue,
             last_occurrence_key: None,
         }
+    }
+
+    fn observe_source(
+        &mut self,
+        source_key: &str,
+        source: Option<&ExactDatasetIdentity>,
+        reachability: &mut SourceReachability,
+        graph: &CompactReferenceGraph,
+        roots: &StableRootOrdinals,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        if self.source_count == 0 {
+            self.source_count = 1;
+            source_key.clone_into(&mut self.last_source_key);
+            return Ok(());
+        }
+        if self.last_source_key == source_key {
+            return Ok(());
+        }
+        if self.source_count == 1 {
+            load_source_reachability(
+                reachability,
+                &self.source_key,
+                self.issue.source.as_ref(),
+                graph,
+                roots,
+                cancellation,
+            )?;
+            self.merge_reachability(reachability, graph, roots)?;
+        }
+        source_key.clone_into(&mut self.last_source_key);
+        self.source_count = self.source_count.saturating_add(1);
+        load_source_reachability(reachability, source_key, source, graph, roots, cancellation)?;
+        self.merge_reachability(reachability, graph, roots)?;
+        self.issue.source = None;
+        self.issue.json_path = None;
+        self.issue.reference_role = None;
+        Ok(())
+    }
+
+    fn merge_reachability(
+        &mut self,
+        reachability: &SourceReachability,
+        graph: &CompactReferenceGraph,
+        roots: &StableRootOrdinals,
+    ) -> anyhow::Result<()> {
+        if self.root_union.is_empty() {
+            self.root_union.resize(roots.roots.len(), false);
+        }
+        for &root_ordinal in &reachability.affected_root_ordinals {
+            let root_index = usize::try_from(root_ordinal)?;
+            self.root_union[root_index] = true;
+            if self.root_witnesses.len() < ISSUE_INLINE_AFFECTED_ROOT_SAMPLE_LIMIT
+                && !self.root_witnesses.contains_key(&root_ordinal)
+            {
+                let root_node_ordinal = roots.graph_node_ordinals[root_index];
+                self.root_witnesses.insert(
+                    root_ordinal,
+                    reconstruct_witness_path(
+                        root_node_ordinal,
+                        &reachability.parent,
+                        &graph.identities,
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn push_occurrence(
@@ -8468,33 +8549,56 @@ fn finalize_coalesced_issue(
     cancellation: &CancellationToken,
     relation_stats: &mut IssueRelationStats,
 ) -> anyhow::Result<()> {
-    let changed_source = load_source_reachability(
-        reachability,
-        &pending.source_key,
-        pending.issue.source.as_ref(),
-        graph,
-        roots,
-        cancellation,
-    )?;
-    let root_impact = if pending.issue.source.is_some() {
-        let impact_key = format!("source:{}", pending.source_key);
+    let root_impact = if pending.source_count <= 1 && pending.issue.source.is_some() {
+        load_source_reachability(
+            reachability,
+            &pending.source_key,
+            pending.issue.source.as_ref(),
+            graph,
+            roots,
+            cancellation,
+        )?;
+        let impact_key = format!("issue:{}", pending.issue.issue_key);
         let mode = reachability
             .impact_mode
             .ok_or_else(|| anyhow::anyhow!("source impact omitted compact encoding"))?;
-        if changed_source {
-            root_impact_writer.append(
-                &impact_key,
-                1,
-                reachability.source_node_ordinal,
-                mode,
-                u32::try_from(reachability.affected_root_ordinals.len())?,
-                &reachability.encoded_ordinals,
-            )?;
-        }
+        root_impact_writer.append(
+            &impact_key,
+            2,
+            reachability.source_node_ordinal,
+            mode,
+            u32::try_from(reachability.affected_root_ordinals.len())?,
+            &reachability.encoded_ordinals,
+        )?;
         RootImpactReference {
             mode,
             impact_key: Some(impact_key),
             source_node_ordinal: reachability.source_node_ordinal,
+            evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
+        }
+    } else if pending.source_count > 1 {
+        let included_ordinals = pending
+            .root_union
+            .iter()
+            .enumerate()
+            .filter(|(_, included)| **included)
+            .map(|(ordinal, _)| u32::try_from(ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mode, encoded_ordinals) =
+            compact_root_impact_encoding(&included_ordinals, roots.roots.len())?;
+        let impact_key = format!("issue:{}", pending.issue.issue_key);
+        root_impact_writer.append(
+            &impact_key,
+            2,
+            None,
+            mode,
+            u32::try_from(included_ordinals.len())?,
+            &encoded_ordinals,
+        )?;
+        RootImpactReference {
+            mode,
+            impact_key: Some(impact_key),
+            source_node_ordinal: None,
             evidence_schema_version: "lcia.scope-closure-root-impact-index.v1".to_owned(),
         }
     } else {
@@ -8560,7 +8664,32 @@ fn finalize_coalesced_issue(
         }
     };
 
-    if !reachability.visited.is_empty() {
+    if pending.source_count > 1 {
+        pending.issue.affected_root_count = u32::try_from(
+            pending
+                .root_union
+                .iter()
+                .filter(|included| **included)
+                .count(),
+        )?;
+        pending.issue.affected_roots.clear();
+        pending.issue.affected_root_witness_paths.clear();
+        pending.issue.witness_path.clear();
+        for (&root_ordinal, witness) in &pending.root_witnesses {
+            let root = roots
+                .roots
+                .get(usize::try_from(root_ordinal)?)
+                .ok_or_else(|| anyhow::anyhow!("root ordinal is out of bounds"))?;
+            pending.issue.affected_roots.push(root.clone());
+            pending
+                .issue
+                .affected_root_witness_paths
+                .push(witness.clone());
+            if pending.issue.witness_path.is_empty() {
+                pending.issue.witness_path = witness.clone();
+            }
+        }
+    } else if !reachability.visited.is_empty() {
         pending.issue.affected_root_count =
             u32::try_from(reachability.affected_root_ordinals.len())?;
         pending.issue.affected_roots.clear();
@@ -8749,7 +8878,17 @@ fn build_issue_relation_spools_with_cancellation_and_progress(
                 &mut stats,
             )?;
         }
-        let pending = current.get_or_insert_with(|| CoalescedIssueState::new(source_key, issue));
+        let source = issue.source.clone();
+        let pending =
+            current.get_or_insert_with(|| CoalescedIssueState::new(source_key.clone(), issue));
+        pending.observe_source(
+            &source_key,
+            source.as_ref(),
+            &mut reachability,
+            &scan.reference_graph,
+            &stable_roots,
+            cancellation,
+        )?;
         pending.push_occurrence(occurrence, &mut stats);
         Ok(())
     })?;
@@ -9123,24 +9262,6 @@ fn write_xlsx_report<W: Write + Seek>(
         .map(plan_snapshot_blocker_worksheets)
         .transpose()?
         .unwrap_or_default();
-    let existing_worksheet_bytes = worksheets.iter().try_fold(0_u64, |total, rows| {
-        total
-            .checked_add(estimate_xlsx_worksheet_bytes(rows)?)
-            .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))
-    })?;
-    let blocker_worksheet_bytes = blocker_sheet_plans.iter().try_fold(0_u64, |total, plan| {
-        total
-            .checked_add(plan.estimated_bytes)
-            .ok_or_else(|| anyhow::anyhow!("xlsx blocker byte estimate overflow"))
-    })?;
-    let total_worksheet_bytes = existing_worksheet_bytes
-        .checked_add(blocker_worksheet_bytes)
-        .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))?;
-    if total_worksheet_bytes > XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES {
-        return Err(anyhow::anyhow!(
-            "artifact_limit_exceeded: xlsx total worksheet bytes {total_worksheet_bytes} exceed {XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES}"
-        ));
-    }
     let sheet_count = 4_usize.saturating_add(blocker_sheet_plans.len());
 
     let mut zip = ZipWriter::new(writer);
@@ -9202,7 +9323,6 @@ fn write_xlsx_report<W: Write + Seek>(
 }
 
 fn preflight_xlsx_worksheets(worksheets: &[&[Vec<String>]]) -> anyhow::Result<()> {
-    let mut total_bytes = 0_u64;
     for (index, rows) in worksheets.iter().enumerate() {
         if rows.len() > XLSX_MAX_WORKSHEET_ROWS {
             return Err(anyhow::anyhow!(
@@ -9221,14 +9341,6 @@ fn preflight_xlsx_worksheets(worksheets: &[&[Vec<String>]]) -> anyhow::Result<()
                 XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES
             ));
         }
-        total_bytes = total_bytes
-            .checked_add(worksheet_bytes)
-            .ok_or_else(|| anyhow::anyhow!("xlsx total byte estimate overflow"))?;
-    }
-    if total_bytes > XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES {
-        return Err(anyhow::anyhow!(
-            "artifact_limit_exceeded: xlsx total worksheet bytes {total_bytes} exceed {XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES}"
-        ));
     }
     Ok(())
 }
@@ -9258,7 +9370,6 @@ fn estimate_xlsx_worksheet_bytes(rows: &[Vec<String>]) -> anyhow::Result<u64> {
 #[derive(Debug, Clone, Copy)]
 struct SnapshotBlockerWorksheetPlan {
     data_rows: usize,
-    estimated_bytes: u64,
 }
 
 fn snapshot_blocker_xlsx_header() -> Vec<String> {
@@ -9271,7 +9382,6 @@ fn snapshot_blocker_xlsx_header() -> Vec<String> {
         "Target id",
         "Target version",
         "Message",
-        "Complete details",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -9295,7 +9405,6 @@ fn snapshot_blocker_xlsx_row(reason: &Value) -> Vec<String> {
         text("targetId"),
         text("targetVersion"),
         text("message"),
-        canonical_value(reason),
     ]
 }
 
@@ -9337,10 +9446,7 @@ fn plan_snapshot_blocker_worksheets(
         let byte_limit_reached =
             estimated_bytes.saturating_add(row_bytes) > XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES;
         if data_rows > 0 && (row_limit_reached || byte_limit_reached) {
-            plans.push(SnapshotBlockerWorksheetPlan {
-                data_rows,
-                estimated_bytes,
-            });
+            plans.push(SnapshotBlockerWorksheetPlan { data_rows });
             data_rows = 0;
             estimated_bytes = initial_bytes;
         }
@@ -9355,10 +9461,7 @@ fn plan_snapshot_blocker_worksheets(
         Ok(())
     })?;
     if data_rows > 0 {
-        plans.push(SnapshotBlockerWorksheetPlan {
-            data_rows,
-            estimated_bytes,
-        });
+        plans.push(SnapshotBlockerWorksheetPlan { data_rows });
     }
     Ok(plans)
 }
@@ -12997,7 +13100,7 @@ mod tests {
                     },
                     "sourceIdentity": format!("source:{}@01.00.000", Uuid::from_u128(index + 1)),
                     "targetType": "flow",
-                    "targetId": Uuid::from_u128(index + 100).to_string(),
+                    "targetId": Uuid::from_u128(100 + (index % 2)).to_string(),
                     "targetVersion": "01.00.000",
                     "jsonPath": format!("$.exchanges.exchange[{index}].referenceToFlowDataSet"),
                     "referenceRole": "exchangeFlow",
@@ -13053,11 +13156,19 @@ mod tests {
         .unwrap();
 
         let relations = scan.issue_relations.as_ref().unwrap();
-        assert_eq!(relations.stats.issue_count, 39);
+        assert_eq!(relations.stats.issue_count, 2);
         assert_eq!(relations.stats.occurrence_count, 39);
-        assert_eq!(relations.stats.blocker_count, 39);
-        assert_eq!(relations.stats.affected_root_count, 39);
-        assert_eq!(scan.issues.len(), 39);
+        assert_eq!(relations.stats.blocker_count, 2);
+        assert_eq!(relations.stats.affected_root_count, 2);
+        assert_eq!(scan.issues.len(), 2);
+        assert_eq!(
+            scan.issues
+                .iter()
+                .map(|issue| u64::from(issue.occurrence_count))
+                .sum::<u64>(),
+            39
+        );
+        assert!(scan.issues.iter().all(|issue| issue.source.is_none()));
         assert_eq!(scan.blocker_codes().len(), 2);
 
         let closure_check_id = Uuid::new_v4();
@@ -13075,9 +13186,9 @@ mod tests {
         .unwrap();
         let reconstructed =
             reconstruct_complete_machine_result(&machine_artifacts, closure_check_id).unwrap();
-        assert_eq!(reconstructed.issue_count, 39);
+        assert_eq!(reconstructed.issue_count, 2);
         assert_eq!(reconstructed.occurrence_count, 39);
-        assert_eq!(reconstructed.affected_root_count, 39);
+        assert_eq!(reconstructed.affected_root_count, 2);
 
         let bytes = write_xlsx_report(
             Cursor::new(Vec::new()),
@@ -13095,7 +13206,7 @@ mod tests {
             &mut issues_xml,
         )
         .unwrap();
-        assert_eq!(issues_xml.matches("<row r=").count(), 40);
+        assert_eq!(issues_xml.matches("<row r=").count(), 3);
         let mut occurrences_xml = String::new();
         std::io::Read::read_to_string(
             &mut archive.by_name("xl/worksheets/sheet3.xml").unwrap(),
@@ -15044,7 +15155,7 @@ mod tests {
         assert_eq!(reconstructed.occurrence_count, 7);
         assert_eq!(reconstructed.affected_root_count, 49);
         assert_eq!(reconstructed.expanded_affected_root_record_count, 0);
-        assert_eq!(reconstructed.root_impact_record_count, 1);
+        assert_eq!(reconstructed.root_impact_record_count, 4);
         assert!(!artifacts.iter().any(|artifact| {
             artifact.descriptor.file_name.starts_with("occurrences/")
                 || artifact.descriptor.file_name.starts_with("affected-roots/")
