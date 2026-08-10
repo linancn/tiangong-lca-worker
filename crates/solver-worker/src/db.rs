@@ -2885,13 +2885,20 @@ async fn verify_certified_closure_bundle_artifact(
 ) -> anyhow::Result<()> {
     let row = sqlx::query(
         r"
-        SELECT artifact_type, storage_path, content_type, byte_size,
-               checksum_sha256, metadata
-        FROM public.worker_job_artifacts
-        WHERE id = $1
+        SELECT artifact.artifact_type, artifact.storage_path, artifact.content_type,
+               artifact.byte_size, artifact.checksum_sha256, artifact.metadata,
+               public.lcia_scope_closure_bundle_binding_matches(
+                   closure_check,
+                   artifact
+               ) AS binding_matches
+        FROM public.worker_job_artifacts artifact
+        CROSS JOIN public.lcia_scope_closure_checks closure_check
+        WHERE artifact.id = $1
+          AND closure_check.id = $2
         ",
     )
     .bind(expected_artifact_id)
+    .bind(expected_closure_check_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| anyhow::anyhow!("certified_closure_bundle_artifact_not_found"))?;
@@ -2902,17 +2909,16 @@ async fn verify_certified_closure_bundle_artifact(
     let byte_size = row.try_get::<i64, _>("byte_size")?;
     let checksum_sha256 = row.try_get::<String, _>("checksum_sha256")?;
     let metadata = row.try_get::<Value, _>("metadata")?;
-    let expected_closure_check_id = expected_closure_check_id.to_string();
+    let binding_matches = row.try_get::<bool, _>("binding_matches")?;
     let artifact_schema = metadata.get("schemaVersion").and_then(Value::as_str);
     if artifact_type != "closure_bundle"
         || content_type != "application/json"
         || checksum_sha256 != expected_bundle_hash
+        || !binding_matches
         || !matches!(
             artifact_schema,
             Some("lcia.scope-closure-artifact.v1" | "lcia.scope-closure-artifact.v2")
         )
-        || metadata.get("closureCheckId").and_then(Value::as_str)
-            != Some(expected_closure_check_id.as_str())
     {
         return Err(anyhow::anyhow!(
             "certified_closure_bundle_artifact_metadata_mismatch"

@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-10"
-lastReviewedCommit: "452e2736efb14a8df2b833bb2fd21f279d324aab"
-lastReviewedNote: "Reviewed for Worker Issue #241: the internal scanner-revision compatibility hotfix remains within Worker runtime ownership and existing routing rules."
+lastReviewedCommit: "818c95b0cb188471327832bdd3e01c449e1e3c3d"
+lastReviewedNote: "Reviewed for Worker Issue #243: Database-authoritative fresh/direct-reuse Closure Bundle binding remains within Worker runtime ownership and existing routing rules."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
