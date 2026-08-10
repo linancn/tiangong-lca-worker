@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
-lastReviewedNote: "Reviewed for Worker Issue #245: accepting the certified LCIA method subset preserves Worker ownership and existing public-interface boundaries."
+lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
+lastReviewedNote: "Reviewed for Worker Issue #247: frozen impact-axis publication preserves Worker ownership and existing public-interface boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

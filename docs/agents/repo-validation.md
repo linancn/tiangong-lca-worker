@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
-lastReviewedNote: "Reviewed for Worker Issue #245: focused Calculation Bundle coverage includes one-method and multi-method certified subsets plus invalid-axis rejection."
+lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
+lastReviewedNote: "Reviewed for Worker Issue #247: result-package coverage proves frozen impact IDs, default resolution, and invalid-default rejection."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

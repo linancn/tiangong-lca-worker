@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-10"
-lastReviewedCommit: "1de9c777b57b034c2b703ceedabd692526bb4fd0"
-lastReviewedNote: "Reviewed for Worker Issue #245: certified LCIA method subsets remain within the existing Calculation Bundle runtime and documentation routes."
+lastReviewedCommit: "cd80d622e364d0db3a1d65584dcd79fda2088c76"
+lastReviewedNote: "Reviewed for Worker Issue #247: publishing the frozen impact axis remains within the existing result-package runtime and documentation routes."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

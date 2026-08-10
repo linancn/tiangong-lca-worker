@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
-lastReviewedNote: "Updated for Worker Issue #245: package materialization preserves the exact certified LCIA method subset while retaining reviewed-catalog validation."
+lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
+lastReviewedNote: "Reviewed for Worker Issue #247: result-package impact metadata does not alter certificate, snapshot, or Closure Bundle binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml

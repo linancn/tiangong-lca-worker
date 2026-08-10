@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
 lastReviewedAt: 2026-08-10
-lastReviewedNote: "Reviewed for Worker Issue #245: certified LCIA method subsets do not change TIDAS import/export tasks or artifact schemas."
+lastReviewedNote: "Reviewed for Worker Issue #247: result-package impact metadata does not change TIDAS import/export tasks or artifact schemas."
 related:
   - AGENTS.md
   - .docpact/config.yaml

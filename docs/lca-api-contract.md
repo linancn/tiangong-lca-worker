@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-10
 lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
-lastReviewedNote: "Updated for Worker Issue #245: Calculation Bundle follows the snapshot's exact non-empty certified LCIA method subset instead of requiring all 25 reviewed methods."
+lastReviewedNote: "Updated for Worker Issue #247: result packages publish ordered canonical impact IDs and a normalized default from the frozen snapshot axis."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -227,7 +227,7 @@ Singular/factorization failure diagnostics load the exact `(process_id, process_
 
 On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. The canonical path never probes or backfills optional `lca_jobs`. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists. Retained `lca_jobs.status/diagnostics` writes are limited to the explicitly enabled legacy pgmq/debug backend.
 
-For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `public.cmd_lcia_result_package_mark_ready(...)`. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `lca_result_cache` or optional legacy `lca_jobs`.
+For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `public.cmd_lcia_result_package_mark_ready(...)`. The ready projection persists `availableImpactCategories` from the frozen snapshot impact axis as ordered canonical impact UUIDs; `defaultImpactCategory` is normalized from either a requested canonical UUID or frozen impact key to the matching canonical UUID, and defaults to the first frozen impact when omitted. An empty impact axis or a requested default outside that axis fails closed instead of publishing an empty category list. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `lca_result_cache` or optional legacy `lca_jobs`.
 
 ## 4. 作业状态机
 
