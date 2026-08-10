@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
-lastReviewedNote: "Reviewed for Worker Issue #243: direct Bundle reuse changes no memory bounds, artifact payloads, or bounded result-publication semantics."
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedNote: "Reviewed for Worker Issue #245: method-subset materialization changes no Scope Closure memory, artifact-layout, or publication bounds."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

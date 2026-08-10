@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
-lastReviewedNote: "Updated for Worker Issue #241: new requests use the cutoff-readiness scanner revision while historical V1 requests remain executable."
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedNote: "Updated for Worker Issue #245: package materialization preserves the exact certified LCIA method subset while retaining reviewed-catalog validation."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -274,6 +274,8 @@ The database Build V2 command atomically enqueues `lcia_result.package_build` wi
 - `closure_bundle_hash`
 
 The Worker accepts this authoritative eleven-field binding only all-or-none and validates every field against a currently valid, complete, passed closure check before package execution. Closure-bundle ownership is evaluated by the Database-owned binding predicate: a fresh artifact belongs to the current check, while a single-level reused artifact remains owned by the direct source check and is accepted only when the source/target bundle, snapshot, scope, policy, data-snapshot, job, metadata, and checksum identities match exactly. Worker must not reinterpret source-owned `metadata.closureCheckId` as the target check ID. It downloads the exact closure-bundle artifact and numerical snapshot artifact by their certified IDs, recomputes their hashes, and requires the snapshot-index sidecar to preserve the exact ordered effective Process axis while the numerical payload preserves the same count. When Calculation Bundle materialization needs release evidence, Worker follows the verified HDF5 descriptor to release metadata and then the verified source-closure descriptor; it checks compressed hash/size/format/content type and dataset count at every hop rather than requiring a persisted compiled graph. `report_artifact_manifest_hash` remains certificate/audit evidence in the job payload, but it is not a substitute for the exact closure-bundle artifact identity. The Worker consumes the certificate and frozen snapshot; it does not rerun administrative closure.
+
+The Calculation Bundle impact axis is the snapshot-index's exact non-empty certified LCIA method axis. Every selected UUID/version must belong to the reviewed 25-method catalog, indices must be contiguous and identities unique, but the selected axis may contain one method or any other reviewed subset. Bundle materialization must not replace that frozen axis with the complete reviewed catalog.
 
 Closure binding changes provenance and eligibility, not numerical computation. The existing package snapshot build, all-unit solve, result artifact, and ready-marking path remains unchanged. Result JSON, result refs, persisted package metadata, and audit context preserve `closureCheckId` so downstream consumers can prove which certificate authorized the unchanged numerical output.
 

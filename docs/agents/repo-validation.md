@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
-lastReviewedNote: "Reviewed for Worker Issue #243: focused coverage includes fresh and direct-reuse Bundle ownership while mismatched bindings remain fail-closed in Database validation."
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedNote: "Reviewed for Worker Issue #245: focused Calculation Bundle coverage includes one-method and multi-method certified subsets plus invalid-axis rejection."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
