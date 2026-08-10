@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedNote: "Updated for Worker Issue #233: validates large discovery transport, integrity failures, bounded terminal output, and cleanup."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
+lastReviewedNote: "Reviewed for Worker Issue #239: focused snapshot-builder coverage proves cutoff warning behavior and closed-policy blockers."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

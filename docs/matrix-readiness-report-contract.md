@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
-lastReviewedNote: "Reviewed for Worker Issue #233: compact discovery projection does not change matrix-readiness report v2 semantics."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
+lastReviewedNote: "Reviewed for Worker Issue #239: snapshot assembly now supplies the effective config while report v2 semantics and defaults remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

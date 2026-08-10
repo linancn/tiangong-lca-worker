@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: cc603507f46e7fa1e611cf2dc2cf7e90a71d78dd
-lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change signed-flow routing or provider selection."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
+lastReviewedNote: "Reviewed for Worker Issue #239: config propagation restores the documented cutoff boundary without changing routing theory."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

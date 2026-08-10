@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedNote: "Reviewed for Worker Issue #233: the discovery transport fix stays within Worker runtime and contract ownership boundaries."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
+lastReviewedNote: "Reviewed for Worker Issue #239: effective snapshot-config propagation remains Worker runtime behavior and preserves public ownership boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

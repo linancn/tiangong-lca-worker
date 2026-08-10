@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedNote: "Reviewed for Worker Issue #233: internal discovery transport does not change public job, result, artifact, or download contracts."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
+lastReviewedNote: "Reviewed for Worker Issue #239: the internal readiness-policy fix does not change public job, result, artifact, or download contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
