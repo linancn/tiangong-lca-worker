@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
 lastReviewedAt: 2026-08-10
-lastReviewedNote: "Reviewed for Worker Issue #243: Closure Bundle reuse verification does not change TIDAS package tasks or artifact schemas."
+lastReviewedNote: "Reviewed for Worker Issue #245: certified LCIA method subsets do not change TIDAS import/export tasks or artifact schemas."
 related:
   - AGENTS.md
   - .docpact/config.yaml

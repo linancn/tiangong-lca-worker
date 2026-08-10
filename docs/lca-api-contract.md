@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
-lastReviewedNote: "Reviewed for Worker Issue #241: the internal cache-identity compatibility fix does not change public job, result, artifact, or download contracts."
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedNote: "Updated for Worker Issue #245: Calculation Bundle follows the snapshot's exact non-empty certified LCIA method subset instead of requiring all 25 reviewed methods."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -308,9 +308,9 @@ evidence/coverage.json
   manifest、bundle 与包含完整 snapshot blocker 明细（超单表限制时拆表）的 XLSX；sidecar 缺失、
   损坏或不完整仍按 protocol `error` 失败。
 - 若 exchange 的 Flow 引用省略 `@version`，release evidence 使用本次 snapshot 实际选择并冻结的 Flow metadata version；若引用显式给出版本，则 worker 精确查询并保持该版本绑定，且 unit metadata 只允许来自同一版本，不能静默回退到另一版本。同一 UUID 的不同显式 revision 作为不同 identity 参与 provider lookup 与 flow axis；任何缺失或不可见的 exact revision 都在 snapshot compilation 时 fail closed。
-- 已审 LCIA 方法中 UUID 与 artifact locator 不同的已知 alias，无论来自 static cache 还是 legacy database-backed package build，都只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。25 个方法任一 identity/version/locator/document UUID 不符合 reviewed mapping 都 fail closed。
+- 已审 LCIA 方法中 UUID 与 artifact locator 不同的已知 alias，无论来自 static cache 还是 legacy database-backed package build，都只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。Calculation Bundle 接受证书 snapshot 冻结的任意非空已审方法子集，并保持 snapshot impact index 的精确顺序；子集中的任一 identity/version/locator/document UUID 不符合 25-method reviewed catalog mapping、重复或 index 不连续都 fail closed。
 - technosphere evidence 使用中性字段固化 `dependent_process_idx`、`residual_exchange_internal_id`、`balancing_process_idx`、`balancing_reference_exchange_internal_id`、residual/reference coefficient、routing weight、activity requirement、Flow UUID/version 和 location；每个最终 balancing reference port 一条 edge。
-- directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
+- directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 绑定已审查 static-cache bundle 1.2.4 中由证书 snapshot 精确选择的非空 method UUID/version 子集，而不是强制发布全部 25 个方法。
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
 - bounded `hdf5:v1` descriptor 与 `all-unit-query:v2` index 是兼容/查询视图；它们不是 canonical release evidence，也不得回退为完整矩阵驻留。旧 `all-unit-query:v1` artifacts remain readable only as historical artifacts; new solves never produce them。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
 

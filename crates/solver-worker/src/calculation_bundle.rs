@@ -1027,10 +1027,9 @@ impl CalculationBundleWriter {
 }
 
 fn validate_impacts(items: &[SnapshotImpactMapEntry]) -> anyhow::Result<Vec<ReleaseImpact>> {
-    if items.len() != usize::try_from(RELEASE_METHOD_COUNT)? {
+    if items.is_empty() {
         return Err(anyhow::anyhow!(
-            "Calculation Bundle requires the reviewed {RELEASE_METHOD_COUNT}-method set; got {}",
-            items.len()
+            "Calculation Bundle requires a non-empty certified impact axis"
         ));
     }
     let mut impacts = items
@@ -1059,18 +1058,27 @@ fn validate_impacts(items: &[SnapshotImpactMapEntry]) -> anyhow::Result<Vec<Rele
             ));
         }
     }
-    let actual = impacts
-        .iter()
-        .map(|impact| (impact.id.to_string(), impact.version.clone()))
-        .collect::<BTreeSet<_>>();
-    let expected = RELEASE_METHOD_IDENTITIES
+    let reviewed = RELEASE_METHOD_IDENTITIES
         .iter()
         .map(|(method_id, version, _)| ((*method_id).to_owned(), (*version).to_owned()))
         .collect::<BTreeSet<_>>();
-    if actual != expected {
-        return Err(anyhow::anyhow!(
-            "Calculation Bundle impact identities do not match the reviewed method set"
-        ));
+    let mut selected = BTreeSet::new();
+    for impact in &impacts {
+        let identity = (impact.id.to_string(), impact.version.clone());
+        if !reviewed.contains(&identity) {
+            return Err(anyhow::anyhow!(
+                "Calculation Bundle impact identity is not in the reviewed method catalog: {}@{}",
+                impact.id,
+                impact.version
+            ));
+        }
+        if !selected.insert(identity) {
+            return Err(anyhow::anyhow!(
+                "Calculation Bundle impact identity is duplicated: {}@{}",
+                impact.id,
+                impact.version
+            ));
+        }
     }
     Ok(impacts)
 }
@@ -1364,8 +1372,26 @@ mod tests {
         snapshot_index::{SnapshotImpactMapEntry, SnapshotProcessMapEntry},
     };
 
+    fn reviewed_impact(method_index: usize, impact_index: i32) -> SnapshotImpactMapEntry {
+        let (method_id, version, _) = RELEASE_METHOD_IDENTITIES[method_index];
+        SnapshotImpactMapEntry {
+            impact_id: Uuid::parse_str(method_id).unwrap(),
+            impact_index,
+            impact_version: Some(version.to_owned()),
+            impact_key: format!("method:{method_index}"),
+            impact_name: format!("Method {method_index}"),
+            unit: "kg".to_owned(),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn fixture_writer() -> CalculationBundleWriter {
+        let method_indices = (0..RELEASE_METHOD_IDENTITIES.len()).collect::<Vec<_>>();
+        fixture_writer_with_method_indices(&method_indices)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_writer_with_method_indices(method_indices: &[usize]) -> CalculationBundleWriter {
         let process_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
         let flow_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let elementary_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
@@ -1388,6 +1414,7 @@ mod tests {
             "method_version": null
         }))
         .unwrap();
+        let method_count = method_indices.len();
         let coverage: SnapshotCoverageReport = serde_json::from_value(json!({
             "schema_version": "snapshot_coverage.v2",
             "matching": {
@@ -1420,32 +1447,27 @@ mod tests {
             "matrix_scale": {
                 "process_count": 1,
                 "flow_count": 1,
-                "impact_count": 25,
+                "impact_count": method_count,
                 "a_nnz": 0,
                 "b_nnz": 1,
-                "c_nnz": 25,
+                "c_nnz": method_count,
                 "m_nnz_estimated": 1,
                 "m_sparsity_estimated": 1.0
             }
         }))
         .unwrap();
-        let impact_map = RELEASE_METHOD_IDENTITIES
+        let impact_map = method_indices
             .iter()
             .enumerate()
-            .map(|(index, (method_id, version, _))| SnapshotImpactMapEntry {
-                impact_id: Uuid::parse_str(method_id).unwrap(),
-                impact_index: i32::try_from(index).unwrap(),
-                impact_version: Some((*version).to_owned()),
-                impact_key: format!("method:{index}"),
-                impact_name: format!("Method {index}"),
-                unit: "kg".to_owned(),
+            .map(|(impact_index, method_index)| {
+                reviewed_impact(*method_index, i32::try_from(impact_index).unwrap())
             })
             .collect();
         let index = SnapshotIndexDocument {
             version: 1,
             snapshot_id,
             process_count: 1,
-            impact_count: 25,
+            impact_count: i32::try_from(method_count).unwrap(),
             process_map: vec![SnapshotProcessMapEntry {
                 process_id,
                 process_index: 0,
@@ -1613,6 +1635,72 @@ mod tests {
         assert!(body.contains(
             "\"path\":\"processes/11111111-1111-4111-8111-111111111111_01.00.000.json\""
         ));
+    }
+
+    #[test]
+    fn accepts_non_empty_reviewed_method_subsets_in_certified_axis_order() {
+        let impacts = validate_impacts(&[
+            reviewed_impact(7, 1),
+            reviewed_impact(3, 0),
+            reviewed_impact(20, 2),
+        ])
+        .unwrap();
+
+        assert_eq!(impacts.len(), 3);
+        assert_eq!(impacts[0].id, reviewed_impact(3, 0).impact_id);
+        assert_eq!(impacts[1].id, reviewed_impact(7, 1).impact_id);
+        assert_eq!(impacts[2].id, reviewed_impact(20, 2).impact_id);
+
+        let single = validate_impacts(&[reviewed_impact(0, 0)]).unwrap();
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn writes_calculation_bundle_for_single_certified_method() {
+        let mut writer = fixture_writer_with_method_indices(&[3]);
+        writer
+            .write_result_chunk(
+                0,
+                &[SolveResult {
+                    x: Some(vec![1.0]),
+                    g: None,
+                    h: Some(vec![42.0]),
+                    factorization_state: FactorizationState::Ready,
+                }],
+            )
+            .unwrap();
+
+        let built = writer.finish().unwrap();
+        assert_eq!(built.manifest.snapshot.impact_count, 1);
+        let lcia = built
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.metadata.kind == "lcia")
+            .unwrap();
+        let mut decoder = GzDecoder::new(File::open(&lcia.local_path).unwrap());
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
+        assert!(body.contains("\"meanAmount\":42.0"));
+        assert!(body.contains(RELEASE_METHOD_IDENTITIES[3].0));
+    }
+
+    #[test]
+    fn rejects_invalid_certified_method_axes() {
+        assert!(validate_impacts(&[]).is_err());
+
+        let duplicate = [reviewed_impact(0, 0), reviewed_impact(0, 1)];
+        assert!(validate_impacts(&duplicate).is_err());
+
+        let gap = [reviewed_impact(0, 0), reviewed_impact(1, 2)];
+        assert!(validate_impacts(&gap).is_err());
+
+        let mut unknown = reviewed_impact(0, 0);
+        unknown.impact_id = Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap();
+        assert!(validate_impacts(&[unknown]).is_err());
+
+        let mut missing_version = reviewed_impact(0, 0);
+        missing_version.impact_version = None;
+        assert!(validate_impacts(&[missing_version]).is_err());
     }
 
     #[test]

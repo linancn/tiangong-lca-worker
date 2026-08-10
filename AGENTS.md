@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
-lastReviewedNote: "Reviewed for Worker Issue #243: consuming the Database-owned fresh/direct-reuse Bundle predicate preserves repository and public-interface ownership boundaries."
+lastReviewedCommit: 1de9c777b57b034c2b703ceedabd692526bb4fd0
+lastReviewedNote: "Reviewed for Worker Issue #245: accepting the certified LCIA method subset preserves Worker ownership and existing public-interface boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
