@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
 lastReviewedAt: 2026-08-10
-lastReviewedNote: "Reviewed for Worker Issue #241: scanner-revision compatibility does not change package tasks or certificate-binding contracts."
+lastReviewedNote: "Reviewed for Worker Issue #243: Closure Bundle reuse verification does not change TIDAS package tasks or artifact schemas."
 related:
   - AGENTS.md
   - .docpact/config.yaml

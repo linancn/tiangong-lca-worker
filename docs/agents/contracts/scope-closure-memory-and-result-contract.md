@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
-lastReviewedNote: "Reviewed for Worker Issue #241: scanner-revision compatibility does not change memory bounds, result publication, or artifact contracts."
+lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
+lastReviewedNote: "Reviewed for Worker Issue #243: direct Bundle reuse changes no memory bounds, artifact payloads, or bounded result-publication semantics."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

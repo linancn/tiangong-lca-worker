@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
-lastReviewedNote: "Reviewed for Worker Issue #241: the closed scanner-revision compatibility set changes no repository topology or public interface."
+lastReviewedCommit: 818c95b0cb188471327832bdd3e01c449e1e3c3d
+lastReviewedNote: "Reviewed for Worker Issue #243: Database-authoritative Bundle binding changes no repository topology or public interface."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
