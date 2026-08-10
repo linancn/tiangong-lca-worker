@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
-lastReviewedNote: "Reviewed for Worker Issue #239: the internal readiness-policy fix does not change public job, result, artifact, or download contracts."
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Reviewed for Worker Issue #241: the internal cache-identity compatibility fix does not change public job, result, artifact, or download contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
