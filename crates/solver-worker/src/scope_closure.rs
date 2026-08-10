@@ -284,6 +284,34 @@ pub struct ScopeLinkPolicy {
     pub provider_universe_policy: String,
 }
 
+pub const CERTIFICATE_SCOPE_CLOSURE_BOUNDARY_POLICY: &str = "cutoff";
+pub const SCOPE_CLOSURE_BOUNDARY_POLICY_ERROR_CODE: &str =
+    "scope_closure_boundary_policy_must_be_cutoff";
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "scope_closure_boundary_policy_must_be_cutoff: certificate-grade Scope Closure requires technosphereBoundaryPolicy=cutoff; got {actual}"
+)]
+struct ScopeClosureBoundaryPolicyError {
+    actual: String,
+}
+
+pub fn ensure_certificate_scope_closure_boundary_policy(actual: &str) -> anyhow::Result<()> {
+    if actual == CERTIFICATE_SCOPE_CLOSURE_BOUNDARY_POLICY {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(ScopeClosureBoundaryPolicyError {
+        actual: actual.to_owned(),
+    }))
+}
+
+#[must_use]
+pub fn scope_closure_input_failure_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<ScopeClosureBoundaryPolicyError>()
+        .map(|_| SCOPE_CLOSURE_BOUNDARY_POLICY_ERROR_CODE)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestedScopeManifest {
@@ -1700,6 +1728,13 @@ pub fn validate_worker_input(input: &ScopeClosureWorkerInput) -> anyhow::Result<
             "scope closure requires versionResolutionPolicy=reference-version-resolution-v1"
         ));
     }
+    ensure_certificate_scope_closure_boundary_policy(
+        input
+            .requested_scope
+            .link_policy
+            .technosphere_boundary_policy
+            .as_str(),
+    )?;
     if !matches!(
         input
             .requested_scope
@@ -9871,7 +9906,7 @@ mod tests {
                     "linkSemanticsVersion": "signed-flow-balance-v1",
                     "flowIdentityPolicy": "exact-flow-version-reference-unit-v2",
                     "allocationSemanticsVersion": "tidas-reference-allocation-v3",
-                    "technosphereBoundaryPolicy": "closed",
+                    "technosphereBoundaryPolicy": "cutoff",
                     "providerUniversePolicy": "scope_only"
                 }
             },
@@ -9914,7 +9949,7 @@ mod tests {
                 link_semantics_version: "signed-flow-balance-v1".to_owned(),
                 flow_identity_policy: "exact-flow-version-reference-unit-v2".to_owned(),
                 allocation_semantics_version: "tidas-reference-allocation-v3".to_owned(),
-                technosphere_boundary_policy: "closed".to_owned(),
+                technosphere_boundary_policy: "cutoff".to_owned(),
                 provider_universe_policy: "scope_only".to_owned(),
             },
             process_manifest_hash: None,
@@ -9944,6 +9979,67 @@ mod tests {
             version_significant_hash: "1".repeat(64),
             semantic_hash: "2".repeat(64),
             canonical_content_hash: canonical_json_sha256(payload).unwrap(),
+        }
+    }
+
+    fn validated_worker_input(boundary_policy: &str) -> ScopeClosureWorkerInput {
+        let root = identity(
+            DatasetCategory::Processes,
+            "90909090-9090-4090-8090-909090909090",
+        );
+        let mut requested_scope = manifest(vec![root.clone()]);
+        requested_scope.link_policy.technosphere_boundary_policy = boundary_policy.to_owned();
+        let snapshot = DataSnapshotManifest {
+            schema_version: "lcia.scope-closure-data-snapshot.v2".to_owned(),
+            requested_scope: requested_scope.clone(),
+            current_public_release: CurrentPublicRelease {
+                publication_id: id("91919191-9191-4191-8191-919191919191"),
+                release_run_id: id("92929292-9292-4292-8292-929292929292"),
+                release_version: "test".to_owned(),
+                published_at: "2026-08-10T00:00:00Z".to_owned(),
+                release_manifest_hash: "a".repeat(64),
+            },
+            datasets: vec![SnapshotDatasetEntry {
+                dataset_type: DatasetCategory::Processes,
+                dataset_id: root.id,
+                dataset_version: root.version,
+                role: "unit_process".to_owned(),
+                source_process_id: None,
+                source_process_version: None,
+                version_significant_hash: "b".repeat(64),
+                semantic_hash: "c".repeat(64),
+                canonical_content_hash: "d".repeat(64),
+            }],
+        };
+        ScopeClosureWorkerInput {
+            closure_check_id: id("93939393-9393-4393-8393-939393939393"),
+            scan_execution_id: id("94949494-9494-4494-8494-949494949494"),
+            numerical_snapshot_id: id("95959595-9595-4595-8595-959595959595"),
+            requested_scope,
+            requested_scope_hash: "1".repeat(64),
+            policy_fingerprint: "2".repeat(64),
+            data_snapshot_token: "3".repeat(64),
+            data_snapshot_manifest: serde_json::to_value(snapshot).unwrap(),
+            data_snapshot_manifest_hash: "4".repeat(64),
+            publication_epoch: 1,
+            expected_validator_scanner_fingerprint: "scope-closure-validator-scanner.v1".to_owned(),
+            request_fingerprint: "5".repeat(64),
+        }
+    }
+
+    #[test]
+    fn certificate_scope_closure_worker_input_requires_cutoff() {
+        validate_worker_input(&validated_worker_input("cutoff"))
+            .expect("canonical cutoff worker input");
+
+        for rejected in ["closed", "open"] {
+            let error = validate_worker_input(&validated_worker_input(rejected))
+                .expect_err("non-cutoff frozen policy must fail closed");
+            assert_eq!(
+                scope_closure_input_failure_code(&error),
+                Some(SCOPE_CLOSURE_BOUNDARY_POLICY_ERROR_CODE)
+            );
+            assert!(error.to_string().contains(rejected));
         }
     }
 

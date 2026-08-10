@@ -152,6 +152,8 @@ Allocation fraction and routing weight are different: the former changes residua
 
 `open/cutoff` must participate in snapshot config and fingerprints and must produce readiness warnings plus per-edge unresolved evidence. They are not silent fallbacks.
 
+That default describes a generic production snapshot. Certificate-grade Scope Closure freezes `cutoff`, so a missing provider affects routing evidence without blocking the completeness certificate; generic `closed/open/cutoff` diagnostics remain available.
+
 ## Audit evidence
 
 Snapshot, release, and readiness evidence retain flow UUID/version/reference unit, flow space/source type, raw direction/amount/coefficient, normalized reference/residual coefficient, candidate eligibility, routing strategy/weight, activity requirement, closure residual, boundary policy, and unresolved reason.

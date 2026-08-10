@@ -99,6 +99,8 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 
 `closed` 是默认 policy。`open` / `cutoff` 会让 closure percentage、unmatched 和 multi-unresolved 不再成为 blocker，但不会删除证据；它们产生 warning，报告通常为 `passed` + `manual_review_warnings`。Equal-fallback、reference/allocation、singular、LCIA 和 compute blockers 不因 boundary policy 放宽。
 
+上述默认值属于 generic `matrix_readiness` / snapshot diagnostic contract。Certificate-grade Scope Closure 的调用绑定固定为 `cutoff`：冻结输入若为 `closed` 或 `open`，Worker 在进入 scan/build 前以 `scope_closure_boundary_policy_must_be_cutoff` 拒绝；在 `cutoff` 下，closure percentage、unmatched provider 与 multi-unresolved 只保留为 warning/evidence。通用 CLI 仍可显式运行 `closed/open/cutoff`，因此本报告的三策略 schema 和历史可读性不变。
+
 ## Findings
 
 `findings` 表示非阻塞发现。存在 warning 但没有 blocker 时，报告仍可为 `passed`，但 `next_action` 会变为 `manual_review_warnings`。

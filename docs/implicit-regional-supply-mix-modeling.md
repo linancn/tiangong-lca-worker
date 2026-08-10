@@ -158,6 +158,8 @@ Allocation fraction 与 routing weight 不可混用：前者改变 residual magn
 
 `open/cutoff` 必须进入 snapshot config、fingerprint、readiness warning 和逐边 unresolved evidence，不能作为静默 fallback。
 
+这里的默认值描述 generic production snapshot。Certificate-grade Scope Closure 固定冻结 `cutoff`，所以缺失 provider 只影响 routing evidence，不阻断完整性证书；generic `closed/open/cutoff` 诊断能力仍保留。
+
 ## 可审计证据
 
 Snapshot/release/readiness 至少保留：flow UUID/version/reference unit、flow space/source type、raw direction/amount/coefficient、normalized reference/residual coefficient、候选 eligibility、routing strategy/weight、activity requirement、closure residual、boundary policy 和 unresolved reason。
