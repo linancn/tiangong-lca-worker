@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
-lastReviewedNote: "Reviewed for Worker Issue #239: focused snapshot-builder coverage proves cutoff warning behavior and closed-policy blockers."
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Reviewed for Worker Issue #241: focused coverage proves exact current and historical scanner revisions are accepted while unknown revisions fail closed."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

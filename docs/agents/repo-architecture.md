@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
-lastReviewedNote: "Reviewed for Worker Issue #239: readiness now consumes the same effective snapshot config without changing repository topology."
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Reviewed for Worker Issue #241: the closed scanner-revision compatibility set changes no repository topology or public interface."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

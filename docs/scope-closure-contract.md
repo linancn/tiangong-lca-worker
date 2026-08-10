@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedNote: "Updated for Worker Issue #233: successful snapshot discovery uses a verified parent-owned temporary JSON file and bounded terminal descriptor."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Updated for Worker Issue #241: new requests use the cutoff-readiness scanner revision while historical V1 requests remain executable."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -61,6 +61,8 @@ The canonical job kind is `lcia.scope_closure_check` with payload schema `lcia.s
 - `request_fingerprint`
 
 The Worker loads the full service input through `svc_lcia_scope_closure_check_get_worker_input`. It requires the normalized requested scope, scope/policy/request hashes, expected validator-scanner fingerprint, publication epoch, and `lcia.scope-closure-data-snapshot.v2`.
+
+The current internal request identity is `scope-closure-validator-scanner.v1+cutoff-readiness-r1`. Worker also accepts the historical exact value `scope-closure-validator-scanner.v1` so already-enqueued and in-flight requests remain executable during rollout. This is a closed compatibility set: any other fingerprint fails before scan claim. The revision changes cache identity only; it does not version or alter the public V1 job, result, certificate, or artifact contracts.
 
 Every newly normalized certificate-grade request freezes `linkPolicy.technosphereBoundaryPolicy=cutoff`. Database accepts the legacy supported input spellings `closed`, `open`, and `cutoff` during normalization, but all of them produce the same canonical cutoff scope before hashes and snapshot identity are computed. Worker requires the frozen value to be exactly `cutoff` at both the service-input and snapshot-builder child-protocol boundaries. It never silently overrides a noncanonical frozen manifest; such input fails before scan claim/publication with `scope_closure_boundary_policy_must_be_cutoff`. Historical artifacts remain readable and generic snapshot/readiness diagnostics retain their explicit three-policy surface.
 

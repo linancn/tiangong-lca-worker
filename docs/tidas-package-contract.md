@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedAt: 2026-08-09
-lastReviewedNote: "Reviewed for Worker Issue #233: discovery transport does not change package tasks or certificate-binding contracts."
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedAt: 2026-08-10
+lastReviewedNote: "Reviewed for Worker Issue #241: scanner-revision compatibility does not change package tasks or certificate-binding contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

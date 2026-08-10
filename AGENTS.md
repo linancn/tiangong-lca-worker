@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-10
-lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
-lastReviewedNote: "Reviewed for Worker Issue #239: effective snapshot-config propagation remains Worker runtime behavior and preserves public ownership boundaries."
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Reviewed for Worker Issue #241: accepting the exact current and historical scanner revisions remains internal Worker runtime behavior and preserves public ownership boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 05bcf3443490c37629689796695fbbf9cf16f38a
-lastReviewedNote: "Updated for Worker Issue #233: successful discovery uses a bounded verified temporary JSON result instead of captured stdout."
+lastReviewedAt: 2026-08-10
+lastReviewedCommit: 452e2736efb14a8df2b833bb2fd21f279d324aab
+lastReviewedNote: "Reviewed for Worker Issue #241: scanner-revision compatibility does not change memory bounds, result publication, or artifact contracts."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

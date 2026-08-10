@@ -49,6 +49,9 @@ pub const SCOPE_CLOSURE_JOB_KIND: &str = "lcia.scope_closure_check";
 pub const SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION: &str = "lcia.scope_closure_check.request.v1";
 pub const SCOPE_CLOSURE_RESULT_SCHEMA_VERSION: &str = "lcia.scope_closure_check.result.v1";
 pub const SCOPE_CLOSURE_SCANNER_VERSION: &str = "scope-closure-scanner.v1";
+const VALIDATOR_SCANNER_FINGERPRINT_V1: &str = "scope-closure-validator-scanner.v1";
+const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1: &str =
+    "scope-closure-validator-scanner.v1+cutoff-readiness-r1";
 pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
 pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
@@ -82,6 +85,17 @@ const XLSX_MAX_WORKSHEET_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const XLSX_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const SCOPE_CLOSURE_ARTIFACT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
+
+fn validate_validator_scanner_fingerprint(fingerprint: &str) -> anyhow::Result<()> {
+    if fingerprint == VALIDATOR_SCANNER_FINGERPRINT_V1
+        || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1
+    {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "unsupported validator/scanner fingerprint: {fingerprint}"
+    ))
+}
 
 fn artifact_registration_batches(items: &[Value]) -> std::slice::Chunks<'_, Value> {
     items.chunks(ARTIFACT_REGISTRATION_BATCH_SIZE)
@@ -4561,12 +4575,7 @@ pub async fn execute_scope_closure_job(
     {
         return Err(anyhow::anyhow!("closure scan/snapshot envelope mismatch"));
     }
-    if input.expected_validator_scanner_fingerprint != "scope-closure-validator-scanner.v1" {
-        return Err(anyhow::anyhow!(
-            "unsupported validator/scanner fingerprint: {}",
-            input.expected_validator_scanner_fingerprint
-        ));
-    }
+    validate_validator_scanner_fingerprint(&input.expected_validator_scanner_fingerprint)?;
     let wait_started = std::time::Instant::now();
     let mut wait_backoff = std::time::Duration::from_secs(1);
     loop {
@@ -9919,6 +9928,23 @@ mod tests {
             "expectedValidatorScannerFingerprint": "scope-closure-validator-scanner.v1",
             "requestFingerprint": "5".repeat(64)
         })
+    }
+
+    #[test]
+    fn validator_scanner_fingerprint_compatibility_is_explicit() {
+        for fingerprint in [
+            VALIDATOR_SCANNER_FINGERPRINT_V1,
+            VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1,
+        ] {
+            assert!(validate_validator_scanner_fingerprint(fingerprint).is_ok());
+        }
+
+        let unsupported = "scope-closure-validator-scanner.v1+unknown-r2";
+        let error = validate_validator_scanner_fingerprint(unsupported).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported validator/scanner fingerprint: {unsupported}")
+        );
     }
 
     fn identity(category: DatasetCategory, value: &str) -> ExactDatasetIdentity {
