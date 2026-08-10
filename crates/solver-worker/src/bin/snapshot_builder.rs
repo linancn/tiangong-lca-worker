@@ -1354,6 +1354,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         &pool,
         snapshot_id,
         &method,
+        &build_config,
         resolved_scope.processes.clone(),
         cli.include_user_id,
         versioned_scope.as_ref(),
@@ -2057,6 +2058,7 @@ async fn run_review_submit_overlay_build(
     let built = assemble_sparse_payload(
         requested_snapshot_id,
         &method,
+        &overlay_config,
         &overlay_graph,
         cli.self_loop_cutoff,
         cli.singular_eps,
@@ -2224,6 +2226,7 @@ async fn load_or_build_review_submit_baseline(
         pool,
         baseline_snapshot_id,
         method,
+        baseline_config,
         baseline_processes.to_vec(),
         include_user_id,
         None,
@@ -3683,6 +3686,7 @@ async fn build_sparse_payload(
     pool: &PgPool,
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     processes: Vec<ProcessRow>,
     include_user_id: Option<Uuid>,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
@@ -3720,6 +3724,7 @@ async fn build_sparse_payload(
     assemble_sparse_payload_with_selection(
         snapshot_id,
         method,
+        build_config,
         &compiled_graph.graph,
         self_loop_cutoff,
         singular_eps,
@@ -4756,6 +4761,7 @@ fn select_active_lcia_factors(
 fn assemble_sparse_payload(
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     compiled_graph: &CompiledGraph,
     self_loop_cutoff: f64,
     singular_eps: f64,
@@ -4778,6 +4784,7 @@ fn assemble_sparse_payload(
     assemble_sparse_payload_with_selection(
         snapshot_id,
         method,
+        build_config,
         compiled_graph,
         self_loop_cutoff,
         singular_eps,
@@ -4793,6 +4800,7 @@ fn assemble_sparse_payload(
 fn assemble_sparse_payload_with_selection(
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     compiled_graph: &CompiledGraph,
     self_loop_cutoff: f64,
     singular_eps: f64,
@@ -5088,7 +5096,7 @@ fn assemble_sparse_payload_with_selection(
     let readiness = verify_matrix_readiness(&MatrixReadinessInput {
         schema_version: "matrix_readiness_input.v2".to_owned(),
         snapshot_id: Some(snapshot_id),
-        config: None,
+        config: Some(build_config.clone()),
         coverage: coverage.clone(),
         payload: data.clone(),
         compiled_graph: Some(compiled_graph.clone()),
@@ -10947,6 +10955,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &overlay_graph,
             0.999_999,
             1e-12,
@@ -11066,6 +11075,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11185,6 +11195,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11227,6 +11238,7 @@ mod tests {
         let built = assemble_sparse_payload(
             snapshot_id,
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11263,6 +11275,79 @@ mod tests {
                 .expect("release evidence link")
                 .byte_size,
             123
+        );
+    }
+
+    #[test]
+    fn assembled_readiness_uses_effective_snapshot_boundary_policy() {
+        let mut graph = super::empty_compiled_graph();
+        graph.matching_stats.input_edges_total = 1;
+        graph.matching_stats.unmatched_no_provider = 1;
+        graph.matching_stats.residual_edges_total = 1;
+        let method = MethodSelection {
+            has_lcia: false,
+            method_id: None,
+            method_version: None,
+            method_count: 0,
+            factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+        let mut build_config = test_snapshot_build_config("tidas-reference-allocation-v3");
+        build_config.technosphere_boundary_policy = "cutoff".to_owned();
+
+        let cutoff = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &build_config,
+            &graph,
+            build_config.self_loop_cutoff,
+            build_config.singular_eps,
+            false,
+            &[],
+            &[],
+            false,
+        )
+        .expect("assemble cutoff readiness input");
+
+        assert!(cutoff.readiness.blockers.iter().all(|blocker| {
+            blocker.code != "provider_closure_unmatched"
+                && blocker.code != "provider_closure_write_pct_below_policy"
+        }));
+        assert!(cutoff.readiness.findings.iter().any(|finding| {
+            finding.code == "technosphere_boundary_unresolved_permitted"
+                && finding.details["technosphere_boundary_policy"] == "cutoff"
+        }));
+
+        build_config.technosphere_boundary_policy = "closed".to_owned();
+        let closed = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &build_config,
+            &graph,
+            build_config.self_loop_cutoff,
+            build_config.singular_eps,
+            false,
+            &[],
+            &[],
+            false,
+        )
+        .expect("assemble closed readiness input");
+
+        assert!(
+            closed
+                .readiness
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.code == "provider_closure_unmatched" })
+        );
+        assert!(
+            closed
+                .readiness
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.code == "provider_closure_write_pct_below_policy" })
         );
     }
 
