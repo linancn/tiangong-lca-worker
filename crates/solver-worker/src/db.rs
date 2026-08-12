@@ -39,7 +39,9 @@ use crate::{
     compiled_graph::CompiledReleaseEvidence,
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
-    db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
+    db_pool::{
+        APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions, sql_string_literal,
+    },
     graph_types::RequestRootProcess,
     snapshot_artifacts::{
         DecodedSnapshotArtifact, DecodedSnapshotReleaseEvidence,
@@ -73,7 +75,7 @@ pub struct QueueMessage {
 pub struct AppState {
     /// Main DB pool for compute, package, snapshot, and result persistence queries.
     pub pool: PgPool,
-    /// Queue-only DB pool for pgmq read/archive operations.
+    /// Control-plane DB pool for worker-job RPCs and pgmq read/archive operations.
     pub queue_pool: PgPool,
     /// Core solver service.
     pub solver: SolverService,
@@ -237,8 +239,44 @@ fn build_snapshot_heartbeat_interval(lease_seconds: i32) -> Duration {
     Duration::from_secs(u64::from((lease_seconds / 3).clamp(1, 60).cast_unsigned()))
 }
 
-fn acquire_build_snapshot_worker_jobs_slot_sql() -> &'static str {
+fn acquire_build_snapshot_worker_jobs_slot_sql(
+    lease: &BuildSnapshotWorkerLease,
+    max_concurrency: u32,
+    diagnostics: &Value,
+) -> String {
     ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL
+        .replace(
+            "$1",
+            format!(
+                "{}::uuid",
+                sql_string_literal(&lease.worker_job_id.to_string())
+            )
+            .as_str(),
+        )
+        .replace(
+            "$2",
+            format!(
+                "{}::uuid",
+                sql_string_literal(&lease.lease_token.to_string())
+            )
+            .as_str(),
+        )
+        .replace(
+            "$3",
+            i32::try_from(max_concurrency)
+                .unwrap_or(i32::MAX)
+                .to_string()
+                .as_str(),
+        )
+        .replace(
+            "$4",
+            lease.lease_seconds.clamp(1, 86_400).to_string().as_str(),
+        )
+        .replace("$5", BUILD_SNAPSHOT_ADVISORY_LOCK_BASE.to_string().as_str())
+        .replace(
+            "$6",
+            format!("{}::jsonb", sql_string_literal(&diagnostics.to_string())).as_str(),
+        )
 }
 
 impl AppState {
@@ -401,15 +439,13 @@ async fn acquire_build_snapshot_worker_jobs_slot(
                 "waiting": false,
             }
         });
-        let row = sqlx::query(acquire_build_snapshot_worker_jobs_slot_sql())
-            .bind(lease.worker_job_id)
-            .bind(lease.lease_token)
-            .bind(i32::try_from(max_concurrency).unwrap_or(i32::MAX))
-            .bind(lease_seconds)
-            .bind(BUILD_SNAPSHOT_ADVISORY_LOCK_BASE)
-            .bind(diagnostics)
-            .fetch_optional(pool)
-            .await?;
+        let sql =
+            acquire_build_snapshot_worker_jobs_slot_sql(&lease, max_concurrency, &diagnostics);
+        let row = sqlx::raw_query(&sql)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .next();
 
         if let Some(row) = row {
             let active_build_count = row.try_get::<i32, _>("active_build_count")?;
@@ -1595,7 +1631,7 @@ async fn handle_job_payload_with_worker_lease(
             let lock_guard = match build_snapshot_worker_lease.clone() {
                 Some(lease) => {
                     acquire_build_snapshot_worker_jobs_slot(
-                        &state.pool,
+                        &state.queue_pool,
                         state.build_snapshot_max_concurrency,
                         state.build_snapshot_lock_poll_interval,
                         lease,
@@ -1684,7 +1720,7 @@ async fn handle_job_payload_with_worker_lease(
             let executed_result = match build_snapshot_worker_lease.as_ref() {
                 Some(lease) => {
                     run_snapshot_builder_job_with_worker_heartbeat(
-                        &state.pool,
+                        &state.queue_pool,
                         lease,
                         build_snapshot_lock.clone(),
                         build_future,
@@ -1738,7 +1774,7 @@ async fn handle_job_payload_with_worker_lease(
             };
             if let Some(lease) = &build_snapshot_worker_lease {
                 crate::worker_jobs::heartbeat_worker_job(
-                    &state.pool,
+                    &state.queue_pool,
                     lease.worker_job_id,
                     lease.lease_token,
                     "build_snapshot",
@@ -4518,14 +4554,27 @@ mod tests {
 
     #[test]
     fn build_snapshot_worker_jobs_slot_sql_uses_short_transaction_and_lease_fencing() {
-        let sql = acquire_build_snapshot_worker_jobs_slot_sql();
+        let lease = BuildSnapshotWorkerLease {
+            worker_job_id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
+            lease_seconds: 300,
+        };
+        let sql = acquire_build_snapshot_worker_jobs_slot_sql(
+            &lease,
+            2,
+            &serde_json::json!({"test": "pooler's test"}),
+        );
 
         assert!(sql.contains("pg_advisory_xact_lock"));
         assert!(
             !sql.contains("pg_try_advisory_xact_lock"),
             "worker_jobs build_snapshot gating must not hold a transaction advisory lock for the build duration"
         );
-        assert!(sql.contains("lease_token is not distinct from $2"));
+        assert!(sql.contains("lease_token is not distinct from"));
+        assert!(sql.contains(lease.lease_token.to_string().as_str()));
+        assert!(!sql.contains("$1"));
+        assert!(!sql.contains("$2"));
+        assert!(sql.contains("pooler''s test"));
         assert!(sql.contains("lease_expires_at >= NOW()"));
         assert!(sql.contains("phase = 'build_snapshot'"));
     }

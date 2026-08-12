@@ -35,9 +35,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: private/api/util SQL boundaries and compact discovery paths remain aligned with Worker runtime ownership."
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
+lastReviewedNote: "Reviewed for Worker PR #225: worker-job control-plane pool isolation and terminal-write recovery remain aligned with Worker runtime ownership."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -195,10 +195,10 @@ Calculation Bundle reads exact release evidence from the current integrity-bound
 ## Operational Baseline
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
-- The worker uses a main DB pool plus an optional queue-only DB pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it must remain on a session/direct connection or session pooler when compute paths use SQLx bound queries. Supabase's known `:6543` transaction endpoint is rejected for the main pool at startup. The queue-only pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; if no queue URL is set it reuses the main pool.
+- The worker uses a main DB pool plus an optional control-plane pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it must remain on a session/direct connection or session pooler when compute paths use SQLx bound queries. Supabase's known `:6543` transaction endpoint is rejected for the main pool at startup. The control-plane pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; it owns worker-job claim, heartbeat, terminal-result RPCs, and pgmq read/archive traffic. If no queue URL is set it reuses the main pool.
 - `WORKER_ID`, `WORKER_JOBS_CLAIM_LIMIT`, and `WORKER_JOBS_LEASE_SECONDS` control solver `worker_jobs` claim diagnostics, batch size, and lease renewal. Keep the lease longer than a normal solve/snapshot heartbeat interval and use `BUILD_SNAPSHOT_MAX_CONCURRENCY` for actual snapshot build throttling.
 - `build_snapshot` is globally throttled with a PostgreSQL transaction-level advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
-- Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. High-frequency pgmq polling and archive operations use the queue-only pool plus `raw_sql` with validated queue-name literals so they can run through the simple query protocol on Supabase's 6543 transaction pooler without moving compute/package/snapshot queries onto that pooler.
+- Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. Worker-job control-plane RPCs and high-frequency pgmq polling/archive operations use the control-plane pool plus simple-query SQL, so they can run through Supabase's 6543 transaction pooler without moving compute, package, snapshot, or artifact queries onto that pooler. Terminal-result writes retry only bounded database/transport failures; an identical same-lease database replay is idempotent.
 - Snapshot-builder local reports under `reports/snapshot-coverage` are guarded optional diagnostics, not durable artifacts. `SNAPSHOT_REPORT_MODE`, `SNAPSHOT_REPORT_RETENTION_DAYS`, `SNAPSHOT_REPORT_MAX_FILES`, and `SNAPSHOT_REPORT_MIN_FREE_BYTES` control local report writes, retention, and low-disk skipping; object-store snapshot artifacts remain the durable compute payload.
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.

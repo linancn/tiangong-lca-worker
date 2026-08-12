@@ -40,8 +40,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
 lastReviewedNote: "Updated for Worker PR #225: combines schema/pool cutover proof with current scope-closure discovery, LCIA-axis, and historical-result exclusion proof."
 related:
   - ../../AGENTS.md

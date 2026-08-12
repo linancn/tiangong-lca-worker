@@ -24,9 +24,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: private worker-job persistence, retired legacy lifecycle, and current artifact/discovery contracts remain aligned."
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
+lastReviewedNote: "Reviewed for Worker PR #225: worker-job control-plane isolation, terminal idempotency, and current artifact/discovery contracts remain aligned."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -230,6 +230,8 @@ For `lcia_result.package_build`, worker builds a published-only snapshot using t
 ## 4. 作业状态机
 
 `worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path`、`prepare_factorization` 或 `lcia_result_package_build`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
+
+Worker 的 claim、heartbeat 与 terminal-result RPC 使用独立 control-plane pool；主业务 pool 仅承担 compute、snapshot、package 与 artifact 查询。终态写入只对数据库/传输错误做有界重试；数据库仅把同一 lease token、同一 status 和同一结果内容的重放视为幂等成功，冲突重放继续返回非成功结果。过期且达到最大尝试次数的任务按有界 `FOR UPDATE SKIP LOCKED` 候选集回收，单个被锁住的旧任务不得阻塞其他 queued/stale 任务的 claim。
 
 ## 5. 结果契约
 

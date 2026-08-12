@@ -23,7 +23,9 @@ use crate::{
         record_scope_closure_failure,
     },
     types::JobPayload,
-    worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
+    worker_jobs::{
+        WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result_reliably,
+    },
 };
 
 const SOLVER_WORKER_QUEUE: &str = "solver";
@@ -348,7 +350,7 @@ pub async fn run_solver_worker_jobs_loop(
 ) -> anyhow::Result<()> {
     loop {
         match claim_worker_jobs(
-            &state.pool,
+            &state.queue_pool,
             SOLVER_WORKER_QUEUE,
             &worker_id,
             claim_limit,
@@ -402,7 +404,7 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
         }),
     };
     if let Err(err) = crate::worker_jobs::heartbeat_worker_job(
-        &state.pool,
+        &state.queue_pool,
         job.id,
         job.lease_token,
         phase,
@@ -695,7 +697,7 @@ async fn record_invalid_solver_worker_job_payload(
         None,
     );
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid worker_jobs payload");
     }
@@ -751,7 +753,8 @@ async fn record_solver_worker_job_failure(
             *closure_check_id,
         ));
         if let Err(record_err) =
-            record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result)
+                .await
         {
             error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs failure");
         }
@@ -787,7 +790,7 @@ async fn record_solver_worker_job_failure(
     );
     result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs failure");
     }
@@ -801,8 +804,13 @@ async fn record_solver_worker_job_success(
 ) {
     match build_solver_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
-            if let Err(err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %err, worker_job_id = %job.id, lca_job_id = %lca_job_id, "failed to record worker_jobs success");
             } else {
@@ -844,8 +852,13 @@ async fn record_solver_worker_job_success(
                     None,
                     *closure_check_id,
                 ));
-                if let Err(record_err) =
-                    record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+                if let Err(record_err) = record_worker_job_result_reliably(
+                    &state.queue_pool,
+                    job.id,
+                    job.lease_token,
+                    result,
+                )
+                .await
                 {
                     error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs projection failure");
                 }
@@ -864,8 +877,13 @@ async fn record_solver_worker_job_success(
                 None,
             );
             result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
-            if let Err(record_err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(record_err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs projection failure");
             }

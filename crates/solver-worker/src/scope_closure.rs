@@ -1484,6 +1484,7 @@ struct OmittedVersionResolution {
 
 pub struct PgScopeClosureProvider<'a> {
     pool: &'a PgPool,
+    control_pool: Option<&'a PgPool>,
     lease: Option<(Uuid, Uuid, i32)>,
     snapshot_universe: BTreeMap<ExactDatasetIdentity, SnapshotDatasetEntry>,
 }
@@ -1493,6 +1494,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     pub fn new(pool: &'a PgPool, snapshot: &DataSnapshotManifest) -> Self {
         Self {
             pool,
+            control_pool: None,
             lease: None,
             snapshot_universe: snapshot_dataset_universe(snapshot),
         }
@@ -1501,6 +1503,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     #[must_use]
     pub fn new_leased(
         pool: &'a PgPool,
+        control_pool: &'a PgPool,
         snapshot: &DataSnapshotManifest,
         worker_job_id: Uuid,
         lease_token: Uuid,
@@ -1508,6 +1511,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     ) -> Self {
         Self {
             pool,
+            control_pool: Some(control_pool),
             lease: Some((worker_job_id, lease_token, lease_seconds)),
             snapshot_universe: snapshot_dataset_universe(snapshot),
         }
@@ -1529,7 +1533,7 @@ impl ScopeClosureProvider for PgScopeClosureProvider<'_> {
     async fn checkpoint(&self, scanned: usize, scheduled: usize) -> anyhow::Result<()> {
         if let Some((worker_job_id, lease_token, lease_seconds)) = self.lease {
             crate::worker_jobs::heartbeat_worker_job(
-                self.pool,
+                self.control_pool.unwrap_or(self.pool),
                 worker_job_id,
                 lease_token,
                 "discover_reference_graph",
@@ -4502,7 +4506,8 @@ pub async fn execute_scope_closure_job(
     data_snapshot_token: &str,
     request_fingerprint: &str,
 ) -> anyhow::Result<ScopeClosureExecutionResult> {
-    let progress = WorkerJobProgress::new(&state.pool, worker_job_id, lease_token, lease_seconds);
+    let progress =
+        WorkerJobProgress::new(&state.queue_pool, worker_job_id, lease_token, lease_seconds);
     progress
         .heartbeat(
             "load_scope",
@@ -4587,6 +4592,7 @@ pub async fn execute_scope_closure_job(
         .await?;
     let provider = PgScopeClosureProvider::new_leased(
         &state.pool,
+        &state.queue_pool,
         &data_snapshot_manifest,
         worker_job_id,
         lease_token,

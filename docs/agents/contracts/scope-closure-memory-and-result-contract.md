@@ -27,8 +27,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
 lastReviewedNote: "Reviewed for Worker PR #225: schema cutover preserves the current bounded, file-backed scope-closure result and memory contract."
 related:
   - ../../../AGENTS.md

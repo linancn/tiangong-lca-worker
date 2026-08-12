@@ -10,7 +10,7 @@ use solver_worker::{
     pgbouncer_sqlx::{self as sqlx, Row},
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
-        record_worker_job_result,
+        record_worker_job_result_reliably,
     },
 };
 use tokio::{
@@ -437,7 +437,9 @@ async fn record_invalid_maintenance_job(pool: &sqlx::PgPool, job: &WorkerJob, er
         Some(json!({"error": err_message})),
         None,
     );
-    if let Err(record_err) = record_worker_job_result(pool, job.id, job.lease_token, result).await {
+    if let Err(record_err) =
+        record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await
+    {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid maintenance worker job");
     }
 }
@@ -471,7 +473,9 @@ async fn record_maintenance_success(
         resolution_scope: None,
         retryable: None,
     };
-    if let Err(record_err) = record_worker_job_result(pool, job.id, job.lease_token, result).await {
+    if let Err(record_err) =
+        record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await
+    {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record maintenance worker success");
     } else {
         info!(worker_job_id = %job.id, job_kind = %command.job_kind, "maintenance worker job completed");
@@ -527,7 +531,9 @@ async fn record_maintenance_failure(
         resolution_scope: None,
         retryable: Some(retryable),
     };
-    if let Err(record_err) = record_worker_job_result(pool, job.id, job.lease_token, result).await {
+    if let Err(record_err) =
+        record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await
+    {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record maintenance worker failure");
     }
 }

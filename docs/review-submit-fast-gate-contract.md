@@ -29,8 +29,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: a56713ac7ef182efd5110093e4939d0e8ed8538c
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
 lastReviewedNote: "Updated for Worker Issue #223: baseline and overlay snapshots persist bounded Review projections instead of compiler IR."
 related:
   - AGENTS.md

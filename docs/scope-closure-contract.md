@@ -31,8 +31,8 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
+lastReviewedAt: 2026-08-12
+lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
 lastReviewedNote: "Updated for Worker PR #225: private/api runtime boundaries and current verified discovery/traversal contracts remain aligned."
 related:
   - AGENTS.md

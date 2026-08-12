@@ -1,5 +1,9 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::time::sleep;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -10,6 +14,8 @@ use crate::{
 pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
 pub const REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION: &str = "review_submit.gate.request.v1";
 pub const REVIEW_SUBMIT_GATE_WORKER_QUEUE: &str = "review_submit_gate";
+
+const RESULT_WRITE_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerJob {
@@ -348,6 +354,47 @@ pub async fn record_worker_job_result(
     Ok(rpc_result)
 }
 
+/// Records a terminal worker result with bounded retries for database/transport failures.
+///
+/// The database RPC treats an identical terminal write from the same lease token as an
+/// idempotent replay, so retrying an ambiguous connection failure cannot strand a completed
+/// execution in `running`.
+pub async fn record_worker_job_result_reliably(
+    pool: &PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    result: WorkerJobResult,
+) -> anyhow::Result<Value> {
+    for attempt in 1..=RESULT_WRITE_MAX_ATTEMPTS {
+        match record_worker_job_result(pool, job_id, lease_token, result.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < RESULT_WRITE_MAX_ATTEMPTS
+                    && error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some()) =>
+            {
+                let delay = result_write_retry_delay(attempt);
+                warn!(
+                    worker_job_id = %job_id,
+                    attempt,
+                    max_attempts = RESULT_WRITE_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %error,
+                    "worker job terminal write failed; retrying"
+                );
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("terminal result retry loop always returns")
+}
+
+fn result_write_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt.saturating_sub(1).min(4)))
+}
+
 fn text_sql(value: Option<&str>) -> String {
     value.map_or_else(|| "NULL".to_owned(), sql_string_literal)
 }
@@ -433,6 +480,7 @@ mod tests {
     use super::{
         REVIEW_SUBMIT_GATE_JOB_KIND, REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
         REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
+        result_write_retry_delay,
     };
 
     #[test]
@@ -440,6 +488,13 @@ mod tests {
         assert_eq!(lease_heartbeat_period(900).as_secs(), 300);
         assert_eq!(lease_heartbeat_period(2).as_secs(), 1);
         assert_eq!(lease_heartbeat_period(-1).as_secs(), 1);
+    }
+
+    #[test]
+    fn terminal_result_retry_backoff_is_bounded() {
+        assert_eq!(result_write_retry_delay(1).as_millis(), 100);
+        assert_eq!(result_write_retry_delay(2).as_millis(), 200);
+        assert_eq!(result_write_retry_delay(99).as_millis(), 1_600);
     }
 
     #[test]

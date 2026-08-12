@@ -22,7 +22,7 @@ use solver_worker::{
     storage::ObjectStoreUploadError,
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
-        lease_heartbeat_period, record_worker_job_result,
+        lease_heartbeat_period, record_worker_job_result_reliably,
     },
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
@@ -129,7 +129,7 @@ async fn run_package_worker_jobs_loop(
 ) -> anyhow::Result<()> {
     loop {
         match claim_worker_jobs(
-            &state.pool,
+            &state.queue_pool,
             PACKAGE_WORKER_QUEUE,
             &worker_id,
             claim_limit,
@@ -259,7 +259,7 @@ async fn heartbeat_package_worker_job(
     let package_job_id = extract_package_job_id(payload);
     let phase = package_payload_type_name(payload);
     if let Err(err) = heartbeat_worker_job(
-        &state.pool,
+        &state.queue_pool,
         job.id,
         job.lease_token,
         phase,
@@ -309,7 +309,7 @@ async fn record_invalid_package_worker_job_payload(
         None,
     );
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid package worker_jobs payload");
     }
@@ -377,7 +377,7 @@ async fn record_package_worker_job_failure(
         retryable: Some(retryable),
     };
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record package worker_jobs failure");
     }
@@ -391,8 +391,13 @@ async fn record_package_worker_job_success(
     let package_job_id = extract_package_job_id(payload);
     match build_package_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
-            if let Err(err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %err, worker_job_id = %job.id, package_job_id = %package_job_id, "failed to record package worker_jobs success");
             } else {
@@ -412,8 +417,13 @@ async fn record_package_worker_job_success(
                 Some(json!({"error": err_message})),
                 None,
             );
-            if let Err(record_err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(record_err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %record_err, worker_job_id = %job.id, "failed to record package worker_jobs projection failure");
             }
