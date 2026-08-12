@@ -25,8 +25,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-12
-lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
-lastReviewedNote: "Reviewed for Worker PR #225: worker-job control-plane isolation, terminal idempotency, and current artifact/discovery contracts remain aligned."
+lastReviewedCommit: 800de2cd5a42c0732e83b87ef19bc77f8c143f2c
+lastReviewedNote: "Reviewed for Worker PR #225 follow-up: indexed referenceToDigitalFile entries now conform to the existing v4 numerical source-closure contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml

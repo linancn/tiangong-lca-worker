@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-12
-lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
-lastReviewedNote: "Reviewed for Worker PR #225: worker-job control-plane pool isolation and terminal-write recovery remain aligned with Worker runtime ownership."
+lastReviewedCommit: 800de2cd5a42c0732e83b87ef19bc77f8c143f2c
+lastReviewedNote: "Reviewed for Worker PR #225 follow-up: terminal array indexes do not change the existing external digital-file/source-closure architecture."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

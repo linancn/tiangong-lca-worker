@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-12
-lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
-lastReviewedNote: "Updated for Worker PR #225: combines schema/pool cutover proof with current scope-closure discovery, LCIA-axis, and historical-result exclusion proof."
+lastReviewedCommit: 800de2cd5a42c0732e83b87ef19bc77f8c143f2c
+lastReviewedNote: "Reviewed for Worker PR #225 follow-up: the existing source-closure suite now includes the real array-shaped external digital-file path regression."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

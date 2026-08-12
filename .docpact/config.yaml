@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-12"
-lastReviewedCommit: "30c8e0216028116556769291481822353266f65b"
-lastReviewedNote: "Reviewed for Worker PR #225 against current main: schema-cutover routing and current scope-closure ownership remain aligned."
+lastReviewedCommit: "800de2cd5a42c0732e83b87ef19bc77f8c143f2c"
+lastReviewedNote: "Reviewed for Worker PR #225 follow-up: terminal numeric indexes on external digital-file paths stay within the existing source-reference runtime contract."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
