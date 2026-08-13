@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Updated for Issue #249: Worker owns the manual informational Review Admin quality diagnostic while submit-time Gate code is compatibility-only."
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
+lastReviewedNote: "Worker owns the manual informational Review Admin quality diagnostic; submit-time Gate code is compatibility-only, and private runtime and publication boundaries remain authoritative."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

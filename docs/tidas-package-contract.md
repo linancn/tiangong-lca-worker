@@ -21,7 +21,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-13
 lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Reviewed for Issue #249: Review Admin quality diagnostics do not change TIDAS import/export jobs, artifacts, validation, retention, or certificate-bound result packages."
+lastReviewedNote: "Review Admin quality diagnostics do not change TIDAS import/export jobs, artifact schemas, validation, retention, certificate binding, or result-package metadata."
 related:
   - AGENTS.md
   - .docpact/config.yaml

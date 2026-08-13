@@ -26,7 +26,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-13
 lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Updated for Issue #249: the shared review-quality contract is a manual informational Review Admin job, not a submit-time numerical Gate."
+lastReviewedNote: "The shared review-quality contract is a manual informational Review Admin job rather than a submit-time Gate; private runtime and canonical publication boundaries remain intact."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -326,7 +326,7 @@ Allocation summary 的兼容计数为：
 
 Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 
-- `candidate_summary`：same-flow reference-port candidate 数量分布。只有 exact-flow、different-process、opposite-sign reference port eligible；same-sign reference 和 non-reference exchange 作为 rejected evidence。
+- `candidate_summary`：same-flow reference-port candidate 数量分布。所有 exact-flow、opposite-sign quantitative-reference port eligible，包括同一 Process 的候选；same-sign reference 和 non-reference exchange 作为 rejected evidence。
 - `resolution_summary`：resolved strategy 与 unresolved reason 分布。
 - `geography_summary`：地理层级、strategy × geography tier、supply-region anchor 来源、exchange location 覆盖情况和 location 粒度分布。
 - `volume_weight_summary`：基于 `annualSupplyOrProductionVolume` 的权重数据可用性与 fallback-to-one 情况。
@@ -375,6 +375,8 @@ fresh `snapshot_builder` run 也会在 `report_dir` 下尝试写出 `matrix-read
 - `status`: `passed` 或 `failed`。
 - `next_action`: 例如 `publish_ready`、`repair_provider_closure_then_recheck`、`repair_compute_stability_then_recheck`。
 - `metrics.provider_closure`: residual/written balance、unmatched opposite-sign reference、multi-candidate unresolved 和 equal-fallback 统计。
+
+`solve_all_unit` 的 canonical Calculation Bundle 继续由 manifest 与 gzip NDJSON shards 组成。Package build 另外生成 `tiangong.calculation-download.v1` 顶层语义产物：`lcia-results.xlsx`、`lcia-results.csv.zip`、`lci-inventory.parquet`、`lci-inventory-csv.zip` 和 `calculation-evidence-bundle.zip`。这些文件以 role、group、media type、record count、byte size、SHA-256 和对象引用登记，但不进入 canonical manifest 的 `artifacts[]`，因此不会改变或递归依赖 bundle content hash。审计 ZIP 原字节收录 manifest 与全部 canonical shards；原始 shard 仍用于预览、查询和机器复核，不作为普通产品下载列表。
 - `metrics.graph_readiness`: process/flow/impact scale、A/B/C/M nnz、reference/allocation closure 和 singular risk。
 - `metrics.compute_stability`: factorization readiness、matrix validation report、sample unit solves、non-finite count 和 negative LCIA count。
 - `balance_evidence` / `unresolved_balances`: signed coefficient、routing weight、activity requirement、closure residual 和未闭合原因；`provider_evidence` 作为兼容投影保留。

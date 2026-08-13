@@ -29,7 +29,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-13
 lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Reviewed for Issue #249: the added short-lived review-quality snapshot helper does not alter Scope Closure issue/result shape, bounded execution, cancellation, or staged publication."
+lastReviewedNote: "The short-lived review-quality snapshot helper does not alter bounded file-backed Scope Closure results, memory limits, cancellation, or staged publication."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

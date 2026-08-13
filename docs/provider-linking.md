@@ -125,11 +125,10 @@ Reference ports 使用 `HashMap<(UUID, version), candidates>` 分桶。每条 re
 ```text
 eligible(reference, residual)
   = reference.is_quantitative_reference
-  && reference.process != residual.process
   && sign(reference.coefficient) == -sign(residual.coefficient)
 ```
 
-因此 Waste Input、Waste Output、Product Input、Product Output 都可能成为 reference port；能否平衡某个 residual 只由 normalized coefficient 的相反符号决定。自链接明确排除。同 flow 的 non-reference exchange 和同符号 reference port 只保留为 rejected candidate evidence。
+因此 Waste Input、Waste Output、Product Input、Product Output 都可能成为 reference port；能否平衡某个 residual 只由 normalized coefficient 的相反符号决定。同一 Process 中另一个合法 opposite-sign quantitative-reference port 与外部候选进入完全相同的 routing；若选中，它自然写入 `A[i,i]`。同 flow 的 non-reference exchange 和同符号 reference port 只保留为 rejected candidate evidence。
 
 ## Signed balance 与 A 写入
 
@@ -142,6 +141,8 @@ closure = c_r + sum(c_i * activity_requirement_i) = 0
 ```
 
 相反符号保证 activity requirement 非负。routing 只分配已确定的 balance magnitude，不改变 exchange 的符号或 reference pivot。
+
+`self_loop_cutoff` 仅保留为对角值风险诊断阈值，不得过滤或改写真实 `A[i,i]`。`M = I - A` 是否可分解由求解器对完整矩阵判定；Worker 不通过删除自链接制造可解矩阵。
 
 候选数量分支：
 

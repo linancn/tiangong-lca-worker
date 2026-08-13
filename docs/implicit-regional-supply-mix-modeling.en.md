@@ -86,7 +86,7 @@ Opposite signs guarantee non-negative activity requirements. Annual volume, geog
 
 When the dependent Process has a `model_id` and at least one candidate has the same `model_id`, routing first narrows to that subset. This is a hard routing filter, not an exchange-level provider pointer or evidence of a real transaction.
 
-Without a same-model candidate, routing uses the wider eligible universe. This fallback never relaxes exact-flow, opposite-sign, reference-port, or self-link rules.
+Without a same-model candidate, routing uses the wider eligible universe. This fallback never relaxes exact-flow, opposite-sign, or reference-port rules. A same-Process opposite-sign reference port is part of that same eligible universe and, if selected, produces an ordinary diagonal `A[i,i]` contribution.
 
 ## Supply-region anchor
 

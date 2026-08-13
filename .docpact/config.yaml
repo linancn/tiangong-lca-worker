@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-13"
-lastReviewedCommit: "223892ac89d08e5266b41c7d697ecb121d20d508"
-lastReviewedNote: "Updated for Issue #249: routes and governed docs now cover the Review Admin quality diagnostic and its non-blocking compatibility boundary."
+lastReviewedCommit: "9165fa7941cbcd8d86343a06d9f57474410c7b5b"
+lastReviewedNote: "Worker routes cover the manual non-blocking Review Admin quality diagnostic while preserving private runtime, scope-closure, and calculation-product contracts."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

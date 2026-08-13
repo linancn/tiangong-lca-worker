@@ -5259,15 +5259,12 @@ async fn reuse_completed_scan_execution(
         .copied()
         .ok_or_else(|| anyhow::anyhow!("reused scan report artifact was not persisted"))?;
     let report_hash = report_artifact_manifest_hash(&state.pool, report_artifact_id).await?;
+    let reused = parse_reused_scan_projection(&data, report_hash.clone())?;
     let result_summary = json!({
         "schemaVersion": "lcia.scope-closure-summary.v1",
         "issueCount": issues.len(),
         "blockerCount": issues.iter().filter(|issue| issue.blocking).count(),
-        "evidenceHash": required_json_text(
-            data.get("evidence")
-                .ok_or_else(|| anyhow::anyhow!("reusable scan omitted evidence"))?,
-            "evidenceHash",
-        )?,
+        "evidenceHash": reused.evidence.evidence_hash.clone(),
         "artifacts": persisted,
         "reusedFromCheckId": completed_check_id,
         "reportArtifactId": report_artifact_id,
@@ -5283,32 +5280,83 @@ async fn reuse_completed_scan_execution(
         &result_summary,
     )
     .await?;
+    Ok(ScopeClosureExecutionResult {
+        closure_check_id,
+        worker_job_id,
+        status: reused.status,
+        scan_completeness: reused.scan_completeness,
+        certificate_hash: finalize
+            .get("data")
+            .and_then(|item| item.get("certificateHash"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        evidence: reused.evidence,
+        report_artifact_id,
+        blocker_codes: reused.blocker_codes,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+struct ReusedScanProjection {
+    status: String,
+    scan_completeness: String,
+    evidence: ScopeClosureEvidence,
+    blocker_codes: Vec<String>,
+}
+
+fn parse_reused_scan_projection(
+    data: &Value,
+    report_artifact_manifest_hash: String,
+) -> anyhow::Result<ReusedScanProjection> {
+    let status = required_json_text(data, "status")?;
+    let scan_completeness = required_json_text(data, "scanCompleteness")?;
+    if scan_completeness != "complete" {
+        return Err(anyhow::anyhow!(
+            "reusable scan must have complete scan evidence"
+        ));
+    }
     let evidence_json = data
         .get("evidence")
         .ok_or_else(|| anyhow::anyhow!("reusable scan omitted evidence"))?;
-    let evidence = ScopeClosureEvidence {
-        schema_version: "lcia.scope-closure-evidence.v2".to_owned(),
-        source_fingerprint: required_json_text(evidence_json, "sourceFingerprint")?,
-        resolution_map_hash: required_json_text(evidence_json, "resolutionMapHash")?,
-        closure_bundle_hash: required_json_text(evidence_json, "closureBundleHash")?,
-        closure_bundle_artifact_id: required_json_text(evidence_json, "closureBundleArtifactId")?
-            .parse()?,
-        snapshot_id: Some(required_json_text(evidence_json, "snapshotId")?.parse()?),
-        snapshot_hash: Some(required_json_text(evidence_json, "snapshotHash")?),
-        snapshot_artifact_id: Some(
-            required_json_text(evidence_json, "snapshotArtifactId")?.parse()?,
+    let source_fingerprint = required_json_text(evidence_json, "sourceFingerprint")?;
+    let resolution_map_hash = required_json_text(evidence_json, "resolutionMapHash")?;
+    let closure_bundle_hash = required_json_text(evidence_json, "closureBundleHash")?;
+    let closure_bundle_artifact_id =
+        required_json_text(evidence_json, "closureBundleArtifactId")?.parse()?;
+    let evidence = match status.as_str() {
+        "passed" => ScopeClosureEvidence {
+            schema_version: "lcia.scope-closure-evidence.v2".to_owned(),
+            source_fingerprint,
+            resolution_map_hash,
+            closure_bundle_hash,
+            closure_bundle_artifact_id,
+            snapshot_id: Some(required_json_text(evidence_json, "snapshotId")?.parse()?),
+            snapshot_hash: Some(required_json_text(evidence_json, "snapshotHash")?),
+            snapshot_artifact_id: Some(
+                required_json_text(evidence_json, "snapshotArtifactId")?.parse()?,
+            ),
+            snapshot_index_sha256: Some(required_json_text(evidence_json, "snapshotIndexSha256")?),
+            snapshot_build_contract_hash: Some(required_json_text(
+                evidence_json,
+                "snapshotBuildContractHash",
+            )?),
+            artifact_format: Some(required_json_text(evidence_json, "artifactFormat")?),
+            report_artifact_manifest_hash,
+            evidence_hash: Some(required_json_text(evidence_json, "evidenceHash")?),
+        },
+        "blocked" => administrative_only_evidence(
+            source_fingerprint,
+            resolution_map_hash,
+            closure_bundle_hash,
+            closure_bundle_artifact_id,
+            report_artifact_manifest_hash,
         ),
-        snapshot_index_sha256: Some(required_json_text(evidence_json, "snapshotIndexSha256")?),
-        snapshot_build_contract_hash: Some(required_json_text(
-            evidence_json,
-            "snapshotBuildContractHash",
-        )?),
-        artifact_format: Some(required_json_text(evidence_json, "artifactFormat")?),
-        report_artifact_manifest_hash: report_hash,
-        evidence_hash: Some(required_json_text(evidence_json, "evidenceHash")?),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "reusable scan has unsupported status {status}"
+            ));
+        }
     };
-    let status = required_json_text(&data, "status")?;
-    let scan_completeness = required_json_text(&data, "scanCompleteness")?;
     let blocker_codes = data
         .get("blockerCodes")
         .and_then(Value::as_array)
@@ -5317,18 +5365,10 @@ async fn reuse_completed_scan_execution(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    Ok(ScopeClosureExecutionResult {
-        closure_check_id,
-        worker_job_id,
+    Ok(ReusedScanProjection {
         status,
         scan_completeness,
-        certificate_hash: finalize
-            .get("data")
-            .and_then(|item| item.get("certificateHash"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
         evidence,
-        report_artifact_id,
         blocker_codes,
     })
 }
@@ -15001,6 +15041,109 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn blocked_reused_scan_accepts_administrative_evidence_without_numerical_fields() {
+        let closure_bundle_artifact_id = id("97979797-9797-4797-8797-979797979797");
+        let projection = parse_reused_scan_projection(
+            &json!({
+                "status": "blocked",
+                "scanCompleteness": "complete",
+                "evidence": {
+                    "sourceFingerprint": "1".repeat(64),
+                    "resolutionMapHash": "2".repeat(64),
+                    "closureBundleHash": "3".repeat(64),
+                    "closureBundleArtifactId": closure_bundle_artifact_id,
+                },
+                "blockerCodes": ["provider_outside_scope_universe"],
+            }),
+            "4".repeat(64),
+        )
+        .expect("complete blocked scans have reusable administrative evidence");
+
+        assert_eq!(projection.status, "blocked");
+        assert_eq!(projection.scan_completeness, "complete");
+        assert_eq!(
+            projection.blocker_codes,
+            vec!["provider_outside_scope_universe"]
+        );
+        assert_eq!(
+            projection.evidence.closure_bundle_artifact_id,
+            closure_bundle_artifact_id
+        );
+        assert!(projection.evidence.snapshot_id.is_none());
+        assert!(projection.evidence.snapshot_hash.is_none());
+        assert!(projection.evidence.snapshot_artifact_id.is_none());
+        assert!(projection.evidence.snapshot_index_sha256.is_none());
+        assert!(projection.evidence.snapshot_build_contract_hash.is_none());
+        assert!(projection.evidence.artifact_format.is_none());
+        assert!(projection.evidence.evidence_hash.is_none());
+    }
+
+    #[test]
+    fn passed_reused_scan_still_requires_every_numerical_evidence_field() {
+        let response = json!({
+            "status": "passed",
+            "scanCompleteness": "complete",
+            "evidence": {
+                "sourceFingerprint": "1".repeat(64),
+                "resolutionMapHash": "2".repeat(64),
+                "closureBundleHash": "3".repeat(64),
+                "closureBundleArtifactId": "98989898-9898-4898-8898-989898989898",
+                "snapshotId": "99999999-9999-4999-8999-999999999999",
+                "snapshotHash": "5".repeat(64),
+                "snapshotArtifactId": "90909090-9090-4090-8090-909090909090",
+                "snapshotIndexSha256": "6".repeat(64),
+                "snapshotBuildContractHash": "7".repeat(64),
+                "artifactFormat": "snapshot-hdf5:v1",
+                "evidenceHash": "8".repeat(64),
+            },
+            "blockerCodes": [],
+        });
+        let projection = parse_reused_scan_projection(&response, "4".repeat(64))
+            .expect("complete passed evidence remains reusable");
+        assert_eq!(projection.status, "passed");
+        assert!(projection.evidence.snapshot_id.is_some());
+        assert!(projection.evidence.evidence_hash.is_some());
+
+        for key in [
+            "snapshotId",
+            "snapshotHash",
+            "snapshotArtifactId",
+            "snapshotIndexSha256",
+            "snapshotBuildContractHash",
+            "artifactFormat",
+            "evidenceHash",
+        ] {
+            let mut missing = response.clone();
+            missing["evidence"].as_object_mut().unwrap().remove(key);
+            let error = parse_reused_scan_projection(&missing, "4".repeat(64)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(key),
+                "missing {key} must remain a hard error"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_scan_rejects_incomplete_or_nonterminal_status() {
+        let administrative = json!({
+            "status": "blocked",
+            "scanCompleteness": "incomplete",
+            "evidence": {
+                "sourceFingerprint": "1".repeat(64),
+                "resolutionMapHash": "2".repeat(64),
+                "closureBundleHash": "3".repeat(64),
+                "closureBundleArtifactId": "91919191-9191-4191-8191-919191919191",
+            },
+        });
+        assert!(parse_reused_scan_projection(&administrative, "4".repeat(64)).is_err());
+
+        let mut running = administrative;
+        running["scanCompleteness"] = json!("complete");
+        running["status"] = json!("running");
+        assert!(parse_reused_scan_projection(&running, "4".repeat(64)).is_err());
     }
 
     #[test]
