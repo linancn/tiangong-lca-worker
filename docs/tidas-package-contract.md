@@ -20,8 +20,8 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: package schema cutover, certificate binding, and result-package impact metadata preserve TIDAS import/export tasks and artifact schemas."
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Reviewed for Issue #249: Review Admin quality diagnostics do not change TIDAS import/export jobs, artifacts, validation, retention, or certificate-bound result packages."
 related:
   - AGENTS.md
   - .docpact/config.yaml

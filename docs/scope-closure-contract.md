@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
-lastReviewedNote: "Updated for Worker PR #225 conflict resolution: private runtime boundaries preserve verified discovery, certificate, snapshot, Closure Bundle, and frozen impact-axis binding."
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Reviewed for Issue #249: the new review-quality snapshot path is non-certificate and does not change frozen Scope Closure traversal, evidence, certificate, or package binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -9,24 +9,24 @@ language: zh-CN
 whenToUse:
   - 当你需要把 edge-functions 请求稳定映射到 worker 异步求解链路时
   - 当 enqueue、polling、service-role、request_key 或 snapshot 选择规则变化时
-  - 当 Edge 需要接入 dataset review-submit gate 的 enqueue/read/rerun/status contract 时
+  - 当 Edge 需要接入 Review Admin quality diagnostic 的 start/read/status contract 时
 whenToUpdate:
   - 当 edge-facing solve API、入队流程、worker 边界或错误处理约定变化时
-  - 当 review-submit gate 的 Edge RPC 边界或 worker runner 结果回写边界变化时
+  - 当 Review Admin quality diagnostic 的 Edge RPC 边界或 worker runner 结果回写边界变化时
 checkPaths:
   - docs/edge-function-integration.md
   - AGENTS.md
   - .docpact/config.yaml
   - docs/lca-api-contract.md
-  - docs/review-submit-fast-gate-contract.md
-  - crates/solver-worker/src/review_submit_gate_runner.rs
+  - docs/review-quality-diagnostic-contract.md
+  - crates/solver-worker/src/review_quality_diagnostic_runner.rs
   - crates/solver-worker/src/worker_jobs.rs
-  - crates/solver-worker/src/bin/review_submit_gate_runner.rs
+  - crates/solver-worker/src/bin/review_quality_diagnostic_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177: canonical scope-closure v3 and Database #316 staged publication remain behind the existing Edge-owned XLSX plus manifest projection; no Edge request or response DTO change is required."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Issue #249: Edge exposes Review Admin-only manual diagnostic start/read behavior and never turns quality findings into Review blockers."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -207,40 +207,39 @@ worker：
 - 不要在 Edge Function 同步等待完整求解结果。
 - 不要在 Edge Function 中进行重数值计算。
 
-## 9. Review Submit Gate 集成边界
+## 9. Review Admin 质量诊断集成边界
 
-提交审核前的数值稳定性 gate 分成三层；legacy gate-run 表和新的 `worker_jobs` 模式在切流期并存：
+提交审核不再创建或等待 worker 数值 Gate。服务端提交接口只处理鉴权、目标状态、所有权、并发和事务不变量；可由当前提交者直接修复的字段规则由 Next 在提交前即时展示。
 
-- Edge 负责鉴权、请求校验、创建 / 读取 / rerun gate task，并把返回状态透出给 Next。
-- Database 负责 `review_submit.submit` root job、`dataset_review_submit_jobs` retained coordinator/history、`worker_jobs` 生命周期、result projection、lease fencing 和发布前断言。
-- worker `review_submit_gate_runner` legacy 模式负责领取 queued gate run，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
-- worker `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 child `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。worker 不 claim `review_submit.submit` root job；root job 由 DB/Edge coordinator 随 `dataset_review_submit_jobs` 推进。
+Review Admin 质量诊断的职责分层：
 
-Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 或 targeted RHS solve。Edge 也不应直接更新 `dataset_review_submit_gate_runs.calculator_report`；结果写入只能由 worker runner 使用 service-role DB 连接完成。
+- Database 负责 Review Admin 鉴权、人工 start/read RPC、`worker_jobs` 生命周期和结果投影。
+- Edge 只把 start/read RPC 暴露给 Review Admin，转发稳定 envelope，不解释矩阵规则。
+- Worker 领取 `worker_queue=review_quality` 的 `review.quality_diagnostic` job，对全部待审核 Process 构建一张联合矩阵并写回报告。
+- Next 只在 Review Admin 页面提供“运行质量诊断”、进度和报告展示；Review Member 与提交者不显示入口或报告。
 
-worker_jobs enqueue payload 只需要表达 dataset revision 与可选诊断 checksum：
+Edge 不执行 snapshot builder、provider closure、factorization 或 unit solve，也不创建 Batch、revision/checksum、waiver 或 risk-acceptance 对象。
+
+payload：
 
 ```json
 {
-  "datasetRevision": {
-    "table": "processes",
-    "id": "<process uuid>",
-    "version": "01.00.000",
-    "revisionChecksum": "optional diagnostic checksum"
-  }
+  "scope": {
+    "kind": "pending_review",
+    "reviewStates": [0, 1]
+  },
+  "requestedAt": "2026-08-13T09:00:00Z"
 }
 ```
 
-worker runtime 会从 `processes.json_ordered` 计算权威 checksum，并在 worker job result 的 `datasetRevision.revisionChecksum` 返回。Edge 不应把浏览器端 checksum 当作权威值。
-
 状态语义：
 
-- `queued` / `running`：Edge 返回待处理，Next 继续轮询。
-- `passed`：提交审核可继续调用发布 / 审核流的后续 RPC。
-- `blocked`：数据修复问题，Next 应展示 `blockingReasons` 和 `calculatorReport.blockers`。
-- `error`：runner、artifact、DB 可见性或部署问题，Next 应提示稍后重试或联系运维。
-- `stale`：旧 gate run 被新的 ensure/rerun 替代，Edge/Next 应读取最新 gate run。
+- `queued` / `running`：显示诊断进度，但不禁用任何 Review 操作。
+- `completed + clear`：已执行检查未发现问题或没有待审核 Process。
+- `completed + findings`：显示完整性/数值稳定性发现；不阻止分配、批准或拒绝。
+- `completed + not_evaluable`：显示导致矩阵无法构建的数据发现；不阻止 Review 操作。
+- `failed`：显示运行故障和重试入口；不阻止 Review 操作。
 
-部署上，`review_submit_gate_runner` 需要与 solver worker 相同的 DB 和 S3 artifact 环境变量。常驻运行时使用 `REVIEW_SUBMIT_GATE_POLL_MS` 轮询；运维和 CI smoke 可使用 `--once` 处理一条后退出。
+Edge/Next 必须以 report 中 `informationalOnly=true`、`affectsReviewState=false` 和 finding `workflowBlocking=false` 为准。finding `level=error` 不是工作流 `blocked`。
 
-worker_jobs 模式部署时增加 `--worker-jobs` 或 `REVIEW_SUBMIT_GATE_WORKER_JOBS=true`。`REVIEW_SUBMIT_GATE_WORKER_ID` 用于 operator 诊断；`REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS` 默认 `900`，必须大于一次 heartbeat 间隔和常见 snapshot build 阶段耗时。
+部署上，`review_quality_diagnostic_runner` 需要与 solver worker 相同的 DB 和 S3 环境。常驻运行时使用 `REVIEW_QUALITY_POLL_MS`、`REVIEW_QUALITY_WORKER_ID` 与 `REVIEW_QUALITY_WORKER_LEASE_SECONDS`；`--once` 仅处理一条或空转退出。

@@ -25,7 +25,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
@@ -36,8 +36,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private control-plane access, indexed digital-file handling, and frozen impact-axis publication preserve the repository topology."
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Issue #249: the current review-quality runtime is the joint pending-review diagnostic runner; the submit Gate is compatibility-only."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -45,7 +45,7 @@ related:
   - ../../docs/lca-api-contract.md
   - ../../docs/scope-closure-contract.md
   - ../../docs/matrix-readiness-report-contract.md
-  - ../../docs/review-submit-fast-gate-contract.md
+  - ../../docs/review-quality-diagnostic-contract.md
   - ./contracts/scope-closure-memory-and-result-contract.md
 ---
 
@@ -93,7 +93,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/scope-closure-contract.md` | closure traversal, immutable source, validation, artifact, reuse, and build-binding contract |
 | `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v4 bounded artifact shape with v3 issue semantics, compact root-impact/witness representation, memory/cancellation invariants, and Database #316 staged-publication handshake |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
-| `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, blocker codes, and targeted probe contract |
+| `docs/review-quality-diagnostic-contract.md` | worker-owned manual Review Admin diagnostic, joint pending-review matrix, and informational report contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
 | `docs/frontend-integration.md` | frontend-side solve/result interaction contract |
 | `docs/provider-linking.md` | current provider-link runtime decision order, default rule, candidate eligibility, and diagnostics contract |
@@ -142,7 +142,7 @@ Certificate-grade Scope Closure accepts only a frozen `cutoff` technosphere boun
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
-`CompiledGraph` is compiler IR, not a durable snapshot schema. A fresh ordinary snapshot persists only numerical payload/config/coverage in `snapshot-hdf5:v1`. Its descriptor binds `snapshot-release-evidence-json-zstd:v2`, which contains Calculation Bundle metadata and a second descriptor for the content-addressed `snapshot-source-closure-json-zstd:v1`; neither metadata sidecar contains source documents twice. Both encoders borrow compiler data and stream to zstd-backed temporary files before bounded multipart upload. Ordinary solve loads only the numerical artifact; Calculation Bundle materialization explicitly hydrates and verifies the two-level descriptor chain. Historical HDF5 numerical payloads remain readable even when an embedded compiler schema has drifted: graph decoding is isolated, incompatible metadata is ignored for ordinary solve, and a purpose-specific consumer reports rebuild guidance. Compatible embedded graphs and v1 full-evidence sidecars remain readable. Review-submit baseline/overlay now persist consumer-owned `SnapshotReviewBaseline` / `SnapshotReviewGateEvidence` projections instead of compiler IR.
+`CompiledGraph` is compiler IR, not a durable snapshot schema. A fresh ordinary snapshot persists only numerical payload/config/coverage in `snapshot-hdf5:v1`. Its descriptor binds `snapshot-release-evidence-json-zstd:v2`, which contains Calculation Bundle metadata and a second descriptor for the content-addressed `snapshot-source-closure-json-zstd:v1`; neither metadata sidecar contains source documents twice. Both encoders borrow compiler data and stream to zstd-backed temporary files before bounded multipart upload. Ordinary solve loads only the numerical artifact; Calculation Bundle materialization explicitly hydrates and verifies the two-level descriptor chain. Historical HDF5 numerical payloads remain readable even when an embedded compiler schema has drifted: graph decoding is isolated, incompatible metadata is ignored for ordinary solve, and a purpose-specific consumer reports rebuild guidance. Compatible embedded graphs and v1 full-evidence sidecars remain readable. Legacy review-submit baseline/overlay artifacts retain consumer-owned `SnapshotReviewBaseline` / `SnapshotReviewGateEvidence` projections instead of compiler IR.
 The current provider-link runtime contract lives in `docs/provider-linking.md`. The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
 The process-column contract is one complete TIDAS Process revision per snapshot matrix column. `quantitativeReference.referenceToReferenceFlow` selects that column's signed normalization pivot; it does not require Product, Output, or a positive amount. Non-reference exchanges do not create derived matrix columns. When another exchange needs an independent activity pivot, upstream must publish another complete Process revision.
@@ -153,9 +153,9 @@ The process-column contract is one complete TIDAS Process revision per snapshot 
 
 `crates/solver-worker/src/readiness.rs` owns the worker-side verification gate for automated data production. It turns coverage, sparse payloads, and optional reference-port/balance evidence into `matrix_readiness_report.v2`. `closed` boundaries block unresolved technosphere coefficients; explicit `open/cutoff` boundaries retain them as auditable warnings. Callers must not reimplement balance/routing, singular-risk, LCIA, or factorization checks outside the worker.
 
-`crates/solver-worker/src/review_submit_gate.rs` owns the worker-side fast gate for dataset revision review submission. It layers revision freshness, process/exchange scans, provider evidence, sparse structural checks, and targeted RHS probes into a binary `passed` / `blocked` report without full matrix inversion or full `solve_all_unit`.
+`crates/solver-worker/src/review_quality_diagnostic_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_quality_diagnostic_runner.rs` own the current Review Admin quality-diagnostic runtime. The runner claims `review.quality_diagnostic` jobs, reads all active Root/Reference Review targets, places every pending Process into one request-root closure snapshot, and projects matrix-readiness completeness and compute facts into `clear / findings / not_evaluable`. Data findings always complete as informational reports with empty worker blocker fields; only runtime failures use `failed`, and no result mutates Review state.
 
-`crates/solver-worker/src/review_submit_gate_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The legacy mode claims persisted `dataset_review_submit_gate_runs`; the `--worker-jobs` mode claims child `review_submit.gate` jobs from `private.worker_jobs`. Both modes build a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, compute the `json_ordered` checksum, execute `review_submit_gate`, and record the result through the database RPC. The root `review_submit.submit` job is created and advanced by the DB/Edge coordinator contract; worker only executes the numeric gate child job.
+`review_submit_gate.rs` and `review_submit_gate_runner.rs` remain compatibility and offline-fixture surfaces. Current product submission must not enqueue or wait for their binary `passed / blocked` result, and new review-quality behavior belongs in the diagnostic runner rather than extending those modules.
 
 ### Maintenance worker
 

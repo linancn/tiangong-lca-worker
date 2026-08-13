@@ -23,7 +23,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/provider-linking.md
@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private runtime boundaries, indexed digital-file handling, and frozen impact-axis publication preserve Worker ownership."
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Issue #249: Worker owns the manual informational Review Admin quality diagnostic while submit-time Gate code is compatibility-only."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -52,7 +52,7 @@ related:
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
@@ -77,7 +77,7 @@ Start here when the task may change what the compute stack does.
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
 | `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
-| `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, passed/blocked semantics, blocker codes, policy defaults, targeted probe contract, and DB runner result-recorder behavior | Edge HTTP API, persistence schema, or Next submit-review UX |
+| `docs/review-quality-diagnostic-contract.md` | worker-owned Review Admin manual diagnostic job, joint pending-review matrix, informational outcome/finding schema, and compatibility boundary | Edge HTTP API, persistence schema, or Next Review Admin UX |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
 | `docs/provider-linking.md` | current provider-link runtime decision order, default provider rule, candidate eligibility, and diagnostics contract | modeling rationale for regional supply mix |
@@ -96,7 +96,7 @@ Read in this order:
    - `docs/scope-closure-contract.md`
    - `docs/agents/contracts/scope-closure-memory-and-result-contract.md`
    - `docs/matrix-readiness-report-contract.md`
-   - `docs/review-submit-fast-gate-contract.md`
+   - `docs/review-quality-diagnostic-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
    - `docs/provider-linking.md`
@@ -114,7 +114,7 @@ Do not start from the root workspace or the edge repo if the change is really ab
 - stable path groups and hotspot families live in `docs/agents/repo-architecture.md`
 - runtime-facing consumer contracts and report artifact contracts live in the narrow docs under `docs/*.md`
 - repo-local documentation maintenance is enforced locally by the pre-push docpact gate; `.github/workflows/ai-doc-lint.yml` is manual-dispatch fallback
-- the main routing intents are `solver-runtime`, `scope-closure`, `matrix-readiness`, `snapshot-and-provider`, `review-submit-gate`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
+- the main routing intents are `solver-runtime`, `scope-closure`, `matrix-readiness`, `snapshot-and-provider`, `review-quality-diagnostic`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
 
 ## Minimal Execution Facts
 
@@ -143,7 +143,7 @@ At a human-readable level, this repo owns:
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the worker runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/scope-closure-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/scope-closure-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-quality-diagnostic-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 
@@ -190,7 +190,7 @@ Route those tasks to:
 - if shared jobs/results/payload/status semantics change, update `docs/lca-api-contract.md`
 - if closure traversal, immutable release evidence, artifacts, reuse, or build-certificate binding changes, update `docs/scope-closure-contract.md`
 - if matrix-readiness report schema, blocker/finding codes, policy defaults, or next_action semantics change, update `docs/matrix-readiness-report-contract.md`
-- if review-submit fast gate schema, blocker codes, policy defaults, targeted probe semantics, or DB runner result-recorder behavior changes, update `docs/review-submit-fast-gate-contract.md`
+- if Review Admin quality-diagnostic job, joint pending-review scope, informational outcomes/findings, or compatibility boundary changes, update `docs/review-quality-diagnostic-contract.md`
 - if edge-facing enqueue, polling, or service-role integration guidance changes, update `docs/edge-function-integration.md`
 - if frontend-facing solve/result interaction guidance changes, update `docs/frontend-integration.md`
 - if provider-link runtime decision order, default provider rule, candidate eligibility, or provider diagnostics change, update `docs/provider-linking.md`

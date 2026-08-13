@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-13"
-lastReviewedCommit: "8d646f8531100e44e734a3a233e9cb60f29983ef"
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: the private schema cutover preserves the frozen impact axis and current runtime/documentation routes."
+lastReviewedCommit: "223892ac89d08e5266b41c7d697ecb121d20d508"
+lastReviewedNote: "Updated for Issue #249: routes and governed docs now cover the Review Admin quality diagnostic and its non-blocking compatibility boundary."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -32,7 +32,7 @@ ownership:
           - docs/lca-api-contract.md
           - docs/scope-closure-contract.md
           - docs/matrix-readiness-report-contract.md
-          - docs/review-submit-fast-gate-contract.md
+          - docs/review-quality-diagnostic-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
           - docs/provider-linking.md
@@ -87,7 +87,7 @@ coverage:
     - docs/lca-api-contract.md
     - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
-    - docs/review-submit-fast-gate-contract.md
+    - docs/review-quality-diagnostic-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/provider-linking.md
@@ -156,15 +156,15 @@ routing:
         - crates/solver-worker/src/compiled_graph.rs
         - docs/matrix-readiness-report-contract.md
         - docs/agents/repo-validation.md
-    review-submit-gate:
+    review-quality-diagnostic:
       paths:
-        - crates/solver-worker/src/review_submit_gate.rs
-        - crates/solver-worker/src/review_submit_gate_runner.rs
-        - crates/solver-worker/src/bin/review_submit_gate.rs
-        - crates/solver-worker/src/bin/review_submit_gate_runner.rs
+        - crates/solver-worker/src/review_quality_diagnostic_runner.rs
+        - crates/solver-worker/src/bin/review_quality_diagnostic_runner.rs
+        - crates/solver-worker/src/worker_jobs.rs
+        - crates/solver-worker/src/db.rs
         - crates/solver-worker/src/readiness.rs
         - crates/solver-worker/src/compiled_graph.rs
-        - docs/review-submit-fast-gate-contract.md
+        - docs/review-quality-diagnostic-contract.md
         - docs/lca-api-contract.md
     snapshot-and-provider:
       paths:
@@ -220,7 +220,7 @@ routing:
         - docs/lca-api-contract.md
         - docs/scope-closure-contract.md
         - docs/matrix-readiness-report-contract.md
-        - docs/review-submit-fast-gate-contract.md
+        - docs/review-quality-diagnostic-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
         - docs/provider-linking.md
@@ -242,7 +242,7 @@ docInventory:
     - docs/lca-api-contract.md
     - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
-    - docs/review-submit-fast-gate-contract.md
+    - docs/review-quality-diagnostic-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/provider-linking.md
@@ -467,19 +467,19 @@ rules:
       - path: docs/matrix-readiness-report-contract.md
         mode: review_or_update
     reason: Worker-owned matrix-readiness report semantics must stay aligned with the CLI, snapshot artifact output, provider evidence, and proof guidance.
-  - id: worker-review-submit-gate-contract
+  - id: worker-review-quality-diagnostic-contract
     scope: repo
     repo: worker
     triggers:
-      - path: docs/review-submit-fast-gate-contract.md
+      - path: docs/review-quality-diagnostic-contract.md
         kind: runtime-contract
-      - path: crates/solver-worker/src/review_submit_gate.rs
+      - path: crates/solver-worker/src/review_quality_diagnostic_runner.rs
         kind: runtime-code
-      - path: crates/solver-worker/src/review_submit_gate_runner.rs
+      - path: crates/solver-worker/src/bin/review_quality_diagnostic_runner.rs
         kind: runtime-code
-      - path: crates/solver-worker/src/bin/review_submit_gate.rs
+      - path: crates/solver-worker/src/worker_jobs.rs
         kind: runtime-code
-      - path: crates/solver-worker/src/bin/review_submit_gate_runner.rs
+      - path: crates/solver-worker/src/db.rs
         kind: runtime-code
       - path: crates/solver-worker/src/readiness.rs
         kind: runtime-code
@@ -496,9 +496,9 @@ rules:
         mode: review_or_update
       - path: docs/lca-api-contract.md
         mode: review_or_update
-      - path: docs/review-submit-fast-gate-contract.md
+      - path: docs/review-quality-diagnostic-contract.md
         mode: review_or_update
-    reason: Dataset review-submit gate semantics must stay aligned with worker-owned blocker codes, policy defaults, provider evidence, and targeted probe behavior.
+    reason: Review Admin quality diagnostics must stay aligned with the manual worker job, joint pending-review matrix, informational outcomes, non-blocking findings, and legacy submit-gate compatibility boundary.
   - id: worker-edge-frontend-integration-contract
     scope: repo
     repo: worker

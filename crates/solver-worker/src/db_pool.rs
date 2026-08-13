@@ -9,6 +9,9 @@ pub const APP_PACKAGE_WORKER: &str = "package-worker";
 pub const APP_PACKAGE_WORKER_QUEUE: &str = "package-worker-queue";
 pub const APP_REVIEW_SUBMIT_GATE_RUNNER: &str = "review-submit-gate-runner";
 pub const APP_REVIEW_SUBMIT_GATE_RUNNER_QUEUE: &str = "review-submit-gate-runner-queue";
+pub const APP_REVIEW_QUALITY_DIAGNOSTIC_RUNNER: &str = "review-quality-diagnostic-runner";
+pub const APP_REVIEW_QUALITY_DIAGNOSTIC_RUNNER_QUEUE: &str =
+    "review-quality-diagnostic-runner-queue";
 pub const APP_PACKAGE_GC: &str = "package-gc";
 pub const APP_ARTIFACT_GC: &str = "artifact-gc";
 pub const APP_SNAPSHOT_GC: &str = "snapshot-gc";

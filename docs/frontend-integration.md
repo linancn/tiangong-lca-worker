@@ -9,20 +9,20 @@ language: zh-CN
 whenToUse:
   - 当你需要给前端消费方说明 solve/result 交互契约时
   - 当 job 状态展示、轮询策略、artifact 读取或幂等键策略变化时
-  - 当提交审核前 review-submit gate 的前端状态消费规则变化时
+  - 当 Review Admin quality diagnostic 的前端状态消费规则变化时
 whenToUpdate:
   - 当前端侧交互流程、结果读取方式或错误处理约定变化时
-  - 当 review-submit gate 的前端轮询、状态展示或 blocker 展示规则变化时
+  - 当 Review Admin quality diagnostic 的前端轮询、状态或报告展示规则变化时
 checkPaths:
   - docs/frontend-integration.md
   - AGENTS.md
   - .docpact/config.yaml
   - docs/lca-api-contract.md
   - docs/edge-function-integration.md
-  - docs/review-submit-fast-gate-contract.md
-lastReviewedAt: 2026-07-30
-lastReviewedCommit: 936b0db78e5241ac81fd3cc72a95c8dd3fcfe959
-lastReviewedNote: "Reviewed for Worker Issue #177: the frontend continues to consume the existing XLSX plus manifest projection through Edge; canonical v3 storage and staged publication do not change the public DTO."
+  - docs/review-quality-diagnostic-contract.md
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Issue #249: submit no longer waits for worker numerical validation; Review Admin manually runs and views an informational report."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -122,26 +122,21 @@ export type JobStatus =
   | 'stale';
 ```
 
-## 9. Review Submit Gate 状态消费
+## 9. Review Admin Quality Diagnostic 状态消费
 
-提交审核前的数值稳定性 gate 不由前端执行。前端只调用 Edge 提供的 submit-review gate 接口，并消费数据库 gate result：
+普通提交审核不创建、轮询或等待 worker 数值任务。前端保留当前数据本身的即时可修复字段校验；服务端提交成功后直接进入 Review 工作流。
 
-- `queued` / `running`：继续轮询，展示待验证或验证中。
-- `passed`：允许继续提交审核。
-- `blocked`：展示 `blockingReasons` 和 `calculatorReport.blockers`，引导用户修复数据后 rerun。
-- `error`：展示系统错误态，允许稍后重试或联系运维。
-- `stale`：旧 gate run 已被替代，应重新读取最新 gate run。
+Review Admin 页面提供单一“运行质量诊断”入口，并通过 Edge 消费服务端 projection：
 
-前端不要复制 worker runtime 的 provider、sparse factorization、targeted RHS solve 或 blocker 判定逻辑。
+- `queued` / `running`：显示进度，但不得禁用分配、批准或拒绝。
+- `completed + clear`：显示本次检查范围和未发现问题。
+- `completed + findings`：按 `completeness` 与 `numerical_stability` 分区显示 findings。
+- `completed + not_evaluable`：说明完整性问题使矩阵无法构建，数值稳定性未执行。
+- `failed`：显示运行故障和重试入口。
 
-切到 `worker_jobs` 后，前端仍然只消费 Edge 返回的服务端 projection，不直接读写 `private.worker_jobs`。状态映射为：
+Review Member 和提交者不显示入口或报告。前端不得复制 provider、factorization 或 solve 规则，不得直接读写 `private.worker_jobs`，不得把 finding `level=error` 当成工作流阻断。report 的 `informationalOnly=true`、`affectsReviewState=false` 和 finding `workflowBlocking=false` 是强制消费语义。
 
-- `queued` / `running`：进入任务中心并展示服务端任务状态，不需要在提交按钮上长时间 blocking loading。
-- `completed`：表示 worker-side gate passed；Edge / database coordinator 才能继续 final submit。前端应使用 result 中的 `datasetRevision.revisionChecksum` 作为权威 checksum 展示 / 传递依据。
-- `blocked`：表示 worker runtime 发现数据 blocker；主提示使用 `blocker_codes` / `calculatorReport.blockers` 的友好文案，raw details 仅作为诊断信息。
-- `failed`：表示 runner、S3、DB 或部署错误；应与数据 blocker 分开展示，支持重试或联系运维。
-
-`worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 适合任务中心展示。浏览器本地 task 只能作为 UI cache，不能作为任务事实来源。
+`worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 可用于该页面的运行状态。浏览器本地状态只能作为 UI cache，不是诊断运行事实来源。
 
 LCA solver/snapshot 使用 `worker_jobs(worker_queue=solver)` 后，前端仍然不读表；Edge 应把 `workerJobId`、`lcaJobId`、`phase`、`progress`、`resultId` 和失败摘要投影给任务中心。worker result ref 使用 `{"domainSource":"worker_jobs","workerJobId":"<uuid>","lcaJobId":"<uuid>"}` 这类服务端诊断结构；前端不直接解释 raw `result_ref`，而是消费 Edge projection。`lcaJobId` 是读取 `lca_results` / `lca_result_cache` 历史 `job_id` columns 的 compatibility domain key，不能被浏览器伪造，也不表示必须存在 `lca_jobs` parent row。
 
@@ -152,5 +147,5 @@ LCA solver/snapshot 使用 `worker_jobs(worker_queue=solver)` 后，前端仍然
 - `failed` 能显示可读错误并支持重试。
 - 结果读取按 artifact 元数据路径工作（不依赖 inline payload）。
 - 用户无法读取他人的 job/result。
-- review-submit gate 的 `blocked` 能显示 blocker code/message/details，`error` 与数据 blocker 文案分开。
-- review-submit gate 切到 `worker_jobs` 后，提交动作能进入任务中心并从服务端恢复状态。
+- 普通提交审核不会进入 worker 数值任务，也不会因上游完整性或矩阵稳定性被卡住。
+- 只有 Review Admin 能运行和查看质量诊断；`findings` / `not_evaluable` / `failed` 均不禁用 Review 操作。
