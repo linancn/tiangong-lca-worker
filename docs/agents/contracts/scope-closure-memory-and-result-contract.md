@@ -28,7 +28,7 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private schema boundaries and frozen impact-axis metadata preserve bounded file-backed Scope Closure results and memory limits."
 related:
   - ../../../AGENTS.md

@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
-lastReviewedNote: "Updated for Worker PR #225 conflict resolution: private runtime boundaries preserve verified discovery, certificate, snapshot, Closure Bundle, and frozen impact-axis binding."
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Worker Issue #251: shared-scan reuse distinguishes certificate-bearing passed evidence from administrative-only blocked evidence."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -253,7 +253,7 @@ A certificate is available only for `status=passed` and `scanCompleteness=comple
 - busy executions wait with lease heartbeats and bounded exponential backoff;
 - completed executions may reuse immutable scan evidence only when the database verifies all request, policy, snapshot, and scan bindings.
 
-Reuse does not copy the source run's report or result summary. The current run rebuilds and uploads a new XLSX tagged with its own `closureCheckId`, supplies a new result summary to the six-argument reuse finalizer, and receives a new target-scoped certificate bound to the new report manifest. Source `evidenceHash` remains immutable.
+Reuse does not copy the source run's report or result summary. The current run rebuilds and uploads a new XLSX tagged with its own `closureCheckId` and supplies a new result summary to the six-argument reuse finalizer. A reused `passed` scan must retain its complete numerical snapshot fields and immutable source `evidenceHash`, and receives a new target-scoped certificate bound to the new report manifest. A reused `blocked` scan carries only its administrative evidence, blocker details, and source Closure Bundle; its target remains `blocked` with no numerical snapshot fields, `evidenceHash`, or certificate.
 
 The early-failure RPC is safe before or after scan claim. It fails only the current run and releases a scan execution only when this job holds its lease; a waiter cannot destroy another run's reusable work.
 
