@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -17,6 +19,7 @@ hdf5-sys.workspace = true
 hex.workspace = true
 hmac.workspace = true
 libc.workspace = true
+parquet.workspace = true
 reqwest.workspace = true
 rayon.workspace = true
 sha2.workspace = true

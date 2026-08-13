@@ -92,7 +92,7 @@ c_r + sum(c_i * activity_requirement_i) = 0
 
 如果 dependent Process 有 `model_id`，并且候选中存在相同 `model_id` 的 reference port，候选 scope 先收窄到该子集。这是 routing hard filter，不是 exchange-level provider pointer，也不是现实交易证明。
 
-若没有同 model 候选，则使用更宽的 eligible candidate universe。这个 fallback 只放宽 routing scope，不放宽 exact-flow、opposite-sign、reference-port 或 self-link 规则。
+若没有同 model 候选，则使用更宽的 eligible candidate universe。这个 fallback 只放宽 routing scope，不放宽 exact-flow、opposite-sign 或 reference-port 规则。同一 Process 的 opposite-sign reference port 属于同一个 eligible universe；若被选中，会形成普通的对角 `A[i,i]` contribution。
 
 ## Supply-region anchor
 

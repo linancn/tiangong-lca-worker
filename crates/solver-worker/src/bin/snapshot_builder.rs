@@ -3630,7 +3630,6 @@ fn sort_reference_port_candidates(
 
 fn eligible_balancing_process_indices(
     ports: Option<&Vec<ReferencePortCandidate>>,
-    dependent_process_idx: i32,
     residual_coefficient: f64,
 ) -> Vec<i32> {
     let Some(ports) = ports else {
@@ -3639,9 +3638,8 @@ fn eligible_balancing_process_indices(
     let mut processes = ports
         .iter()
         .filter_map(|candidate| {
-            (candidate.process_idx != dependent_process_idx
-                && candidate.coefficient.signum() != residual_coefficient.signum())
-            .then_some(candidate.process_idx)
+            (candidate.coefficient.signum() != residual_coefficient.signum())
+                .then_some(candidate.process_idx)
         })
         .collect::<Vec<_>>();
     processes.dedup();
@@ -4009,17 +4007,10 @@ fn compile_signed_flow_balances(
 
         let supply_region_anchor = supply_region_anchor_for_exchange(exchange, process_meta)?;
         let candidate_ports = reference_port_map.get(&flow_link_identity(exchange));
-        let balancing_processes = eligible_balancing_process_indices(
-            candidate_ports,
-            exchange.process_idx,
-            residual_coefficient,
-        );
-        let candidates = compiled_balance_candidates(
-            candidate_ports,
-            process_meta,
-            exchange.process_idx,
-            residual_coefficient,
-        )?;
+        let balancing_processes =
+            eligible_balancing_process_indices(candidate_ports, residual_coefficient);
+        let candidates =
+            compiled_balance_candidates(candidate_ports, process_meta, residual_coefficient)?;
         let candidate_count = i32::try_from(balancing_processes.len())
             .map_err(|_| anyhow::anyhow!("balance candidate count overflow"))?;
 
@@ -4137,12 +4128,7 @@ fn compile_signed_flow_balances(
         });
 
         if allocations.is_empty() {
-            let total_candidates = candidate_ports.map_or(0, |ports| {
-                ports
-                    .iter()
-                    .filter(|port| port.process_idx != exchange.process_idx)
-                    .count()
-            });
+            let total_candidates = candidate_ports.map_or(0, Vec::len);
             batch.unresolved.push(CompiledUnresolvedBalance {
                 dependent_process_idx: exchange.process_idx,
                 residual_exchange_internal_id: exchange.internal_id.clone().unwrap_or_default(),
@@ -4854,12 +4840,8 @@ fn assemble_sparse_payload_with_selection(
     )
     .map_err(|_| anyhow::anyhow!("prefilter count overflow"))?;
 
-    let mut technosphere_entries = Vec::new();
-    technosphere_entries.reserve(a_map.len());
+    let mut technosphere_entries = Vec::with_capacity(a_map.len());
     for ((row, col), value) in a_map {
-        if row == col && value.abs() >= self_loop_cutoff {
-            continue;
-        }
         technosphere_entries.push(SparseTriplet { row, col, value });
     }
 
@@ -5778,7 +5760,6 @@ fn process_meta_for_idx(process_meta: &[ProcessMeta], process_idx: i32) -> Optio
 fn compiled_balance_candidates(
     ports: Option<&Vec<ReferencePortCandidate>>,
     process_meta: &[ProcessMeta],
-    dependent_process_idx: i32,
     residual_coefficient: f64,
 ) -> anyhow::Result<Vec<CompiledProviderCandidate>> {
     let Some(ports) = ports else {
@@ -5790,8 +5771,7 @@ fn compiled_balance_candidates(
             let meta = process_meta_for_idx(process_meta, port.process_idx).ok_or_else(|| {
                 anyhow::anyhow!("missing balancing process meta idx={}", port.process_idx)
             })?;
-            let is_eligible = port.process_idx != dependent_process_idx
-                && port.coefficient.signum() != residual_coefficient.signum();
+            let is_eligible = port.coefficient.signum() != residual_coefficient.signum();
             Ok(CompiledProviderCandidate {
                 provider_idx: port.process_idx,
                 provider_id: meta.process_id,
@@ -6589,11 +6569,8 @@ fn resolve_process_selection_with_flow_versions(
                 continue;
             };
             let reference_ports = reference_port_map.get(&flow_link_identity(exchange));
-            let providers = eligible_balancing_process_indices(
-                reference_ports,
-                exchange.process_idx,
-                residual_coefficient,
-            );
+            let providers =
+                eligible_balancing_process_indices(reference_ports, residual_coefficient);
             let provider_cnt = providers.len();
             let next_indices = if provider_cnt == 1 {
                 providers
@@ -10091,7 +10068,7 @@ mod tests {
         CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
         CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseSourceDataset,
         CompiledReleaseSourceDatasetRole, CompiledReleaseSourceDatasetType,
-        CompiledReleaseTechnosphereEdge,
+        CompiledReleaseTechnosphereEdge, CompiledTechnosphereEdge,
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
     use solver_worker::pgbouncer_sqlx::postgres::PgPoolOptions;
@@ -10474,6 +10451,209 @@ mod tests {
         assert!(mismatched_batch.technosphere_edges.is_empty());
         assert_eq!(mismatched_batch.unresolved.len(), 1);
         assert_eq!(mismatched_batch.unresolved[0].candidate_count, 0);
+    }
+
+    #[test]
+    fn generic_balance_compiler_accepts_opposite_sign_reference_from_same_process() {
+        let flow_id = Uuid::new_v4();
+        let process_meta = vec![
+            test_process_meta(0, Some("GLO"), Some(1.0)),
+            test_process_meta(1, Some("GLO"), Some(1.0)),
+        ];
+        let compiled_processes = process_meta
+            .iter()
+            .map(|process| CompiledProcess {
+                process_idx: process.process_idx,
+                process_id: process.process_id,
+                process_version: process.process_version.clone(),
+                process_name: process.process_name.clone(),
+                model_id: process.model_id,
+                location: process.location.clone(),
+                reference_year: process.reference_year,
+                annual_supply_or_production_volume: process.annual_supply_or_production_volume,
+                partition: ScopeProcessPartition::Public,
+            })
+            .collect::<Vec<_>>();
+        let reference = ParsedExchange {
+            process_idx: 0,
+            flow_id,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            internal_id: Some("reference".to_owned()),
+            exchange_id: "reference".to_owned(),
+            flow_version: "01.00.000".to_owned(),
+            is_reference_exchange: true,
+            raw_amount: Some(1.0),
+            signed_raw_coefficient: Some(-1.0),
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
+            location: Some("GLO".to_owned()),
+        };
+        let residual = ParsedExchange {
+            process_idx: 0,
+            flow_id,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some("residual".to_owned()),
+            exchange_id: "residual".to_owned(),
+            flow_version: "01.00.000".to_owned(),
+            is_reference_exchange: false,
+            raw_amount: Some(3.0),
+            signed_raw_coefficient: Some(3.0),
+            amount: Some(3.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
+            location: Some("GLO".to_owned()),
+        };
+        let identity = super::flow_link_identity(&reference);
+        let ports = HashMap::from([(
+            identity.clone(),
+            vec![
+                super::reference_port_candidate_from_exchange(&reference)
+                    .expect("same-process reference port"),
+            ],
+        )]);
+
+        let batch = super::compile_signed_flow_balances(
+            std::slice::from_ref(&residual),
+            &HashMap::from([(identity, CompiledFlowSpace::Technosphere)]),
+            &ports,
+            &process_meta,
+            &compiled_processes,
+            ProviderRule::StrictUniqueProvider,
+        )
+        .expect("same-process opposite-sign balance");
+
+        assert_eq!(batch.technosphere_edges.len(), 1);
+        assert_eq!(batch.technosphere_edges[0].provider_idx, 0);
+        assert_eq!(batch.technosphere_edges[0].consumer_idx, 0);
+        assert_close(batch.technosphere_edges[0].amount, 3.0);
+        assert_close(
+            batch.resolutions[0].residual_coefficient
+                + batch.resolutions[0].reference_coefficient
+                    * batch.resolutions[0].activity_requirement,
+            0.0,
+        );
+        assert_eq!(
+            batch.decisions[0].candidates[0].eligibility,
+            CompiledProviderCandidateEligibility::AcceptedOppositeSignReference
+        );
+
+        let mut external_reference = reference.clone();
+        external_reference.process_idx = 1;
+        external_reference.exchange_id = "external-reference".to_owned();
+        external_reference.internal_id = Some("external-reference".to_owned());
+        let mixed_ports = HashMap::from([(
+            super::flow_link_identity(&reference),
+            vec![
+                super::reference_port_candidate_from_exchange(&reference)
+                    .expect("same-process reference port"),
+                super::reference_port_candidate_from_exchange(&external_reference)
+                    .expect("external reference port"),
+            ],
+        )]);
+        let mixed = super::compile_signed_flow_balances(
+            std::slice::from_ref(&residual),
+            &HashMap::from([(
+                super::flow_link_identity(&reference),
+                CompiledFlowSpace::Technosphere,
+            )]),
+            &mixed_ports,
+            &process_meta,
+            &compiled_processes,
+            ProviderRule::SplitEqual,
+        )
+        .expect("same and external candidates share routing");
+        assert_eq!(mixed.technosphere_edges.len(), 2);
+        assert_eq!(
+            mixed
+                .technosphere_edges
+                .iter()
+                .map(|edge| edge.provider_idx)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+        assert_close(
+            mixed
+                .technosphere_edges
+                .iter()
+                .map(|edge| edge.amount)
+                .sum::<f64>(),
+            3.0,
+        );
+        assert!(mixed.decisions[0].candidates.iter().all(|candidate| {
+            candidate.eligibility
+                == CompiledProviderCandidateEligibility::AcceptedOppositeSignReference
+        }));
+    }
+
+    #[test]
+    fn sparse_assembly_retains_diagonal_a_entries_above_self_loop_cutoff() {
+        let process_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let mut graph = super::empty_compiled_graph();
+        graph.processes.push(CompiledProcess {
+            process_idx: 0,
+            process_id,
+            process_version: "01.00.000".to_owned(),
+            process_name: None,
+            model_id: None,
+            location: None,
+            reference_year: None,
+            annual_supply_or_production_volume: None,
+            partition: ScopeProcessPartition::Public,
+        });
+        let method = MethodSelection {
+            has_lcia: false,
+            method_id: None,
+            method_version: None,
+            method_count: 0,
+            factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+
+        for (amount, expected_risk_count) in [(0.5, 0), (1.0, 1), (1.25, 1)] {
+            graph.technosphere_edges = vec![CompiledTechnosphereEdge {
+                provider_idx: 0,
+                consumer_idx: 0,
+                flow_id,
+                amount,
+                provider_partition: ScopeProcessPartition::Public,
+                consumer_partition: ScopeProcessPartition::Public,
+                partition: solver_worker::compiled_graph::CompiledEdgePartition::PublicToPublic,
+            }];
+            let built = assemble_sparse_payload(
+                Uuid::new_v4(),
+                &method,
+                &test_snapshot_build_config("tidas-reference-allocation-v3"),
+                &graph,
+                0.999_999,
+                1e-12,
+                false,
+                &[],
+                &[],
+                false,
+            )
+            .expect("assemble retained diagonal");
+
+            assert_eq!(built.data.technosphere_entries.len(), 1);
+            assert_eq!(built.data.technosphere_entries[0].row, 0);
+            assert_eq!(built.data.technosphere_entries[0].col, 0);
+            assert_close(built.data.technosphere_entries[0].value, amount);
+            assert_eq!(
+                built.coverage.singular_risk.prefilter_diag_abs_ge_cutoff,
+                expected_risk_count
+            );
+            assert_eq!(
+                built.coverage.singular_risk.postfilter_a_diag_abs_ge_cutoff,
+                expected_risk_count
+            );
+        }
     }
 
     #[test]
