@@ -36,7 +36,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private control-plane access, indexed digital-file handling, and frozen impact-axis publication preserve the repository topology."
 related:
   - ../../AGENTS.md

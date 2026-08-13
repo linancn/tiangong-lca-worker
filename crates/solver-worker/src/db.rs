@@ -1673,11 +1673,9 @@ async fn handle_job_payload_with_worker_lease(
                         include_user_state_codes: include_user_state_codes.clone().ok_or_else(
                             || anyhow::anyhow!("versioned build missing include_user_state_codes"),
                         )?,
-                        include_user_unassigned_only: include_user_unassigned_only
-                            .ok_or_else(|| anyhow::anyhow!("versioned build missing team guard"))?,
-                        include_user_review_free_only: include_user_review_free_only.ok_or_else(
-                            || anyhow::anyhow!("versioned build missing review guard"),
-                        )?,
+                        include_user_unassigned_only: include_user_unassigned_only.unwrap_or(false),
+                        include_user_review_free_only: include_user_review_free_only
+                            .unwrap_or(false),
                         data_scope: data_scope.clone(),
                         scope_manifest: scope_manifest.clone().ok_or_else(|| {
                             anyhow::anyhow!("versioned build missing scope_manifest")

@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve provider eligibility, routing, and evidence semantics."
 related:
   - AGENTS.md
