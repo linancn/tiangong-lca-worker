@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private runtime boundaries, indexed digital-file handling, and frozen impact-axis publication preserve Worker ownership."
 related:
   - .docpact/config.yaml
