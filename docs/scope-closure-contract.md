@@ -32,7 +32,7 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
 lastReviewedNote: "Updated for Worker Issue #251: shared-scan reuse distinguishes certificate-bearing passed evidence from administrative-only blocked evidence."
 related:
   - AGENTS.md

@@ -150,10 +150,10 @@ pub enum JobPayload {
         /// Owner-only state filter for the versioned private-incubation scope.
         #[serde(default)]
         include_user_state_codes: Option<String>,
-        /// Require owner drafts to have no team assignment.
+        /// Legacy v1 scope guard requiring no team assignment.
         #[serde(default)]
         include_user_unassigned_only: Option<bool>,
-        /// Require owner drafts to have no active review assignment.
+        /// Legacy v1 scope guard requiring no active review assignment.
         #[serde(default)]
         include_user_review_free_only: Option<bool>,
         /// Named versioned data scope.

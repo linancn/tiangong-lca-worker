@@ -4,8 +4,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const PUBLIC_PLUS_OWNER_DRAFT_SCOPE: &str = "public_plus_owner_draft";
-pub const SCOPE_MANIFEST_SCHEMA_VERSION: &str = "lca.data_scope.manifest.v1";
-pub const SCOPE_PREDICATE_VERSION: &str = "public_state_100_or_authenticated_owner_state_0.v1";
+pub const LEGACY_SCOPE_MANIFEST_SCHEMA_VERSION: &str = "lca.data_scope.manifest.v1";
+pub const LEGACY_SCOPE_PREDICATE_VERSION: &str =
+    "public_state_100_or_authenticated_owner_state_0.v1";
+pub const SCOPE_MANIFEST_SCHEMA_VERSION: &str = "lca.data_scope.manifest.v2";
+pub const SCOPE_PREDICATE_VERSION: &str = "public_state_100_or_authenticated_owner_state_0.v2";
 pub const METHOD_SOURCE_REQUEST_SCHEMA_VERSION: &str = "lca.method_factor_source.request.v2";
 pub const METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION: &str = "lca.method_factor_source.snapshot.v2";
 pub const STATIC_CACHE_BUNDLE_SCHEMA_VERSION: &str = "lcia.static_cache_bundle.v1";
@@ -183,6 +186,8 @@ pub struct PublicOwnerDraftBuildRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedPublicOwnerDraftScope {
     pub actor_user_id: Uuid,
+    pub include_user_unassigned_only: bool,
+    pub include_user_review_free_only: bool,
     pub scope_manifest: Value,
     pub scope_manifest_sha256: String,
     pub lcia_method_factor_source: Value,
@@ -271,6 +276,33 @@ pub fn expected_scope_manifest(actor_user_id: Uuid) -> Value {
         "schema_version": SCOPE_MANIFEST_SCHEMA_VERSION,
         "scope": PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
         "predicate_version": SCOPE_PREDICATE_VERSION,
+        "actor": {
+            "kind": "authenticated_user",
+            "user_id": actor_user_id,
+        },
+        "applies_to": ["processes", "flows"],
+        "predicate": {
+            "operator": "or",
+            "clauses": [
+                {"state_code": {"eq": 100}},
+                {
+                    "operator": "and",
+                    "clauses": [
+                        {"user_id": {"eq": actor_user_id}},
+                        {"state_code": {"eq": 0}},
+                    ],
+                },
+            ],
+        },
+    })
+}
+
+#[must_use]
+pub fn expected_legacy_scope_manifest(actor_user_id: Uuid) -> Value {
+    serde_json::json!({
+        "schema_version": LEGACY_SCOPE_MANIFEST_SCHEMA_VERSION,
+        "scope": PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
+        "predicate_version": LEGACY_SCOPE_PREDICATE_VERSION,
         "actor": {
             "kind": "authenticated_user",
             "user_id": actor_user_id,
@@ -507,7 +539,7 @@ pub fn validate_method_factor_source_request(value: &Value) -> anyhow::Result<()
     Ok(())
 }
 
-/// Validates the complete v2 producer contract. No legacy defaults are applied.
+/// Validates the versioned producer contract without changing legacy manifest semantics.
 pub fn validate_public_owner_draft_build_request(
     request: PublicOwnerDraftBuildRequest<'_>,
 ) -> anyhow::Result<ValidatedPublicOwnerDraftScope> {
@@ -529,13 +561,6 @@ pub fn validate_public_owner_draft_build_request(
             "v2 build requires include_user_state_codes exactly 0"
         ));
     }
-    if request.include_user_unassigned_only != Some(true)
-        || request.include_user_review_free_only != Some(true)
-    {
-        return Err(anyhow::anyhow!(
-            "v2 build requires owner draft team_id/review_id null guards"
-        ));
-    }
     if request.no_lcia != Some(false) {
         return Err(anyhow::anyhow!("v2 build requires no_lcia=false"));
     }
@@ -549,10 +574,36 @@ pub fn validate_public_owner_draft_build_request(
         ));
     }
 
-    let expected_manifest = expected_scope_manifest(actor_user_id);
     let actual_manifest = request
         .scope_manifest
         .ok_or_else(|| anyhow::anyhow!("v2 build requires scope_manifest"))?;
+    let (expected_manifest, include_user_unassigned_only, include_user_review_free_only) =
+        match actual_manifest
+            .get("schema_version")
+            .and_then(Value::as_str)
+        {
+            Some(SCOPE_MANIFEST_SCHEMA_VERSION) => {
+                if request.include_user_unassigned_only == Some(true)
+                    || request.include_user_review_free_only == Some(true)
+                {
+                    return Err(anyhow::anyhow!(
+                        "v2 scope manifest does not permit team_id/review_id owner-draft guards"
+                    ));
+                }
+                (expected_scope_manifest(actor_user_id), false, false)
+            }
+            Some(LEGACY_SCOPE_MANIFEST_SCHEMA_VERSION) => {
+                if request.include_user_unassigned_only != Some(true)
+                    || request.include_user_review_free_only != Some(true)
+                {
+                    return Err(anyhow::anyhow!(
+                        "legacy v1 scope manifest requires team_id/review_id null guards"
+                    ));
+                }
+                (expected_legacy_scope_manifest(actor_user_id), true, true)
+            }
+            _ => return Err(anyhow::anyhow!("unsupported scope_manifest schema version")),
+        };
     if actual_manifest != &expected_manifest {
         return Err(anyhow::anyhow!(
             "v2 build scope_manifest differs from the frozen predicate"
@@ -581,6 +632,8 @@ pub fn validate_public_owner_draft_build_request(
 
     Ok(ValidatedPublicOwnerDraftScope {
         actor_user_id,
+        include_user_unassigned_only,
+        include_user_review_free_only,
         scope_manifest: expected_manifest,
         scope_manifest_sha256: expected_manifest_sha256,
         lcia_method_factor_source: method_source.clone(),
@@ -870,8 +923,8 @@ mod tests {
             process_states: Some("100"),
             include_user_id: Some(actor),
             include_user_state_codes: Some("0"),
-            include_user_unassigned_only: Some(true),
-            include_user_review_free_only: Some(true),
+            include_user_unassigned_only: None,
+            include_user_review_free_only: None,
             data_scope: Some(PUBLIC_PLUS_OWNER_DRAFT_SCOPE),
             scope_manifest: Some(&manifest),
             scope_manifest_sha256: Some(&hash),
@@ -882,6 +935,36 @@ mod tests {
         })
         .expect("valid v2 contract");
         assert_eq!(validated.actor_user_id, actor);
+        assert!(!validated.include_user_unassigned_only);
+        assert!(!validated.include_user_review_free_only);
+        assert_eq!(validated.scope_manifest_sha256, hash);
+    }
+
+    #[test]
+    fn accepts_legacy_guarded_scope_without_reinterpreting_its_hash() {
+        let actor = Uuid::new_v4();
+        let manifest = expected_legacy_scope_manifest(actor);
+        let hash = canonical_json_sha256(&manifest).expect("manifest hash");
+        let method_source = method_factor_source_contract_fixture();
+        let coverage = expected_factor_coverage_contract();
+        let validated = validate_public_owner_draft_build_request(PublicOwnerDraftBuildRequest {
+            all_states: Some(false),
+            process_states: Some("100"),
+            include_user_id: Some(actor),
+            include_user_state_codes: Some("0"),
+            include_user_unassigned_only: Some(true),
+            include_user_review_free_only: Some(true),
+            data_scope: Some(PUBLIC_PLUS_OWNER_DRAFT_SCOPE),
+            scope_manifest: Some(&manifest),
+            scope_manifest_sha256: Some(&hash),
+            lcia_method_factor_source: Some(&method_source),
+            lcia_factor_coverage_contract: Some(&coverage),
+            no_lcia: Some(false),
+            requested_by: Some(actor),
+        })
+        .expect("legacy v1 scope remains readable");
+        assert!(validated.include_user_unassigned_only);
+        assert!(validated.include_user_review_free_only);
         assert_eq!(validated.scope_manifest_sha256, hash);
     }
 
@@ -890,7 +973,7 @@ mod tests {
         let actor = Uuid::parse_str("dab05739-1a42-421b-8170-3b77146d1d64").expect("actor");
         assert_eq!(
             canonical_json_sha256(&expected_scope_manifest(actor)).expect("scope hash"),
-            "621966942c1980dd8786b3ccfb0fda040fb77e5a842c9eb97a9e97e9c889841d"
+            "40bf56e121cfd1dd82cf55cf429609fc5d481d08a20364fe7625de0698e789a3"
         );
     }
 

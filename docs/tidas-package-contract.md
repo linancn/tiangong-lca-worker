@@ -20,7 +20,7 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: package schema cutover, certificate binding, and result-package impact metadata preserve TIDAS import/export tasks and artifact schemas."
 related:
   - AGENTS.md
