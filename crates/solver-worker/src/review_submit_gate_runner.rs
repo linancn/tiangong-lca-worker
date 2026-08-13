@@ -30,7 +30,7 @@ use crate::{
     snapshot_index::SnapshotIndexDocument,
     worker_jobs::{
         REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, WorkerJobProgress, WorkerJobResult,
-        claim_worker_jobs, record_worker_job_result,
+        claim_worker_jobs, record_worker_job_result_reliably,
     },
 };
 
@@ -221,7 +221,7 @@ pub async fn run_one_review_submit_gate_worker_job(
     options: &ReviewSubmitGateWorkerJobsOptions,
 ) -> anyhow::Result<Option<RecordedGateStatus>> {
     let jobs = claim_worker_jobs(
-        &state.pool,
+        &state.queue_pool,
         REVIEW_SUBMIT_GATE_WORKER_QUEUE,
         &options.worker_id,
         1,
@@ -291,13 +291,17 @@ async fn process_claimed_review_submit_gate_worker_job(
     job: &WorkerJob,
     options: &ReviewSubmitGateWorkerJobsOptions,
 ) -> anyhow::Result<RecordedGateStatus> {
-    let progress =
-        WorkerJobProgress::new(&state.pool, job.id, job.lease_token, options.lease_seconds);
+    let progress = WorkerJobProgress::new(
+        &state.queue_pool,
+        job.id,
+        job.lease_token,
+        options.lease_seconds,
+    );
     let run = match worker_job_to_gate_run(job) {
         Ok(run) => run,
         Err(err) => {
-            record_worker_job_result(
-                &state.pool,
+            record_worker_job_result_reliably(
+                &state.queue_pool,
                 job.id,
                 job.lease_token,
                 WorkerJobResult::failed(
@@ -338,7 +342,8 @@ async fn process_claimed_review_submit_gate_worker_job(
     };
 
     let worker_result = worker_job_result_for_outcome(&run, &outcome);
-    record_worker_job_result(&state.pool, job.id, job.lease_token, worker_result).await?;
+    record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, worker_result)
+        .await?;
 
     info!(
         worker_job_id = %job.id,
@@ -559,7 +564,7 @@ async fn claim_next_review_submit_gate_run(
         r"
         WITH claimed AS (
             SELECT id
-            FROM public.dataset_review_submit_gate_runs
+            FROM private.dataset_review_submit_gate_runs
             WHERE policy_profile = $2
               AND report_schema_version = $3
               AND (
@@ -575,7 +580,7 @@ async fn claim_next_review_submit_gate_run(
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        UPDATE public.dataset_review_submit_gate_runs AS gate_run
+        UPDATE private.dataset_review_submit_gate_runs AS gate_run
         SET status = 'running',
             modified_at = now()
         FROM claimed
@@ -718,7 +723,7 @@ async fn record_review_submit_gate_result(
 ) -> anyhow::Result<Value> {
     let row = sqlx::query(
         r"
-        SELECT public.cmd_dataset_review_submit_gate_record_result(
+        SELECT private.cmd_dataset_review_submit_gate_record_result(
             $1,
             $2,
             $3::jsonb,

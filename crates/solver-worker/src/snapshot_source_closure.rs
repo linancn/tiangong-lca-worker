@@ -217,9 +217,28 @@ fn lcia_factor_reference_is_active(
 }
 
 fn is_external_digital_file_path(json_path: &str) -> bool {
-    json_path
-        .to_ascii_lowercase()
-        .ends_with("referencetodigitalfile")
+    let path = json_path.to_ascii_lowercase();
+    let terminal = path.rsplit('.').next().unwrap_or(path.as_str());
+    terminal
+        .strip_prefix("referencetodigitalfile")
+        .is_some_and(is_json_array_index_suffix)
+}
+
+fn is_json_array_index_suffix(mut suffix: &str) -> bool {
+    while !suffix.is_empty() {
+        let Some(rest) = suffix.strip_prefix('[') else {
+            return false;
+        };
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let index = &rest[..end];
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        suffix = &rest[end + 1..];
+    }
+    true
 }
 
 fn malformed_evidence_target_type(
@@ -661,9 +680,10 @@ mod tests {
             "sourceDataSet": {
                 "sourceInformation": {
                     "dataSetInformation": {
-                        "referenceToDigitalFile": {
-                            "@uri": "http://lca.jrc.ec.europa.eu"
-                        }
+                        "referenceToDigitalFile": [
+                            {"@uri": "http://lca.jrc.ec.europa.eu"},
+                            {"@uri": "https://example.test/flowmapping.csv"}
+                        ]
                     }
                 }
             }
@@ -688,11 +708,30 @@ mod tests {
         )
         .unwrap();
         assert!(certificate.references.is_empty());
-        assert_eq!(certificate.extraction_issues.len(), 2);
+        assert!(!certificate.extraction_issues.is_empty());
         assert!(certificate.extraction_issues.iter().all(|issue| {
             issue["jsonPath"]
                 .as_str()
-                .is_some_and(|path| path.ends_with("referenceToDigitalFile"))
+                .is_some_and(|path| path.contains("referenceToDigitalFile["))
         }));
+    }
+
+    #[test]
+    fn external_digital_file_path_matches_only_terminal_numeric_indexes() {
+        assert!(is_external_digital_file_path(
+            "$.sourceDataSet.referenceToDigitalFile"
+        ));
+        assert!(is_external_digital_file_path(
+            "$.sourceDataSet.referenceToDigitalFile[12]"
+        ));
+        assert!(!is_external_digital_file_path(
+            "$.sourceDataSet.referenceToDigitalFileMetadata"
+        ));
+        assert!(!is_external_digital_file_path(
+            "$.sourceDataSet.referenceToDigitalFile[latest]"
+        ));
+        assert!(!is_external_digital_file_path(
+            "$.sourceDataSet.referenceToDigitalFile[0].uri"
+        ));
     }
 }

@@ -22,9 +22,9 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-10
-lastReviewedCommit: d9feea1edde75874aebb25e91a774cd147ac61c5
-lastReviewedNote: "Reviewed for Worker Issue #239: readiness config propagation restores the documented cutoff behavior without changing provider linking."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve provider eligibility, routing, and evidence semantics."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

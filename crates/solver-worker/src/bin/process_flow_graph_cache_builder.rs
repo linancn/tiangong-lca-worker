@@ -23,7 +23,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use solver_worker::{
-    pgbouncer_sqlx::{self as sqlx, Row, postgres::PgPoolOptions},
+    db_pool::{APP_PROCESS_FLOW_GRAPH_CACHE_BUILDER, WorkerDbPoolOptions},
+    pgbouncer_sqlx::{self as sqlx, Row},
     storage::ObjectStoreClient,
 };
 
@@ -961,16 +962,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let page_size = cli.page_size.clamp(1, MAX_PAGE_SIZE);
     let build_id = cli.build_id.clone().unwrap_or_else(default_build_id);
-    let pool = PgPoolOptions::new()
+    let pool = WorkerDbPoolOptions::new(APP_PROCESS_FLOW_GRAPH_CACHE_BUILDER)
         .max_connections(1)
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::query("SET default_transaction_read_only = on")
-                    .execute(conn)
-                    .await?;
-                Ok(())
-            })
-        })
+        .default_transaction_read_only(true)
         .connect(resolve_database_url(&cli)?)
         .await?;
 

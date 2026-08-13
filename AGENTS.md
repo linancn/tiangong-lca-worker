@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-10
-lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
-lastReviewedNote: "Reviewed for Worker Issue #247: frozen impact-axis publication preserves Worker ownership and existing public-interface boundaries."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private runtime boundaries, indexed digital-file handling, and frozen impact-axis publication preserve Worker ownership."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

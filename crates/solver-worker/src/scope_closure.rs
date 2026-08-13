@@ -1526,6 +1526,7 @@ struct OmittedVersionResolution {
 
 pub struct PgScopeClosureProvider<'a> {
     pool: &'a PgPool,
+    control_pool: Option<&'a PgPool>,
     lease: Option<(Uuid, Uuid, i32)>,
     snapshot_universe: BTreeMap<ExactDatasetIdentity, SnapshotDatasetEntry>,
 }
@@ -1535,6 +1536,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     pub fn new(pool: &'a PgPool, snapshot: &DataSnapshotManifest) -> Self {
         Self {
             pool,
+            control_pool: None,
             lease: None,
             snapshot_universe: snapshot_dataset_universe(snapshot),
         }
@@ -1543,6 +1545,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     #[must_use]
     pub fn new_leased(
         pool: &'a PgPool,
+        control_pool: &'a PgPool,
         snapshot: &DataSnapshotManifest,
         worker_job_id: Uuid,
         lease_token: Uuid,
@@ -1550,6 +1553,7 @@ impl<'a> PgScopeClosureProvider<'a> {
     ) -> Self {
         Self {
             pool,
+            control_pool: Some(control_pool),
             lease: Some((worker_job_id, lease_token, lease_seconds)),
             snapshot_universe: snapshot_dataset_universe(snapshot),
         }
@@ -1571,7 +1575,7 @@ impl ScopeClosureProvider for PgScopeClosureProvider<'_> {
     async fn checkpoint(&self, scanned: usize, scheduled: usize) -> anyhow::Result<()> {
         if let Some((worker_job_id, lease_token, lease_seconds)) = self.lease {
             crate::worker_jobs::heartbeat_worker_job(
-                self.pool,
+                self.control_pool.unwrap_or(self.pool),
                 worker_job_id,
                 lease_token,
                 "discover_reference_graph",
@@ -1710,7 +1714,7 @@ pub async fn load_scope_closure_worker_input(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_check_get_worker_input($1) AS result
+        SELECT private.svc_lcia_scope_closure_check_get_worker_input($1) AS result
         FROM _service_role
         ",
     )
@@ -1879,8 +1883,8 @@ async fn validate_worker_input_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
-               public.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS requested_scope_hash,
+               private.lcia_scope_closure_sha256($2::jsonb) AS snapshot_manifest_hash
         FROM _service_role
         ",
     )
@@ -4246,7 +4250,7 @@ async fn scope_closure_snapshot_binding(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash
         FROM _service_role
         ",
     )
@@ -4551,7 +4555,8 @@ pub async fn execute_scope_closure_job(
     data_snapshot_token: &str,
     request_fingerprint: &str,
 ) -> anyhow::Result<ScopeClosureExecutionResult> {
-    let progress = WorkerJobProgress::new(&state.pool, worker_job_id, lease_token, lease_seconds);
+    let progress =
+        WorkerJobProgress::new(&state.queue_pool, worker_job_id, lease_token, lease_seconds);
     progress
         .heartbeat(
             "load_scope",
@@ -4631,6 +4636,7 @@ pub async fn execute_scope_closure_job(
         .await?;
     let provider = PgScopeClosureProvider::new_leased(
         &state.pool,
+        &state.queue_pool,
         &data_snapshot_manifest,
         worker_job_id,
         lease_token,
@@ -5163,7 +5169,7 @@ async fn claim_scan_execution(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_claim_scan_execution($1, $2, $3) AS result
+        SELECT private.svc_lcia_scope_closure_claim_scan_execution($1, $2, $3) AS result
         FROM _service_role
         ",
     )
@@ -5206,7 +5212,7 @@ async fn reuse_completed_scan_execution(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_reuse_completed_scan($1, $2, $3, $4) AS result
+        SELECT private.svc_lcia_scope_closure_reuse_completed_scan($1, $2, $3, $4) AS result
         FROM _service_role
         ",
     )
@@ -5341,7 +5347,7 @@ async fn finalize_reused_scan_execution(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_finalize_reused_scan(
+        SELECT private.svc_lcia_scope_closure_finalize_reused_scan(
             $1, $2, $3, $4, $5, $6::jsonb
         ) AS result
         FROM _service_role
@@ -5391,7 +5397,7 @@ async fn load_reused_issues(
                    'referenceRole', o.reference_role,
                    'details', o.details
                  ) ORDER BY o.occurrence_key)
-                 FROM public.lcia_scope_closure_issue_occurrences o
+                 FROM private.lcia_scope_closure_issue_occurrences o
                  WHERE o.closure_issue_id = i.id
                ), '[]'::jsonb) AS occurrences,
                COALESCE((
@@ -5401,10 +5407,10 @@ async fn load_reused_issues(
                    'version', r.root_dataset_version,
                    'witnessPath', r.witness_path
                  ) ORDER BY r.root_dataset_type, r.root_dataset_id, r.root_dataset_version)
-                 FROM public.lcia_scope_closure_issue_roots r
+                 FROM private.lcia_scope_closure_issue_roots r
                  WHERE r.closure_issue_id = i.id
                ), '[]'::jsonb) AS affected_roots
-        FROM public.lcia_scope_closure_issues i
+        FROM private.lcia_scope_closure_issues i
         WHERE closure_check_id = $1
         ORDER BY issue_key
         ",
@@ -5544,7 +5550,7 @@ pub async fn record_scope_closure_failure(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_fail_before_scan(
+        SELECT private.svc_lcia_scope_closure_fail_before_scan(
             $1, $2, $3, $4
         ) AS result
         FROM _service_role
@@ -5640,7 +5646,7 @@ async fn record_scope_closure_result_v3_raw(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_check_record_result_v3(
+        SELECT private.svc_lcia_scope_closure_check_record_result_v3(
             $1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb,
             $9::jsonb, $10::text[], $11, $12, $13
         ) AS result
@@ -7259,7 +7265,7 @@ async fn create_closure_artifact_write_set_v2(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_create_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_create_v2(
           $1, $2, $3, $4, 'lcia.scope-closure-artifact-write-set.v2',
           $5, $6, $7::jsonb, $8, $9
         ) AS result
@@ -7300,7 +7306,7 @@ async fn register_closure_artifact_write_set_batch_v2(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
           $1, $2, $3, $4, $5, $6::jsonb
         ) AS result
         FROM _service_role
@@ -7333,7 +7339,7 @@ async fn read_closure_artifact_write_set_status_v2(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_status_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_status_v2(
           $1, $2, $3, $4
         ) AS result
         FROM _service_role
@@ -7363,7 +7369,7 @@ async fn seal_closure_artifact_write_set_v2(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_seal_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_seal_v2(
           $1, $2, $3, $4
         ) AS result
         FROM _service_role
@@ -7392,7 +7398,7 @@ async fn finalize_closure_artifact_write_set(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_finalize_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_finalize_v2(
           $1, $2, $3, $4
         ) AS result
         FROM _service_role
@@ -7432,7 +7438,7 @@ async fn fail_closure_artifact_write_set(
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_fail_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_fail_v2(
           $1, $2, $3, $4, $5
         ) AS result
         FROM _service_role
@@ -7698,7 +7704,7 @@ async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
 async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyhow::Result<String> {
     let row = sqlx::query(
         r"
-        SELECT public.lcia_scope_closure_sha256(jsonb_build_object(
+        SELECT private.lcia_scope_closure_sha256(jsonb_build_object(
             'artifactId', id,
             'bucket', storage_bucket,
             'objectPath', storage_path,
@@ -7706,7 +7712,7 @@ async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyh
             'byteSize', byte_size,
             'checksumSha256', checksum_sha256
         )) AS manifest_hash
-        FROM public.worker_job_artifacts
+        FROM private.worker_job_artifacts
         WHERE id = $1
         ",
     )
@@ -8157,7 +8163,7 @@ async fn lookup_document_validation_evidence(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_document_validation_evidence_lookup($1::jsonb) AS result
+        SELECT private.svc_lcia_document_validation_evidence_lookup($1::jsonb) AS result
         FROM _service_role
         ",
     )
@@ -8183,7 +8189,7 @@ async fn record_document_validation_evidence(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_document_validation_evidence_record($1::jsonb, $2) AS result
+        SELECT private.svc_lcia_document_validation_evidence_record($1::jsonb, $2) AS result
         FROM _service_role
         ",
     )
@@ -9701,15 +9707,15 @@ pub async fn validate_package_closure_binding(
                c.requested_scope_manifest->>'certificateFreshnessPolicy' AS freshness_policy,
                EXISTS (
                  SELECT 1
-                 FROM public.lcia_scope_closure_data_snapshots s
-                 JOIN public.lca_release_publications p
+                 FROM private.lcia_scope_closure_data_snapshots s
+                 JOIN private.lca_release_publications p
                    ON p.is_current = true AND p.status = 'current'
-                 JOIN public.lca_release_runs r ON r.id = p.release_run_id
+                 JOIN private.lca_release_runs r ON r.id = p.release_run_id
                  WHERE s.data_snapshot_token = c.data_snapshot_token
                    AND s.root_manifest->'currentPublicRelease'->>'releaseRunId' = r.id::text
                    AND s.root_manifest->'currentPublicRelease'->>'releaseManifestHash' = r.release_manifest_hash
                ) AS current_release_matches
-        FROM public.lcia_scope_closure_checks c
+        FROM private.lcia_scope_closure_checks c
         WHERE c.id = $1
         ",
     )

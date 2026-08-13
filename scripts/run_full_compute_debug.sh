@@ -191,11 +191,11 @@ gen_uuid() {
 }
 
 if [ -z "$SNAPSHOT_ID" ]; then
-  SNAPSHOT_ID="$(sql_scalar_soft "SELECT snapshot_id::text FROM public.lca_snapshot_artifacts WHERE status = 'ready' ORDER BY created_at DESC LIMIT 1;")"
+  SNAPSHOT_ID="$(sql_scalar_soft "SELECT snapshot_id::text FROM private.lca_snapshot_artifacts WHERE status = 'ready' ORDER BY created_at DESC LIMIT 1;")"
 fi
 
 if [ -z "$SNAPSHOT_ID" ]; then
-  SNAPSHOT_ID="$(sql_scalar_soft "SELECT id::text FROM public.lca_network_snapshots ORDER BY created_at DESC LIMIT 1;")"
+  SNAPSHOT_ID="$(sql_scalar_soft "SELECT id::text FROM private.lca_network_snapshots ORDER BY created_at DESC LIMIT 1;")"
 fi
 
 if [ -z "$SNAPSHOT_ID" ]; then
@@ -216,7 +216,7 @@ SELECT
   a_nnz::text || '|' ||
   b_nnz::text || '|' ||
   c_nnz::text
-FROM public.lca_snapshot_artifacts
+FROM private.lca_snapshot_artifacts
 WHERE snapshot_id = '$SNAPSHOT_ID'::uuid
   AND status = 'ready'
 ORDER BY created_at DESC
@@ -227,12 +227,8 @@ if [ -n "$ARTIFACT_COUNTS" ]; then
   IFS='|' read -r PROCESS_COUNT FLOW_COUNT A_NNZ B_NNZ C_NNZ <<< "$ARTIFACT_COUNTS"
   MATRIX_SOURCE="artifact_metadata"
 else
-  PROCESS_COUNT="$(sql_scalar_soft "SELECT COUNT(*)::int FROM public.lca_process_index WHERE snapshot_id = '$SNAPSHOT_ID'::uuid;")"
-  FLOW_COUNT="$(sql_scalar_soft "SELECT COUNT(*)::int FROM public.lca_flow_index WHERE snapshot_id = '$SNAPSHOT_ID'::uuid;")"
-  A_NNZ="$(sql_scalar_soft "SELECT COUNT(*)::bigint FROM public.lca_technosphere_entries WHERE snapshot_id = '$SNAPSHOT_ID'::uuid;")"
-  B_NNZ="$(sql_scalar_soft "SELECT COUNT(*)::bigint FROM public.lca_biosphere_entries WHERE snapshot_id = '$SNAPSHOT_ID'::uuid;")"
-  C_NNZ="$(sql_scalar_soft "SELECT COUNT(*)::bigint FROM public.lca_characterization_factors WHERE snapshot_id = '$SNAPSHOT_ID'::uuid;")"
-  MATRIX_SOURCE="legacy_tables"
+  echo "snapshot $SNAPSHOT_ID has no ready artifact metadata; retired matrix-table fallback is unavailable" >&2
+  exit 1
 fi
 
 PROCESS_COUNT="${PROCESS_COUNT:-0}"
@@ -405,7 +401,7 @@ load_job_timing_from_db() {
     COALESCE(diagnostics #>> '{job_status_update_timing_sec,failed_db_write_sec}', ''),
     COALESCE(diagnostics #>> '{job_status_update_timing_sec,last_db_write_sec}', ''),
     COALESCE(diagnostics #>> '{job_status_update_timing_sec,last_status}', '')
-  FROM public.lca_jobs
+  FROM private.worker_jobs
   WHERE id = '$job_id'::uuid
   LIMIT 1;
   ")"
@@ -683,6 +679,7 @@ WORKER_START_NS="$(now_ns)"
   export DATABASE_URL="$DB_URL"
   export PGMQ_QUEUE="$QUEUE_NAME"
   export SOLVER_MODE=worker
+  export SOLVER_QUEUE_BACKEND=worker-jobs
   export RUST_LOG="${RUST_LOG:-info,solver_worker=debug,solver_core=debug}"
   export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
   "$WORKER_BIN"
@@ -708,24 +705,24 @@ enqueue_prepare() {
       'snapshot_id', '$SNAPSHOT_ID'::uuid,
       'print_level', $PRINT_LEVEL::double precision
     ) AS message
-  ),
-  ins AS (
-    INSERT INTO public.lca_jobs (
-      id, job_type, snapshot_id, status, payload, created_at, updated_at
+  )
+  INSERT INTO private.worker_jobs (
+      id, job_kind, worker_runtime, worker_queue, requester_type, visibility,
+      subject_type, subject_id, payload_schema_version, payload_json, status
     )
     SELECT
       '$job_id'::uuid,
-      'prepare_factorization',
+      'lca.factorization_prepare',
+      'calculator',
+      'solver',
+      'operator',
+      'operator',
+      'snapshot',
       '$SNAPSHOT_ID'::uuid,
-      'queued',
+      'lca.factorization_prepare.request.v1',
       message,
-      NOW(),
-      NOW()
-    FROM payload
-    RETURNING payload
-  )
-  SELECT pgmq.send('$QUEUE_NAME', payload) AS msg_id
-  FROM ins;
+      'queued'
+    FROM payload;
   "
 }
 
@@ -754,24 +751,24 @@ enqueue_solve() {
       ),
       'print_level', $PRINT_LEVEL::double precision
     ) AS message
-  ),
-  ins AS (
-    INSERT INTO public.lca_jobs (
-      id, job_type, snapshot_id, status, payload, created_at, updated_at
+  )
+  INSERT INTO private.worker_jobs (
+      id, job_kind, worker_runtime, worker_queue, requester_type, visibility,
+      subject_type, subject_id, payload_schema_version, payload_json, status
     )
     SELECT
       '$job_id'::uuid,
-      'solve_one',
+      'lca.solve_one',
+      'calculator',
+      'solver',
+      'operator',
+      'operator',
+      'snapshot',
       '$SNAPSHOT_ID'::uuid,
-      'queued',
+      'lca.solve_one.request.v1',
       message,
-      NOW(),
-      NOW()
-    FROM payload
-    RETURNING payload
-  )
-  SELECT pgmq.send('$QUEUE_NAME', payload) AS msg_id
-  FROM ins;
+      'queued'
+    FROM payload;
   "
 }
 
@@ -782,19 +779,19 @@ poll_job() {
 
   while true; do
     local status
-    status="$(sql_scalar "SELECT COALESCE(status, 'missing') FROM public.lca_jobs WHERE id = '$job_id'::uuid;")"
+    status="$(sql_scalar "SELECT COALESCE(status, 'missing') FROM private.worker_jobs WHERE id = '$job_id'::uuid;")"
     local updated_at
-    updated_at="$(sql_scalar "SELECT COALESCE(to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS'), 'n/a') FROM public.lca_jobs WHERE id = '$job_id'::uuid;")"
+    updated_at="$(sql_scalar "SELECT COALESCE(to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS'), 'n/a') FROM private.worker_jobs WHERE id = '$job_id'::uuid;")"
 
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $label status=$status updated_at=$updated_at"
 
     case "$status" in
       completed|ready)
-        sql_exec "SELECT jsonb_pretty(COALESCE(diagnostics, '{}'::jsonb)) AS diagnostics FROM public.lca_jobs WHERE id = '$job_id'::uuid;"
+        sql_exec "SELECT jsonb_pretty(COALESCE(diagnostics, '{}'::jsonb)) AS diagnostics FROM private.worker_jobs WHERE id = '$job_id'::uuid;"
         return 0
         ;;
       failed)
-        sql_exec "SELECT jsonb_pretty(COALESCE(diagnostics, '{}'::jsonb)) AS diagnostics FROM public.lca_jobs WHERE id = '$job_id'::uuid;"
+        sql_exec "SELECT jsonb_pretty(COALESCE(diagnostics, '{}'::jsonb)) AS diagnostics FROM private.worker_jobs WHERE id = '$job_id'::uuid;"
         return 1
         ;;
       missing)
@@ -840,7 +837,7 @@ IFS='|' read -r RESULT_ID RESULT_ARTIFACT_FORMAT RESULT_ARTIFACT_SIZE RESULT_ART
     COALESCE(diagnostics #>> '{persistence_timing_sec,upload_artifact_sec}', ''),
     COALESCE(diagnostics #>> '{persistence_timing_sec,db_write_sec}', ''),
     COALESCE(diagnostics #>> '{persistence_timing_sec,total_sec}', '')
-  FROM public.lca_results
+  FROM private.lca_results
   WHERE job_id = '$SOLVE_JOB_ID'::uuid
   ORDER BY created_at DESC
   LIMIT 1;
@@ -857,7 +854,7 @@ SELECT
   artifact_byte_size,
   artifact_url,
   created_at
-FROM public.lca_results
+FROM private.lca_results
 WHERE job_id = '$SOLVE_JOB_ID'::uuid
 ORDER BY created_at DESC
 LIMIT 1;

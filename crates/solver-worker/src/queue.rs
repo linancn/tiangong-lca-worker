@@ -23,7 +23,9 @@ use crate::{
         record_scope_closure_failure, scope_closure_input_failure_code,
     },
     types::JobPayload,
-    worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
+    worker_jobs::{
+        WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result_reliably,
+    },
 };
 
 const SOLVER_WORKER_QUEUE: &str = "solver";
@@ -95,7 +97,7 @@ fn calculation_evidence_binding_for_payload(payload: &JobPayload) -> Option<Valu
 /// Fetches snapshot coverage from `lca_snapshot_artifacts` for richer error diagnostics.
 async fn fetch_snapshot_coverage(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Option<Value> {
     sqlx::query_scalar::<Value>(
-        "SELECT coverage FROM public.lca_snapshot_artifacts \
+        "SELECT coverage FROM private.lca_snapshot_artifacts \
          WHERE snapshot_id = $1 AND status = 'ready' \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -348,7 +350,7 @@ pub async fn run_solver_worker_jobs_loop(
 ) -> anyhow::Result<()> {
     loop {
         match claim_worker_jobs(
-            &state.pool,
+            &state.queue_pool,
             SOLVER_WORKER_QUEUE,
             &worker_id,
             claim_limit,
@@ -402,7 +404,7 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
         }),
     };
     if let Err(err) = crate::worker_jobs::heartbeat_worker_job(
-        &state.pool,
+        &state.queue_pool,
         job.id,
         job.lease_token,
         phase,
@@ -538,7 +540,7 @@ async fn fetch_authoritative_package_closure_binding(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_build_binding($1) AS result
+        SELECT private.svc_lcia_scope_closure_build_binding($1) AS result
         FROM _service_role
         ",
     )
@@ -651,8 +653,8 @@ async fn validate_authoritative_package_closure_hashes(
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
-               public.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
+        SELECT private.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
+               private.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
         FROM _service_role
         ",
     )
@@ -696,7 +698,7 @@ async fn record_invalid_solver_worker_job_payload(
         None,
     );
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid worker_jobs payload");
     }
@@ -752,7 +754,8 @@ async fn record_solver_worker_job_failure(
             *closure_check_id,
         ));
         if let Err(record_err) =
-            record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result)
+                .await
         {
             error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs failure");
         }
@@ -788,7 +791,7 @@ async fn record_solver_worker_job_failure(
     );
     result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs failure");
     }
@@ -802,8 +805,13 @@ async fn record_solver_worker_job_success(
 ) {
     match build_solver_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
-            if let Err(err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %err, worker_job_id = %job.id, lca_job_id = %lca_job_id, "failed to record worker_jobs success");
             } else {
@@ -845,8 +853,13 @@ async fn record_solver_worker_job_success(
                     None,
                     *closure_check_id,
                 ));
-                if let Err(record_err) =
-                    record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+                if let Err(record_err) = record_worker_job_result_reliably(
+                    &state.queue_pool,
+                    job.id,
+                    job.lease_token,
+                    result,
+                )
+                .await
                 {
                     error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs projection failure");
                 }
@@ -865,8 +878,13 @@ async fn record_solver_worker_job_success(
                 None,
             );
             result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
-            if let Err(record_err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(record_err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs projection failure");
             }
@@ -1001,7 +1019,7 @@ async fn fetch_worker_job_diagnostics(
     pool: &sqlx::PgPool,
     worker_job_id: Uuid,
 ) -> anyhow::Result<Value> {
-    let row = sqlx::query("SELECT diagnostics FROM public.worker_jobs WHERE id = $1")
+    let row = sqlx::query("SELECT diagnostics FROM private.worker_jobs WHERE id = $1")
         .bind(worker_job_id)
         .fetch_optional(pool)
         .await?
@@ -1049,7 +1067,7 @@ async fn fetch_lcia_result_package_projection(
         r"
         SELECT id, package_version, status, build_id, snapshot_id, result_id,
                latest_all_unit_result_id, included_input_count, created_at
-        FROM public.lcia_result_packages
+        FROM private.lcia_result_packages
         WHERE build_worker_job_id = $1
         ORDER BY created_at DESC
         LIMIT 1
@@ -1105,22 +1123,22 @@ fn lcia_result_package_worker_result_ref(
 
 const CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES: [&str; 4] = [
     r"
-        UPDATE public.lca_results
+        UPDATE private.lca_results
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
     r"
-        UPDATE public.lca_result_cache
+        UPDATE private.lca_result_cache
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
     r"
-        UPDATE public.lca_latest_all_unit_results
+        UPDATE private.lca_latest_all_unit_results
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
     r"
-        UPDATE public.lca_factorization_registry
+        UPDATE private.lca_factorization_registry
            SET prepared_worker_job_id = $1
          WHERE prepared_job_id = $2
         ",

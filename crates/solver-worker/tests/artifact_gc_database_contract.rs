@@ -252,7 +252,7 @@ async fn seed_crash_closure(
     .await
     .expect("seed crash-test auth user");
     sqlx::query(
-        "INSERT INTO public.users (id, raw_user_meta_data, contact) VALUES ($1, '{}', null)",
+        "INSERT INTO private.users (id, raw_user_meta_data, contact) VALUES ($1, '{}', null)",
     )
     .bind(owner_id)
     .execute(pool)
@@ -260,7 +260,7 @@ async fn seed_crash_closure(
     .expect("seed crash-test public user");
     sqlx::query(
         r"
-        INSERT INTO public.worker_jobs (
+        INSERT INTO private.worker_jobs (
           id, job_kind, worker_runtime, worker_queue, requester_type,
           requested_by, visibility, payload_schema_version, payload_json, status,
           lease_token, lease_expires_at
@@ -279,7 +279,7 @@ async fn seed_crash_closure(
     .expect("seed crash-test worker job");
     sqlx::query(
         r"
-        INSERT INTO public.lcia_scope_closure_checks (
+        INSERT INTO private.lcia_scope_closure_checks (
           id, worker_job_id, requested_by, request_idempotency_token, request_key,
           request_fingerprint, requested_scope_hash, policy_fingerprint,
           data_snapshot_token, expected_validator_scanner_fingerprint, status,
@@ -498,7 +498,7 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_create_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_create_v2(
           $1, $2, $3, $4, 'lcia.scope-closure-artifact-write-set.v2',
           $5, $6, $7::jsonb, 2, null
         ) AS result
@@ -537,7 +537,7 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
             WITH _service_role AS (
               SELECT set_config('request.jwt.claim.role', 'service_role', true)
             )
-            SELECT public.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
+            SELECT private.svc_lcia_scope_closure_artifact_write_set_register_batch_v2(
               $1, $2, $3, $4, $5, $6::jsonb
             ) AS result
             FROM _service_role
@@ -562,7 +562,7 @@ async fn db_first_crash_child_aborts_after_n_uploads() {
         WITH _service_role AS (
           SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.svc_lcia_scope_closure_artifact_write_set_seal_v2(
+        SELECT private.svc_lcia_scope_closure_artifact_write_set_seal_v2(
           $1, $2, $3, $4
         ) AS result
         FROM _service_role
@@ -710,7 +710,7 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
     let write_set = sqlx::query(
         r"
         SELECT id, status
-        FROM public.lcia_scope_closure_artifact_write_sets
+        FROM private.lcia_scope_closure_artifact_write_sets
         WHERE closure_check_id = $1
         ",
     )
@@ -723,8 +723,8 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
     let ready_count = sqlx::query(
         r"
         SELECT count(*) AS count
-        FROM public.worker_job_artifacts artifact
-        JOIN public.lcia_scope_closure_artifact_write_set_items item
+        FROM private.worker_job_artifacts artifact
+        JOIN private.lcia_scope_closure_artifact_write_set_items item
           ON item.id = artifact.id
         WHERE item.write_set_id = $1
         ",
@@ -739,7 +739,7 @@ async fn db_first_crash_is_fully_reconciled_after_restart() {
     let retained_item_count = sqlx::query(
         r"
         SELECT count(*) AS count
-        FROM public.lcia_scope_closure_artifact_write_set_items
+        FROM private.lcia_scope_closure_artifact_write_set_items
         WHERE write_set_id = $1
         ",
     )
@@ -767,13 +767,13 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
         r"
         SELECT
           to_regprocedure(
-            'public.svc_lcia_scope_closure_artifact_gc_preview(integer)'
+            'private.svc_lcia_scope_closure_artifact_gc_preview(integer)'
           ) IS NOT NULL AS preview_exists,
           to_regprocedure(
-            'public.svc_lcia_scope_closure_artifact_gc_renew(uuid,integer)'
+            'private.svc_lcia_scope_closure_artifact_gc_renew(uuid,integer)'
           ) IS NOT NULL AS renew_exists,
           to_regprocedure(
-            'public.svc_lcia_scope_closure_artifact_write_set_reconcile(integer,integer)'
+            'private.svc_lcia_scope_closure_artifact_write_set_reconcile(integer,integer)'
           ) IS NOT NULL AS reconcile_exists
         ",
     )
@@ -806,7 +806,7 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
     .await
     .expect("seed auth user");
     sqlx::query(
-        "INSERT INTO public.users (id, raw_user_meta_data, contact) VALUES ($1, '{}', null)",
+        "INSERT INTO private.users (id, raw_user_meta_data, contact) VALUES ($1, '{}', null)",
     )
     .bind(owner_id)
     .execute(&pool)
@@ -814,7 +814,7 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
     .expect("seed public user");
     sqlx::query(
         r"
-        INSERT INTO public.worker_jobs (
+        INSERT INTO private.worker_jobs (
           id, job_kind, worker_runtime, worker_queue, requester_type,
           requested_by, visibility, payload_schema_version, payload_json, status
         ) VALUES (
@@ -830,7 +830,7 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
     .expect("seed worker job");
     sqlx::query(
         r"
-        INSERT INTO public.worker_job_artifacts (
+        INSERT INTO private.worker_job_artifacts (
           id, job_id, artifact_type, storage_bucket, storage_path, content_type,
           byte_size, checksum_sha256, metadata, created_at
         ) VALUES (
@@ -874,7 +874,7 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
     let artifact = sqlx::query(
         r"
         SELECT lifecycle_state, storage_bucket, storage_path
-        FROM public.worker_job_artifacts
+        FROM private.worker_job_artifacts
         WHERE id = $1
         ",
     )
@@ -899,17 +899,17 @@ async fn production_cli_uses_exact_database_gc_contract_and_fake_s3() {
             .is_none()
     );
 
-    sqlx::query("DELETE FROM public.worker_job_artifacts WHERE id = $1")
+    sqlx::query("DELETE FROM private.worker_job_artifacts WHERE id = $1")
         .bind(artifact_id)
         .execute(&pool)
         .await
         .expect("clean artifact");
-    sqlx::query("DELETE FROM public.worker_jobs WHERE id = $1")
+    sqlx::query("DELETE FROM private.worker_jobs WHERE id = $1")
         .bind(worker_job_id)
         .execute(&pool)
         .await
         .expect("clean worker job");
-    sqlx::query("DELETE FROM public.users WHERE id = $1")
+    sqlx::query("DELETE FROM private.users WHERE id = $1")
         .bind(owner_id)
         .execute(&pool)
         .await

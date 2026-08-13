@@ -17,7 +17,7 @@ for f in "$@"; do
     exit 1
   fi
 
-  # ALTER TABLE is only allowed for public.lca_* objects.
+  # ALTER TABLE must stay within the migration's explicitly declared schema.
   if rg -n -i "alter\s+table\s+public\." "$f" >/tmp/alter_hits.txt; then
     if rg -n -i -v "alter\s+table\s+public\.lca_" /tmp/alter_hits.txt >/tmp/alter_bad.txt; then
       echo "non-lca ALTER TABLE detected in $f" >&2

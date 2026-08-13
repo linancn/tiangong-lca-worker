@@ -1,12 +1,21 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::time::sleep;
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
+use crate::{
+    db_pool::sql_string_literal,
+    pgbouncer_sqlx::{self as sqlx, PgPool, Row},
+};
 
 pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
 pub const REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION: &str = "review_submit.gate.request.v1";
 pub const REVIEW_SUBMIT_GATE_WORKER_QUEUE: &str = "review_submit_gate";
+
+const RESULT_WRITE_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerJob {
@@ -244,21 +253,20 @@ pub async fn claim_worker_jobs(
     limit: i32,
     lease_seconds: i32,
 ) -> anyhow::Result<Vec<WorkerJob>> {
-    let row = sqlx::query(
+    let sql = format!(
         r"
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_claim_jobs($1, $2, $3, $4) AS result
+        SELECT private.worker_claim_jobs({}, {}, {}, {}) AS result
         FROM _service_role
         ",
-    )
-    .bind(worker_queue)
-    .bind(worker_id)
-    .bind(limit)
-    .bind(lease_seconds)
-    .fetch_one(pool)
-    .await?;
+        sql_string_literal(worker_queue),
+        sql_string_literal(worker_id),
+        limit.clamp(1, 50),
+        lease_seconds.clamp(1, 86_400),
+    );
+    let row = sqlx::raw_query(&sql).fetch_one(pool).await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_claim_jobs")?;
 
@@ -277,23 +285,22 @@ pub async fn heartbeat_worker_job(
     diagnostics: Option<Value>,
     lease_seconds: i32,
 ) -> anyhow::Result<()> {
-    let row = sqlx::query(
+    let sql = format!(
         r"
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_heartbeat_job($1, $2, $3, $4::double precision::numeric, $5::jsonb, $6) AS result
+        SELECT private.worker_heartbeat_job({}::uuid, {}::uuid, {}, {}::double precision::numeric, {}::jsonb, {}) AS result
         FROM _service_role
         ",
-    )
-    .bind(job_id)
-    .bind(lease_token)
-    .bind(phase)
-    .bind(progress)
-    .bind(diagnostics)
-    .bind(lease_seconds)
-    .fetch_one(pool)
-    .await?;
+        sql_string_literal(&job_id.to_string()),
+        sql_string_literal(&lease_token.to_string()),
+        sql_string_literal(phase),
+        progress,
+        json_sql(diagnostics.as_ref()),
+        lease_seconds.clamp(1, 86_400),
+    );
+    let row = sqlx::raw_query(&sql).fetch_one(pool).await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_heartbeat_job")?;
     Ok(())
@@ -305,47 +312,121 @@ pub async fn record_worker_job_result(
     lease_token: Uuid,
     result: WorkerJobResult,
 ) -> anyhow::Result<Value> {
-    let row = sqlx::query(
+    let sql = format!(
         r"
         WITH _service_role AS (
             SELECT set_config('request.jwt.claim.role', 'service_role', true)
         )
-        SELECT public.worker_record_job_result(
-            $1,
-            $2,
-            $3,
-            $4::jsonb,
-            $5,
-            $6::jsonb,
-            $7::jsonb,
-            $8,
-            $9,
-            $10::jsonb,
-            $11::text[],
-            $12,
-            $13
+        SELECT private.worker_record_job_result(
+            {}::uuid,
+            {}::uuid,
+            {},
+            {}::jsonb,
+            {},
+            {}::jsonb,
+            {}::jsonb,
+            {},
+            {},
+            {}::jsonb,
+            {},
+            {},
+            {}
         ) AS result
         FROM _service_role
         ",
-    )
-    .bind(job_id)
-    .bind(lease_token)
-    .bind(result.status)
-    .bind(result.result_json)
-    .bind(result.result_schema_version)
-    .bind(result.result_ref)
-    .bind(result.diagnostics)
-    .bind(result.error_code)
-    .bind(result.error_message)
-    .bind(result.error_details)
-    .bind(result.blocker_codes)
-    .bind(result.resolution_scope)
-    .bind(result.retryable)
-    .fetch_one(pool)
-    .await?;
+        sql_string_literal(&job_id.to_string()),
+        sql_string_literal(&lease_token.to_string()),
+        sql_string_literal(&result.status),
+        json_sql(result.result_json.as_ref()),
+        text_sql(result.result_schema_version.as_deref()),
+        json_sql(result.result_ref.as_ref()),
+        json_sql(result.diagnostics.as_ref()),
+        text_sql(result.error_code.as_deref()),
+        text_sql(result.error_message.as_deref()),
+        json_sql(result.error_details.as_ref()),
+        text_array_sql(&result.blocker_codes),
+        text_sql(result.resolution_scope.as_deref()),
+        bool_sql(result.retryable),
+    );
+    let row = sqlx::raw_query(&sql).fetch_one(pool).await?;
     let rpc_result = row.try_get::<Value, _>("result")?;
     ensure_ok(&rpc_result, "worker_record_job_result")?;
     Ok(rpc_result)
+}
+
+/// Records a terminal worker result with bounded retries for database/transport failures.
+///
+/// The database RPC treats an identical terminal write from the same lease token as an
+/// idempotent replay, so retrying an ambiguous connection failure cannot strand a completed
+/// execution in `running`.
+pub async fn record_worker_job_result_reliably(
+    pool: &PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    result: WorkerJobResult,
+) -> anyhow::Result<Value> {
+    for attempt in 1..=RESULT_WRITE_MAX_ATTEMPTS {
+        match record_worker_job_result(pool, job_id, lease_token, result.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < RESULT_WRITE_MAX_ATTEMPTS
+                    && error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some()) =>
+            {
+                let delay = result_write_retry_delay(attempt);
+                warn!(
+                    worker_job_id = %job_id,
+                    attempt,
+                    max_attempts = RESULT_WRITE_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %error,
+                    "worker job terminal write failed; retrying"
+                );
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("terminal result retry loop always returns")
+}
+
+fn result_write_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt.saturating_sub(1).min(4)))
+}
+
+fn text_sql(value: Option<&str>) -> String {
+    value.map_or_else(|| "NULL".to_owned(), sql_string_literal)
+}
+
+fn bool_sql(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "NULL",
+    }
+}
+
+fn json_sql(value: Option<&Value>) -> String {
+    value.map_or_else(
+        || "NULL".to_owned(),
+        |value| sql_string_literal(&value.to_string()),
+    )
+}
+
+fn text_array_sql(values: &[String]) -> String {
+    if values.is_empty() {
+        "ARRAY[]::text[]".to_owned()
+    } else {
+        format!(
+            "ARRAY[{}]::text[]",
+            values
+                .iter()
+                .map(|value| sql_string_literal(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 fn ensure_ok(result: &Value, rpc_name: &str) -> anyhow::Result<()> {
@@ -399,6 +480,7 @@ mod tests {
     use super::{
         REVIEW_SUBMIT_GATE_JOB_KIND, REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
         REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
+        result_write_retry_delay,
     };
 
     #[test]
@@ -406,6 +488,13 @@ mod tests {
         assert_eq!(lease_heartbeat_period(900).as_secs(), 300);
         assert_eq!(lease_heartbeat_period(2).as_secs(), 1);
         assert_eq!(lease_heartbeat_period(-1).as_secs(), 1);
+    }
+
+    #[test]
+    fn terminal_result_retry_backoff_is_bounded() {
+        assert_eq!(result_write_retry_delay(1).as_millis(), 100);
+        assert_eq!(result_write_retry_delay(2).as_millis(), 200);
+        assert_eq!(result_write_retry_delay(99).as_millis(), 1_600);
     }
 
     #[test]

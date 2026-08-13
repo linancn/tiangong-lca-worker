@@ -4,27 +4,25 @@ use clap::{Parser, ValueEnum};
 use serde_json::{Map, Value, json};
 use solver_worker::{
     config::AppConfig,
-    db::{AppState, archive_queue_message, read_one_queue_message},
+    db::AppState,
     db_pool::{APP_PACKAGE_WORKER, APP_PACKAGE_WORKER_QUEUE},
     package_db::{
-        PackageJobContinuation, extract_package_job_id, extract_package_job_id_from_raw_payload,
-        handle_package_job_payload, handle_package_job_payload_once,
+        PackageJobContinuation, extract_package_job_id, handle_package_job_payload_once,
         is_retryable_package_job_error, mark_package_request_cache_failed,
-        reschedule_retryable_package_job, update_package_job_status,
     },
     package_execution::clear_runtime_export_traversal_cache,
     package_retention::refresh_import_source_retention,
     package_types::{
         PACKAGE_EXPORT_PAYLOAD_SCHEMA_VERSION, PACKAGE_EXPORT_RESULT_SCHEMA_VERSION,
         PACKAGE_EXPORT_WORKER_JOB_KIND, PACKAGE_IMPORT_PAYLOAD_SCHEMA_VERSION,
-        PACKAGE_IMPORT_RESULT_SCHEMA_VERSION, PACKAGE_IMPORT_WORKER_JOB_KIND, PACKAGE_QUEUE_NAME,
-        PACKAGE_WORKER_QUEUE, PackageJobPayload,
+        PACKAGE_IMPORT_RESULT_SCHEMA_VERSION, PACKAGE_IMPORT_WORKER_JOB_KIND, PACKAGE_WORKER_QUEUE,
+        PackageJobPayload,
     },
     pgbouncer_sqlx::{self as sqlx, Row},
     storage::ObjectStoreUploadError,
     worker_jobs::{
         WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
-        lease_heartbeat_period, record_worker_job_result,
+        lease_heartbeat_period, record_worker_job_result_reliably,
     },
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
@@ -59,7 +57,7 @@ struct PackageWorkerCli {
 enum PackageQueueBackend {
     /// Legacy `pgmq` queue payloads.
     Pgmq,
-    /// Unified `public.worker_jobs` queue payloads.
+    /// Unified `private.worker_jobs` queue payloads.
     WorkerJobs,
 }
 
@@ -104,22 +102,9 @@ async fn main() -> anyhow::Result<()> {
         PackageQueueBackend::Pgmq => {
             cli.app
                 .require_legacy_job_table_backend_allowed("package pgmq backend")?;
-            let queue_name = resolve_queue_name(&cli.app.pgmq_queue);
-
-            if cli.app.pgmq_queue == "lca_jobs" {
-                info!(
-                    queue = %queue_name,
-                    "using package queue default instead of solver-worker queue default"
-                );
-            }
-
-            run_package_worker_loop(
-                state,
-                queue_name,
-                cli.app.worker_vt_seconds,
-                cli.app.poll_interval(),
+            anyhow::bail!(
+                "PACKAGE_QUEUE_BACKEND=pgmq is retired because the lca_package_jobs lifecycle no longer exists; use PACKAGE_QUEUE_BACKEND=worker-jobs"
             )
-            .await
         }
         PackageQueueBackend::WorkerJobs => {
             run_package_worker_jobs_loop(
@@ -135,138 +120,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[instrument(skip(state))]
-#[allow(clippy::too_many_lines)]
-async fn run_package_worker_loop(
-    state: Arc<AppState>,
-    queue_name: String,
-    vt_seconds: i32,
-    poll_interval: std::time::Duration,
-) -> anyhow::Result<()> {
-    loop {
-        match read_one_queue_message(&state.queue_pool, &queue_name, vt_seconds).await {
-            Ok(Some(message)) => {
-                let parsed = serde_json::from_value::<PackageJobPayload>(message.payload.clone());
-                match parsed {
-                    Ok(payload) => {
-                        if let Err(err) = handle_package_job_payload(&state, payload.clone()).await
-                        {
-                            error!(error = %err, "package job execution failed");
-                            let job_id = extract_package_job_id(&payload);
-                            let err_message = err.to_string();
-                            let mut rescheduled = false;
-                            clear_runtime_export_traversal_cache(job_id);
-                            if is_retryable_package_job_error(&err) {
-                                match reschedule_retryable_package_job(
-                                    &state.pool,
-                                    &payload,
-                                    &err_message,
-                                )
-                                .await
-                                {
-                                    Ok(true) => {
-                                        rescheduled = true;
-                                    }
-                                    Ok(false) => {
-                                        warn!(
-                                            job_id = %job_id,
-                                            error = %err_message,
-                                            "package job retry budget exhausted"
-                                        );
-                                    }
-                                    Err(retry_err) => {
-                                        warn!(
-                                            job_id = %job_id,
-                                            error = %retry_err,
-                                            original_error = %err_message,
-                                            "failed to reschedule retryable package job"
-                                        );
-                                    }
-                                }
-                            }
-                            if !rescheduled {
-                                let diagnostics =
-                                    build_package_job_failure_diagnostics(&payload, &err);
-                                let cache_error_code =
-                                    package_request_cache_error_code(&err).to_owned();
-                                let cache_error_message =
-                                    package_request_cache_error_message(&payload, &err);
-                                let _ = update_package_job_status(
-                                    &state.pool,
-                                    job_id,
-                                    "failed",
-                                    diagnostics,
-                                )
-                                .await;
-                                let _ = mark_package_request_cache_failed(
-                                    &state.pool,
-                                    job_id,
-                                    cache_error_code.as_str(),
-                                    cache_error_message.as_str(),
-                                )
-                                .await;
-                                if let PackageJobPayload::ImportPackage {
-                                    source_artifact_id, ..
-                                } = payload
-                                    && let Err(err) = refresh_import_source_retention(
-                                        &state.pool,
-                                        source_artifact_id,
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        job_id = %job_id,
-                                        source_artifact_id = %source_artifact_id,
-                                        error = %err,
-                                        "failed to refresh import source retention after failed import job"
-                                    );
-                                }
-                            }
-                        } else {
-                            info!("package job completed");
-                        }
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "invalid package job payload");
-                        if let Some(job_id) =
-                            extract_package_job_id_from_raw_payload(&message.payload)
-                        {
-                            let err_message = format!("invalid package job payload: {err}");
-                            let _ = update_package_job_status(
-                                &state.pool,
-                                job_id,
-                                "failed",
-                                json!({"error": err_message}),
-                            )
-                            .await;
-                            let _ = mark_package_request_cache_failed(
-                                &state.pool,
-                                job_id,
-                                "invalid_job_payload",
-                                &err_message,
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                if let Err(err) =
-                    archive_queue_message(&state.queue_pool, &queue_name, message.msg_id).await
-                {
-                    error!(error = %err, msg_id = message.msg_id, "failed to archive queue message");
-                }
-            }
-            Ok(None) => {
-                sleep(poll_interval).await;
-            }
-            Err(err) => {
-                error!(error = %err, "package queue read error");
-                sleep(poll_interval).await;
-            }
-        }
-    }
-}
-
-#[instrument(skip(state))]
 async fn run_package_worker_jobs_loop(
     state: Arc<AppState>,
     worker_id: String,
@@ -276,7 +129,7 @@ async fn run_package_worker_jobs_loop(
 ) -> anyhow::Result<()> {
     loop {
         match claim_worker_jobs(
-            &state.pool,
+            &state.queue_pool,
             PACKAGE_WORKER_QUEUE,
             &worker_id,
             claim_limit,
@@ -406,7 +259,7 @@ async fn heartbeat_package_worker_job(
     let package_job_id = extract_package_job_id(payload);
     let phase = package_payload_type_name(payload);
     if let Err(err) = heartbeat_worker_job(
-        &state.pool,
+        &state.queue_pool,
         job.id,
         job.lease_token,
         phase,
@@ -456,7 +309,7 @@ async fn record_invalid_package_worker_job_payload(
         None,
     );
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid package worker_jobs payload");
     }
@@ -475,8 +328,6 @@ async fn record_package_worker_job_failure(
     let cache_error_message = package_request_cache_error_message(payload, err);
     clear_runtime_export_traversal_cache(package_job_id);
 
-    let _ =
-        update_package_job_status(&state.pool, package_job_id, "failed", diagnostics.clone()).await;
     let _ = mark_package_request_cache_failed(
         &state.pool,
         package_job_id,
@@ -526,7 +377,7 @@ async fn record_package_worker_job_failure(
         retryable: Some(retryable),
     };
     if let Err(record_err) =
-        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record package worker_jobs failure");
     }
@@ -540,8 +391,13 @@ async fn record_package_worker_job_success(
     let package_job_id = extract_package_job_id(payload);
     match build_package_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
-            if let Err(err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %err, worker_job_id = %job.id, package_job_id = %package_job_id, "failed to record package worker_jobs success");
             } else {
@@ -561,8 +417,13 @@ async fn record_package_worker_job_success(
                 Some(json!({"error": err_message})),
                 None,
             );
-            if let Err(record_err) =
-                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            if let Err(record_err) = record_worker_job_result_reliably(
+                &state.queue_pool,
+                job.id,
+                job.lease_token,
+                result,
+            )
+            .await
             {
                 error!(error = %record_err, worker_job_id = %job.id, "failed to record package worker_jobs projection failure");
             }
@@ -577,7 +438,7 @@ async fn build_package_worker_job_result(
 ) -> anyhow::Result<WorkerJobResult> {
     let package_job_id = extract_package_job_id(payload);
     link_package_worker_job_domain_refs(&state.pool, worker_job_id, package_job_id).await?;
-    let package_job = fetch_package_job_projection(&state.pool, package_job_id).await?;
+    let package_job = fetch_package_job_projection(&state.pool, worker_job_id).await?;
     let artifacts = fetch_package_artifact_projection(&state.pool, package_job_id).await?;
     let result_json = json!({
         "workerJobId": worker_job_id,
@@ -612,18 +473,7 @@ async fn link_package_worker_job_domain_refs(
     execute_optional_worker_job_ref_update(
         pool,
         r"
-        UPDATE public.lca_package_jobs
-           SET worker_job_id = $1
-         WHERE id = $2
-        ",
-        worker_job_id,
-        package_job_id,
-    )
-    .await?;
-    execute_optional_worker_job_ref_update(
-        pool,
-        r"
-        UPDATE public.lca_package_artifacts
+        UPDATE private.lca_package_artifacts
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
@@ -634,7 +484,7 @@ async fn link_package_worker_job_domain_refs(
     execute_optional_worker_job_ref_update(
         pool,
         r"
-        UPDATE public.lca_package_export_items
+        UPDATE private.lca_package_export_items
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
@@ -645,7 +495,7 @@ async fn link_package_worker_job_domain_refs(
     execute_optional_worker_job_ref_update(
         pool,
         r"
-        UPDATE public.lca_package_request_cache
+        UPDATE private.lca_package_request_cache
            SET worker_job_id = $1
          WHERE job_id = $2
         ",
@@ -683,39 +533,30 @@ fn package_worker_result_ref(worker_job_id: Uuid, package_job_id: Uuid) -> Value
     })
 }
 
-async fn fetch_package_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let result = sqlx::query(
+async fn fetch_package_job_projection(
+    pool: &sqlx::PgPool,
+    worker_job_id: Uuid,
+) -> anyhow::Result<Value> {
+    let row = sqlx::query(
         r"
-        SELECT status, job_type, scope, root_count, diagnostics
-        FROM public.lca_package_jobs
+        SELECT status, job_kind, subject_id, payload_json, diagnostics
+        FROM private.worker_jobs
         WHERE id = $1
         ",
     )
-    .bind(job_id)
+    .bind(worker_job_id)
     .fetch_optional(pool)
-    .await;
-
-    let row = match result {
-        Ok(row) => row,
-        Err(err) if is_undefined_table(&err) => {
-            return Ok(json!({
-                "id": job_id,
-                "missing": true,
-                "legacyTableMissing": true,
-            }));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    .await?;
 
     Ok(row.map_or_else(
-        || json!({"id": job_id, "missing": true}),
+        || json!({"id": worker_job_id, "missing": true}),
         |row| {
             json!({
-                "id": job_id,
+                "id": worker_job_id,
                 "status": row.try_get::<String, _>("status").ok(),
-                "jobType": row.try_get::<String, _>("job_type").ok(),
-                "scope": row.try_get::<String, _>("scope").ok(),
-                "rootCount": row.try_get::<i32, _>("root_count").ok(),
+                "jobKind": row.try_get::<String, _>("job_kind").ok(),
+                "subjectId": row.try_get::<Option<Uuid>, _>("subject_id").ok().flatten(),
+                "payload": row.try_get::<Value, _>("payload_json").ok(),
                 "diagnostics": row.try_get::<Value, _>("diagnostics").ok(),
             })
         },
@@ -736,7 +577,7 @@ async fn fetch_package_artifact_projection(
     let rows = sqlx::query(
         r"
         SELECT id, artifact_kind, status, artifact_format, content_type, artifact_byte_size, artifact_url
-        FROM public.lca_package_artifacts
+        FROM private.lca_package_artifacts
         WHERE job_id = $1
           AND status <> 'deleted'
         ORDER BY created_at DESC
@@ -888,14 +729,6 @@ fn package_progress_from_diagnostics(diagnostics: &Value, fallback: f64) -> f64 
         .and_then(Value::as_f64)
         .unwrap_or_default();
     (processed / total).clamp(0.05, 0.95)
-}
-
-fn resolve_queue_name(requested: &str) -> String {
-    if requested == "lca_jobs" {
-        PACKAGE_QUEUE_NAME.to_owned()
-    } else {
-        requested.to_owned()
-    }
 }
 
 fn build_package_job_failure_diagnostics(

@@ -59,14 +59,9 @@ async fn run_worker(state: Arc<AppState>, config: &AppConfig) -> anyhow::Result<
     match config.queue_backend {
         QueueBackend::Pgmq => {
             config.require_legacy_job_table_backend_allowed("solver pgmq backend")?;
-            let queue_name = config.pgmq_queue.clone();
-            queue::run_worker_loop(
-                state,
-                queue_name,
-                config.worker_vt_seconds,
-                config.poll_interval(),
+            anyhow::bail!(
+                "SOLVER_QUEUE_BACKEND=pgmq is retired because the lca_jobs lifecycle no longer exists; use SOLVER_QUEUE_BACKEND=worker-jobs"
             )
-            .await
         }
         QueueBackend::WorkerJobs => {
             queue::run_solver_worker_jobs_loop(

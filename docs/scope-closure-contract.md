@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-10
-lastReviewedCommit: cd80d622e364d0db3a1d65584dcd79fda2088c76
-lastReviewedNote: "Reviewed for Worker Issue #247: result-package impact metadata does not alter certificate, snapshot, or Closure Bundle binding."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Updated for Worker PR #225 conflict resolution: private runtime boundaries preserve verified discovery, certificate, snapshot, Closure Bundle, and frozen impact-axis binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml

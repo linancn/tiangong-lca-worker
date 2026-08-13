@@ -36,7 +36,7 @@ related:
 
 # Edge Function Integration Guide
 
-本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 worker 异步链路。legacy 路径是 `lca_jobs + pgmq`；统一任务路径是 `worker_jobs(worker_queue=solver)`，result/cache domain truth 由 `worker_jobs`、`lca_results` 与 `lca_result_cache` 承载，`lca_jobs` 仅为 optional historical compatibility。
+本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 worker 异步链路。统一任务路径是 `private.worker_jobs(worker_queue=solver)`，result/cache domain truth 由 `private.worker_jobs`、`private.lca_results` 与 `private.lca_result_cache` 承载；旧 `lca_jobs + pgmq` 生命周期已退役。
 
 ## 1. 为什么必须走 Edge Function
 
@@ -152,16 +152,15 @@ Header 建议：
    - 若 `ready` 且有 `result_id`，直接返回 `cache_hit`
    - 若 `pending/running` 且有 `job_id`，返回 `in_progress`
    - 否则生成 `lcaJobId` compatibility UUID，并创建或更新 `lca_result_cache(status='pending', job_id=lcaJobId)`
-   - legacy pgmq 路径：调用 `public.lca_enqueue_job('lca_jobs', payload)` RPC 入队
-   - `worker_jobs` 路径：调用 `public.worker_enqueue_job(...)`，使用 `job_kind=lca.solve_one|lca.solve_batch|lca.solve_all_unit|lca.build_snapshot|lca.contribution_path`、`worker_queue=solver`，并在 payload 中携带 `lcaJobId`
+   - 调用 `private.worker_enqueue_job(...)`，使用 `job_kind=lca.solve_one|lca.solve_batch|lca.solve_all_unit|lca.build_snapshot|lca.contribution_path`、`worker_queue=solver`，并在 payload 中携带 `lcaJobId`
    - 回写 `lca_result_cache.worker_job_id`
 7. 返回 `queued`。`worker_jobs` 路径应额外返回 `workerJobId`，供任务中心和 operator 查询使用。
 
-worker 侧以 `worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results`、`lca_factorization_registry` 中可关联的 rows 回填到同一个 `worker_job_id`；optional `lca_jobs` 存在时才做 best-effort retained row 回填。
+worker 侧以 `private.worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`private.lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `private.lca_results`、`private.lca_result_cache`、`private.lca_latest_all_unit_results`、`private.lca_factorization_registry` 中可关联的 rows 回填到同一个 `worker_job_id`。
 
 `public_plus_owner_draft` 是 fail-closed 协议：Edge 负责生产和预校验证据，worker 仍会独立验证 payload、process/flow 数据库行可见性、reviewed static LCIA bundle、snapshot-index evidence 与 solve binding。scope manifest 只覆盖 processes/flows；LCIA 来源是 actor-independent、hash-bound 的 25-method cache bundle。Edge 只能发送固定相对清单路径、最终 raw SHA 和完全相同的 embedded manifest，不能发送 URL。worker 从可信配置的 HTTPS base（或本地验证目录）取文件，验证大小、全部哈希、alias、方法成员和 factor 数值后参与计算。coverage 按 method/exchange pair 统计；任一方法缺 factor 都保持 `incomplete_coverage_not_zero` 和外置 JSONL 证据，不能被 UI 当成“完整的零影响”。
 
-LCIA result package 构建走同一个 `worker_jobs(worker_queue=solver)` 生命周期，但不是普通 `/lca/solve` 请求。Edge 的 data product manager command 应先通过数据库 command 解析权限、published-only eligibility 和默认 impact category，再 enqueue `job_kind=lcia_result.package_build` / `payload_schema_version=lcia_result.package_build.request.v1`。payload 使用数据库返回的 `buildId`、`requestedBy`、`coverageMode`、`inputManifest`、`inputManifestHash`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`；worker 只消费已发布 `stateCode/state_code=100..199` 的 manifest 输入。worker 完成后用 service-role DB 连接调用 `public.cmd_lcia_result_package_mark_ready(...)` 固化 `lcia_result_packages` preview package；发布仍由 Edge manager command 调用数据库 publish RPC 完成。
+LCIA result package 构建走同一个 `worker_jobs(worker_queue=solver)` 生命周期，但不是普通 `/lca/solve` 请求。Edge 的 data product manager command 应先通过数据库 command 解析权限、published-only eligibility 和默认 impact category，再 enqueue `job_kind=lcia_result.package_build` / `payload_schema_version=lcia_result.package_build.request.v1`。payload 使用数据库返回的 `buildId`、`requestedBy`、`coverageMode`、`inputManifest`、`inputManifestHash`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`；worker 只消费已发布 `stateCode/state_code=100..199` 的 manifest 输入。worker 完成后用 service-role DB 连接调用 `private.cmd_lcia_result_package_mark_ready(...)` 固化 `lcia_result_packages` preview package；发布仍由 Edge manager command 调用数据库 publish RPC 完成。
 
 ## 5. 与 worker 的职责边界
 
@@ -178,16 +177,16 @@ worker：
 - 分解/求解
 - heartbeat `worker_jobs.phase/progress`
 - 用 `worker_record_job_result` 写统一任务终态、错误、`result_json` 和 `result_ref`
-- 写 domain/cache metadata（如 `lca_results` artifact、`lca_result_cache`），并在 optional `lca_jobs` 存在时 best-effort 写兼容状态；这些都不替代 `worker_jobs` 任务生命周期事实
+- 写 domain/cache metadata（如 `private.lca_results` artifact、`private.lca_result_cache`）；这些都不替代 `private.worker_jobs` 任务生命周期事实
 - 对 `lcia_result.package_build`，构建 published-only snapshot、持久化 all-unit result/query artifacts，并通过 service-role `cmd_lcia_result_package_mark_ready` 标记 package preview ready；失败只写 `worker_jobs` package-specific result，不更新 `lca_result_cache`
-- 对 `build_snapshot`，从同一 `worker_jobs` heartbeat diagnostics 投影 resolved snapshot ID 与 calculation evidence；不依赖 optional `lca_jobs`，snapshot reuse 也必须返回真实 resolved ID
+- 对 `build_snapshot`，从同一 `worker_jobs` heartbeat diagnostics 投影 resolved snapshot ID 与 calculation evidence；snapshot reuse 也必须返回真实 resolved ID
 
 不要让 Edge 自己更新 worker lease/result 字段。
 
 ## 6. 失败与重试建议
 
 - Edge 入队失败：返回 `5xx`，前端可用同 `X-Idempotency-Key` 重试。
-- worker 失败：以 `worker_jobs.status=failed` 和 `error_*` 字段为任务事实；optional `lca_jobs.status=failed` 与 `diagnostics.error` 仅用于兼容诊断，不要求表存在。
+- worker 失败：以 `private.worker_jobs.status=failed` 和 `error_*` 字段为任务事实。
 - 前端轮询到 `failed` 时，提示用户重试并保留 `job_id` 便于追踪。
 
 ## 7. 最小实现清单

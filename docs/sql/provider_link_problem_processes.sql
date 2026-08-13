@@ -19,7 +19,7 @@ with latest_processes as (
     p.version,
     p.created_at,
     p.json::jsonb as j
-  from processes p
+  from public.processes p
   order by p.id, p.created_at desc
 ),
 process_meta as (
@@ -113,7 +113,7 @@ with latest_processes as (
     p.version,
     p.created_at,
     p.json::jsonb as j
-  from processes p
+  from public.processes p
   order by p.id, p.created_at desc
 ),
 latest_flows as (
@@ -122,7 +122,7 @@ latest_flows as (
     f.version,
     f.created_at,
     f.json::jsonb as j
-  from flows f
+  from public.flows f
   order by f.id, f.created_at desc
 ),
 process_meta as (
