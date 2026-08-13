@@ -13,6 +13,8 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
 axum = "0.8"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -23,6 +25,7 @@ flate2 = "1"
 fs2 = "0.4"
 hmac = "0.12"
 libc = "0.2"
+parquet = { version = "59.2.0", default-features = false, features = ["arrow", "zstd"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rayon = "1"
 sha2 = "0.10"

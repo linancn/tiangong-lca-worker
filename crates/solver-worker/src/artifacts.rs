@@ -509,6 +509,7 @@ mod tests {
             manifest_sha256: "e".repeat(64),
             manifest_byte_size: 456,
             artifact_count: 1,
+            downloads: Vec::new(),
         };
 
         let encoded =
