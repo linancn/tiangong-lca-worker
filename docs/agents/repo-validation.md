@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-12
-lastReviewedCommit: 800de2cd5a42c0732e83b87ef19bc77f8c143f2c
-lastReviewedNote: "Reviewed for Worker PR #225 follow-up: the existing source-closure suite now includes the real array-shaped external digital-file path regression."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: existing schema-cutover, indexed-reference, certificate-binding, and result-package impact-axis gates remain required."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -89,6 +89,8 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations | record separately when durable schema proof is required in `database-engine` | Local migration files here are not the workspace-wide source of truth. |
 | manual debug, parity, or target-validation scripts | run the touched script with safe args or `--help` when available, plus baseline gates if code changed nearby | `./scripts/run_full_compute_debug.sh`, `./scripts/run_bw25_validation.sh`, or `./scripts/validate_lcia_targets.sh` as applicable | `bw25-validator` is manual-only and out-of-band. |
 | repo docs, `.env.example`, or docpact config only | `scripts/docpact validate-config --root . --strict`; `scripts/docpact lint --root . --worktree --mode enforce` | perform route checks for affected intent surfaces such as `solver-runtime`, `package-worker`, or `runtime-sql-boundary` | Refresh review metadata even when prose-only docs change. Keep `.env.example` secret-free. |
+
+Certificate-grade Scope Closure validation must additionally prove that the frozen boundary is exactly `cutoff`, `closed/open` inputs fail with `scope_closure_boundary_policy_must_be_cutoff`, and unresolved provider balances remain warnings with complete evidence. Generic snapshot-builder and matrix-readiness diagnostics keep their explicit three-policy compatibility tests.
 
 ### Scope-closure capacity input modes
 

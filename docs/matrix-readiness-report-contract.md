@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: schema cutover and compact discovery do not change matrix-readiness report v2 semantics."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and effective snapshot configuration preserve matrix-readiness report v2 semantics and defaults."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -98,6 +98,8 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 | `negative_lcia_values` | sample solve 的 LCIA 输出低于 `-policy.negative_lcia_epsilon`，且 `negative_lcia_policy = blocker` | 复核 LCIA / matrix sign / inventory 数据后重跑 | 是，调整 `negative_lcia_policy` 或 `negative_lcia_epsilon` |
 
 `closed` 是默认 policy。`open` / `cutoff` 会让 closure percentage、unmatched 和 multi-unresolved 不再成为 blocker，但不会删除证据；它们产生 warning，报告通常为 `passed` + `manual_review_warnings`。Equal-fallback、reference/allocation、singular、LCIA 和 compute blockers 不因 boundary policy 放宽。
+
+上述默认值属于 generic `matrix_readiness` / snapshot diagnostic contract。Certificate-grade Scope Closure 的调用绑定固定为 `cutoff`：冻结输入若为 `closed` 或 `open`，Worker 在进入 scan/build 前以 `scope_closure_boundary_policy_must_be_cutoff` 拒绝；在 `cutoff` 下，closure percentage、unmatched provider 与 multi-unresolved 只保留为 warning/evidence。通用 CLI 仍可显式运行 `closed/open/cutoff`，因此本报告的三策略 schema 和历史可读性不变。
 
 ## Findings
 

@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: schema cutover and scope-closure transport changes do not alter signed-flow routing or provider-selection semantics."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve signed-flow routing and provider-selection semantics."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -151,6 +151,8 @@ Allocation fraction and routing weight are different: the former changes residua
 - `cutoff`: a balance may be omitted under an explicit cutoff boundary.
 
 `open/cutoff` must participate in snapshot config and fingerprints and must produce readiness warnings plus per-edge unresolved evidence. They are not silent fallbacks.
+
+That default describes a generic production snapshot. Certificate-grade Scope Closure freezes `cutoff`, so a missing provider affects routing evidence without blocking the completeness certificate; generic `closed/open/cutoff` diagnostics remain available.
 
 ## Audit evidence
 

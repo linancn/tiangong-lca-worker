@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-12
-lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
-lastReviewedNote: "Reviewed for Worker PR #225: package-worker schema cutover and current certificate-binding/discovery contracts remain aligned."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: package schema cutover, certificate binding, and result-package impact metadata preserve TIDAS import/export tasks and artifact schemas."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -236,6 +236,8 @@ cargo run -p solver-worker --bin package_gc -- --execute
 ### 7.3 与 certificate-bound LCIA result package 的边界
 
 `lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。数值 HDF5 不再要求内嵌完整 `CompiledGraph`；Calculation Bundle 所需 release metadata 由 HDF5 descriptor 指向 `snapshot-release-evidence-json-zstd:v2`，后者再绑定 `snapshot-source-closure-json-zstd:v1`，materialization 逐层校验 size/SHA-256/format/content type/dataset count。Legacy numerical payload 即使 graph schema 漂移也仍可读；schema-compatible graph-bearing snapshot 与 v1 full-evidence sidecar 可用于 bundle，incompatible evidence 明确要求重建。
+
+可用于该 binding 的新 certificate-grade Scope Closure 请求固定冻结 `technosphereBoundaryPolicy=cutoff`；provider gap 仍保留为 warning/evidence，但不单独阻断证书。这个约束不改变 TIDAS import/export package 的 payload、状态机或校验规则。
 
 Fresh scope closure uses the bounded `lcia.scope-closure-bundle.v4` binding manifest. Package verification downloads that JSON through the bounded file API, recomputes its exact hash, and streams only the schema/token binding fields; historical v1/v3 bundle files remain readable without materializing the complete object in memory. The growing administrative evidence is partitioned under the closure manifest and does not change TIDAS import/export ZIP semantics.
 

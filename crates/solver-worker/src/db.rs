@@ -2002,6 +2002,7 @@ async fn solve_all_unit_with_calculation_bundle(
     Ok(SolvedAllUnitArtifacts {
         calculation_bundle: bundle_ref,
         query_artifact_meta,
+        impact_map: snapshot_index.impact_map,
     })
 }
 
@@ -2171,6 +2172,7 @@ struct QueryArtifactMeta {
 struct SolvedAllUnitArtifacts {
     calculation_bundle: CalculationBundleArtifactRef,
     query_artifact_meta: QueryArtifactMeta,
+    impact_map: Vec<crate::snapshot_index::SnapshotImpactMapEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -2196,6 +2198,7 @@ struct LciaResultPackageArtifacts {
     result_diag: Value,
     query_artifact_meta: QueryArtifactMeta,
     calculation_bundle: CalculationBundleArtifactRef,
+    impact_map: Vec<crate::snapshot_index::SnapshotImpactMapEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2574,6 +2577,11 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     };
     let artifacts =
         persist_lcia_result_package_all_unit_artifacts(state, result_job_id, snapshot_id).await?;
+    let (available_impact_categories, resolved_default_impact_category) =
+        lcia_result_package_impact_axis(
+            artifacts.impact_map.as_slice(),
+            default_impact_category.as_deref(),
+        )?;
     link_lcia_result_package_worker_job_domain_refs(
         &state.pool,
         build_worker_job_id,
@@ -2654,8 +2662,8 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             result_artifact_ref: lcia_result_artifact_ref(&artifacts.result_diag),
             query_artifact_ref: lcia_result_query_artifact_ref(&artifacts.query_artifact_meta),
             artifact_manifest,
-            available_impact_categories: serde_json::json!([]),
-            default_impact_category: default_impact_category.clone(),
+            available_impact_categories,
+            default_impact_category: Some(resolved_default_impact_category),
             package_result_hash: artifacts
                 .result_diag
                 .get("artifact_sha256")
@@ -2784,13 +2792,20 @@ async fn verify_certified_closure_bundle_artifact(
 ) -> anyhow::Result<()> {
     let row = sqlx::query(
         r"
-        SELECT artifact_type, storage_path, content_type, byte_size,
-               checksum_sha256, metadata
-        FROM private.worker_job_artifacts
-        WHERE id = $1
+        SELECT artifact.artifact_type, artifact.storage_path, artifact.content_type,
+               artifact.byte_size, artifact.checksum_sha256, artifact.metadata,
+               private.lcia_scope_closure_bundle_binding_matches(
+                   closure_check,
+                   artifact
+               ) AS binding_matches
+        FROM private.worker_job_artifacts artifact
+        CROSS JOIN private.lcia_scope_closure_checks closure_check
+        WHERE artifact.id = $1
+          AND closure_check.id = $2
         ",
     )
     .bind(expected_artifact_id)
+    .bind(expected_closure_check_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| anyhow::anyhow!("certified_closure_bundle_artifact_not_found"))?;
@@ -2801,17 +2816,16 @@ async fn verify_certified_closure_bundle_artifact(
     let byte_size = row.try_get::<i64, _>("byte_size")?;
     let checksum_sha256 = row.try_get::<String, _>("checksum_sha256")?;
     let metadata = row.try_get::<Value, _>("metadata")?;
-    let expected_closure_check_id = expected_closure_check_id.to_string();
+    let binding_matches = row.try_get::<bool, _>("binding_matches")?;
     let artifact_schema = metadata.get("schemaVersion").and_then(Value::as_str);
     if artifact_type != "closure_bundle"
         || content_type != "application/json"
         || checksum_sha256 != expected_bundle_hash
+        || !binding_matches
         || !matches!(
             artifact_schema,
             Some("lcia.scope-closure-artifact.v1" | "lcia.scope-closure-artifact.v2")
         )
-        || metadata.get("closureCheckId").and_then(Value::as_str)
-            != Some(expected_closure_check_id.as_str())
     {
         return Err(anyhow::anyhow!(
             "certified_closure_bundle_artifact_metadata_mismatch"
@@ -3222,7 +3236,39 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         result_diag,
         query_artifact_meta: all_unit_artifacts.query_artifact_meta,
         calculation_bundle: all_unit_artifacts.calculation_bundle,
+        impact_map: all_unit_artifacts.impact_map,
     })
+}
+
+fn lcia_result_package_impact_axis(
+    impact_map: &[crate::snapshot_index::SnapshotImpactMapEntry],
+    requested_default: Option<&str>,
+) -> anyhow::Result<(Value, String)> {
+    let first = impact_map
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("lcia_result package snapshot impact axis is empty"))?;
+    let available = impact_map
+        .iter()
+        .map(|impact| impact.impact_id.to_string())
+        .collect::<Vec<_>>();
+    let default = match requested_default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(requested) => impact_map
+            .iter()
+            .find(|impact| {
+                impact.impact_id.to_string() == requested || impact.impact_key == requested
+            })
+            .map(|impact| impact.impact_id.to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "default impact category {requested} is not present in the frozen snapshot axis"
+                )
+            })?,
+        None => first.impact_id.to_string(),
+    };
+    Ok((serde_json::to_value(available)?, default))
 }
 
 fn lcia_result_artifact_ref(result_diag: &Value) -> Value {
@@ -4398,14 +4444,15 @@ mod tests {
         SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
         acquire_build_snapshot_worker_jobs_slot_sql, append_scope_closure_snapshot_args,
         build_all_unit_rhs_batch, build_snapshot_heartbeat_interval,
-        lcia_result_package_request_roots, lcia_result_package_version,
-        normalize_all_unit_batch_size, package_snapshot_execution_mode,
-        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        read_certified_closure_bundle_binding, redact_sensitive_diagnostics,
-        redacted_builder_command, resolve_solve_all_unit_options, retired_snapshot_fallback_error,
-        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
-        snapshot_builder_process_failure_code, snapshot_builder_wall_timeout_seconds_from,
-        tail_text, utf8_safe_tail, validate_certified_process_axis,
+        lcia_result_package_impact_axis, lcia_result_package_request_roots,
+        lcia_result_package_version, normalize_all_unit_batch_size,
+        package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
+        parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
+        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
+        retired_snapshot_fallback_error, run_snapshot_builder_job,
+        run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_process_failure_code,
+        snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
+        validate_certified_process_axis,
     };
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -4422,7 +4469,7 @@ mod tests {
     use tokio::time::sleep;
     use uuid::Uuid;
 
-    use crate::graph_types::RequestRootProcess;
+    use crate::{graph_types::RequestRootProcess, snapshot_index::SnapshotImpactMapEntry};
 
     static SNAPSHOT_BUILDER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -5121,6 +5168,55 @@ mod tests {
             lcia_result_package_version(build_id),
             "lcia-result-3d620e54-2b83-47f6-9809-0b65ab00bfd9"
         );
+    }
+
+    #[test]
+    fn lcia_result_package_impact_axis_uses_frozen_ids_and_resolves_default_key() {
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let impacts = vec![
+            SnapshotImpactMapEntry {
+                impact_id: first_id,
+                impact_index: 0,
+                impact_version: Some("01.00.000".to_owned()),
+                impact_key: "method:first".to_owned(),
+                impact_name: "First".to_owned(),
+                unit: "kg".to_owned(),
+            },
+            SnapshotImpactMapEntry {
+                impact_id: second_id,
+                impact_index: 1,
+                impact_version: Some("01.00.000".to_owned()),
+                impact_key: "method:second".to_owned(),
+                impact_name: "Second".to_owned(),
+                unit: "kg".to_owned(),
+            },
+        ];
+
+        let (available, default) =
+            lcia_result_package_impact_axis(&impacts, Some("method:second")).unwrap();
+        assert_eq!(
+            available,
+            json!([first_id.to_string(), second_id.to_string()])
+        );
+        assert_eq!(default, second_id.to_string());
+    }
+
+    #[test]
+    fn lcia_result_package_impact_axis_defaults_to_first_and_rejects_unknown() {
+        let impact_id = Uuid::new_v4();
+        let impacts = vec![SnapshotImpactMapEntry {
+            impact_id,
+            impact_index: 0,
+            impact_version: Some("01.00.000".to_owned()),
+            impact_key: "method:only".to_owned(),
+            impact_name: "Only".to_owned(),
+            unit: "kg".to_owned(),
+        }];
+
+        let (_, default) = lcia_result_package_impact_axis(&impacts, None).unwrap();
+        assert_eq!(default, impact_id.to_string());
+        assert!(lcia_result_package_impact_axis(&impacts, Some("method:missing")).is_err());
     }
 
     #[test]

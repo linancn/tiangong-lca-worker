@@ -63,7 +63,9 @@ use solver_worker::readiness::{
     MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, ReadinessFinding,
     ReadinessStatus, verify_matrix_readiness,
 };
-use solver_worker::scope_closure::{DataSnapshotManifest, DatasetCategory};
+use solver_worker::scope_closure::{
+    DataSnapshotManifest, DatasetCategory, ensure_certificate_scope_closure_boundary_policy,
+};
 use solver_worker::signed_flow::{
     ReferencePivot, SIGNED_FLOW_CLOSURE_TOLERANCE, SignedFlowDirection, TechnosphereBoundaryPolicy,
     WeightedReferencePort, normalize_reference_coefficient, resolve_weighted_balance,
@@ -871,10 +873,6 @@ fn parse_scope_closure_snapshot_args(
                 || link_policy.flow_identity_policy != "exact-flow-version-reference-unit-v2"
                 || link_policy.allocation_semantics_version != "tidas-reference-allocation-v3"
                 || !matches!(
-                    link_policy.technosphere_boundary_policy.as_str(),
-                    "closed" | "open" | "cutoff"
-                )
-                || !matches!(
                     link_policy.provider_universe_policy.as_str(),
                     "scope_only" | "eligible_transitive_expansion-v1"
                 )
@@ -883,6 +881,9 @@ fn parse_scope_closure_snapshot_args(
                     "scope closure data snapshot contains an unsupported link policy"
                 ));
             }
+            ensure_certificate_scope_closure_boundary_policy(
+                link_policy.technosphere_boundary_policy.as_str(),
+            )?;
             Ok(Some((binding, snapshot, mode)))
         }
         _ => Err(anyhow::anyhow!(
@@ -1353,6 +1354,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         &pool,
         snapshot_id,
         &method,
+        &build_config,
         resolved_scope.processes.clone(),
         cli.include_user_id,
         versioned_scope.as_ref(),
@@ -2056,6 +2058,7 @@ async fn run_review_submit_overlay_build(
     let built = assemble_sparse_payload(
         requested_snapshot_id,
         &method,
+        &overlay_config,
         &overlay_graph,
         cli.self_loop_cutoff,
         cli.singular_eps,
@@ -2223,6 +2226,7 @@ async fn load_or_build_review_submit_baseline(
         pool,
         baseline_snapshot_id,
         method,
+        baseline_config,
         baseline_processes.to_vec(),
         include_user_id,
         None,
@@ -3682,6 +3686,7 @@ async fn build_sparse_payload(
     pool: &PgPool,
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     processes: Vec<ProcessRow>,
     include_user_id: Option<Uuid>,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
@@ -3719,6 +3724,7 @@ async fn build_sparse_payload(
     assemble_sparse_payload_with_selection(
         snapshot_id,
         method,
+        build_config,
         &compiled_graph.graph,
         self_loop_cutoff,
         singular_eps,
@@ -4755,6 +4761,7 @@ fn select_active_lcia_factors(
 fn assemble_sparse_payload(
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     compiled_graph: &CompiledGraph,
     self_loop_cutoff: f64,
     singular_eps: f64,
@@ -4777,6 +4784,7 @@ fn assemble_sparse_payload(
     assemble_sparse_payload_with_selection(
         snapshot_id,
         method,
+        build_config,
         compiled_graph,
         self_loop_cutoff,
         singular_eps,
@@ -4792,6 +4800,7 @@ fn assemble_sparse_payload(
 fn assemble_sparse_payload_with_selection(
     snapshot_id: Uuid,
     method: &MethodSelection,
+    build_config: &SnapshotBuildConfig,
     compiled_graph: &CompiledGraph,
     self_loop_cutoff: f64,
     singular_eps: f64,
@@ -5087,7 +5096,7 @@ fn assemble_sparse_payload_with_selection(
     let readiness = verify_matrix_readiness(&MatrixReadinessInput {
         schema_version: "matrix_readiness_input.v2".to_owned(),
         snapshot_id: Some(snapshot_id),
-        config: None,
+        config: Some(build_config.clone()),
         coverage: coverage.clone(),
         payload: data.clone(),
         compiled_graph: Some(compiled_graph.clone()),
@@ -10653,7 +10662,7 @@ mod tests {
     #[test]
     fn snapshot_builder_reads_scope_closure_snapshot_from_file() {
         let (binding, snapshot, _) =
-            frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+            frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery");
         let mut input = tempfile::NamedTempFile::new().expect("snapshot input file");
         serde_json::to_writer(&mut input, &snapshot).expect("write snapshot input");
         input.flush().expect("flush snapshot input");
@@ -10681,7 +10690,7 @@ mod tests {
 
     #[test]
     fn one_method_scope_closure_axis_never_expands_to_the_reviewed_catalog() {
-        let (_, snapshot, _) = frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let (_, snapshot, _) = frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery");
         let method_id = Uuid::new_v4();
         let mut value = serde_json::to_value(snapshot).unwrap();
         value["requestedScope"]["lciaMethods"] = json!([{
@@ -10703,7 +10712,7 @@ mod tests {
     #[test]
     fn snapshot_builder_rejects_conflicting_scope_closure_snapshot_inputs() {
         let (binding, snapshot, _) =
-            frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+            frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery");
         let input = tempfile::NamedTempFile::new().expect("snapshot input file");
         let binding_json = serde_json::to_string(&binding).expect("binding JSON");
         let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot JSON");
@@ -10946,6 +10955,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &overlay_graph,
             0.999_999,
             1e-12,
@@ -11065,6 +11075,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11184,6 +11195,7 @@ mod tests {
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11226,6 +11238,7 @@ mod tests {
         let built = assemble_sparse_payload(
             snapshot_id,
             &method,
+            &test_snapshot_build_config("tidas-reference-allocation-v3"),
             &graph,
             0.999_999,
             1e-12,
@@ -11262,6 +11275,79 @@ mod tests {
                 .expect("release evidence link")
                 .byte_size,
             123
+        );
+    }
+
+    #[test]
+    fn assembled_readiness_uses_effective_snapshot_boundary_policy() {
+        let mut graph = super::empty_compiled_graph();
+        graph.matching_stats.input_edges_total = 1;
+        graph.matching_stats.unmatched_no_provider = 1;
+        graph.matching_stats.residual_edges_total = 1;
+        let method = MethodSelection {
+            has_lcia: false,
+            method_id: None,
+            method_version: None,
+            method_count: 0,
+            factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+        let mut build_config = test_snapshot_build_config("tidas-reference-allocation-v3");
+        build_config.technosphere_boundary_policy = "cutoff".to_owned();
+
+        let cutoff = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &build_config,
+            &graph,
+            build_config.self_loop_cutoff,
+            build_config.singular_eps,
+            false,
+            &[],
+            &[],
+            false,
+        )
+        .expect("assemble cutoff readiness input");
+
+        assert!(cutoff.readiness.blockers.iter().all(|blocker| {
+            blocker.code != "provider_closure_unmatched"
+                && blocker.code != "provider_closure_write_pct_below_policy"
+        }));
+        assert!(cutoff.readiness.findings.iter().any(|finding| {
+            finding.code == "technosphere_boundary_unresolved_permitted"
+                && finding.details["technosphere_boundary_policy"] == "cutoff"
+        }));
+
+        build_config.technosphere_boundary_policy = "closed".to_owned();
+        let closed = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &build_config,
+            &graph,
+            build_config.self_loop_cutoff,
+            build_config.singular_eps,
+            false,
+            &[],
+            &[],
+            false,
+        )
+        .expect("assemble closed readiness input");
+
+        assert!(
+            closed
+                .readiness
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.code == "provider_closure_unmatched" })
+        );
+        assert!(
+            closed
+                .readiness
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.code == "provider_closure_write_pct_below_policy" })
         );
     }
 
@@ -11352,7 +11438,7 @@ mod tests {
         let root_id = Uuid::new_v4();
         let provider_id = Uuid::new_v4();
         let roots = [RequestRootProcess::new(root_id, "01.00.000")];
-        let frozen = frozen_scope_closure_snapshot("scope_only", "closed", "discovery");
+        let frozen = frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery");
         let candidate_axis = scope_closure_candidate_process_axis(Some(&frozen), &roots)
             .expect("scope_only must restrict discovery candidates");
 
@@ -11377,7 +11463,7 @@ mod tests {
         let roots = [RequestRootProcess::new(root_id, "01.00.000")];
         let frozen = frozen_scope_closure_snapshot(
             "eligible_transitive_expansion-v1",
-            "closed",
+            "cutoff",
             "discovery",
         );
         assert_eq!(
@@ -11428,7 +11514,7 @@ mod tests {
         );
 
         let build =
-            frozen_scope_closure_snapshot("eligible_transitive_expansion-v1", "closed", "build");
+            frozen_scope_closure_snapshot("eligible_transitive_expansion-v1", "cutoff", "build");
         assert_eq!(
             scope_closure_candidate_process_axis(Some(&build), &roots),
             Some(BTreeSet::from([(root_id, "01.00.000".to_owned())])),
@@ -11437,21 +11523,48 @@ mod tests {
     }
 
     #[test]
-    fn frozen_open_and_cutoff_boundary_policies_override_cli_default() {
-        for expected in ["open", "cutoff"] {
-            let frozen = frozen_scope_closure_snapshot("scope_only", expected, "discovery");
-            assert_eq!(
-                scope_closure_boundary_policy("closed", Some(&frozen)),
-                expected
+    fn frozen_cutoff_boundary_policy_overrides_cli_default() {
+        let frozen = frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery");
+        assert_eq!(
+            scope_closure_boundary_policy("closed", Some(&frozen)),
+            "cutoff"
+        );
+        assert_eq!(
+            TechnosphereBoundaryPolicy::parse(
+                scope_closure_boundary_policy("closed", Some(&frozen)).as_str()
+            )
+            .expect("supported frozen boundary")
+            .as_str(),
+            "cutoff"
+        );
+    }
+
+    #[test]
+    fn certificate_scope_closure_rejects_closed_and_open_boundaries() {
+        for rejected in ["closed", "open"] {
+            let (binding, snapshot, _) =
+                frozen_scope_closure_snapshot("scope_only", rejected, "discovery");
+            let binding_json = serde_json::to_string(&binding).expect("binding JSON");
+            let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot JSON");
+            let cli = Cli::try_parse_from([
+                "snapshot_builder",
+                "--scope-closure-mode",
+                "discovery",
+                "--scope-closure-binding-json",
+                binding_json.as_str(),
+                "--scope-closure-data-snapshot-json",
+                snapshot_json.as_str(),
+            ])
+            .expect("parse scope closure CLI");
+
+            let error = parse_scope_closure_snapshot_args(&cli)
+                .expect_err("non-cutoff certificate boundary must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("scope_closure_boundary_policy_must_be_cutoff")
             );
-            assert_eq!(
-                TechnosphereBoundaryPolicy::parse(
-                    scope_closure_boundary_policy("closed", Some(&frozen)).as_str()
-                )
-                .expect("supported frozen boundary")
-                .as_str(),
-                expected
-            );
+            assert!(error.to_string().contains(rejected));
         }
     }
 

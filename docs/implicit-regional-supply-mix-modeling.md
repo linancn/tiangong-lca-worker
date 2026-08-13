@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: schema cutover and scope-closure transport changes do not alter signed-flow routing or provider-selection semantics."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve signed-flow routing and provider-selection semantics."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -157,6 +157,8 @@ Allocation fraction 与 routing weight 不可混用：前者改变 residual magn
 - `cutoff`：允许按明确 cutoff 省略 balance。
 
 `open/cutoff` 必须进入 snapshot config、fingerprint、readiness warning 和逐边 unresolved evidence，不能作为静默 fallback。
+
+这里的默认值描述 generic production snapshot。Certificate-grade Scope Closure 固定冻结 `cutoff`，所以缺失 provider 只影响 routing evidence，不阻断完整性证书；generic `closed/open/cutoff` 诊断能力仍保留。
 
 ## 可审计证据
 

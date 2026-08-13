@@ -661,7 +661,11 @@ fn review_submit_benchmark_fixture() -> anyhow::Result<Fixture> {
     })
 }
 
-async fn request_closure(pool: &PgPool, fixture: &Fixture) -> anyhow::Result<(Uuid, Uuid)> {
+async fn request_closure(
+    pool: &PgPool,
+    fixture: &Fixture,
+    label: &str,
+) -> anyhow::Result<(Uuid, Uuid)> {
     let scope = json!({
         "coverageMode": "subset",
         "certificateFreshnessPolicy": "frozen-artifact-reusable-v1",
@@ -680,7 +684,10 @@ async fn request_closure(pool: &PgPool, fixture: &Fixture) -> anyhow::Result<(Uu
            FROM _claims"#,
     )
     .bind(scope)
-    .bind(format!("scope-closure-package-v2-e2e-{}", fixture.actor))
+    .bind(format!(
+        "scope-closure-package-v2-e2e-{label}-{}",
+        fixture.actor
+    ))
     .bind(fixture.actor.to_string())
     .fetch_one(pool)
     .await?;
@@ -982,12 +989,57 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     let state = Arc::new(AppState::new(&test_config()).await?);
     let fixture = setup_fixture(&state.pool).await?;
 
-    let (check_id, closure_job_id) = request_closure(&state.pool, &fixture).await?;
+    let (check_id, closure_job_id) = request_closure(&state.pool, &fixture, "fresh").await?;
     anyhow::ensure!(
         run_one_job(state.clone(), closure_job_id, "closure").await? == "completed",
         "scope closure Worker job did not complete"
     );
     let certificate = load_certificate(&state.pool, check_id).await?;
+
+    let (reused_check_id, reused_closure_job_id) =
+        request_closure(&state.pool, &fixture, "reused").await?;
+    anyhow::ensure!(
+        run_one_job(state.clone(), reused_closure_job_id, "closure-reused").await? == "completed",
+        "reused scope closure Worker job did not complete"
+    );
+    let reused_certificate = load_certificate(&state.pool, reused_check_id).await?;
+    let reused_binding = sqlx::query(
+        r#"SELECT target.reused_from_check_id,
+                  target.closure_bundle_artifact_id = source.closure_bundle_artifact_id AS same_artifact,
+                  bundle.metadata->>'closureCheckId' AS artifact_closure_check_id
+           FROM public.lcia_scope_closure_checks target
+           JOIN public.lcia_scope_closure_checks source ON source.id=target.reused_from_check_id
+           JOIN public.worker_job_artifacts bundle ON bundle.id=target.closure_bundle_artifact_id
+           WHERE target.id=$1"#,
+    )
+    .bind(reused_check_id)
+    .fetch_one(&state.pool)
+    .await?;
+    anyhow::ensure!(
+        reused_binding.try_get::<Uuid, _>("reused_from_check_id")? == check_id
+            && reused_binding.try_get::<bool, _>("same_artifact")?
+            && reused_binding.try_get::<String, _>("artifact_closure_check_id")?
+                == check_id.to_string(),
+        "reused certificate must retain the source-owned Closure Bundle"
+    );
+    let reused_build = request_build(
+        &state.pool,
+        &fixture,
+        &reused_certificate,
+        "reused-certificate",
+    )
+    .await?;
+    anyhow::ensure!(
+        run_one_job(state.clone(), reused_build.worker_job_id, "build-reused").await?
+            == "completed",
+        "directly reused Closure Bundle was rejected by the package Worker"
+    );
+    let reused_package = package_projection(&state.pool, &reused_build).await?;
+    anyhow::ensure!(
+        reused_package["closure_check_id"] == json!(reused_check_id),
+        "Calculation Bundle must remain bound to the target reused check"
+    );
+
     assert_record_result_v3_wire(&state.pool, check_id).await?;
     let database_effective_scope_hash =
         sqlx::query_scalar::<_, String>("SELECT private.lcia_scope_closure_sha256($1::jsonb)")
@@ -1209,6 +1261,15 @@ async fn certified_snapshot_lifecycle_is_frozen_reusable_and_fail_closed() -> an
     .fetch_one(&state.pool)
     .await?;
     anyhow::ensure!(ready_packages == 2);
+    anyhow::ensure!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM public.lcia_result_packages WHERE closure_check_id=$1 AND status='preview_ready'",
+        )
+        .bind(reused_check_id)
+        .fetch_one(&state.pool)
+        .await?
+            == 1
+    );
     anyhow::ensure!(certificate.snapshot_artifact_id != Uuid::nil());
     anyhow::ensure!(!certificate.snapshot_build_contract_hash.is_empty());
     Ok(())

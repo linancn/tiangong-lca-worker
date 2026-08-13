@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-12
-lastReviewedCommit: 800de2cd5a42c0732e83b87ef19bc77f8c143f2c
-lastReviewedNote: "Reviewed for Worker PR #225 follow-up: array-shaped external digital-file path handling remains within Worker source-closure ownership."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private runtime boundaries, indexed digital-file handling, and frozen impact-axis publication preserve Worker ownership."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -174,7 +174,7 @@ Route those tasks to:
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
-- certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
+- certificate-grade closure reads only the immutable current-public-release dataset manifest, requires the frozen technosphere boundary policy to be exactly `cutoff`, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset; unresolved provider balances remain warning/evidence rather than certificate blockers
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
 - package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION` (active governed default `0.1.3`), verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities

@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-12
-lastReviewedCommit: 30c8e0216028116556769291481822353266f65b
-lastReviewedNote: "Reviewed for Worker PR #225: schema cutover preserves the current bounded, file-backed scope-closure result and memory contract."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: private schema boundaries and frozen impact-axis metadata preserve bounded file-backed Scope Closure results and memory limits."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -52,6 +52,8 @@ related:
 - typed snapshot source-preflight blockers from discovery or the final numerical build preflight.
 
 Every distinct issue has one `lcia.scope-closure-issue.v3` main record. Snapshot source blockers coalesce by error code plus requested target identity (or raw malformed-target fingerprint plus extraction code); source/path/role remain occurrence evidence. A multi-source grouped issue omits a misleading single top-level source/path. Stable semantic fields include `issueKey`, `code`, `message`, `severity`, `blocker`, `occurrenceCount`, `affectedRootCount`, and bounded occurrence/root samples; source/path remain present for single-source issues. Reference role, requested target, suggested action, and truncation flags remain present when applicable. The complete blocker count, blocker-code set, verdict, certificate inputs, occurrence count, and affected-root count are derived from this unified set. Inline RPC and general XLSX views are bounded projections and are never completeness authorities. The exception is the dedicated snapshot-blocker worksheets: they stream every record from the verified canonical NDJSON sidecar and split instead of truncating.
+
+Certificate-grade Scope Closure binds the frozen technosphere boundary to `cutoff`. Provider gaps, unresolved balances, and A-write coverage stay in the unified evidence and warning findings, but they do not contribute blocker codes or invalidate a certificate by themselves. A non-cutoff frozen manifest is an input-contract failure before canonical issue/result production, not a rewritten result and not a domain blocker.
 
 Issue identity and order are deterministic:
 

@@ -22,9 +22,9 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-09
-lastReviewedCommit: 63dac07d858a14427f663a03c69f17db9ed26419
-lastReviewedNote: "Reviewed for Worker PR #225: schema cutover and scope-closure transport do not change provider eligibility, routing, or evidence semantics."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 8d646f8531100e44e734a3a233e9cb60f29983ef
+lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve provider eligibility, routing, and evidence semantics."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md
@@ -171,6 +171,8 @@ closure = c_r + sum(c_i * activity_requirement_i) = 0
 - `cutoff`：允许按明确 cutoff 边界省略该 balance，同样必须保留 warning 和逐边证据。
 
 未知策略 fail closed。`open/cutoff` 不是“没有找到 provider 时静默跳过”的别名。
+
+这三个值是 generic snapshot/readiness 的显式策略面。Certificate-grade Scope Closure 不使用 generic 默认值：数据库先把省略值以及兼容的 `closed/open/cutoff` 输入统一规范化为 `cutoff`，Worker 只接受冻结后的 `cutoff`。因此该工作流中的 unmatched provider、A-write coverage 和 unresolved balance 必须保留完整诊断与逐边证据，但不能升级为 certificate blocker；非 `cutoff` 冻结输入属于合同错误，Worker 不静默改写。
 
 ## 当前默认 rule
 
