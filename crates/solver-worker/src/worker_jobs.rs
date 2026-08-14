@@ -14,6 +14,10 @@ use crate::{
 pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
 pub const REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION: &str = "review_submit.gate.request.v1";
 pub const REVIEW_SUBMIT_GATE_WORKER_QUEUE: &str = "review_submit_gate";
+pub const REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND: &str = "review.quality_diagnostic";
+pub const REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION: &str =
+    "review.quality_diagnostic.request.v1";
+pub const REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE: &str = "review_quality";
 
 const RESULT_WRITE_MAX_ATTEMPTS: u32 = 3;
 
@@ -37,6 +41,14 @@ pub struct ReviewSubmitGateWorkerRequest {
     pub revision_checksum: Option<String>,
     pub policy_profile: Option<String>,
     pub report_schema_version: Option<String>,
+    pub requested_by: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewQualityDiagnosticWorkerRequest {
+    pub scope_kind: String,
+    pub review_states: Vec<i32>,
+    pub requested_at: Option<String>,
     pub requested_by: Uuid,
 }
 
@@ -120,6 +132,61 @@ impl WorkerJob {
             revision_checksum: payload.dataset_revision.revision_checksum,
             policy_profile: payload.policy_profile,
             report_schema_version: payload.report_schema_version,
+            requested_by,
+        })
+    }
+
+    pub fn review_quality_diagnostic_request(
+        &self,
+    ) -> anyhow::Result<ReviewQualityDiagnosticWorkerRequest> {
+        if self.job_kind != REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND {
+            return Err(anyhow::anyhow!(
+                "unsupported worker job kind for review quality diagnostic: {}",
+                self.job_kind
+            ));
+        }
+        if self.worker_queue != REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE {
+            return Err(anyhow::anyhow!(
+                "unsupported worker queue for review quality diagnostic: {}",
+                self.worker_queue
+            ));
+        }
+        if self.payload_schema_version != REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION {
+            return Err(anyhow::anyhow!(
+                "unsupported review quality diagnostic payload schema: {}",
+                self.payload_schema_version
+            ));
+        }
+
+        let payload =
+            serde_json::from_value::<ReviewQualityDiagnosticPayload>(self.payload.clone())?;
+        if payload.scope.kind != "pending_review" {
+            return Err(anyhow::anyhow!(
+                "unsupported review quality diagnostic scope: {}",
+                payload.scope.kind
+            ));
+        }
+        let mut review_states = payload.scope.review_states;
+        review_states.sort_unstable();
+        review_states.dedup();
+        if review_states.is_empty() {
+            return Err(anyhow::anyhow!(
+                "review quality diagnostic scope must include review states"
+            ));
+        }
+        if review_states.iter().any(|state| !matches!(state, 0 | 1)) {
+            return Err(anyhow::anyhow!(
+                "review quality diagnostic scope supports pending review states 0 and 1 only"
+            ));
+        }
+        let requested_by = self.requested_by.ok_or_else(|| {
+            anyhow::anyhow!("review quality diagnostic worker job is missing requestedBy")
+        })?;
+
+        Ok(ReviewQualityDiagnosticWorkerRequest {
+            scope_kind: payload.scope.kind,
+            review_states,
+            requested_at: payload.requested_at,
             requested_by,
         })
     }
@@ -472,15 +539,31 @@ struct ReviewSubmitGateDatasetRevision {
     revision_checksum: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewQualityDiagnosticPayload {
+    scope: ReviewQualityDiagnosticScope,
+    #[serde(default)]
+    requested_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewQualityDiagnosticScope {
+    kind: String,
+    review_states: Vec<i32>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        REVIEW_SUBMIT_GATE_JOB_KIND, REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
-        REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
-        result_write_retry_delay,
+        REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND, REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
+        REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE, REVIEW_SUBMIT_GATE_JOB_KIND,
+        REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION, REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob,
+        lease_heartbeat_period, result_write_retry_delay,
     };
 
     #[test]
@@ -547,5 +630,81 @@ mod tests {
         .unwrap();
 
         assert!(job.review_submit_gate_request().is_err());
+    }
+
+    #[test]
+    fn parses_review_quality_diagnostic_worker_job_payload() {
+        let requested_by = Uuid::new_v4();
+        let job = WorkerJob::from_json(&json!({
+            "id": Uuid::new_v4(),
+            "jobKind": REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND,
+            "workerQueue": REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE,
+            "payloadSchemaVersion": REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
+            "payload": {
+                "scope": {
+                    "kind": "pending_review",
+                    "reviewStates": [0, 1]
+                },
+                "requestedAt": "2026-08-13T09:00:00Z"
+            },
+            "requestedBy": requested_by,
+            "leaseToken": Uuid::new_v4(),
+            "attemptCount": 1
+        }))
+        .unwrap();
+
+        let request = job.review_quality_diagnostic_request().unwrap();
+
+        assert_eq!(request.scope_kind, "pending_review");
+        assert_eq!(request.review_states, vec![0, 1]);
+        assert_eq!(
+            request.requested_at.as_deref(),
+            Some("2026-08-13T09:00:00Z")
+        );
+        assert_eq!(request.requested_by, requested_by);
+    }
+
+    #[test]
+    fn rejects_review_quality_diagnostic_without_pending_review_scope() {
+        let job = WorkerJob::from_json(&json!({
+            "id": Uuid::new_v4(),
+            "jobKind": REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND,
+            "workerQueue": REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE,
+            "payloadSchemaVersion": REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
+            "payload": {
+                "scope": {
+                    "kind": "single_dataset",
+                    "reviewStates": [0, 1]
+                }
+            },
+            "requestedBy": Uuid::new_v4(),
+            "leaseToken": Uuid::new_v4(),
+            "attemptCount": 1
+        }))
+        .unwrap();
+
+        assert!(job.review_quality_diagnostic_request().is_err());
+    }
+
+    #[test]
+    fn rejects_review_quality_diagnostic_with_non_pending_state() {
+        let job = WorkerJob::from_json(&json!({
+            "id": Uuid::new_v4(),
+            "jobKind": REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND,
+            "workerQueue": REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE,
+            "payloadSchemaVersion": REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
+            "payload": {
+                "scope": {
+                    "kind": "pending_review",
+                    "reviewStates": [0, 100]
+                }
+            },
+            "requestedBy": Uuid::new_v4(),
+            "leaseToken": Uuid::new_v4(),
+            "attemptCount": 1
+        }))
+        .unwrap();
+
+        assert!(job.review_quality_diagnostic_request().is_err());
     }
 }

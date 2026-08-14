@@ -18,13 +18,13 @@ checkPaths:
   - .docpact/config.yaml
   - docs/agents/**
   - docs/lca-api-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-05
-lastReviewedCommit: 9a44912cf81641f4269221bf97d7d1f7a51f7cd8
-lastReviewedNote: "Reviewed for Issue #193: the active governed Rust tidas baseline is v0.1.3 while scope-closure v3 retains the 2048 MiB Linux RSS guard."
+lastReviewedAt: 2026-08-13
+lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedNote: "Updated for Issue #249: Review Admin manually runs an informational joint pending-review quality diagnostic; submit-time numerical gating is no longer an active product path."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -38,7 +38,7 @@ related:
 
 # Tiangong LCA Worker
 
-面向 Supabase + Rust + SuiteSparse 的大规模 LCA worker runtime，承载稀疏求解、review-submit gate、package worker、maintenance GC 和统一 `worker_jobs` 消费。
+面向 Supabase + Rust + SuiteSparse 的大规模 LCA worker runtime，承载稀疏求解、Review Admin 质量诊断、package worker、maintenance GC 和统一 `worker_jobs` 消费。
 
 ## AI Docs Entry
 
@@ -50,7 +50,7 @@ related:
 4. `docs/agents/repo-architecture.md`
 5. 再按任务加载对应窄契约：
    - `docs/lca-api-contract.md`
-   - `docs/review-submit-fast-gate-contract.md`
+   - `docs/review-quality-diagnostic-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
    - `docs/tidas-package-contract.md`
@@ -104,9 +104,10 @@ related:
   - Calculation Bundle 的发布元数据流式压缩为 `release-evidence-v2-<sha256>.json.zst`，完整 TIDAS 源文档另存为 `source-closure-v1-<sha256>.json.zst`；HDF5 → release evidence → source closure 形成 URL/SHA-256/byte-size/format/count 绑定链，大文件上传自动使用 multipart
   - review-submit baseline 只持久化可继续构建 overlay 的 baseline projection；最终 overlay 只持久化 gate 实际读取的 flow/provider/edge evidence，不写入完整 `CompiledGraph`
   - worker 优先从 `lca_snapshot_artifacts` 下载 artifact，失败才回退到旧 `lca_*_entries` 读取
-- 已支持 review-submit gate：
-  - `review_submit_gate` 可对文件输入产出 `review_submit_gate_report.v1`
-  - `review_submit_gate_runner` 可领取数据库中的 submit-review gate run，并写回 `passed` / `blocked` / `error`
+- 已支持 Review Admin 手动质量诊断：
+  - `review_quality_diagnostic_runner` 一次性构建全部待审核 Process 的联合矩阵
+  - 完整性与数值稳定性结论写入 `review.quality_diagnostic.report.v1`，仅供查看且不阻断任何 Review 操作
+  - `review_submit_gate` / `review_submit_gate_runner` 仅保留离线 fixture 与历史运行兼容，不属于当前提交审核路径
 
 ## 3. 结果文件格式（已选定）
 
@@ -346,9 +347,10 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 - `SNAPSHOT_REPORT_RETENTION_DAYS`（`reports/snapshot-coverage` 下已知本地报告的保留天数，默认 `14`）
 - `SNAPSHOT_REPORT_MAX_FILES`（`reports/snapshot-coverage` 下已知本地报告最多保留文件数，默认 `100`，超过后删除最旧文件）
 - `SNAPSHOT_REPORT_MIN_FREE_BYTES`（`guarded` 模式下写本地报告后必须保留的最小可用磁盘空间，默认 `1073741824`，即 1 GiB）
-- `REVIEW_SUBMIT_GATE_POLL_MS`（review-submit gate runner 轮询间隔，默认 `1000`）
-- `REVIEW_SUBMIT_GATE_MAX_RUNS`（可选；设置后 runner 处理指定条数后退出）
-- `REVIEW_SUBMIT_GATE_STALE_RUNNING_SECONDS`（runner 重新领取 stale `running` gate run 的阈值，默认 `21600`）
+- `REVIEW_QUALITY_POLL_MS`（Review Admin quality diagnostic runner 轮询间隔，默认 `1000`）
+- `REVIEW_QUALITY_MAX_RUNS`（可选；设置后 runner 处理指定条数后退出）
+- `REVIEW_QUALITY_WORKER_ID`（runner lease owner 标识，默认 `review_quality_diagnostic_runner`）
+- `REVIEW_QUALITY_WORKER_LEASE_SECONDS`（worker job lease，默认 `900`）
 
 Supabase 连接说明：
 
@@ -501,18 +503,18 @@ test "$("$tidas_bin" version --format json --progress never | jq -r '.summary.bi
 cargo run -p solver-worker --bin package_worker --release
 ```
 
-启动 review-submit gate runner：
+启动 Review Admin quality diagnostic runner：
 
 ```bash
 set -a && source .env && set +a
-cargo run -p solver-worker --bin review_submit_gate_runner --release --
+cargo run -p solver-worker --bin review_quality_diagnostic_runner --release --
 ```
 
 说明：
 
 - `solver-worker` 消费 `worker_queue=solver` 的 `private.worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；旧 PGMQ backend 会在启动时失败。
 - `package_worker` 消费 `worker_queue=package` 的 `private.worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；旧 package PGMQ backend 会在启动时失败。
-- `review_submit_gate_runner` 消费数据库表 `dataset_review_submit_gate_runs` 中的 gate run，执行 request-root snapshot + calculator gate，并通过数据库 RPC 写回结果。
+- `review_quality_diagnostic_runner` 消费 `worker_queue=review_quality` 的 `review.quality_diagnostic` job，把全部待审核 Process 作为同一次 request-root snapshot 的 roots，并写回 informational `clear` / `findings` / `not_evaluable` 报告。数据发现不会产生 `blocked` worker 状态，也不会修改 Review 状态。
 
 ### 6.2 计算正确性基线流程（Expected 对比）
 

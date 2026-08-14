@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
-lastReviewedNote: "Updated for Worker Issue #251: shared-scan reuse distinguishes certificate-bearing passed evidence from administrative-only blocked evidence."
+lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
+lastReviewedNote: "Review-quality snapshots remain non-certificate diagnostics; actor-owned draft scope and shared-scan reuse preserve the distinction between certificate-bearing passed evidence and administrative-only blocked evidence."
 related:
   - AGENTS.md
   - .docpact/config.yaml

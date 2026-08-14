@@ -20,20 +20,20 @@ checkPaths:
   - crates/**
   - supabase/migrations/**
   - docs/matrix-readiness-report-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-13
 lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Updated for Worker PR #225 conflict resolution: private runtime boundaries preserve indexed source closure and frozen canonical impact-axis publication."
+lastReviewedNote: "The shared review-quality contract is a manual informational Review Admin job rather than a submit-time Gate; private runtime and canonical publication boundaries remain intact."
 related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/provider-linking.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
-  - docs/review-submit-fast-gate-contract.md
+  - docs/review-quality-diagnostic-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/repo-validation.md
@@ -386,52 +386,30 @@ fresh `snapshot_builder` run 也会在 `report_dir` 下尝试写出 `matrix-read
 
 Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics`、`balance_evidence` 和 `unresolved_balances`；不应在外部复制 worker runtime 的 balance、routing、singular-risk 或 UMFPACK readiness 规则。
 
-### 5.2 Review-submit fast gate report
+### 5.2 Review Admin quality diagnostic report
 
-dataset revision 提交审核前使用 worker 侧 `review_submit_gate` 判断当前 revision 是否可进入审核流程。该 gate 输出二元结果：`passed` 或 `blocked`，不产生 `manual_review_required` 状态。
+提交审核不再运行 worker 数值 Gate。Review Admin 可以人工发起 `review.quality_diagnostic`，由 worker 对全部待审核 Process 的联合矩阵同时执行完整性与数值稳定性诊断。
 
-文件输入/输出入口：
-
-```bash
-cargo run -p solver-worker --bin review_submit_gate -- \
-  --input review-submit-gate-input.json \
-  --out review-submit-gate-report.json
-```
-
-数据库运行时入口：
+运行入口：
 
 ```bash
-cargo run -p solver-worker --bin review_submit_gate_runner -- --once
+cargo run -p solver-worker --bin review_quality_diagnostic_runner -- --once
 ```
 
-worker_jobs 运行时入口：
+runner 领取 `worker_queue=review_quality`、`payload_schema_version=review.quality_diagnostic.request.v1` 的 job。payload 固定为 `scope.kind=pending_review` 和待检查的 Review state 列表；不携带 Batch、dataset revision 或 checksum。
 
-```bash
-cargo run -p solver-worker --bin review_submit_gate_runner -- \
-  --worker-jobs \
-  --once
-```
+worker 使用所有待审核 Process 作为同一个 request-root snapshot 的 roots，并写回 `review.quality_diagnostic.report.v1`：
 
-Edge/API 不直接运行数值 gate。legacy 路径中，Edge 通过数据库 RPC 创建、读取或 rerun `dataset_review_submit_gate_runs`；worker runner 领取 queued gate run，默认构造 no-LCIA review-submit baseline + draft overlay snapshot，执行 `review_submit_gate`，再通过 `cmd_dataset_review_submit_gate_record_result` 写回 `passed`、`blocked` 或 `error`。
+- job `status=completed`，report `outcome=clear`：已执行的检查未发现问题，或没有待审核 Process。
+- job `status=completed`，report `outcome=findings`：矩阵可构建，但完整性或数值稳定性存在发现。
+- job `status=completed`，report `outcome=not_evaluable`：数据/依赖不足，矩阵无法完整构建，数值稳定性未执行。
+- job `status=failed`：DB、S3、进程、timeout 或 protocol 等 worker 运行故障。
 
-新 `worker_jobs` 路径中，Edge 只 enqueue `job_kind=review_submit.gate`，worker 使用 `worker_claim_jobs` 领取、按阶段 heartbeat、执行同一 gate，然后用 `worker_record_job_result` 写回：
+前三类结果的 `blocker_codes=[]`、`resolution_scope=null`；report 固定包含 `informationalOnly=true`、`affectsReviewState=false`。任何结果都不得阻止 Review Admin 分配、批准或拒绝，也不得由 Edge 或 Next 翻译成 Review 操作禁用条件。
 
-- `completed`：gate passed，result 中包含 `calculatorReport` 与权威 `datasetRevision.revisionChecksum`。
-- `blocked`：gate blocked，`blocker_codes` 来自 report blockers，`resolution_scope=user`，`retryable=true`。
-- `failed`：runner、S3、DB 或暂不支持的数据集类型错误，写入 operator diagnostics。
+report 包含 scope/summary、固定 `completeness` 与 `numerical_stability` sections，以及扁平 `findings[]`。finding 的 `level=error` 只表示质量严重程度，`workflowBlocking` 始终为 `false`。
 
-`worker_jobs` 模式不调用 final submit，也不修改 review-submit domain 状态；gate passed 后的 durable coordinator 属于 Edge / database 层。
-
-输入 `review_submit_gate_input.v1` 复用 snapshot coverage、`ModelSparseData` sparse payload、compiled provider graph，并可附加 dataset revision checksum、target process indices 和 process/exchange scan records。输出 `review_submit_gate_report.v1` 包含：
-
-- `status`: `passed` 或 `blocked`。
-- `policy`: 默认 profile 为 `review_submit_fast.v1`。
-- `metrics`: revision、process_scan、provider_scan、sparse_scan 和 targeted probe 统计。
-- `blockers`: 提交审核硬失败 code、message 和 detail payload。
-
-该 gate 先执行 revision/process/provider/flow/sparse 结构检查；只有没有结构 blocker 时才执行 sparse factorization readiness 与 targeted RHS solve。默认 targeted probe 只验证 `x/g` 稳定性，不计算 LCIA `h`。它不 materialize inverse，也不要求 full `solve_all_unit`。
-
-稳定 blocker code、policy 默认值、快速验证顺序和 caller consumption 约束由 `docs/review-submit-fast-gate-contract.md` 维护。Edge 或 Next 在提交审核链路中应消费 DB gate result 里的 status、blockingReasons 和 calculatorReport，不应直接把 `matrix_readiness_report.v2` 的 blocker 当成提交审核结论。
+稳定 payload、联合矩阵范围、outcome、finding 与兼容边界由 `docs/review-quality-diagnostic-contract.md` 维护。`review_submit_gate` / `review_submit_gate_runner` 仅保留离线 fixture 与历史运行兼容；当前产品路径不得 enqueue 或等待 `review_submit.gate`。
 
 ### 5.3 Worker resource 与 object file I/O 内部契约
 

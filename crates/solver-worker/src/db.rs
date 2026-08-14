@@ -133,6 +133,8 @@ FROM updated
 ";
 const REVIEW_SUBMIT_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_submit_overlay";
 const REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS: i64 = 14 * 24 * 60 * 60;
+const REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_quality_diagnostic";
+const REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 fn pgmq_queue_name_literal(queue_name: &str) -> anyhow::Result<String> {
     if queue_name
@@ -2405,6 +2407,70 @@ pub(crate) async fn run_review_submit_gate_snapshot_builder(
                 );
             }
             Err(err)
+        }
+    }
+}
+
+pub(crate) async fn run_review_quality_diagnostic_snapshot_builder(
+    state: &AppState,
+    snapshot_id: Uuid,
+    request_roots: &[crate::graph_types::RequestRootProcess],
+) -> anyhow::Result<SnapshotBuilderExecution> {
+    let process_states = std::iter::once("20".to_owned())
+        .chain(
+            (crate::DEFAULT_SNAPSHOT_PROCESS_STATE_START
+                ..=crate::DEFAULT_SNAPSHOT_PROCESS_STATE_END)
+                .map(|state| state.to_string()),
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+    let lock_guard = acquire_build_snapshot_lock(
+        &state.pool,
+        state.build_snapshot_max_concurrency,
+        state.build_snapshot_lock_poll_interval,
+    )
+    .await?;
+    let executed_result = run_snapshot_builder_job(
+        snapshot_id,
+        Some(process_states.as_str()),
+        None,
+        Some(request_roots),
+        Some("split_by_process_volume"),
+        Some("lenient"),
+        Some("lenient"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_ARTIFACT_PURPOSE),
+        Some(REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_TTL_SECONDS),
+        Some(REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_TTL_SECONDS),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    let release_result = lock_guard.release().await;
+
+    match executed_result {
+        Ok(executed) => {
+            release_result.map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to release build_snapshot lock after review quality diagnostic: {error}"
+                )
+            })?;
+            Ok(executed)
+        }
+        Err(error) => {
+            if let Err(release_error) = release_result {
+                warn!(
+                    error = %release_error,
+                    "failed to release build_snapshot lock after review quality diagnostic failure"
+                );
+            }
+            Err(error)
         }
     }
 }

@@ -33,6 +33,7 @@ pub mod pgbouncer_sqlx;
 pub mod queue;
 pub mod readiness;
 pub mod resource;
+pub mod review_quality_diagnostic_runner;
 pub mod review_submit_gate;
 pub mod review_submit_gate_runner;
 pub mod scope_closure;
