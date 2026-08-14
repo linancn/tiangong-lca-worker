@@ -29,7 +29,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-14
-lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
+lastReviewedCommit: 4949413104b478017b7194dd476d156d959d677c
 lastReviewedNote: "Reviewed after versioned calculation snapshots made legacy team/review guard fields optional; Review Admin diagnostics use their separate pending-review scope and this contract remains unchanged."
 related:
   - AGENTS.md

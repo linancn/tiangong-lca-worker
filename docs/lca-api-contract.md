@@ -24,8 +24,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
+lastReviewedAt: 2026-08-14
+lastReviewedCommit: 4949413104b478017b7194dd476d156d959d677c
 lastReviewedNote: "The shared review-quality contract is a manual informational Review Admin job rather than a submit-time Gate; private runtime and canonical publication boundaries remain intact."
 related:
   - AGENTS.md
