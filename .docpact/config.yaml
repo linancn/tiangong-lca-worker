@@ -1,7 +1,7 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-13"
-lastReviewedCommit: "ad0b5871390f907a9421e484c99c03601de38d1c"
+lastReviewedAt: "2026-08-14"
+lastReviewedCommit: "4949413104b478017b7194dd476d156d959d677c"
 lastReviewedNote: "Worker routes cover the manual non-blocking Review Admin diagnostic, actor-owned collaborative draft scope, private runtime, scope closure, and calculation-product contracts."
 
 # Keep deterministic governance facts here.
