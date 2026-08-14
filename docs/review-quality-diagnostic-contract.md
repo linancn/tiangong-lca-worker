@@ -28,9 +28,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Replaced the submit-time numerical Gate with a manual, informational Review Admin diagnostic over the joint pending-review matrix."
+lastReviewedAt: 2026-08-14
+lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
+lastReviewedNote: "Reviewed after versioned calculation snapshots made legacy team/review guard fields optional; Review Admin diagnostics use their separate pending-review scope and this contract remains unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

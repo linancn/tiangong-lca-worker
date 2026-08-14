@@ -25,7 +25,7 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-13
-lastReviewedCommit: 8d975edc16c1088d7d3d9d57f8ef8d4809c498c2
+lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
 lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and effective snapshot configuration preserve matrix-readiness report v2 semantics and defaults."
 related:
   - AGENTS.md

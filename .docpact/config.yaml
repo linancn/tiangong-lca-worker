@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-13"
-lastReviewedCommit: "9165fa7941cbcd8d86343a06d9f57474410c7b5b"
-lastReviewedNote: "Worker routes cover the manual non-blocking Review Admin quality diagnostic while preserving private runtime, scope-closure, and calculation-product contracts."
+lastReviewedCommit: "ad0b5871390f907a9421e484c99c03601de38d1c"
+lastReviewedNote: "Worker routes cover the manual non-blocking Review Admin diagnostic, actor-owned collaborative draft scope, private runtime, scope closure, and calculation-product contracts."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

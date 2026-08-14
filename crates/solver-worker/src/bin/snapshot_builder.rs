@@ -6750,12 +6750,14 @@ async fn fetch_flow_source_summary(
                OR (
                  user_id = $1
                  AND state_code = 0
-                 AND team_id IS NULL
-                 AND review_id IS NULL
+                 AND (NOT $2 OR team_id IS NULL)
+                 AND (NOT $3 OR review_id IS NULL)
                )
             "#,
         )
         .bind(scope.actor_user_id)
+        .bind(scope.include_user_unassigned_only)
+        .bind(scope.include_user_review_free_only)
         .fetch_one(pool)
         .await?
     } else {
@@ -6997,8 +6999,8 @@ async fn fetch_processes(
                 OR (
                     user_id = $1
                     AND state_code = 0
-                    AND team_id IS NULL
-                    AND review_id IS NULL
+                    AND (NOT $2 OR team_id IS NULL)
+                    AND (NOT $3 OR review_id IS NULL)
                 )
               )
               AND json ? 'processDataSet'
@@ -7006,6 +7008,8 @@ async fn fetch_processes(
             "#,
         )
         .bind(scope.actor_user_id)
+        .bind(scope.include_user_unassigned_only)
+        .bind(scope.include_user_review_free_only)
         .fetch_all(pool)
         .await?
     } else if all_states {
@@ -7079,7 +7083,12 @@ async fn fetch_processes(
             json: row.try_get::<Value, _>("json")?,
         };
         if let Some(scope) = versioned_scope {
-            validate_process_row_visibility(&process, scope.actor_user_id)?;
+            validate_process_row_visibility(
+                &process,
+                scope.actor_user_id,
+                scope.include_user_unassigned_only,
+                scope.include_user_review_free_only,
+            )?;
         }
         if let Some(snapshot) = scope_closure_snapshot {
             let expected = snapshot
@@ -7130,12 +7139,17 @@ async fn fetch_processes(
     Ok(out)
 }
 
-fn validate_process_row_visibility(row: &ProcessRow, actor_user_id: Uuid) -> anyhow::Result<()> {
+fn validate_process_row_visibility(
+    row: &ProcessRow,
+    actor_user_id: Uuid,
+    include_user_unassigned_only: bool,
+    include_user_review_free_only: bool,
+) -> anyhow::Result<()> {
     if row.state_code == 100
         || (row.state_code == 0
             && row.user_id == Some(actor_user_id)
-            && row.team_id.is_none()
-            && row.review_id.is_none())
+            && (!include_user_unassigned_only || row.team_id.is_none())
+            && (!include_user_review_free_only || row.review_id.is_none()))
     {
         return Ok(());
     }
@@ -7188,8 +7202,8 @@ async fn fetch_flow_meta(
                 OR (
                   f.user_id = $3
                   AND f.state_code = 0
-                  AND f.team_id IS NULL
-                  AND f.review_id IS NULL
+                  AND (NOT $4 OR f.team_id IS NULL)
+                  AND (NOT $5 OR f.review_id IS NULL)
                 )
               )
             ORDER BY f.id, btrim(f.version::text),
@@ -7199,6 +7213,8 @@ async fn fetch_flow_meta(
         .bind(&exact_ids)
         .bind(&exact_versions)
         .bind(scope.actor_user_id)
+        .bind(scope.include_user_unassigned_only)
+        .bind(scope.include_user_review_free_only)
         .fetch_all(pool)
         .await?
     } else {
@@ -7235,8 +7251,8 @@ async fn fetch_flow_meta(
                 OR (
                   user_id = $2
                   AND state_code = 0
-                  AND team_id IS NULL
-                  AND review_id IS NULL
+                  AND (NOT $3 OR team_id IS NULL)
+                  AND (NOT $4 OR review_id IS NULL)
                 )
               )
             ORDER BY id, btrim(version::text) DESC,
@@ -7245,6 +7261,8 @@ async fn fetch_flow_meta(
         )
         .bind(&omitted_ids)
         .bind(scope.actor_user_id)
+        .bind(scope.include_user_unassigned_only)
+        .bind(scope.include_user_review_free_only)
         .fetch_all(pool)
         .await?
     } else {
@@ -7298,7 +7316,12 @@ async fn fetch_flow_meta(
             json: row.try_get("json")?,
         };
         if let Some(scope) = versioned_scope {
-            validate_flow_row_visibility(&flow, scope.actor_user_id)?;
+            validate_flow_row_visibility(
+                &flow,
+                scope.actor_user_id,
+                scope.include_user_unassigned_only,
+                scope.include_user_review_free_only,
+            )?;
         }
         if resolves_omitted {
             out.omitted_version_by_id
@@ -8557,12 +8580,17 @@ fn parse_text_value(value: &Value) -> Option<String> {
     }
 }
 
-fn validate_flow_row_visibility(row: &FlowRow, actor_user_id: Uuid) -> anyhow::Result<()> {
+fn validate_flow_row_visibility(
+    row: &FlowRow,
+    actor_user_id: Uuid,
+    include_user_unassigned_only: bool,
+    include_user_review_free_only: bool,
+) -> anyhow::Result<()> {
     if row.state_code == 100
         || (row.state_code == 0
             && row.user_id == Some(actor_user_id)
-            && row.team_id.is_none()
-            && row.review_id.is_none())
+            && (!include_user_unassigned_only || row.team_id.is_none())
+            && (!include_user_review_free_only || row.review_id.is_none()))
     {
         return Ok(());
     }
@@ -8900,8 +8928,8 @@ async fn persist_snapshot_metadata(
             "process_states": [100],
             "include_user_id": versioned_scope.actor_user_id,
             "include_user_state_codes": [0],
-            "include_user_unassigned_only": true,
-            "include_user_review_free_only": true,
+            "include_user_unassigned_only": versioned_scope.include_user_unassigned_only,
+            "include_user_review_free_only": versioned_scope.include_user_review_free_only,
             "data_scope": PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
             "scope_manifest": versioned_scope.scope_manifest,
             "scope_manifest_sha256": versioned_scope.scope_manifest_sha256,
@@ -10934,8 +10962,6 @@ mod tests {
             "false",
             "--include-user-state-codes",
             "0",
-            "--include-user-unassigned-only",
-            "--include-user-review-free-only",
             "--data-scope",
             "public_plus_owner_draft",
             "--scope-manifest-json",
@@ -10952,6 +10978,8 @@ mod tests {
             .expect("validate v2 cli")
             .expect("versioned scope");
         assert_eq!(validated.actor_user_id, actor);
+        assert!(!validated.include_user_unassigned_only);
+        assert!(!validated.include_user_review_free_only);
         assert_eq!(validated.scope_manifest_sha256, manifest_hash);
     }
 
@@ -13876,7 +13904,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_visibility_rechecks_reject_nonpublic_and_collaboration_drafts() {
+    fn exact_visibility_rechecks_use_actor_and_state_for_current_scope() {
         let actor = Uuid::new_v4();
         let foreign = Uuid::new_v4();
         let base = ProcessRow {
@@ -13890,25 +13918,27 @@ mod tests {
             modified_at: None,
             json: json!({}),
         };
-        validate_process_row_visibility(&base, actor).expect("owner draft");
+        validate_process_row_visibility(&base, actor, false, false).expect("owner draft");
 
         let mut row = base.clone();
         row.state_code = 100;
         row.user_id = Some(foreign);
-        validate_process_row_visibility(&row, actor).expect("public state 100");
+        validate_process_row_visibility(&row, actor, false, false).expect("public state 100");
         row.state_code = 101;
-        assert!(validate_process_row_visibility(&row, actor).is_err());
+        assert!(validate_process_row_visibility(&row, actor, false, false).is_err());
         row.state_code = 0;
-        assert!(validate_process_row_visibility(&row, actor).is_err());
+        assert!(validate_process_row_visibility(&row, actor, false, false).is_err());
         row.user_id = Some(actor);
         row.state_code = 1;
-        assert!(validate_process_row_visibility(&row, actor).is_err());
+        assert!(validate_process_row_visibility(&row, actor, false, false).is_err());
         row.state_code = 0;
         row.team_id = Some(Uuid::new_v4());
-        assert!(validate_process_row_visibility(&row, actor).is_err());
-        row.team_id = None;
+        validate_process_row_visibility(&row, actor, false, false)
+            .expect("team metadata does not revoke owner visibility");
         row.review_id = Some(Uuid::new_v4());
-        assert!(validate_process_row_visibility(&row, actor).is_err());
+        validate_process_row_visibility(&row, actor, false, false)
+            .expect("review metadata does not revoke owner visibility");
+        assert!(validate_process_row_visibility(&row, actor, true, true).is_err());
 
         let flow = FlowRow {
             id: row.id,
@@ -13919,7 +13949,9 @@ mod tests {
             review_id: row.review_id,
             json: json!({}),
         };
-        assert!(validate_flow_row_visibility(&flow, actor).is_err());
+        validate_flow_row_visibility(&flow, actor, false, false)
+            .expect("current scope includes actor-owned collaborative Flow drafts");
+        assert!(validate_flow_row_visibility(&flow, actor, true, true).is_err());
     }
 
     #[test]

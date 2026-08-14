@@ -9,8 +9,9 @@ use uuid::Uuid;
 
 use crate::{
     calculation_evidence::{
-        PublicOwnerDraftBuildRequest, canonical_json_sha256, expected_scope_manifest,
-        validate_calculation_evidence, validate_public_owner_draft_build_request,
+        PublicOwnerDraftBuildRequest, canonical_json_sha256, expected_legacy_scope_manifest,
+        expected_scope_manifest, validate_calculation_evidence,
+        validate_public_owner_draft_build_request,
     },
     db::{
         AppState, archive_queue_message, fetch_snapshot_index_document, handle_job_payload,
@@ -1502,7 +1503,11 @@ fn validate_versioned_payload_contract(
             let actor = requested_by
                 .ok_or_else(|| anyhow::anyhow!("v2 solve requires authenticated requested_by"))?;
             let expected_scope_hash = canonical_json_sha256(&expected_scope_manifest(actor))?;
-            if binding.scope_manifest_sha256 != expected_scope_hash {
+            let expected_legacy_scope_hash =
+                canonical_json_sha256(&expected_legacy_scope_manifest(actor))?;
+            if binding.scope_manifest_sha256 != expected_scope_hash
+                && binding.scope_manifest_sha256 != expected_legacy_scope_hash
+            {
                 return Err(anyhow::anyhow!(
                     "v2 solve requested_by differs from snapshot scope actor"
                 ));
@@ -1855,8 +1860,8 @@ mod tests {
             RELEASE_METHOD_IDENTITY_MANIFEST_SHA256, RELEASE_METHOD_MANIFEST_SHA256,
             RELEASE_SOURCE_SNAPSHOT_SHA256, STATIC_CACHE_BUNDLE_MANIFEST_PATH,
             STATIC_CACHE_BUNDLE_SCHEMA_VERSION, canonical_json_sha256,
-            expected_factor_coverage_contract, expected_scope_manifest,
-            method_factor_source_contract_fixture,
+            expected_factor_coverage_contract, expected_legacy_scope_manifest,
+            expected_scope_manifest, method_factor_source_contract_fixture,
         },
         queue::{
             AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
@@ -2131,8 +2136,6 @@ mod tests {
                 "process_states": "100",
                 "include_user_id": actor,
                 "include_user_state_codes": "0",
-                "include_user_unassigned_only": true,
-                "include_user_review_free_only": true,
                 "data_scope": "public_plus_owner_draft",
                 "scope_manifest": manifest,
                 "scope_manifest_sha256": manifest_hash,
@@ -2169,8 +2172,6 @@ mod tests {
                 "process_states": "100",
                 "include_user_id": actor,
                 "include_user_state_codes": "0",
-                "include_user_unassigned_only": true,
-                "include_user_review_free_only": true,
                 "data_scope": "public_plus_owner_draft",
                 "scope_manifest": manifest,
                 "scope_manifest_sha256": manifest_hash,
@@ -2205,8 +2206,6 @@ mod tests {
                 "process_states": "100,101",
                 "include_user_id": actor,
                 "include_user_state_codes": "0",
-                "include_user_unassigned_only": true,
-                "include_user_review_free_only": true,
                 "data_scope": "public_plus_owner_draft",
                 "scope_manifest": manifest,
                 "scope_manifest_sha256": manifest_hash,
@@ -2236,6 +2235,23 @@ mod tests {
         );
         job.requested_by = Some(actor);
         assert!(solver_worker_job_payload(&job).is_ok());
+
+        let legacy_evidence = complete_calculation_evidence(
+            canonical_json_sha256(&expected_legacy_scope_manifest(actor))
+                .expect("legacy scope hash"),
+        );
+        let mut legacy_job = worker_job(
+            "lca.solve_one",
+            "lca.solve_one.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "rhs": [1.0],
+                "calculation_evidence_binding": legacy_evidence,
+            }),
+        );
+        legacy_job.requested_by = Some(actor);
+        assert!(solver_worker_job_payload(&legacy_job).is_ok());
 
         let mut actor_drift = job.clone();
         actor_drift.requested_by = Some(Uuid::new_v4());
