@@ -133,11 +133,6 @@ pub fn classify_source_document_with_lcia_flow_axis(
             ) {
                 return None;
             }
-            if purpose != ArtifactPurpose::CertificateClosure
-                && is_external_digital_file_path(issue.json_path.as_str())
-            {
-                return None;
-            }
             let role = classify_malformed_reference_role(
                 issue.source_category.as_str(),
                 issue.json_path.as_str(),
@@ -214,31 +209,6 @@ fn lcia_factor_reference_is_active(
     Uuid::parse_str(target_uuid)
         .ok()
         .is_some_and(|flow_id| active_lcia_flow_ids.contains(&flow_id))
-}
-
-fn is_external_digital_file_path(json_path: &str) -> bool {
-    let path = json_path.to_ascii_lowercase();
-    let terminal = path.rsplit('.').next().unwrap_or(path.as_str());
-    terminal
-        .strip_prefix("referencetodigitalfile")
-        .is_some_and(is_json_array_index_suffix)
-}
-
-fn is_json_array_index_suffix(mut suffix: &str) -> bool {
-    while !suffix.is_empty() {
-        let Some(rest) = suffix.strip_prefix('[') else {
-            return false;
-        };
-        let Some(end) = rest.find(']') else {
-            return false;
-        };
-        let index = &rest[..end];
-        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-            return false;
-        }
-        suffix = &rest[end + 1..];
-    }
-    true
 }
 
 fn malformed_evidence_target_type(
@@ -692,6 +662,7 @@ mod tests {
         for purpose in [
             ArtifactPurpose::ReviewSubmit,
             ArtifactPurpose::CalculationBundle,
+            ArtifactPurpose::CertificateClosure,
         ] {
             let classified = classify_source_document(
                 &source(CompiledReleaseSourceDatasetType::Source, document.clone()),
@@ -701,37 +672,5 @@ mod tests {
             assert!(classified.references.is_empty());
             assert!(classified.extraction_issues.is_empty());
         }
-
-        let certificate = classify_source_document(
-            &source(CompiledReleaseSourceDatasetType::Source, document),
-            ArtifactPurpose::CertificateClosure,
-        )
-        .unwrap();
-        assert!(certificate.references.is_empty());
-        assert!(!certificate.extraction_issues.is_empty());
-        assert!(certificate.extraction_issues.iter().all(|issue| {
-            issue["jsonPath"]
-                .as_str()
-                .is_some_and(|path| path.contains("referenceToDigitalFile["))
-        }));
-    }
-
-    #[test]
-    fn external_digital_file_path_matches_only_terminal_numeric_indexes() {
-        assert!(is_external_digital_file_path(
-            "$.sourceDataSet.referenceToDigitalFile"
-        ));
-        assert!(is_external_digital_file_path(
-            "$.sourceDataSet.referenceToDigitalFile[12]"
-        ));
-        assert!(!is_external_digital_file_path(
-            "$.sourceDataSet.referenceToDigitalFileMetadata"
-        ));
-        assert!(!is_external_digital_file_path(
-            "$.sourceDataSet.referenceToDigitalFile[latest]"
-        ));
-        assert!(!is_external_digital_file_path(
-            "$.sourceDataSet.referenceToDigitalFile[0].uri"
-        ));
     }
 }

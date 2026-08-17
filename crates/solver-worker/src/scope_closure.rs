@@ -55,6 +55,8 @@ const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1: &str =
     "scope-closure-validator-scanner.v1+cutoff-readiness-r1";
 const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2: &str =
     "scope-closure-validator-scanner.v1+cutoff-readiness-r2";
+const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3: &str =
+    "scope-closure-validator-scanner.v1+cutoff-readiness-r3";
 pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
 pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
@@ -93,6 +95,7 @@ fn validate_validator_scanner_fingerprint(fingerprint: &str) -> anyhow::Result<(
     if fingerprint == VALIDATOR_SCANNER_FINGERPRINT_V1
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2
+        || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3
     {
         return Ok(());
     }
@@ -2406,6 +2409,13 @@ fn walk_references(
     include_process_lcia_results: bool,
     result: &mut ReferenceExtractionResult,
 ) {
+    if source_category == DatasetCategory::Sources
+        && path.eq_ignore_ascii_case(
+            "$.sourceDataSet.sourceInformation.dataSetInformation.referenceToDigitalFile",
+        )
+    {
+        return;
+    }
     if !include_process_lcia_results
         && source_category == DatasetCategory::Processes
         && path.eq_ignore_ascii_case("$.processDataSet.LCIAResults")
@@ -10003,6 +10013,7 @@ mod tests {
             VALIDATOR_SCANNER_FINGERPRINT_V1,
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1,
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2,
+            VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3,
         ] {
             assert!(validate_validator_scanner_fingerprint(fingerprint).is_ok());
         }
@@ -10013,6 +10024,36 @@ mod tests {
             error.to_string(),
             format!("unsupported validator/scanner fingerprint: {unsupported}")
         );
+    }
+
+    #[test]
+    fn source_digital_file_locators_are_not_dataset_references() {
+        let contact_id = id("11111111-1111-4111-8111-111111111111");
+        let result = extract_references(
+            "source:test@01.00.000",
+            DatasetCategory::Sources,
+            &json!({
+                "sourceDataSet": {
+                    "sourceInformation": {
+                        "dataSetInformation": {
+                            "referenceToDigitalFile": [
+                                {"@uri": "../external_docs/report.jpg"},
+                                {"@uri": "https://example.test/report.pdf"}
+                            ],
+                            "referenceToContact": {
+                                "@type": "contact data set",
+                                "@refObjectId": contact_id,
+                                "@version": "01.00.000"
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+
+        assert!(result.issues.is_empty());
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].target_uuid, contact_id.to_string());
     }
 
     fn identity(category: DatasetCategory, value: &str) -> ExactDatasetIdentity {
