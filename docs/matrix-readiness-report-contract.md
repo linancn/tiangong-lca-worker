@@ -90,7 +90,7 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 | `reference_normalization_not_closed` | quantitative reference 存在 missing 或 invalid 计数 | 修复 process reference 后重跑 | 否 |
 | `allocation_fraction_invalid` | 除两个有界 legacy fallback 外，已声明 allocation 的 target、fraction 或 targetless shape 无法按 TIDAS target-aware 规则安全解析，因而产生 invalid 计数 | 修复 allocation target / fraction 声明后重跑 | 否 |
 | `singular_risk_high` | singular risk 为 `high`，且 `allow_high_singular_risk = false` | 修复矩阵结构或人工确认风险 | 是，设置 `allow_high_singular_risk` |
-| `singular_risk_medium` | singular risk 为 `medium`，且 `allow_medium_singular_risk = false` | 复核矩阵结构或人工确认风险 | 是，设置 `allow_medium_singular_risk` |
+| `singular_risk_medium` | generic readiness 中 singular risk 为 `medium`，且 `allow_medium_singular_risk = false` | 复核矩阵结构或人工确认风险 | 是，设置 `allow_medium_singular_risk`；证书级 Scope Closure 固定转为 warning |
 | `lcia_factors_missing` | `require_lcia_factors = true` 且 `coverage.matrix_scale.c_nnz = 0` | 补齐 LCIA factors 后重跑 | 是，设置 `require_lcia_factors = false` |
 | `factorization_not_ready` | `SolverService.prepare` 失败，包含结构校验或 UMFPACK factorization 失败 | 修复 compute stability 后重跑 | 否 |
 | `sample_unit_solve_failed` | sample unit demand solve 对某个 process index 失败 | 修复 compute stability 后重跑 | 否 |
@@ -99,7 +99,7 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 
 `closed` 是默认 policy。`open` / `cutoff` 会让 closure percentage、unmatched 和 multi-unresolved 不再成为 blocker，但不会删除证据；它们产生 warning，报告通常为 `passed` + `manual_review_warnings`。Equal-fallback、reference/allocation、singular、LCIA 和 compute blockers 不因 boundary policy 放宽。
 
-上述默认值属于 generic `matrix_readiness` / snapshot diagnostic contract。Certificate-grade Scope Closure 的调用绑定固定为 `cutoff`：冻结输入若为 `closed` 或 `open`，Worker 在进入 scan/build 前以 `scope_closure_boundary_policy_must_be_cutoff` 拒绝；在 `cutoff` 下，closure percentage、unmatched provider 与 multi-unresolved 只保留为 warning/evidence。通用 CLI 仍可显式运行 `closed/open/cutoff`，因此本报告的三策略 schema 和历史可读性不变。
+上述默认值属于 generic `matrix_readiness` / snapshot diagnostic contract。Certificate-grade Scope Closure 的调用绑定固定为 `cutoff`，并通过已有 `scope_closure_binding` 显式启用 `allow_medium_singular_risk`：`medium` 仍以 `singular_risk_medium` warning 和完整计数进入 readiness/closure evidence，但不再单独阻断数值 snapshot 或证书；`high`、实际 factorization/sample solve 失败和非有限计算仍 fail closed。冻结输入若为 `closed` 或 `open`，Worker 在进入 scan/build 前以 `scope_closure_boundary_policy_must_be_cutoff` 拒绝；在 `cutoff` 下，closure percentage、unmatched provider 与 multi-unresolved 只保留为 warning/evidence。通用 CLI 仍可显式运行 `closed/open/cutoff`，并默认继续阻断 medium，因此本报告的三策略 schema 和历史可读性不变。
 
 ## Findings
 
@@ -109,6 +109,7 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 | --- | --- | --- |
 | `provider_closure_no_input_edges` | `warning` | snapshot 没有 input edges 可检查 provider closure |
 | `technosphere_boundary_unresolved_permitted` | `warning` | `open` / `cutoff` 显式允许一个或多个 unresolved balance；details 保留 policy 和 evidence count |
+| `singular_risk_medium` | `warning` | policy 显式允许 medium singular risk；证书级 Scope Closure 固定采用该策略并保留对角线风险计数 |
 | `singular_risk_observed` | `info` | singular risk level 不是 `low` / `medium` / `high` 中的已知值 |
 | `biosphere_entries_missing` | `warning` | `coverage.matrix_scale.b_nnz = 0`，结果可能缺少环境流信息 |
 | `matrix_validation_warning` | `warning` | factorization matrix validation 返回 near-singular warning |

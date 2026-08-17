@@ -28,8 +28,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-14
-lastReviewedCommit: 4949413104b478017b7194dd476d156d959d677c
+lastReviewedAt: 2026-08-17
+lastReviewedCommit: 4c9f23335c10b01bd48466650ac9f0323b5ff9c4
 lastReviewedNote: "Reviewed after versioned calculation snapshots made legacy team/review guard fields optional; Review Admin diagnostics use their separate pending-review scope and this contract remains unchanged."
 related:
   - AGENTS.md

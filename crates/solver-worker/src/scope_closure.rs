@@ -34,7 +34,7 @@ use crate::{
     file_cache::{advise_sequential_access, release_file_cache},
     graph_types::RequestRootProcess,
     pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row},
-    readiness::{ReadinessFinding, ReadinessStatus},
+    readiness::{FindingSeverity, ReadinessFinding, ReadinessStatus},
     resource::{CancellationToken, ResourceCounters, ResourceMeasurement},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
     source_reference_policy::{ArtifactPurpose, SourceReferenceRole, classify_reference},
@@ -57,6 +57,8 @@ const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2: &str =
     "scope-closure-validator-scanner.v1+cutoff-readiness-r2";
 const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3: &str =
     "scope-closure-validator-scanner.v1+cutoff-readiness-r3";
+const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R4: &str =
+    "scope-closure-validator-scanner.v1+cutoff-readiness-r4";
 pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
 pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
@@ -96,6 +98,7 @@ fn validate_validator_scanner_fingerprint(fingerprint: &str) -> anyhow::Result<(
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3
+        || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R4
     {
         return Ok(());
     }
@@ -3993,6 +3996,8 @@ struct ScopeClosureSnapshotReadiness {
     schema_version: String,
     status: ReadinessStatus,
     next_action: String,
+    #[serde(default)]
+    findings: Vec<ReadinessFinding>,
     blockers: Vec<ReadinessFinding>,
 }
 
@@ -4447,13 +4452,57 @@ fn add_process_axis_drift_issue(
     Ok(())
 }
 
-fn merge_matrix_readiness_blockers(
+fn merge_medium_singular_risk_warnings(
     scan: &mut ScopeClosureScan,
     readiness: &ScopeClosureSnapshotReadiness,
 ) -> anyhow::Result<()> {
-    if readiness.status == ReadinessStatus::Passed && readiness.blockers.is_empty() {
-        return Ok(());
+    for finding in readiness.findings.iter().filter(|finding| {
+        finding.code == "singular_risk_medium" && finding.severity == FindingSeverity::Warning
+    }) {
+        let details = json!({
+            "readinessSchemaVersion": readiness.schema_version,
+            "nextAction": readiness.next_action,
+            "finding": finding,
+        });
+        let (affected_roots, affected_root_witness_paths) = bounded_all_root_evidence(&scan.roots);
+        scan.issues.push(ClosureIssue {
+            issue_key: format!(
+                "matrix_readiness:{}:{}",
+                finding.code,
+                canonical_json_sha256(&details)?
+            ),
+            severity: "warning".to_owned(),
+            blocking: false,
+            issue_code: format!("matrix_readiness_{}", finding.code),
+            source: None,
+            json_path: None,
+            reference_role: Some("numerical_snapshot_readiness".to_owned()),
+            requested_target_type: None,
+            requested_target_id: None,
+            requested_target_version: None,
+            message: finding.message.clone(),
+            suggested_action: Some(readiness.next_action.clone()),
+            occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: format!("matrix_readiness_{}", finding.code),
+                source: None,
+                json_path: None,
+                reference_role: Some("numerical_snapshot_readiness".to_owned()),
+                details,
+            }],
+            affected_root_count: u32::try_from(scan.roots.len()).unwrap_or(u32::MAX),
+            affected_roots,
+            affected_root_witness_paths,
+            witness_path: Vec::new(),
+        });
     }
+    Ok(())
+}
+
+fn merge_matrix_readiness_issues(
+    scan: &mut ScopeClosureScan,
+    readiness: &ScopeClosureSnapshotReadiness,
+) -> anyhow::Result<()> {
     for blocker in &readiness.blockers {
         let details = json!({
             "readinessSchemaVersion": readiness.schema_version,
@@ -4492,6 +4541,7 @@ fn merge_matrix_readiness_blockers(
             witness_path: Vec::new(),
         });
     }
+    merge_medium_singular_risk_warnings(scan, readiness)?;
     if readiness.status == ReadinessStatus::Failed && readiness.blockers.is_empty() {
         let (affected_roots, affected_root_witness_paths) = bounded_all_root_evidence(&scan.roots);
         scan.issues.push(ClosureIssue {
@@ -4835,7 +4885,7 @@ pub async fn execute_scope_closure_job(
                     frozen_process_axis.as_slice(),
                     &effective_scope,
                 )?;
-                merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
+                merge_matrix_readiness_issues(&mut scan, &discovery.readiness)?;
                 scan.issues
                     .sort_by(|left, right| left.issue_key.cmp(&right.issue_key));
             }
@@ -10014,6 +10064,7 @@ mod tests {
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1,
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2,
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R3,
+            VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R4,
         ] {
             assert!(validate_validator_scanner_fingerprint(fingerprint).is_ok());
         }
@@ -10024,6 +10075,42 @@ mod tests {
             error.to_string(),
             format!("unsupported validator/scanner fingerprint: {unsupported}")
         );
+    }
+
+    #[test]
+    fn medium_singular_risk_warning_does_not_block_numerical_snapshot() {
+        let mut scan = capacity_scan(
+            ClosureDocumentSpool::empty().expect("empty document spool"),
+            Vec::new(),
+            CompactReferenceGraph::default(),
+        );
+        let readiness = ScopeClosureSnapshotReadiness {
+            schema_version: "matrix_readiness_report.v2".to_owned(),
+            status: ReadinessStatus::Passed,
+            next_action: "manual_review_warnings".to_owned(),
+            findings: vec![ReadinessFinding {
+                code: "singular_risk_medium".to_owned(),
+                severity: FindingSeverity::Warning,
+                message: "matrix singular risk is medium and requires manual review".to_owned(),
+                details: json!({
+                    "prefilter_diag_abs_ge_cutoff": 21,
+                    "postfilter_a_diag_abs_ge_cutoff": 21,
+                }),
+            }],
+            blockers: Vec::new(),
+        };
+
+        merge_matrix_readiness_issues(&mut scan, &readiness)
+            .expect("warning should merge into closure evidence");
+
+        assert!(closure_scan_allows_numerical_snapshot(&scan));
+        assert_eq!(scan.issues.len(), 1);
+        assert_eq!(
+            scan.issues[0].issue_code,
+            "matrix_readiness_singular_risk_medium"
+        );
+        assert_eq!(scan.issues[0].severity, "warning");
+        assert!(!scan.issues[0].blocking);
     }
 
     #[test]

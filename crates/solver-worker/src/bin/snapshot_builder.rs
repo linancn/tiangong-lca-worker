@@ -153,6 +153,7 @@ fn scope_closure_discovery_value(
     readiness_schema_version: &str,
     readiness_status: ReadinessStatus,
     next_action: &str,
+    findings: &[ReadinessFinding],
     blockers: &[ReadinessFinding],
 ) -> Value {
     serde_json::json!({
@@ -162,9 +163,21 @@ fn scope_closure_discovery_value(
             "schema_version": readiness_schema_version,
             "status": readiness_status,
             "next_action": next_action,
+            "findings": findings,
             "blockers": blockers,
         },
     })
+}
+
+fn matrix_readiness_policy(
+    build_config: &SnapshotBuildConfig,
+    has_lcia: bool,
+) -> MatrixReadinessPolicy {
+    MatrixReadinessPolicy {
+        allow_medium_singular_risk: build_config.scope_closure_binding.is_some(),
+        require_lcia_factors: has_lcia,
+        ..MatrixReadinessPolicy::default()
+    }
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -1414,6 +1427,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
             &built.readiness.schema_version,
             readiness_status,
             &built.readiness.next_action,
+            &built.readiness.findings,
             &built.readiness.blockers,
         );
         let discovery_path = cli
@@ -5082,10 +5096,7 @@ fn assemble_sparse_payload_with_selection(
         coverage: coverage.clone(),
         payload: data.clone(),
         compiled_graph: Some(compiled_graph.clone()),
-        policy: MatrixReadinessPolicy {
-            require_lcia_factors: has_lcia,
-            ..MatrixReadinessPolicy::default()
-        },
+        policy: matrix_readiness_policy(build_config, has_lcia),
     });
 
     let lcia_factor_coverage = directional_lcia
@@ -9913,8 +9924,8 @@ mod tests {
         compute_scope_hash, compute_source_fingerprint_from_summary,
         exact_scope_closure_method_axis, flow_reference_requests_from_source_references, geo_score,
         insert_compiled_source_dataset, load_impact_factor_sets, location_granularity_label,
-        no_balancing_reference_failure_reason, normalize_request_roots, parse_number,
-        parse_process_annual_supply_or_production_volume, parse_process_states,
+        matrix_readiness_policy, no_balancing_reference_failure_reason, normalize_request_roots,
+        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, parse_scope_closure_snapshot_args,
         plan_source_support_read_batches, resolve_allocation_fraction,
         resolve_database_lcia_method_row, resolve_database_lcia_method_rows,
@@ -9955,6 +9966,7 @@ mod tests {
             "matrix_readiness_report.v2",
             ReadinessStatus::Failed,
             "repair_provider_closure_then_recheck",
+            &[],
             &[blocker],
         );
 
@@ -9965,14 +9977,20 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             keys,
-            BTreeSet::from(["blockers", "next_action", "schema_version", "status"])
+            BTreeSet::from([
+                "blockers",
+                "findings",
+                "next_action",
+                "schema_version",
+                "status",
+            ])
         );
         assert!(discovery["processAxis"].is_array());
         assert!(readiness.get("provider_evidence").is_none());
         assert!(readiness.get("balance_evidence").is_none());
         assert!(readiness.get("unresolved_balances").is_none());
         assert!(readiness.get("metrics").is_none());
-        assert!(readiness.get("findings").is_none());
+        assert_eq!(readiness["findings"], json!([]));
         assert!(readiness.get("policy").is_none());
     }
 
@@ -10192,6 +10210,22 @@ mod tests {
             method_id: None,
             method_version: None,
         }
+    }
+
+    #[test]
+    fn certificate_grade_scope_closure_allows_only_medium_singular_risk() {
+        let mut config = test_snapshot_build_config("tidas-reference-allocation-v3");
+        let generic_policy = matrix_readiness_policy(&config, true);
+        assert!(!generic_policy.allow_medium_singular_risk);
+        assert!(!generic_policy.allow_high_singular_risk);
+
+        config.scope_closure_binding =
+            Some(frozen_scope_closure_snapshot("scope_only", "cutoff", "discovery").0);
+        let certificate_policy = matrix_readiness_policy(&config, true);
+        assert!(certificate_policy.allow_medium_singular_risk);
+        assert!(!certificate_policy.allow_high_singular_risk);
+        assert!(certificate_policy.run_factorization);
+        assert!(certificate_policy.require_lcia_factors);
     }
 
     #[test]
