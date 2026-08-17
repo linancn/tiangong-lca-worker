@@ -19,8 +19,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-13
-lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
+lastReviewedAt: 2026-08-17
+lastReviewedCommit: 5e9f45dca1570378b8c4ff21975422839ca8cc0c
 lastReviewedNote: "Review Admin diagnostics and actor-owned draft scope do not change TIDAS import/export jobs, artifact schemas, validation, retention, certificate binding, or result-package metadata."
 related:
   - AGENTS.md
