@@ -599,6 +599,15 @@ fn add_graph_findings(
                 "postfilter_a_diag_abs_ge_cutoff": coverage.singular_risk.postfilter_a_diag_abs_ge_cutoff
             }),
         ),
+        "medium" => findings.push(finding(
+            "singular_risk_medium",
+            FindingSeverity::Warning,
+            "matrix singular risk is medium and requires manual review",
+            json!({
+                "prefilter_diag_abs_ge_cutoff": coverage.singular_risk.prefilter_diag_abs_ge_cutoff,
+                "postfilter_a_diag_abs_ge_cutoff": coverage.singular_risk.postfilter_a_diag_abs_ge_cutoff
+            }),
+        )),
         "low" => {}
         other => findings.push(finding(
             "singular_risk_observed",
@@ -1283,6 +1292,59 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.code == "allocation_fraction_invalid")
         );
+    }
+
+    #[test]
+    fn medium_singular_risk_is_a_blocker_by_default() {
+        let mut input = fixture_input(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            true,
+        );
+        input.coverage.singular_risk.risk_level = "medium".to_owned();
+        input.coverage.singular_risk.prefilter_diag_abs_ge_cutoff = 21;
+        input.coverage.singular_risk.postfilter_a_diag_abs_ge_cutoff = 21;
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Failed);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "singular_risk_medium")
+        );
+    }
+
+    #[test]
+    fn allowed_medium_singular_risk_is_a_manual_review_warning() {
+        let mut input = fixture_input(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            true,
+        );
+        input.coverage.singular_risk.risk_level = "medium".to_owned();
+        input.coverage.singular_risk.prefilter_diag_abs_ge_cutoff = 21;
+        input.coverage.singular_risk.postfilter_a_diag_abs_ge_cutoff = 21;
+        input.policy.allow_medium_singular_risk = true;
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Passed);
+        assert_eq!(report.next_action, "manual_review_warnings");
+        assert!(report.blockers.is_empty());
+        let warning = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "singular_risk_medium")
+            .expect("medium singular risk warning");
+        assert_eq!(warning.severity, FindingSeverity::Warning);
+        assert_eq!(warning.details["prefilter_diag_abs_ge_cutoff"], 21);
+        assert_eq!(warning.details["postfilter_a_diag_abs_ge_cutoff"], 21);
     }
 
     fn fixture_input(

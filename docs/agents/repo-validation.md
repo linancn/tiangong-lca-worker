@@ -41,7 +41,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-17
-lastReviewedCommit: eca5c551ff4eb8332f074f1b988b692b4074483c
+lastReviewedCommit: 4c9f23335c10b01bd48466650ac9f0323b5ff9c4
 lastReviewedNote: "Validation proves joint pending-review diagnostics remain informational and non-blocking while schema, indexed-reference, certificate, and result-package gates remain required."
 related:
   - ../../AGENTS.md
