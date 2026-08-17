@@ -37,6 +37,7 @@ use crate::{
     readiness::{ReadinessFinding, ReadinessStatus},
     resource::{CancellationToken, ResourceCounters, ResourceMeasurement},
     snapshot_artifacts::ScopeClosureSnapshotBinding,
+    source_reference_policy::{ArtifactPurpose, SourceReferenceRole, classify_reference},
     storage::ObjectTransferOptions,
     tidas_cli,
     worker_jobs::{WorkerJobProgress, lease_heartbeat_period},
@@ -52,6 +53,8 @@ pub const SCOPE_CLOSURE_SCANNER_VERSION: &str = "scope-closure-scanner.v1";
 const VALIDATOR_SCANNER_FINGERPRINT_V1: &str = "scope-closure-validator-scanner.v1";
 const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1: &str =
     "scope-closure-validator-scanner.v1+cutoff-readiness-r1";
+const VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2: &str =
+    "scope-closure-validator-scanner.v1+cutoff-readiness-r2";
 pub const TIDAS_BATCH_PROTOCOL: &str = tidas_cli::TIDAS_BATCH_PROTOCOL;
 pub const TIDAS_BATCH_PROFILE: &str = tidas_cli::TIDAS_BATCH_PROFILE;
 pub const REFERENCE_EDGE_SCHEMA_VERSION: &str = "tidas.reference-edge.v1";
@@ -89,6 +92,7 @@ const SCOPE_CLOSURE_ARTIFACT_STAGING_SECONDS: i32 = 3_600;
 fn validate_validator_scanner_fingerprint(fingerprint: &str) -> anyhow::Result<()> {
     if fingerprint == VALIDATOR_SCANNER_FINGERPRINT_V1
         || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1
+        || fingerprint == VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2
     {
         return Ok(());
     }
@@ -1965,7 +1969,15 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
                     .iter()
                     .map(|issue| extraction_issue(&document.identity, issue)),
             );
-            for edge in extraction.edges {
+            for mut edge in extraction.edges {
+                let classified_reference =
+                    classify_reference(&edge, ArtifactPurpose::CertificateClosure).ok();
+                if let Some(classified_reference) = &classified_reference {
+                    classified_reference
+                        .role
+                        .as_str()
+                        .clone_into(&mut edge.reference_role);
+                }
                 let target_category = parse_category(edge.target_category.as_str())?;
                 let target_id = Uuid::parse_str(edge.target_uuid.as_str()).ok();
                 let target = match (
@@ -2005,7 +2017,16 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
                     raw_issues.push(omitted_version_issue(&document.identity, &edge, target_id));
                 }
                 if let Some(target) = target {
+                    // Certificate closure traverses lineage and other administrative Process
+                    // references, but only a real provider_process edge is governed by the
+                    // numerical provider universe. Unknown Process paths keep the historical
+                    // fail-closed behavior until they receive an explicit shared-policy role.
+                    let process_reference_is_provider =
+                        classified_reference.as_ref().is_none_or(|classified| {
+                            classified.role == SourceReferenceRole::ProviderProcess
+                        });
                     if target.category == DatasetCategory::Processes
+                        && process_reference_is_provider
                         && !root_set.contains(&target)
                         && manifest.link_policy.provider_universe_policy == "scope_only"
                     {
@@ -9981,6 +10002,7 @@ mod tests {
         for fingerprint in [
             VALIDATOR_SCANNER_FINGERPRINT_V1,
             VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R1,
+            VALIDATOR_SCANNER_FINGERPRINT_CUTOFF_READINESS_R2,
         ] {
             assert!(validate_validator_scanner_fingerprint(fingerprint).is_ok());
         }
@@ -10411,6 +10433,107 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn preceding_dataset_version_is_lineage_not_a_provider_dependency() {
+        let mut current = identity(
+            DatasetCategory::Processes,
+            "51515151-5151-4151-8151-515151515151",
+        );
+        current.version = "01.01.011".to_owned();
+        let mut preceding = current.clone();
+        preceding.version = "01.01.002".to_owned();
+        let documents = [
+            ClosureDocument {
+                identity: current.clone(),
+                payload: json!({
+                    "processDataSet": {
+                        "administrativeInformation": {
+                            "publicationAndOwnership": {
+                                "common:referenceToPrecedingDataSetVersion": reference(
+                                    "process",
+                                    preceding.id,
+                                    Some(&preceding.version),
+                                )
+                            }
+                        }
+                    }
+                }),
+            },
+            ClosureDocument {
+                identity: preceding.clone(),
+                payload: json!({}),
+            },
+        ]
+        .into_iter()
+        .map(|document| (document.identity.clone(), document))
+        .collect();
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+
+        let scan = collect_scope_closure(&provider, &manifest(vec![current.clone()]))
+            .await
+            .unwrap();
+
+        assert!(scan.complete);
+        assert!(scan.issues.is_empty());
+        assert_eq!(scan.roots, vec![current]);
+        assert!(scan.provider_universe.contains(&preceding));
+        let mut roles = Vec::new();
+        scan.resolved_references
+            .visit(|reference| {
+                roles.push(reference["referenceRole"].as_str().unwrap().to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(roles, vec!["lineage"]);
+    }
+
+    #[tokio::test]
+    async fn true_provider_process_outside_scope_only_roots_stays_blocked() {
+        let root = identity(
+            DatasetCategory::Processes,
+            "52525252-5252-4252-8252-525252525252",
+        );
+        let provider_process = identity(
+            DatasetCategory::Processes,
+            "53535353-5353-4353-8353-535353535353",
+        );
+        let documents = [ClosureDocument {
+            identity: root.clone(),
+            payload: json!({
+                "provider": {
+                    "referenceProcess": reference(
+                        "process",
+                        provider_process.id,
+                        Some(&provider_process.version),
+                    )
+                }
+            }),
+        }]
+        .into_iter()
+        .map(|document| (document.identity.clone(), document))
+        .collect();
+        let provider = FakeProvider {
+            documents,
+            ..FakeProvider::default()
+        };
+
+        let scan = collect_scope_closure(&provider, &manifest(vec![root]))
+            .await
+            .unwrap();
+
+        assert!(scan.complete);
+        assert_eq!(scan.issues.len(), 1);
+        assert_eq!(scan.issues[0].issue_code, "provider_outside_scope_universe");
+        assert_eq!(
+            scan.issues[0].reference_role.as_deref(),
+            Some("provider_process")
+        );
+        assert!(!scan.provider_universe.contains(&provider_process));
     }
 
     #[tokio::test]

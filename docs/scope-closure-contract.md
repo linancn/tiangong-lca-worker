@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-13
+lastReviewedAt: 2026-08-17
 lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
-lastReviewedNote: "Review-quality snapshots remain non-certificate diagnostics; actor-owned draft scope and shared-scan reuse preserve the distinction between certificate-bearing passed evidence and administrative-only blocked evidence."
+lastReviewedNote: "Certificate closure now keeps lineage references in exact-identity administrative traversal while excluding them from provider-universe enforcement; the scanner cache identity advances to cutoff-readiness-r2."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -62,7 +62,7 @@ The canonical job kind is `lcia.scope_closure_check` with payload schema `lcia.s
 
 The Worker loads the full service input through `svc_lcia_scope_closure_check_get_worker_input`. It requires the normalized requested scope, scope/policy/request hashes, expected validator-scanner fingerprint, publication epoch, and `lcia.scope-closure-data-snapshot.v2`.
 
-The current internal request identity is `scope-closure-validator-scanner.v1+cutoff-readiness-r1`. Worker also accepts the historical exact value `scope-closure-validator-scanner.v1` so already-enqueued and in-flight requests remain executable during rollout. This is a closed compatibility set: any other fingerprint fails before scan claim. The revision changes cache identity only; it does not version or alter the public V1 job, result, certificate, or artifact contracts.
+The current internal request identity is `scope-closure-validator-scanner.v1+cutoff-readiness-r2`. Worker also accepts the historical exact values `scope-closure-validator-scanner.v1+cutoff-readiness-r1` and `scope-closure-validator-scanner.v1` so already-enqueued and in-flight requests remain executable during rollout. This is a closed compatibility set: any other fingerprint fails before scan claim. The revision changes cache identity only; it does not version or alter the public V1 job, result, certificate, or artifact contracts.
 
 Every newly normalized certificate-grade request freezes `linkPolicy.technosphereBoundaryPolicy=cutoff`. Database accepts the legacy supported input spellings `closed`, `open`, and `cutoff` during normalization, but all of them produce the same canonical cutoff scope before hashes and snapshot identity are computed. Worker requires the frozen value to be exactly `cutoff` at both the service-input and snapshot-builder child-protocol boundaries. It never silently overrides a noncanonical frozen manifest; such input fails before scan claim/publication with `scope_closure_boundary_policy_must_be_cutoff`. Historical artifacts remain readable and generic snapshot/readiness diagnostics retain their explicit three-policy surface.
 
@@ -104,7 +104,7 @@ Every database fetch is constrained to an identity in the frozen release manifes
 
 An exact reference never falls back to another version. A missing exact identity is a complete negative finding when it is absent from both the release allowlist and the observed closure. The legacy omitted-version policy is normally `reject`. If a tracked future scope explicitly uses `latest_eligible`, candidates and the deterministic winner must come only from the frozen release manifest, and the resolution map records the policy, candidate universe, candidates, and selected identity.
 
-`linkPolicy.providerUniversePolicy=scope_only` rejects a process provider outside the requested roots. `eligible_transitive_expansion-v1` may add a referenced process only when that exact identity is in the frozen release. Every accepted transitive process is part of the effective scope and evidence; the Worker never searches a mutable live provider universe.
+`linkPolicy.providerUniversePolicy=scope_only` rejects a `provider_process` reference outside the requested roots. It does not apply to a Process-target `lineage` reference such as `referenceToPrecedingDataSetVersion`: certificate closure traverses and validates that exact frozen-release identity as administrative evidence without adding it to the numerical Process axis. `eligible_transitive_expansion-v1` may add a referenced provider process only when that exact identity is in the frozen release. Every accepted transitive provider process is part of the effective scope and evidence; the Worker never searches a mutable live provider universe.
 
 ## TIDAS validation
 
