@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-17
-lastReviewedCommit: ad0b5871390f907a9421e484c99c03601de38d1c
-lastReviewedNote: "Certificate closure now keeps lineage references in exact-identity administrative traversal while excluding them from provider-universe enforcement; the scanner cache identity advances to cutoff-readiness-r2."
+lastReviewedCommit: eca5c551ff4eb8332f074f1b988b692b4074483c
+lastReviewedNote: "Source digital-file locators are excluded from dataset-reference traversal for every consumer; the scanner cache identity advances to cutoff-readiness-r3."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -62,7 +62,7 @@ The canonical job kind is `lcia.scope_closure_check` with payload schema `lcia.s
 
 The Worker loads the full service input through `svc_lcia_scope_closure_check_get_worker_input`. It requires the normalized requested scope, scope/policy/request hashes, expected validator-scanner fingerprint, publication epoch, and `lcia.scope-closure-data-snapshot.v2`.
 
-The current internal request identity is `scope-closure-validator-scanner.v1+cutoff-readiness-r2`. Worker also accepts the historical exact values `scope-closure-validator-scanner.v1+cutoff-readiness-r1` and `scope-closure-validator-scanner.v1` so already-enqueued and in-flight requests remain executable during rollout. This is a closed compatibility set: any other fingerprint fails before scan claim. The revision changes cache identity only; it does not version or alter the public V1 job, result, certificate, or artifact contracts.
+The current internal request identity is `scope-closure-validator-scanner.v1+cutoff-readiness-r3`. Worker also accepts the historical exact values `scope-closure-validator-scanner.v1+cutoff-readiness-r2`, `scope-closure-validator-scanner.v1+cutoff-readiness-r1`, and `scope-closure-validator-scanner.v1` so already-enqueued and in-flight requests remain executable during rollout. This is a closed compatibility set: any other fingerprint fails before scan claim. The revision changes cache identity only; it does not version or alter the public V1 job, result, certificate, or artifact contracts.
 
 Every newly normalized certificate-grade request freezes `linkPolicy.technosphereBoundaryPolicy=cutoff`. Database accepts the legacy supported input spellings `closed`, `open`, and `cutoff` during normalization, but all of them produce the same canonical cutoff scope before hashes and snapshot identity are computed. Worker requires the frozen value to be exactly `cutoff` at both the service-input and snapshot-builder child-protocol boundaries. It never silently overrides a noncanonical frozen manifest; such input fails before scan claim/publication with `scope_closure_boundary_policy_must_be_cutoff`. Historical artifacts remain readable and generic snapshot/readiness diagnostics retain their explicit three-policy surface.
 
@@ -211,10 +211,10 @@ targets are fetched when available, while malformed placeholders and unavailable
 retained only in bounded provenance evidence. Numerical exchange/provider references and required
 Flow Property, Unit Group, and LCIA support remain fail-closed. This distinction is identified by
 `source-reference-policy.v4` and participates in snapshot/review fingerprints.
-Schema-defined `referenceToDigitalFile` URI values are external attachment locators rather than
-dataset references. The numerical source walk ignores their raw extraction findings for
-review-submit and ordinary Calculation Bundles; certificate-grade administrative traversal keeps
-its existing strict extraction and issue-aggregation behavior.
+Schema-defined `sourceDataSet.sourceInformation.dataSetInformation.referenceToDigitalFile` values
+are opaque external attachment locators rather than dataset references. Reference extraction skips
+that exact field for review-submit, Calculation Bundle, and certificate-grade Scope Closure. The
+Worker does not resolve the locator, enforce path safety, or check file or network availability.
 
 Each fresh scan produces deterministic administrative artifacts:
 
