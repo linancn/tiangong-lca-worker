@@ -132,7 +132,7 @@ payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_
 
 1. 下载上传 ZIP artifact；
 2. 解压到临时目录；
-3. 使用唯一 `TIDAS_BIN`（默认 `tidas`）执行 `version` 与 `validate --describe` 握手，要求精确匹配 `TIDAS_EXPECTED_VERSION`（active governed 默认 `0.1.3`）、公开 validation protocol/profile 和 asset fingerprint；
+3. 使用唯一 `TIDAS_BIN`（默认 `tidas`）执行 `version` 与 `validate --describe` 握手，要求精确匹配 `TIDAS_EXPECTED_VERSION`（active governed 默认 `0.1.4`）、公开 validation protocol/profile 和 asset fingerprint；
 4. 通过 `tidas validate <dir> --input-format tidas-json --issues <spool> --format json --progress never` 执行结构化校验；issue 必须写入临时文件型有界 spool，operation report 作为有界 JSON 捕获，Worker 对 report schema、完整性、asset fingerprint 以及 spool SHA-256/bytes/event count 全量复核；
 5. 若 `summary.error_count > 0`，直接产出 import report：
    - `code = VALIDATION_FAILED`
