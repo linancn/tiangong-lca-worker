@@ -284,6 +284,7 @@ pub struct CalculationBundleWriter {
     processes: Vec<ReleaseProcessRecord>,
     impacts: Vec<ReleaseImpact>,
     biosphere_by_process: Vec<Vec<CompiledReleaseInventoryExchange>>,
+    process_axis_schema_version: &'static str,
     artifacts: Vec<LocalCalculationBundleArtifact>,
     completed_result_chunks: BTreeSet<usize>,
 }
@@ -310,6 +311,18 @@ struct QuantitativeReference {
     direction: &'static str,
     reference_unit: String,
     mean_amount: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pivot: Option<QuantitativeReferencePivot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuantitativeReferencePivot {
+    raw_direction: CompiledExchangeDirection,
+    raw_mean_amount: f64,
+    signed_raw_coefficient: f64,
+    normalization_scale: f64,
+    normalized_coefficient: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +527,65 @@ impl CalculationBundleWriter {
                     process.normalized_mean_amount,
                     "quantitativeReference.meanAmount",
                 )?;
+                let pivot = match (
+                    process.reference_direction,
+                    process.raw_reference_amount,
+                    process.signed_raw_reference_coefficient,
+                    process.normalized_reference_coefficient,
+                ) {
+                    (None, None, None, None) => None,
+                    (
+                        Some(raw_direction),
+                        Some(raw_mean_amount),
+                        Some(signed_raw_coefficient),
+                        Some(normalized_coefficient),
+                    ) => {
+                        ensure_finite_nonzero(
+                            raw_mean_amount,
+                            "quantitativeReference.pivot.rawMeanAmount",
+                        )?;
+                        ensure_finite_nonzero(
+                            signed_raw_coefficient,
+                            "quantitativeReference.pivot.signedRawCoefficient",
+                        )?;
+                        ensure_finite_nonzero(
+                            normalized_coefficient,
+                            "quantitativeReference.pivot.normalizedCoefficient",
+                        )?;
+                        let direction_sign = match raw_direction {
+                            CompiledExchangeDirection::Input => -1.0,
+                            CompiledExchangeDirection::Output => 1.0,
+                        };
+                        ensure_nearly_equal(
+                            signed_raw_coefficient,
+                            direction_sign * raw_mean_amount,
+                            "quantitativeReference.pivot.signedRawCoefficient",
+                        )?;
+                        let normalization_scale = 1.0 / signed_raw_coefficient.abs();
+                        ensure_nearly_equal(
+                            process.normalized_mean_amount,
+                            raw_mean_amount * normalization_scale,
+                            "quantitativeReference.meanAmount",
+                        )?;
+                        ensure_nearly_equal(
+                            normalized_coefficient,
+                            signed_raw_coefficient.signum(),
+                            "quantitativeReference.pivot.normalizedCoefficient",
+                        )?;
+                        Some(QuantitativeReferencePivot {
+                            raw_direction,
+                            raw_mean_amount,
+                            signed_raw_coefficient,
+                            normalization_scale,
+                            normalized_coefficient,
+                        })
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "quantitativeReference.pivot is partially populated for processIndex={process_index}"
+                        ));
+                    }
+                };
                 Ok(ReleaseProcessRecord {
                     process_index,
                     root_process: GlobalReference {
@@ -531,6 +603,7 @@ impl CalculationBundleWriter {
                         direction: "Output",
                         reference_unit: process.reference_unit.clone(),
                         mean_amount: process.normalized_mean_amount,
+                        pivot,
                     },
                 })
             })
@@ -544,6 +617,21 @@ impl CalculationBundleWriter {
                 ));
             }
         }
+        let pivot_count = processes
+            .iter()
+            .filter(|process| process.quantitative_reference.pivot.is_some())
+            .count();
+        if pivot_count != 0 && pivot_count != processes.len() {
+            return Err(anyhow::anyhow!(
+                "Calculation Bundle process-axis pivot evidence is mixed: withPivot={pivot_count} total={}",
+                processes.len()
+            ));
+        }
+        let process_axis_schema_version = if pivot_count == processes.len() {
+            "tiangong.calculation-bundle.process-axis.v2"
+        } else {
+            "tiangong.calculation-bundle.process-axis.v1"
+        };
 
         let impacts = validate_impacts(&snapshot_index.impact_map)?;
         let calculation_evidence = snapshot_index
@@ -582,6 +670,7 @@ impl CalculationBundleWriter {
             processes,
             impacts,
             biosphere_by_process,
+            process_axis_schema_version,
             artifacts: Vec::new(),
             completed_result_chunks: BTreeSet::new(),
         };
@@ -837,7 +926,7 @@ impl CalculationBundleWriter {
             }
             self.push_finished_ndjson(
                 "process_axis",
-                "tiangong.calculation-bundle.process-axis.v1",
+                self.process_axis_schema_version,
                 process_path,
                 first_process_index,
                 last_process_index,
@@ -1981,6 +2070,19 @@ fn ensure_finite_nonzero(value: f64, field: &str) -> anyhow::Result<()> {
     }
 }
 
+fn ensure_nearly_equal(actual: f64, expected: f64, field: &str) -> anyhow::Result<()> {
+    ensure_finite(actual, field)?;
+    ensure_finite(expected, field)?;
+    let tolerance = 1.0e-12 * actual.abs().max(expected.abs()).max(1.0);
+    if (actual - expected).abs() <= tolerance {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{field} is inconsistent: actual={actual} expected={expected} tolerance={tolerance}"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -2014,6 +2116,15 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn fixture_writer_with_method_indices(method_indices: &[usize]) -> CalculationBundleWriter {
+        fixture_writer_with_pivot(method_indices, CompiledExchangeDirection::Output, 1.0)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_writer_with_pivot(
+        method_indices: &[usize],
+        reference_direction: CompiledExchangeDirection,
+        raw_reference_amount: f64,
+    ) -> CalculationBundleWriter {
         let process_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
         let flow_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let elementary_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
@@ -2121,11 +2232,22 @@ mod tests {
                 quantitative_reference_flow_id: flow_id,
                 quantitative_reference_flow_version: "01.00.000".to_owned(),
                 reference_unit: "kg".to_owned(),
-                normalized_mean_amount: 1.0,
-                reference_direction: Some(CompiledExchangeDirection::Output),
-                raw_reference_amount: Some(1.0),
-                signed_raw_reference_coefficient: Some(1.0),
-                normalized_reference_coefficient: Some(1.0),
+                normalized_mean_amount: raw_reference_amount / raw_reference_amount.abs(),
+                reference_direction: Some(reference_direction),
+                raw_reference_amount: Some(raw_reference_amount),
+                signed_raw_reference_coefficient: Some(
+                    match reference_direction {
+                        CompiledExchangeDirection::Input => -1.0,
+                        CompiledExchangeDirection::Output => 1.0,
+                    } * raw_reference_amount,
+                ),
+                normalized_reference_coefficient: Some(
+                    (match reference_direction {
+                        CompiledExchangeDirection::Input => -1.0,
+                        CompiledExchangeDirection::Output => 1.0,
+                    } * raw_reference_amount)
+                        .signum(),
+                ),
             }],
             inventory_exchanges: vec![CompiledReleaseInventoryExchange {
                 process_idx: 0,
@@ -2310,6 +2432,31 @@ mod tests {
 
         let single = validate_impacts(&[reviewed_impact(0, 0)]).unwrap();
         assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn preserves_input_quantitative_reference_pivot_evidence() {
+        let method_indices = (0..RELEASE_METHOD_IDENTITIES.len()).collect::<Vec<_>>();
+        let writer =
+            fixture_writer_with_pivot(&method_indices, CompiledExchangeDirection::Input, 2.5);
+        let process_axis = writer
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.metadata.kind == "process_axis")
+            .unwrap();
+        assert_eq!(
+            process_axis.metadata.schema_version,
+            "tiangong.calculation-bundle.process-axis.v2"
+        );
+        let mut decoder = GzDecoder::new(File::open(&process_axis.local_path).unwrap());
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
+        assert!(body.contains("\"meanAmount\":1.0"));
+        assert!(body.contains("\"rawDirection\":\"Input\""));
+        assert!(body.contains("\"rawMeanAmount\":2.5"));
+        assert!(body.contains("\"signedRawCoefficient\":-2.5"));
+        assert!(body.contains("\"normalizationScale\":0.4"));
+        assert!(body.contains("\"normalizedCoefficient\":-1.0"));
     }
 
     #[test]
