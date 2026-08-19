@@ -107,7 +107,7 @@ related:
 - 已支持 Review Admin 手动质量诊断：
   - `review_quality_diagnostic_runner` 一次性构建全部待审核 Process 的联合矩阵
   - 完整性与数值稳定性结论写入 `review.quality_diagnostic.report.v1`，仅供查看且不阻断任何 Review 操作
-  - `review_submit_gate` / `review_submit_gate_runner` 仅保留离线 fixture 与历史运行兼容，不属于当前提交审核路径
+  - `review_submit_gate` 仅保留离线 fixture；生产 `review_submit_gate_runner` 已移除，不属于当前提交审核路径
 
 ## 3. 结果文件格式（已选定）
 

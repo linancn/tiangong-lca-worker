@@ -11,9 +11,6 @@ use crate::{
     pgbouncer_sqlx::{self as sqlx, PgPool, Row},
 };
 
-pub const REVIEW_SUBMIT_GATE_JOB_KIND: &str = "review_submit.gate";
-pub const REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION: &str = "review_submit.gate.request.v1";
-pub const REVIEW_SUBMIT_GATE_WORKER_QUEUE: &str = "review_submit_gate";
 pub const REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND: &str = "review.quality_diagnostic";
 pub const REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION: &str =
     "review.quality_diagnostic.request.v1";
@@ -31,17 +28,6 @@ pub struct WorkerJob {
     pub requested_by: Option<Uuid>,
     pub lease_token: Uuid,
     pub attempt_count: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewSubmitGateWorkerRequest {
-    pub dataset_table: String,
-    pub dataset_id: Uuid,
-    pub dataset_version: String,
-    pub revision_checksum: Option<String>,
-    pub policy_profile: Option<String>,
-    pub report_schema_version: Option<String>,
-    pub requested_by: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,42 +83,6 @@ impl WorkerJob {
                 .get("attemptCount")
                 .and_then(Value::as_i64)
                 .unwrap_or_default(),
-        })
-    }
-
-    pub fn review_submit_gate_request(&self) -> anyhow::Result<ReviewSubmitGateWorkerRequest> {
-        if self.job_kind != REVIEW_SUBMIT_GATE_JOB_KIND {
-            return Err(anyhow::anyhow!(
-                "unsupported worker job kind for review-submit gate: {}",
-                self.job_kind
-            ));
-        }
-        if self.worker_queue != REVIEW_SUBMIT_GATE_WORKER_QUEUE {
-            return Err(anyhow::anyhow!(
-                "unsupported worker queue for review-submit gate: {}",
-                self.worker_queue
-            ));
-        }
-        if self.payload_schema_version != REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION {
-            return Err(anyhow::anyhow!(
-                "unsupported review-submit gate payload schema: {}",
-                self.payload_schema_version
-            ));
-        }
-
-        let payload = serde_json::from_value::<ReviewSubmitGatePayload>(self.payload.clone())?;
-        let requested_by = payload.requested_by.or(self.requested_by).ok_or_else(|| {
-            anyhow::anyhow!("review-submit gate worker job is missing requestedBy")
-        })?;
-
-        Ok(ReviewSubmitGateWorkerRequest {
-            dataset_table: payload.dataset_revision.dataset_table,
-            dataset_id: payload.dataset_revision.dataset_id,
-            dataset_version: payload.dataset_revision.dataset_version,
-            revision_checksum: payload.dataset_revision.revision_checksum,
-            policy_profile: payload.policy_profile,
-            report_schema_version: payload.report_schema_version,
-            requested_by,
         })
     }
 
@@ -517,30 +467,6 @@ fn required_text(value: &Value, key: &str) -> anyhow::Result<String> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReviewSubmitGatePayload {
-    dataset_revision: ReviewSubmitGateDatasetRevision,
-    #[serde(default)]
-    requested_by: Option<Uuid>,
-    #[serde(default)]
-    policy_profile: Option<String>,
-    #[serde(default)]
-    report_schema_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ReviewSubmitGateDatasetRevision {
-    #[serde(alias = "table", alias = "datasetTable")]
-    dataset_table: String,
-    #[serde(alias = "id", alias = "datasetId")]
-    dataset_id: Uuid,
-    #[serde(alias = "version", alias = "datasetVersion")]
-    dataset_version: String,
-    #[serde(default, alias = "revisionChecksum")]
-    revision_checksum: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ReviewQualityDiagnosticPayload {
     scope: ReviewQualityDiagnosticScope,
     #[serde(default)]
@@ -561,9 +487,8 @@ mod tests {
 
     use super::{
         REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND, REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
-        REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE, REVIEW_SUBMIT_GATE_JOB_KIND,
-        REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION, REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob,
-        lease_heartbeat_period, result_write_retry_delay,
+        REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
+        result_write_retry_delay,
     };
 
     #[test]
@@ -579,59 +504,6 @@ mod tests {
         assert_eq!(result_write_retry_delay(2).as_millis(), 200);
         assert_eq!(result_write_retry_delay(99).as_millis(), 1_600);
     }
-
-    #[test]
-    fn parses_review_submit_gate_worker_job_payload() {
-        let job_id = Uuid::new_v4();
-        let lease_token = Uuid::new_v4();
-        let requested_by = Uuid::new_v4();
-        let dataset_id = Uuid::new_v4();
-        let job = WorkerJob::from_json(&json!({
-            "id": job_id,
-            "jobKind": REVIEW_SUBMIT_GATE_JOB_KIND,
-            "workerQueue": REVIEW_SUBMIT_GATE_WORKER_QUEUE,
-            "payloadSchemaVersion": REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
-            "payload": {
-                "datasetRevision": {
-                    "table": "processes",
-                    "id": dataset_id,
-                    "version": "01.00.000",
-                    "revisionChecksum": "abc123"
-                }
-            },
-            "requestedBy": requested_by,
-            "leaseToken": lease_token,
-            "attemptCount": 2
-        }))
-        .unwrap();
-
-        let request = job.review_submit_gate_request().unwrap();
-
-        assert_eq!(request.dataset_table, "processes");
-        assert_eq!(request.dataset_id, dataset_id);
-        assert_eq!(request.dataset_version, "01.00.000");
-        assert_eq!(request.revision_checksum.as_deref(), Some("abc123"));
-        assert_eq!(request.requested_by, requested_by);
-        assert_eq!(job.attempt_count, 2);
-    }
-
-    #[test]
-    fn rejects_wrong_review_submit_worker_job_kind() {
-        let job = WorkerJob::from_json(&json!({
-            "id": Uuid::new_v4(),
-            "jobKind": "lca.solve_one",
-            "workerQueue": REVIEW_SUBMIT_GATE_WORKER_QUEUE,
-            "payloadSchemaVersion": REVIEW_SUBMIT_GATE_PAYLOAD_SCHEMA_VERSION,
-            "payload": {},
-            "requestedBy": Uuid::new_v4(),
-            "leaseToken": Uuid::new_v4(),
-            "attemptCount": 1
-        }))
-        .unwrap();
-
-        assert!(job.review_submit_gate_request().is_err());
-    }
-
     #[test]
     fn parses_review_quality_diagnostic_worker_job_payload() {
         let requested_by = Uuid::new_v4();

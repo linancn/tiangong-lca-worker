@@ -131,8 +131,6 @@ updated AS (
 SELECT active_build_count
 FROM updated
 ";
-const REVIEW_SUBMIT_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_submit_overlay";
-const REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS: i64 = 14 * 24 * 60 * 60;
 const REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_quality_diagnostic";
 const REVIEW_QUALITY_DIAGNOSTIC_SNAPSHOT_TTL_SECONDS: i64 = 24 * 60 * 60;
 
@@ -2351,64 +2349,6 @@ struct PersistTimingContext {
     upload_artifact_sec: f64,
     calculation_evidence: Option<LcaCalculationEvidence>,
     calculation_bundle: Option<CalculationBundleArtifactRef>,
-}
-
-pub(crate) async fn run_review_submit_gate_snapshot_builder(
-    state: &AppState,
-    snapshot_id: Uuid,
-    include_user_id: Uuid,
-    request_roots: &[crate::graph_types::RequestRootProcess],
-    revision_checksum: &str,
-) -> anyhow::Result<SnapshotBuilderExecution> {
-    let lock_guard = acquire_build_snapshot_lock(
-        &state.pool,
-        state.build_snapshot_max_concurrency,
-        state.build_snapshot_lock_poll_interval,
-    )
-    .await?;
-    let executed_result = run_snapshot_builder_job(
-        snapshot_id,
-        None,
-        Some(include_user_id),
-        Some(request_roots),
-        Some("split_by_process_volume"),
-        Some("lenient"),
-        Some("lenient"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(REVIEW_SUBMIT_SNAPSHOT_ARTIFACT_PURPOSE),
-        Some(REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS),
-        Some(REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS),
-        Some(revision_checksum),
-        None,
-        None,
-        true,
-    )
-    .await;
-    let release_result = lock_guard.release().await;
-
-    match executed_result {
-        Ok(executed) => {
-            if let Err(err) = release_result {
-                return Err(anyhow::anyhow!(
-                    "failed to release build_snapshot advisory lock: {err}"
-                ));
-            }
-            Ok(executed)
-        }
-        Err(err) => {
-            if let Err(release_err) = release_result {
-                warn!(
-                    error = %release_err,
-                    "failed to release build_snapshot advisory lock after review-submit snapshot builder failure"
-                );
-            }
-            Err(err)
-        }
-    }
 }
 
 pub(crate) async fn run_review_quality_diagnostic_snapshot_builder(
