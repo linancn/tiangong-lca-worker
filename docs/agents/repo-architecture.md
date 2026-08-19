@@ -156,7 +156,7 @@ The process-column contract is one complete TIDAS Process revision per snapshot 
 
 `crates/solver-worker/src/review_quality_diagnostic_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_quality_diagnostic_runner.rs` own the current Review Admin quality-diagnostic runtime. The runner claims `review.quality_diagnostic` jobs, reads all active Root/Reference Review targets, places every pending Process into one request-root closure snapshot, and projects matrix-readiness completeness and compute facts into `clear / findings / not_evaluable`. Data findings always complete as informational reports with empty worker blocker fields; only runtime failures use `failed`, and no result mutates Review state.
 
-`review_submit_gate.rs` and `review_submit_gate_runner.rs` remain compatibility and offline-fixture surfaces. Current product submission must not enqueue or wait for their binary `passed / blocked` result, and new review-quality behavior belongs in the diagnostic runner rather than extending those modules.
+`review_submit_gate.rs` remains only as an offline fixture. The production `review_submit_gate_runner` binary and worker-job adapter have been removed. Current product submission never enqueues or waits for a Gate result; review-quality behavior belongs in the diagnostic runner.
 
 ### Maintenance worker
 

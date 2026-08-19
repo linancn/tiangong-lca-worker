@@ -31,8 +31,8 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-17
-lastReviewedCommit: eca5c551ff4eb8332f074f1b988b692b4074483c
+lastReviewedAt: 2026-08-19
+lastReviewedCommit: f51f816c53e32315d541346abf94cf3fd7dab345
 lastReviewedNote: "Certificate-grade medium singular risk remains an auditable warning while compute failures stay blocking; the scanner cache identity advances to cutoff-readiness-r4."
 related:
   - AGENTS.md

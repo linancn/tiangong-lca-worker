@@ -156,7 +156,7 @@ snapshot 使用 `review_quality_diagnostic` artifact purpose、no-LCIA 模式和
 
 ## 兼容边界
 
-`review_submit_gate` 与 `review_submit_gate_runner` 暂时保留为离线 fixture / 历史运行兼容入口。当前产品提交审核流程不得 enqueue `review_submit.gate`，也不得等待其 `passed / blocked` 结果；新功能不得继续扩展 legacy Gate contract。
+`review_submit_gate` 仅保留为离线 fixture。生产 `review_submit_gate_runner` 及其 `review_submit.gate` 消费逻辑已经移除；当前产品提交审核流程不会 enqueue 或等待 Gate 结果，新功能不得扩展 legacy Gate contract。
 
 ## 最小验证
 

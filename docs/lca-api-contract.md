@@ -409,7 +409,7 @@ worker 使用所有待审核 Process 作为同一个 request-root snapshot 的 r
 
 report 包含 scope/summary、固定 `completeness` 与 `numerical_stability` sections，以及扁平 `findings[]`。finding 的 `level=error` 只表示质量严重程度，`workflowBlocking` 始终为 `false`。
 
-稳定 payload、联合矩阵范围、outcome、finding 与兼容边界由 `docs/review-quality-diagnostic-contract.md` 维护。`review_submit_gate` / `review_submit_gate_runner` 仅保留离线 fixture 与历史运行兼容；当前产品路径不得 enqueue 或等待 `review_submit.gate`。
+稳定 payload、联合矩阵范围、outcome、finding 与兼容边界由 `docs/review-quality-diagnostic-contract.md` 维护。`review_submit_gate` 仅保留离线 fixture；生产 Runner 已移除，当前产品路径不会 enqueue 或等待 `review_submit.gate`。
 
 ### 5.3 Worker resource 与 object file I/O 内部契约
 

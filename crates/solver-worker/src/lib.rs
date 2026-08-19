@@ -35,7 +35,6 @@ pub mod readiness;
 pub mod resource;
 pub mod review_quality_diagnostic_runner;
 pub mod review_submit_gate;
-pub mod review_submit_gate_runner;
 pub mod scope_closure;
 pub mod signed_flow;
 pub mod snapshot_artifacts;
