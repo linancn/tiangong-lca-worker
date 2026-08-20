@@ -40,7 +40,7 @@
       "additionalProperties": false,
       "required": ["version", "protocol", "events", "spoolBytes", "spoolSha256", "wallTimeSeconds", "processPeakRssBytes"],
       "properties": {
-        "version": {"const": "0.1.4"},
+        "version": {"const": "0.2.0"},
         "protocol": {"const": "document-validation-batch.v1"},
         "events": {"type": "integer", "minimum": 1},
         "spoolBytes": {"type": "integer", "minimum": 1},

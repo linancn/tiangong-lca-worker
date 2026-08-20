@@ -27,8 +27,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-19
-lastReviewedCommit: f51f816c53e32315d541346abf94cf3fd7dab345
+lastReviewedAt: 2026-08-20
+lastReviewedCommit: 8b5197374dbb681d2b7b809967458f2209f743ad
 lastReviewedNote: "The review-quality snapshot helper and actor-owned draft scope preserve bounded file-backed Scope Closure results, private schema boundaries, memory limits, cancellation, and staged publication."
 related:
   - ../../../AGENTS.md
