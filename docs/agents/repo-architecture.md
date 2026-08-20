@@ -35,8 +35,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-19
-lastReviewedCommit: 0e60a6c3b5790aad379cd3917de4b18845edd8a4
+lastReviewedAt: 2026-08-20
+lastReviewedCommit: 8b5197374dbb681d2b7b809967458f2209f743ad
 lastReviewedNote: "The review-quality runtime is the joint pending-review diagnostic runner; actor-owned draft scope and compatibility-only submit Gate handling preserve private control-plane and publication boundaries."
 related:
   - ../../AGENTS.md
