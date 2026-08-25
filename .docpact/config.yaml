@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-20"
-lastReviewedCommit: "8b5197374dbb681d2b7b809967458f2209f743ad"
-lastReviewedNote: "Worker routes cover the manual non-blocking Review Admin diagnostic, actor-owned collaborative draft scope, private runtime, scope closure, and calculation-product contracts."
+lastReviewedAt: "2026-08-25"
+lastReviewedCommit: "efa9d44f784eaa6a2a56908ef6c2c955c40fde12"
+lastReviewedNote: "Worker routes now include the generic ai-worker runtime and versioned AI handler contract introduced for Worker Issue #273."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -33,6 +33,7 @@ ownership:
           - docs/scope-closure-contract.md
           - docs/matrix-readiness-report-contract.md
           - docs/review-quality-diagnostic-contract.md
+          - docs/ai-worker-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
           - docs/provider-linking.md
@@ -88,6 +89,7 @@ coverage:
     - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
     - docs/review-quality-diagnostic-contract.md
+    - docs/ai-worker-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/provider-linking.md
@@ -166,6 +168,16 @@ routing:
         - crates/solver-worker/src/compiled_graph.rs
         - docs/review-quality-diagnostic-contract.md
         - docs/lca-api-contract.md
+    ai-worker:
+      paths:
+        - crates/solver-worker/src/ai/**
+        - crates/solver-worker/src/bin/ai_worker.rs
+        - crates/solver-worker/src/worker_jobs.rs
+        - crates/solver-worker/src/tidas_cli.rs
+        - docs/ai-worker-contract.md
+        - docs/lca-api-contract.md
+        - docs/agents/repo-architecture.md
+        - docs/agents/repo-validation.md
     snapshot-and-provider:
       paths:
         - crates/solver-worker/src/bin/snapshot_builder.rs
@@ -221,6 +233,7 @@ routing:
         - docs/scope-closure-contract.md
         - docs/matrix-readiness-report-contract.md
         - docs/review-quality-diagnostic-contract.md
+        - docs/ai-worker-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
         - docs/provider-linking.md
@@ -243,6 +256,7 @@ docInventory:
     - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
     - docs/review-quality-diagnostic-contract.md
+    - docs/ai-worker-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/provider-linking.md
@@ -499,6 +513,34 @@ rules:
       - path: docs/review-quality-diagnostic-contract.md
         mode: review_or_update
     reason: Review Admin quality diagnostics must stay aligned with the manual worker job, joint pending-review matrix, informational outcomes, non-blocking findings, and legacy submit-gate compatibility boundary.
+  - id: worker-ai-worker-contract
+    scope: repo
+    repo: worker
+    triggers:
+      - path: docs/ai-worker-contract.md
+        kind: runtime-contract
+      - path: crates/solver-worker/src/ai/**
+        kind: runtime-code
+      - path: crates/solver-worker/src/bin/ai_worker.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/worker_jobs.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/tidas_cli.rs
+        kind: runtime-code
+    requiredDocs:
+      - path: AGENTS.md
+        mode: review_or_update
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/lca-api-contract.md
+        mode: review_or_update
+      - path: docs/ai-worker-contract.md
+        mode: review_or_update
+    reason: The generic AI runtime, versioned handler contracts, authoritative TIDAS ruleset binding, and provider safety boundaries must evolve together.
   - id: worker-edge-frontend-integration-contract
     scope: repo
     repo: worker
