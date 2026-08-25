@@ -206,9 +206,7 @@ fn lcia_factor_reference_is_active(
     {
         return true;
     }
-    Uuid::parse_str(target_uuid)
-        .ok()
-        .is_some_and(|flow_id| active_lcia_flow_ids.contains(&flow_id))
+    Uuid::parse_str(target_uuid).is_ok_and(|flow_id| active_lcia_flow_ids.contains(&flow_id))
 }
 
 fn malformed_evidence_target_type(
