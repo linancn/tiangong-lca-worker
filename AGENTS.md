@@ -24,6 +24,7 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/provider-linking.md
@@ -41,9 +42,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-19
-lastReviewedCommit: f51f816c53e32315d541346abf94cf3fd7dab345
-lastReviewedNote: "Worker owns the manual informational Review Admin diagnostic and actor-owned draft snapshot scope; submit-time Gate code is compatibility-only, and private runtime and publication boundaries remain authoritative."
+lastReviewedAt: 2026-08-25
+lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
+lastReviewedNote: "Worker now owns a generic ai-worker runtime; ai.tidas_suggestion is its first versioned handler and remains behind Edge/Database control-plane boundaries."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -53,6 +54,7 @@ related:
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
@@ -78,6 +80,7 @@ Start here when the task may change what the compute stack does.
 | `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
 | `docs/review-quality-diagnostic-contract.md` | worker-owned Review Admin manual diagnostic job, joint pending-review matrix, informational outcome/finding schema, and compatibility boundary | Edge HTTP API, persistence schema, or Next Review Admin UX |
+| `docs/ai-worker-contract.md` | generic AI queue runtime, versioned handler contracts, TIDAS ruleset/model bindings, and partial-failure semantics | Edge auth/API, durable Database schema, or Next acceptance UX |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
 | `docs/provider-linking.md` | current provider-link runtime decision order, default provider rule, candidate eligibility, and diagnostics contract | modeling rationale for regional supply mix |
@@ -97,6 +100,7 @@ Read in this order:
    - `docs/agents/contracts/scope-closure-memory-and-result-contract.md`
    - `docs/matrix-readiness-report-contract.md`
    - `docs/review-quality-diagnostic-contract.md`
+   - `docs/ai-worker-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
    - `docs/provider-linking.md`
@@ -114,7 +118,7 @@ Do not start from the root workspace or the edge repo if the change is really ab
 - stable path groups and hotspot families live in `docs/agents/repo-architecture.md`
 - runtime-facing consumer contracts and report artifact contracts live in the narrow docs under `docs/*.md`
 - repo-local documentation maintenance is enforced locally by the pre-push docpact gate; `.github/workflows/ai-doc-lint.yml` is manual-dispatch fallback
-- the main routing intents are `solver-runtime`, `scope-closure`, `matrix-readiness`, `snapshot-and-provider`, `review-quality-diagnostic`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
+- the main routing intents are `solver-runtime`, `scope-closure`, `matrix-readiness`, `snapshot-and-provider`, `review-quality-diagnostic`, `ai-worker`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
 
 ## Minimal Execution Facts
 
@@ -140,10 +144,10 @@ The authoritative path-level ownership map lives in `.docpact/config.yaml`.
 
 At a human-readable level, this repo owns:
 
-- `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
+- `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, generic AI jobs, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the worker runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/scope-closure-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-quality-diagnostic-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/scope-closure-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-quality-diagnostic-contract.md`, `docs/ai-worker-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 
@@ -172,6 +176,7 @@ Route those tasks to:
 - solve result persistence is S3-only; `lca_results` stores artifact metadata and diagnostics, not inline payloads
 - snapshots never persist fresh `CompiledGraph` IR: ordinary numerical artifacts bind separate v2 release metadata and content-addressed v1 source closure, while Review baseline/overlay persist consumer-owned projections; Calculation Bundle sidecars load only during bundle materialization, legacy numerical payloads remain readable even when their compiler metadata schema has drifted, and compatible legacy graph/v1 evidence remains read-compatible
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
+- `ai-worker` is the reusable `worker_queue=ai` runtime; capabilities enter as versioned handlers, and `ai.tidas_suggestion` must bind exact TIDAS ruleset and model configuration versions without writing Process/Flow rows
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, requires the frozen technosphere boundary policy to be exactly `cutoff`, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset; unresolved provider balances remain warning/evidence rather than certificate blockers

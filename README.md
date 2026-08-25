@@ -19,18 +19,20 @@ checkPaths:
   - docs/agents/**
   - docs/lca-api-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-13
-lastReviewedCommit: 223892ac89d08e5266b41c7d697ecb121d20d508
-lastReviewedNote: "Updated for Issue #249: Review Admin manually runs an informational joint pending-review quality diagnostic; submit-time numerical gating is no longer an active product path."
+lastReviewedAt: 2026-08-25
+lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
+lastReviewedNote: "Added the generic ai-worker runtime and operator entrypoint for Worker Issue #273."
 related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
   - docs/lca-api-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
@@ -38,7 +40,7 @@ related:
 
 # Tiangong LCA Worker
 
-面向 Supabase + Rust + SuiteSparse 的大规模 LCA worker runtime，承载稀疏求解、Review Admin 质量诊断、package worker、maintenance GC 和统一 `worker_jobs` 消费。
+面向 Supabase + Rust + SuiteSparse 的 LCA worker runtime，承载稀疏求解、通用 AI jobs、Review Admin 质量诊断、package worker、maintenance GC 和统一 `worker_jobs` 消费。
 
 ## AI Docs Entry
 
@@ -51,6 +53,7 @@ related:
 5. 再按任务加载对应窄契约：
    - `docs/lca-api-contract.md`
    - `docs/review-quality-diagnostic-contract.md`
+   - `docs/ai-worker-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
    - `docs/tidas-package-contract.md`
@@ -63,6 +66,7 @@ related:
 - 前端对接：`docs/frontend-integration.md`
 - 统一契约（jobs/results/payload/status）：`docs/lca-api-contract.md`
 - TIDAS package 异步契约：`docs/tidas-package-contract.md`
+- AI worker 与版本化 handler 契约：`docs/ai-worker-contract.md`
 
 ## 1. 架构定位
 
@@ -351,6 +355,11 @@ scope-closure 的完整 issue、occurrence 和 affected-root/witness 结果只�
 - `REVIEW_QUALITY_MAX_RUNS`（可选；设置后 runner 处理指定条数后退出）
 - `REVIEW_QUALITY_WORKER_ID`（runner lease owner 标识，默认 `review_quality_diagnostic_runner`）
 - `REVIEW_QUALITY_WORKER_LEASE_SECONDS`（worker job lease，默认 `900`）
+- `AI_WORKER_ID` / `AI_WORKER_CLAIM_LIMIT` / `AI_WORKER_LEASE_SECONDS` / `AI_WORKER_POLL_MS`（通用 AI queue consumer 的 claim 与 lease 配置）
+- `AI_PROVIDER_BASE_URL` / `AI_PROVIDER_API_KEY` / `AI_PROVIDER_MODEL`（OpenAI-compatible provider；key 不得写入模板或日志）
+- `AI_MODEL_CONFIG_VERSION`（prompt/provider 配置的部署版本，随结果持久化）
+- `AI_REQUEST_TIMEOUT_SECONDS` / `AI_MAX_RESPONSE_BYTES` / `AI_PROVIDER_MAX_ATTEMPTS`（单模型请求边界）
+- `AI_MAX_CONCURRENCY` / `AI_MAX_INPUT_BYTES`（handler 内模型并发与输入上限）
 
 Supabase 连接说明：
 
@@ -358,7 +367,7 @@ Supabase 连接说明：
 - 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler（Supabase 通常使用 `:5432`）；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。若主连接指向 Supabase `:6543`，进程会在启动时 fail fast，避免领取任务后才因 prepared-statement protocol 失败。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
-- worker 入口会设置明确的 PostgreSQL `application_name`，例如 `solver-worker`、`snapshot-builder`、`package-worker`、`package-gc`、`snapshot-gc`、`result-gc`、`maintenance-worker` 和 `maintenance-enqueue`，用于在 `pg_stat_activity` 中归因长连接或长事务。
+- worker 入口会设置明确的 PostgreSQL `application_name`，例如 `solver-worker`、`ai-worker-queue`、`snapshot-builder`、`package-worker`、`package-gc`、`snapshot-gc`、`result-gc`、`maintenance-worker` 和 `maintenance-enqueue`，用于在 `pg_stat_activity` 中归因长连接或长事务。
 - 如果 `snapshot_builder` 查询超过 `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS`，当前任务应失败并释放连接；短期可调大该值恢复生产，但稳定超时应进入后续查询优化，而不是长期设置为 `0`。
 
 对象存储（snapshot builder / solver-worker / result_gc 必需；`package_gc --execute` 删除 package artifact 对象时也必需）：
@@ -503,6 +512,13 @@ test "$("$tidas_bin" version --format json --progress never | jq -r '.summary.bi
 cargo run -p solver-worker --bin package_worker --release
 ```
 
+启动通用 AI worker（当前注册 `ai.tidas_suggestion` handler）：
+
+```bash
+set -a && source .env && set +a
+cargo run -p solver-worker --bin ai_worker --release --
+```
+
 启动 Review Admin quality diagnostic runner：
 
 ```bash
@@ -514,6 +530,7 @@ cargo run -p solver-worker --bin review_quality_diagnostic_runner --release --
 
 - `solver-worker` 消费 `worker_queue=solver` 的 `private.worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；旧 PGMQ backend 会在启动时失败。
 - `package_worker` 消费 `worker_queue=package` 的 `private.worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；旧 package PGMQ backend 会在启动时失败。
+- `ai_worker` 消费 `worker_queue=ai`，按版本化 job kind dispatch；当前 `ai.tidas_suggestion` 使用 Rust HTTP client 和严格 TIDAS ruleset 生成 advisory 完整数据结果，不写 Process/Flow domain row。
 - `review_quality_diagnostic_runner` 消费 `worker_queue=review_quality` 的 `review.quality_diagnostic` job，把全部待审核 Process 作为同一次 request-root snapshot 的 roots，并写回 informational `clear` / `findings` / `not_evaluable` 报告。数据发现不会产生 `blocked` worker 状态，也不会修改 Review 状态。
 
 ### 6.2 计算正确性基线流程（Expected 对比）

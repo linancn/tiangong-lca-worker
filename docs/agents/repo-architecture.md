@@ -26,6 +26,7 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
@@ -35,9 +36,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-20
-lastReviewedCommit: 8b5197374dbb681d2b7b809967458f2209f743ad
-lastReviewedNote: "The review-quality runtime is the joint pending-review diagnostic runner; actor-owned draft scope and compatibility-only submit Gate handling preserve private control-plane and publication boundaries."
+lastReviewedAt: 2026-08-25
+lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
+lastReviewedNote: "The runtime map now includes the generic ai-worker process and its first versioned ai.tidas_suggestion handler."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -46,6 +47,7 @@ related:
   - ../../docs/scope-closure-contract.md
   - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/review-quality-diagnostic-contract.md
+  - ../../docs/ai-worker-contract.md
   - ./contracts/scope-closure-memory-and-result-contract.md
 ---
 
@@ -86,6 +88,8 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
 | `docs/agents/contracts/scope-closure-*-result.v1.schema.json` | compatibility snapshots for the root child-result envelopes and the owning-repository provider fragment boundary |
 | `crates/solver-worker/src/tidas_cli.rs` | single-binary Rust tidas version/protocol handshake, bounded command execution, report validation, and spool hash/count verification |
+| `crates/solver-worker/src/ai/**` | generic AI provider boundary, integrity-bound ruleset loading, versioned handler registry, and AI queue runner |
+| `crates/solver-worker/src/bin/ai_worker.rs` | queue-only `ai-worker` process entrypoint |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
 | `tools/bw25-validator/**` | manual Brightway comparison tooling |
@@ -95,6 +99,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v4 bounded artifact shape with v3 issue semantics, compact root-impact/witness representation, memory/cancellation invariants, and Database #316 staged-publication handshake |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
 | `docs/review-quality-diagnostic-contract.md` | worker-owned manual Review Admin diagnostic, joint pending-review matrix, and informational report contract |
+| `docs/ai-worker-contract.md` | generic AI queue and versioned handler contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
 | `docs/frontend-integration.md` | frontend-side solve/result interaction contract |
 | `docs/provider-linking.md` | current provider-link runtime decision order, default rule, candidate eligibility, and diagnostics contract |
@@ -121,6 +126,12 @@ The worker currently covers families such as:
 These flows belong to the worker runtime, not to the API repo.
 
 The main solver worker uses `SOLVER_QUEUE_BACKEND=worker-jobs`. It claims `private.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Ordinary solve jobs link LCA domain rows and use `private.worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `private.lca_results` plus `private.lca_latest_all_unit_results` as Worker-produced artifacts and then mark `private.lcia_result_packages` preview-ready through the database service-role command. The retired `lca_jobs` lifecycle and matrix-table fallback are not compatibility surfaces: selecting `SOLVER_QUEUE_BACKEND=pgmq` or encountering a snapshot without a ready artifact fails closed. The independent `pgmq` extension remains available to unrelated consumers.
+
+### Generic AI jobs
+
+`crates/solver-worker/src/ai/runner.rs` and `crates/solver-worker/src/bin/ai_worker.rs` own the reusable `worker_queue=ai` runtime. The runner claims only the dedicated AI queue, maintains lease heartbeats, dispatches exact job-kind/schema pairs, and writes versioned terminal results. It uses a queue-only database pool and does not instantiate solver S3/AppState.
+
+`ai.tidas_suggestion` is the first handler, not the process identity. It loads Process and Flow strict-authoring rules from the integrity-locked unified Rust `tidas` CLI before claiming work, binds exact ruleset/catalog/model configuration versions into results, and calls an OpenAI-compatible provider through bounded `reqwest` requests. Each existing rule path is processed independently with bounded Tokio concurrency; valid successful paths survive other path failures, while all-path failure preserves the original dataset. This is advisory transformation only and never writes Process/Flow rows. See `docs/ai-worker-contract.md`.
 
 ### Scope closure and certificate-bound build
 

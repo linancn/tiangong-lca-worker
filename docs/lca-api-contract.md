@@ -21,12 +21,13 @@ checkPaths:
   - supabase/migrations/**
   - docs/matrix-readiness-report-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-20
-lastReviewedCommit: 8b5197374dbb681d2b7b809967458f2209f743ad
-lastReviewedNote: "The shared review-quality contract is a manual informational Review Admin job rather than a submit-time Gate; private runtime and canonical publication boundaries remain intact."
+lastReviewedAt: 2026-08-25
+lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
+lastReviewedNote: "The shared job surface now includes the generic ai queue and versioned ai.tidas_suggestion request/result contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -34,6 +35,7 @@ related:
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-quality-diagnostic-contract.md
+  - docs/ai-worker-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/repo-validation.md
@@ -48,7 +50,7 @@ related:
 
 - 数值核心固定为 `M = I - A`，只解 `M x = y`。
 - `snapshot_builder` 对 elementary flow 的 `B` 采用 `gross` 口径（`Input/Output` 均按原始 `amount` 入模，不做方向符号翻转）。
-- 计算入口是异步任务；统一队列路径使用 `private.worker_jobs(worker_queue=solver)`。旧 `lca_jobs` + `pgmq` lifecycle 已退役并 fail closed。前端不直连队列。
+- 计算与 AI 入口都是异步任务；统一队列路径分别使用 `private.worker_jobs(worker_queue=solver)` 与 `private.worker_jobs(worker_queue=ai)`。旧 `lca_jobs` + `pgmq` lifecycle 已退役并 fail closed。前端不直连队列。
 - worker 连接池可通过 `DB_MAX_CONNECTIONS`、`DB_MIN_CONNECTIONS` 和 `DB_ACQUIRE_TIMEOUT_SECONDS` 调整；默认采用 `max_connections = 8`、`min_connections = 1`、`acquire_timeout = 30s`、`idle_timeout = 5min` 与 `max_lifetime = 30min`，以保证长时求解与 artifact 落盘阶段有稳定连接窗口。
 - 主路径读取 `private.lca_snapshot_artifacts`（artifact-only）；artifact 缺失或不可读时 fail closed。
 - 所有写操作由服务端（Edge Function / worker，`service_role`）执行。
@@ -57,7 +59,7 @@ related:
 
 - `lca_network_snapshots`: snapshot 元信息（含 `source_hash`）。
 - `lca_snapshot_artifacts`: snapshot 矩阵 artifact 元信息（`snapshot-hdf5:v1`）。
-- `worker_jobs`: canonical worker 生命周期表；solver 队列任务使用 `worker_queue=solver`，用于服务端任务中心、operator 查询、lease fencing、状态、错误、进度和 result projection。
+- `worker_jobs`: canonical worker 生命周期表；solver 与 AI 队列任务分别使用 `worker_queue=solver` / `ai`，用于服务端任务中心、operator 查询、lease fencing、状态、错误、进度和 result projection。
 - retired `lca_jobs`: 不再是运行时依赖；显式选择旧 PGMQ backend 会 fail closed。
 - `lca_results`: 作业结果主表（仅 artifact 元数据 + diagnostics）。
 - `lca_active_snapshots`: 各 scope 的当前生效 snapshot 指针。
@@ -228,6 +230,16 @@ Singular/factorization failure diagnostics load the exact `(process_id, process_
 On success or failure, the worker links `private.lca_results`, `private.lca_result_cache`, `private.lca_latest_all_unit_results`, and `private.lca_factorization_registry` rows back to the canonical `private.worker_jobs.id` where those rows exist. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `private.lca_result_cache` failed state where a cache row exists. The retired PGMQ lifecycle fails closed.
 
 For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `private.cmd_lcia_result_package_mark_ready(...)`. The ready projection persists `availableImpactCategories` from the frozen snapshot impact axis as ordered canonical impact UUIDs; `defaultImpactCategory` is normalized from either a requested canonical UUID or frozen impact key to the matching canonical UUID, and defaults to the first frozen impact when omitted. An empty impact axis or a requested default outside that axis fails closed instead of publishing an empty category list. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `private.lca_result_cache`.
+
+### 3.9 `worker_jobs` AI 队列映射
+
+`ai_worker` 只 claim `worker_queue=ai`。当前注册项为：
+
+| `job_kind` | `payload_schema_version` | result schema |
+| --- | --- | --- |
+| `ai.tidas_suggestion` | `ai.tidas_suggestion.request.v1` | `ai.tidas_suggestion.result.v1` |
+
+request 固定包含 `dataType=process|flow` 和完整 `data` object。结果返回完整建议后 dataset、input SHA-256、严格 TIDAS ruleset/catalog binding、模型/config binding、路径计数和有界失败列表。`complete` 与 `partial` 写 `worker_jobs.status=completed`；所有命中路径都失败时写 `status=failed`，但仍保留原始完整 dataset 的 versioned result。AI handler 不写 Process/Flow domain row。精确 schema、provider 和部分失败语义由 `docs/ai-worker-contract.md` 维护。
 
 ## 4. 作业状态机
 
