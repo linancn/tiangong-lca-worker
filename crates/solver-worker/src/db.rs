@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, Row, Transaction};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use solver_core::{
@@ -43,6 +44,10 @@ use crate::{
         APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions, sql_string_literal,
     },
     graph_types::RequestRootProcess,
+    portal_lcia_projection::{
+        BoundPortalLciaProjection, PORTAL_LCIA_PROJECTION_CONTRACT_VERSION,
+        PortalProjectionSourceBinding, PreparedPortalLciaProjection,
+    },
     snapshot_artifacts::{
         DecodedSnapshotArtifact, DecodedSnapshotReleaseEvidence,
         SNAPSHOT_RELEASE_EVIDENCE_CONTENT_TYPE, SNAPSHOT_RELEASE_EVIDENCE_FORMAT,
@@ -1338,6 +1343,7 @@ async fn handle_job_payload_with_worker_lease(
                 n,
                 batch_size,
                 level,
+                false,
             )
             .await?;
             let result_diag = persist_solve_all_unit_result(
@@ -1941,6 +1947,7 @@ async fn solve_all_unit_with_calculation_bundle(
     process_count: usize,
     solve_batch_size: usize,
     print_level: f64,
+    prepare_portal_projection: bool,
 ) -> anyhow::Result<SolvedAllUnitArtifacts> {
     let snapshot_meta = fetch_snapshot_artifact_meta(&state.pool, snapshot_id)
         .await?
@@ -1964,6 +1971,9 @@ async fn solve_all_unit_with_calculation_bundle(
         &snapshot_index,
         &release_evidence,
     )?;
+    if prepare_portal_projection {
+        bundle_writer.enable_portal_lcia_projection(&release_evidence)?;
+    }
 
     let internal_options = SolveOptions {
         return_x: true,
@@ -1987,7 +1997,7 @@ async fn solve_all_unit_with_calculation_bundle(
         }
         bundle_writer.write_result_chunk(artifact_start, artifact_items.as_slice())?;
     }
-    let built = bundle_writer.finish()?;
+    let mut built = bundle_writer.finish()?;
     let bundle_ref = upload_built_calculation_bundle(&state.object_store, &built).await?;
     let query_artifact_meta = persist_solve_all_unit_query_artifact(
         state,
@@ -2001,6 +2011,7 @@ async fn solve_all_unit_with_calculation_bundle(
         calculation_bundle: bundle_ref,
         query_artifact_meta,
         impact_map: snapshot_index.impact_map,
+        portal_lcia_projection: built.portal_lcia_projection.take(),
     })
 }
 
@@ -2171,6 +2182,7 @@ struct SolvedAllUnitArtifacts {
     calculation_bundle: CalculationBundleArtifactRef,
     query_artifact_meta: QueryArtifactMeta,
     impact_map: Vec<crate::snapshot_index::SnapshotImpactMapEntry>,
+    portal_lcia_projection: Option<PreparedPortalLciaProjection>,
 }
 
 #[derive(Debug, Clone)]
@@ -2197,6 +2209,7 @@ struct LciaResultPackageArtifacts {
     query_artifact_meta: QueryArtifactMeta,
     calculation_bundle: CalculationBundleArtifactRef,
     impact_map: Vec<crate::snapshot_index::SnapshotImpactMapEntry>,
+    portal_lcia_projection: Option<PreparedPortalLciaProjection>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2476,6 +2489,8 @@ pub(crate) async fn run_scope_closure_snapshot_builder(
 pub(crate) async fn handle_lcia_result_package_build_worker_job(
     state: &AppState,
     build_worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    lease_seconds: i32,
     payload: &JobPayload,
 ) -> anyhow::Result<Value> {
     let JobPayload::LciaResultPackageBuild {
@@ -2495,6 +2510,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         snapshot_artifact_id,
         snapshot_index_sha256,
         snapshot_build_contract_hash,
+        portal_projection_contract_version,
         ..
     } = payload
     else {
@@ -2579,8 +2595,15 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             }),
         )
     };
-    let artifacts =
-        persist_lcia_result_package_all_unit_artifacts(state, result_job_id, snapshot_id).await?;
+    let prepare_portal_projection = portal_projection_contract_version.as_deref()
+        == Some(PORTAL_LCIA_PROJECTION_CONTRACT_VERSION);
+    let mut artifacts = persist_lcia_result_package_all_unit_artifacts(
+        state,
+        result_job_id,
+        snapshot_id,
+        prepare_portal_projection,
+    )
+    .await?;
     let (available_impact_categories, resolved_default_impact_category) =
         lcia_result_package_impact_axis(
             artifacts.impact_map.as_slice(),
@@ -2593,7 +2616,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     )
     .await?;
 
-    let artifact_manifest = serde_json::json!({
+    let mut artifact_manifest = serde_json::json!({
         "artifactManifestVersion": "lcia-result-package-worker.v1",
         "inputManifestHash": input_manifest_hash,
         "snapshotSource": snapshot_source,
@@ -2617,6 +2640,55 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             "reportArtifactManifestHash": report_artifact_manifest_hash,
         })),
     });
+
+    let portal_projection = if prepare_portal_projection {
+        let prepared = artifacts.portal_lcia_projection.take().ok_or_else(|| {
+            anyhow::anyhow!("V3 package build omitted its prepared Portal LCIA projection")
+        })?;
+        artifact_manifest["bundleContentHash"] =
+            Value::String(artifacts.calculation_bundle.bundle_content_hash.clone());
+        artifact_manifest["bundleManifestSha256"] =
+            Value::String(artifacts.calculation_bundle.manifest_sha256.clone());
+        artifact_manifest["lciaChunkSetSha256"] =
+            Value::String(prepared.chunk_descriptor_set_hash.clone());
+        Some(
+            prepared.bind_source(PortalProjectionSourceBinding {
+                input_manifest_hash: input_manifest_hash.clone(),
+                closure_certificate_hash: required_portal_projection_hash(
+                    closure_certificate_hash.as_deref(),
+                    "closureCertificateHash",
+                )?,
+                snapshot_hash: required_portal_projection_hash(
+                    closure_snapshot_hash.as_deref(),
+                    "snapshotHash",
+                )?,
+                closure_bundle_hash: required_portal_projection_hash(
+                    closure_bundle_hash.as_deref(),
+                    "closureBundleHash",
+                )?,
+                snapshot_index_sha256: required_portal_projection_hash(
+                    snapshot_index_sha256.as_deref(),
+                    "snapshotIndexSha256",
+                )?,
+                snapshot_build_contract_hash: required_portal_projection_hash(
+                    snapshot_build_contract_hash.as_deref(),
+                    "snapshotBuildContractHash",
+                )?,
+                bundle_content_hash: artifacts.calculation_bundle.bundle_content_hash.clone(),
+                bundle_manifest_sha256: artifacts.calculation_bundle.manifest_sha256.clone(),
+                result_artifact_sha256: required_portal_projection_hash(
+                    artifacts
+                        .result_diag
+                        .get("artifact_sha256")
+                        .and_then(Value::as_str),
+                    "resultArtifactSha256",
+                )?,
+                query_artifact_sha256: artifacts.query_artifact_meta.sha256.clone(),
+            })?,
+        )
+    } else {
+        None
+    };
 
     // Close the object-store TOCTOU window as far as the worker can immediately before the
     // database performs its final lease, revocation, and authoritative-metadata checks.
@@ -2655,37 +2727,63 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         .await?;
     }
 
-    let mark_ready = mark_lcia_result_package_ready(
-        &state.pool,
-        LciaResultPackageReadyInput {
-            build_worker_job_id,
-            package_version: lcia_result_package_version(*build_id),
-            snapshot_id,
-            result_id: artifacts.result_id,
-            latest_all_unit_result_id: Some(artifacts.latest_all_unit_result_id),
-            result_artifact_ref: lcia_result_artifact_ref(&artifacts.result_diag),
-            query_artifact_ref: lcia_result_query_artifact_ref(&artifacts.query_artifact_meta),
-            artifact_manifest,
-            available_impact_categories,
-            default_impact_category: Some(resolved_default_impact_category),
-            package_result_hash: artifacts
-                .result_diag
-                .get("artifact_sha256")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            audit: serde_json::json!({
-                "command": "worker_lcia_result_package_build",
-                "buildId": build_id,
-                "buildWorkerJobId": build_worker_job_id,
-                "snapshotId": snapshot_id,
-                "closureCheckId": closure_check_id,
-                "closureCertificateHash": closure_certificate_hash,
-                "resultId": artifacts.result_id,
-                "latestAllUnitResultId": artifacts.latest_all_unit_result_id,
-            }),
-        },
-    )
-    .await?;
+    let projection_id = match portal_projection.as_ref() {
+        Some(projection) => Some(
+            materialize_portal_lcia_projection(
+                state,
+                build_worker_job_id,
+                worker_lease_token,
+                lease_seconds,
+                projection,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    if let (Some(projection_id), Some(projection)) = (projection_id, portal_projection.as_ref()) {
+        artifact_manifest["portalProjectionId"] = Value::String(projection_id.to_string());
+        artifact_manifest["portalProjectionContentHash"] =
+            Value::String(projection.content_hash.clone());
+    }
+    let ready_input = LciaResultPackageReadyInput {
+        build_worker_job_id,
+        package_version: lcia_result_package_version(*build_id),
+        snapshot_id,
+        result_id: artifacts.result_id,
+        latest_all_unit_result_id: Some(artifacts.latest_all_unit_result_id),
+        result_artifact_ref: lcia_result_artifact_ref(&artifacts.result_diag),
+        query_artifact_ref: lcia_result_query_artifact_ref(&artifacts.query_artifact_meta),
+        artifact_manifest,
+        available_impact_categories,
+        default_impact_category: Some(resolved_default_impact_category),
+        package_result_hash: artifacts
+            .result_diag
+            .get("artifact_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        audit: serde_json::json!({
+            "command": "worker_lcia_result_package_build",
+            "buildId": build_id,
+            "buildWorkerJobId": build_worker_job_id,
+            "snapshotId": snapshot_id,
+            "closureCheckId": closure_check_id,
+            "closureCertificateHash": closure_certificate_hash,
+            "resultId": artifacts.result_id,
+            "latestAllUnitResultId": artifacts.latest_all_unit_result_id,
+        }),
+    };
+    let mark_ready = match projection_id {
+        Some(projection_id) => {
+            mark_portal_lcia_result_package_ready(
+                &state.pool,
+                projection_id,
+                worker_lease_token,
+                ready_input,
+            )
+            .await?
+        }
+        None => mark_lcia_result_package_ready(&state.pool, ready_input).await?,
+    };
 
     Ok(mark_ready)
 }
@@ -3196,6 +3294,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
     state: &AppState,
     result_job_id: Uuid,
     snapshot_id: Uuid,
+    prepare_portal_projection: bool,
 ) -> anyhow::Result<LciaResultPackageArtifacts> {
     ensure_prepared(state, snapshot_id, 0.0).await?;
     let process_count = fetch_snapshot_process_count(&state.pool, snapshot_id).await?;
@@ -3215,6 +3314,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         n,
         batch_size,
         0.0,
+        prepare_portal_projection,
     )
     .await?;
     let result_diag =
@@ -3241,6 +3341,7 @@ async fn persist_lcia_result_package_all_unit_artifacts(
         query_artifact_meta: all_unit_artifacts.query_artifact_meta,
         calculation_bundle: all_unit_artifacts.calculation_bundle,
         impact_map: all_unit_artifacts.impact_map,
+        portal_lcia_projection: all_unit_artifacts.portal_lcia_projection,
     })
 }
 
@@ -3391,6 +3492,528 @@ async fn mark_lcia_result_package_ready(
     } else {
         Err(anyhow::anyhow!(
             "cmd_lcia_result_package_mark_ready returned non-ok result: {result}"
+        ))
+    }
+}
+
+const PORTAL_LCIA_HASH_CONTRACT_VERSION: &str = "portal.lcia-projection.int32be-frame-sha256.v1";
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PortalProjectionRpc<T> {
+    Success(PortalProjectionRpcSuccess<T>),
+    Error(PortalProjectionRpcError),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalProjectionRpcSuccess<T> {
+    ok: bool,
+    #[serde(default)]
+    idempotent_replay: Option<bool>,
+    data: T,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalProjectionRpcError {
+    ok: bool,
+    code: String,
+    status: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalProjectionStageData {
+    projection_id: Uuid,
+    build_worker_job_id: Uuid,
+    status: String,
+    process_count: u64,
+    impact_count: u64,
+    expected_value_count: u64,
+    hash_contract_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalProjectionBatchData {
+    projection_id: Uuid,
+    accepted_record_count: u64,
+    inserted_record_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalProjectionStatusData {
+    projection_id: Uuid,
+    build_worker_job_id: Uuid,
+    status: String,
+    process_count: u64,
+    expected_process_count: u64,
+    impact_count: u64,
+    expected_impact_count: u64,
+    value_count: u64,
+    expected_value_count: u64,
+    hash_contract_version: String,
+    #[serde(default)]
+    process_axis_hash: Option<String>,
+    #[serde(default)]
+    impact_axis_hash: Option<String>,
+    #[serde(default)]
+    value_grid_hash: Option<String>,
+    #[serde(default)]
+    relation_hash: Option<String>,
+    #[serde(default)]
+    content_hash: Option<String>,
+    #[serde(default)]
+    failure_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalProjectionSealData {
+    projection_id: Uuid,
+    status: String,
+    process_count: u64,
+    impact_count: u64,
+    value_count: u64,
+    process_axis_hash: String,
+    impact_axis_hash: String,
+    value_grid_hash: String,
+    relation_hash: String,
+    content_hash: String,
+    hash_contract_version: String,
+}
+
+fn parse_portal_projection_rpc<T>(value: Value, operation: &str) -> anyhow::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match serde_json::from_value::<PortalProjectionRpc<T>>(value)? {
+        PortalProjectionRpc::Success(success) if success.ok => {
+            let _ = success.idempotent_replay;
+            Ok(success.data)
+        }
+        PortalProjectionRpc::Success(_) => Err(anyhow::anyhow!(
+            "{operation} returned a malformed success envelope"
+        )),
+        PortalProjectionRpc::Error(error) if !error.ok => Err(anyhow::anyhow!(
+            "{operation} rejected the projection: code={} status={}",
+            error.code,
+            error.status
+        )),
+        PortalProjectionRpc::Error(_) => Err(anyhow::anyhow!(
+            "{operation} returned a malformed error envelope"
+        )),
+    }
+}
+
+fn required_portal_projection_hash(value: Option<&str>, field: &str) -> anyhow::Result<String> {
+    value
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("V3 package build omitted valid {field}"))
+}
+
+async fn materialize_portal_lcia_projection(
+    state: &AppState,
+    build_worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    lease_seconds: i32,
+    projection: &BoundPortalLciaProjection,
+) -> anyhow::Result<Uuid> {
+    let process_count = i32::try_from(projection.process_relation.record_count)?;
+    let impact_count = i32::try_from(projection.impact_relation.record_count)?;
+    let source = serde_json::json!({
+        "schemaVersion": "portal.lcia-projection.source.v1",
+        "bundleContentHash": projection.source.bundle_content_hash,
+        "bundleManifestSha256": projection.source.bundle_manifest_sha256,
+        "lciaChunkSetSha256": projection.chunk_descriptor_set_hash,
+        "resultArtifactSha256": projection.source.result_artifact_sha256,
+        "queryArtifactSha256": projection.source.query_artifact_sha256,
+    });
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_stage_begin_v1(
+            $1, $2, $3, $4, $5::jsonb
+        )
+        FROM _service_role
+        ",
+    )
+    .bind(build_worker_job_id)
+    .bind(worker_lease_token)
+    .bind(process_count)
+    .bind(impact_count)
+    .bind(source)
+    .fetch_one(&state.pool)
+    .await?;
+    let stage_data: PortalProjectionStageData =
+        parse_portal_projection_rpc(result, "portal projection stage begin")?;
+    if stage_data.build_worker_job_id != build_worker_job_id
+        || stage_data.process_count != projection.process_relation.record_count
+        || stage_data.impact_count != projection.impact_relation.record_count
+        || stage_data.expected_value_count != projection.value_relation.record_count
+        || stage_data.hash_contract_version != PORTAL_LCIA_HASH_CONTRACT_VERSION
+        || !matches!(stage_data.status.as_str(), "staging" | "prepared")
+    {
+        return Err(anyhow::anyhow!(
+            "portal projection stage begin returned mismatched authoritative data"
+        ));
+    }
+
+    let materialized = materialize_portal_lcia_projection_stage(
+        state,
+        build_worker_job_id,
+        worker_lease_token,
+        lease_seconds,
+        stage_data.projection_id,
+        stage_data.status.as_str(),
+        projection,
+    )
+    .await;
+    if materialized.is_err() {
+        let _ = fail_portal_lcia_projection_stage(
+            &state.pool,
+            stage_data.projection_id,
+            worker_lease_token,
+            "portal_lcia_projection_failed",
+            "Portal LCIA projection materialization failed",
+            serde_json::json!({
+                "buildWorkerJobId": build_worker_job_id,
+                "projectionId": stage_data.projection_id,
+                "contractVersion": PORTAL_LCIA_PROJECTION_CONTRACT_VERSION,
+            }),
+        )
+        .await;
+    }
+    materialized.map(|()| stage_data.projection_id)
+}
+
+async fn materialize_portal_lcia_projection_stage(
+    state: &AppState,
+    build_worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    lease_seconds: i32,
+    projection_id: Uuid,
+    stage_status: &str,
+    projection: &BoundPortalLciaProjection,
+) -> anyhow::Result<()> {
+    if stage_status == "prepared" {
+        let status =
+            portal_lcia_projection_status(&state.pool, projection_id, worker_lease_token).await?;
+        return verify_portal_lcia_projection_status(
+            &status,
+            projection_id,
+            build_worker_job_id,
+            projection,
+            true,
+        );
+    }
+
+    let total_records = projection
+        .process_relation
+        .record_count
+        .checked_add(projection.impact_relation.record_count)
+        .and_then(|count| count.checked_add(projection.value_relation.record_count))
+        .ok_or_else(|| anyhow::anyhow!("Portal projection total record count overflow"))?;
+    let mut completed_records = 0_u64;
+    for relation in projection.relations() {
+        let mut batches = relation.batches()?;
+        while let Some(batch) = batches.next_batch()? {
+            let progress = 0.70
+                + 0.24
+                    * (f64::from(u32::try_from(completed_records)?)
+                        / f64::from(u32::try_from(total_records)?));
+            crate::worker_jobs::heartbeat_worker_job(
+                &state.queue_pool,
+                build_worker_job_id,
+                worker_lease_token,
+                "portal_lcia_projection",
+                progress.min(0.94),
+                Some(serde_json::json!({
+                    "projectionId": projection_id,
+                    "relation": batch.relation,
+                    "batchOrdinal": batch.batch_ordinal,
+                    "firstOrdinal": batch.first_ordinal,
+                    "lastOrdinal": batch.last_ordinal,
+                })),
+                lease_seconds.clamp(1, 86_400),
+            )
+            .await?;
+            let accepted = register_portal_lcia_projection_batch_with_recovery(
+                &state.pool,
+                projection_id,
+                worker_lease_token,
+                batch.payload,
+            )
+            .await?;
+            if accepted.projection_id != projection_id
+                || accepted.accepted_record_count != u64::try_from(batch.record_count)?
+                || accepted.inserted_record_count > accepted.accepted_record_count
+            {
+                return Err(anyhow::anyhow!(
+                    "portal projection batch returned mismatched acknowledgement"
+                ));
+            }
+            completed_records = completed_records
+                .checked_add(u64::try_from(batch.record_count)?)
+                .ok_or_else(|| anyhow::anyhow!("Portal projection progress overflow"))?;
+        }
+    }
+
+    let status =
+        portal_lcia_projection_status(&state.pool, projection_id, worker_lease_token).await?;
+    verify_portal_lcia_projection_status(
+        &status,
+        projection_id,
+        build_worker_job_id,
+        projection,
+        false,
+    )?;
+    let seal = seal_portal_lcia_projection(&state.pool, projection_id, worker_lease_token).await?;
+    verify_portal_lcia_projection_seal(&seal, projection_id, projection)
+}
+
+async fn register_portal_lcia_projection_batch_with_recovery(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+    batch: Value,
+) -> anyhow::Result<PortalProjectionBatchData> {
+    match register_portal_lcia_projection_batch(
+        pool,
+        projection_id,
+        worker_lease_token,
+        batch.clone(),
+    )
+    .await
+    {
+        Ok(data) => Ok(data),
+        Err(first_error) => {
+            portal_lcia_projection_status(pool, projection_id, worker_lease_token)
+                .await
+                .map_err(|status_error| {
+                    anyhow::anyhow!(
+                        "portal projection batch response was lost ({first_error}); status readback failed ({status_error})"
+                    )
+                })?;
+            register_portal_lcia_projection_batch(pool, projection_id, worker_lease_token, batch)
+                .await
+        }
+    }
+}
+
+async fn register_portal_lcia_projection_batch(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+    batch: Value,
+) -> anyhow::Result<PortalProjectionBatchData> {
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_stage_register_batch_v1(
+            $1, $2, $3::jsonb
+        )
+        FROM _service_role
+        ",
+    )
+    .bind(projection_id)
+    .bind(worker_lease_token)
+    .bind(batch)
+    .fetch_one(pool)
+    .await?;
+    parse_portal_projection_rpc(result, "portal projection register batch")
+}
+
+async fn portal_lcia_projection_status(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+) -> anyhow::Result<PortalProjectionStatusData> {
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_stage_status_v1($1, $2)
+        FROM _service_role
+        ",
+    )
+    .bind(projection_id)
+    .bind(worker_lease_token)
+    .fetch_one(pool)
+    .await?;
+    parse_portal_projection_rpc(result, "portal projection status")
+}
+
+async fn seal_portal_lcia_projection(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+) -> anyhow::Result<PortalProjectionSealData> {
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_stage_seal_v1($1, $2)
+        FROM _service_role
+        ",
+    )
+    .bind(projection_id)
+    .bind(worker_lease_token)
+    .fetch_one(pool)
+    .await?;
+    parse_portal_projection_rpc(result, "portal projection seal")
+}
+
+async fn fail_portal_lcia_projection_stage(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+    code: &str,
+    message: &str,
+    audit: Value,
+) -> anyhow::Result<()> {
+    let message = message.chars().take(2_000).collect::<String>();
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_stage_fail_v1(
+            $1, $2, $3, $4, $5::jsonb
+        )
+        FROM _service_role
+        ",
+    )
+    .bind(projection_id)
+    .bind(worker_lease_token)
+    .bind(code)
+    .bind(message)
+    .bind(audit)
+    .fetch_one(pool)
+    .await?;
+    let _: Value = parse_portal_projection_rpc(result, "portal projection fail")?;
+    Ok(())
+}
+
+fn verify_portal_lcia_projection_status(
+    status: &PortalProjectionStatusData,
+    projection_id: Uuid,
+    build_worker_job_id: Uuid,
+    projection: &BoundPortalLciaProjection,
+    require_prepared: bool,
+) -> anyhow::Result<()> {
+    if status.projection_id != projection_id
+        || status.build_worker_job_id != build_worker_job_id
+        || status.process_count != projection.process_relation.record_count
+        || status.expected_process_count != projection.process_relation.record_count
+        || status.impact_count != projection.impact_relation.record_count
+        || status.expected_impact_count != projection.impact_relation.record_count
+        || status.value_count != projection.value_relation.record_count
+        || status.expected_value_count != projection.value_relation.record_count
+        || status.hash_contract_version != PORTAL_LCIA_HASH_CONTRACT_VERSION
+        || status.failure_code.is_some()
+        || (require_prepared && status.status != "prepared")
+        || (!require_prepared && status.status != "staging")
+    {
+        return Err(anyhow::anyhow!(
+            "Portal projection status readback does not match the prepared spool"
+        ));
+    }
+    if require_prepared
+        && (status.process_axis_hash.as_deref()
+            != Some(projection.process_relation.relation_hash.as_str())
+            || status.impact_axis_hash.as_deref()
+                != Some(projection.impact_relation.relation_hash.as_str())
+            || status.value_grid_hash.as_deref()
+                != Some(projection.value_relation.relation_hash.as_str())
+            || status.relation_hash.as_deref() != Some(projection.relation_hash.as_str())
+            || status.content_hash.as_deref() != Some(projection.content_hash.as_str()))
+    {
+        return Err(anyhow::anyhow!(
+            "Portal projection prepared status hash readback mismatches Worker evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_portal_lcia_projection_seal(
+    seal: &PortalProjectionSealData,
+    projection_id: Uuid,
+    projection: &BoundPortalLciaProjection,
+) -> anyhow::Result<()> {
+    if seal.projection_id != projection_id
+        || seal.status != "prepared"
+        || seal.process_count != projection.process_relation.record_count
+        || seal.impact_count != projection.impact_relation.record_count
+        || seal.value_count != projection.value_relation.record_count
+        || seal.process_axis_hash != projection.process_relation.relation_hash
+        || seal.impact_axis_hash != projection.impact_relation.relation_hash
+        || seal.value_grid_hash != projection.value_relation.relation_hash
+        || seal.relation_hash != projection.relation_hash
+        || seal.content_hash != projection.content_hash
+        || seal.hash_contract_version != PORTAL_LCIA_HASH_CONTRACT_VERSION
+    {
+        return Err(anyhow::anyhow!(
+            "Portal projection seal hash/count readback mismatches Worker evidence"
+        ));
+    }
+    Ok(())
+}
+
+async fn mark_portal_lcia_result_package_ready(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+    input: LciaResultPackageReadyInput,
+) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_package_mark_ready_v1(
+            $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+            $10::jsonb, $11::jsonb, $12, $13, $14::jsonb
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(projection_id)
+    .bind(input.build_worker_job_id)
+    .bind(worker_lease_token)
+    .bind(input.package_version)
+    .bind(input.snapshot_id)
+    .bind(input.result_id)
+    .bind(input.latest_all_unit_result_id)
+    .bind(input.result_artifact_ref)
+    .bind(input.query_artifact_ref)
+    .bind(input.artifact_manifest)
+    .bind(input.available_impact_categories)
+    .bind(input.default_impact_category)
+    .bind(input.package_result_hash)
+    .bind(input.audit)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(result)
+    } else {
+        Err(anyhow::anyhow!(
+            "svc_portal_lcia_projection_package_mark_ready_v1 returned non-ok result: {result}"
         ))
     }
 }

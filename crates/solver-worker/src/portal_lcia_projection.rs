@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use flate2::read::GzDecoder;
@@ -12,7 +13,8 @@ use uuid::Uuid;
 
 pub const PORTAL_LCIA_PROJECTION_CONTRACT_VERSION: &str = "portal.lcia-projection.v1";
 pub const PORTAL_LCIA_DECIMAL_CONTRACT_VERSION: &str = "ieee754-binary64-shortest-fixed-p38.v1";
-pub const PORTAL_LCIA_HASH_CONTRACT_VERSION: &str = "int32be-length-prefixed-sha256.v1";
+pub const PORTAL_LCIA_HASH_CONTRACT_VERSION: &str =
+    "portal.lcia-projection.int32be-frame-sha256.v1";
 pub const PORTAL_LCIA_PROCESS_SCHEMA_VERSION: &str = "portal.lcia-projection.process.v1";
 pub const PORTAL_LCIA_IMPACT_SCHEMA_VERSION: &str = "portal.lcia-projection.impact.v1";
 pub const PORTAL_LCIA_VALUE_SCHEMA_VERSION: &str = "portal.lcia-projection.value.v1";
@@ -88,8 +90,6 @@ pub struct PortalProjectionSourceBinding {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortalProcessRecord {
-    pub schema_version: &'static str,
-    pub ordinal: u64,
     pub process_index: u64,
     pub process_id: Uuid,
     pub process_version: String,
@@ -110,24 +110,24 @@ pub struct PortalProcessRecord {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortalImpactRecord {
-    pub schema_version: &'static str,
-    pub ordinal: u64,
     pub impact_index: u64,
     pub method_id: Uuid,
     pub method_version: String,
     pub method_document_sha256: String,
+    #[serde(rename = "impactId")]
     pub impact_category_id: String,
     pub impact_name: Vec<PortalLocalizedText>,
+    #[serde(rename = "unit")]
     pub result_unit: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortalValueRecord {
-    pub schema_version: &'static str,
     pub ordinal: u64,
     pub process_index: u64,
     pub impact_index: u64,
+    #[serde(rename = "value")]
     pub value_text: String,
 }
 
@@ -150,6 +150,9 @@ pub struct PreparedPortalLciaProjection {
     pub process_relation: PreparedPortalRelation,
     pub impact_relation: PreparedPortalRelation,
     pub value_relation: PreparedPortalRelation,
+    #[serde(skip)]
+    #[allow(dead_code)]
+    directory_guard: Arc<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +168,9 @@ pub struct BoundPortalLciaProjection {
     pub process_relation: PreparedPortalRelation,
     pub impact_relation: PreparedPortalRelation,
     pub value_relation: PreparedPortalRelation,
+    #[serde(skip)]
+    #[allow(dead_code)]
+    directory_guard: Arc<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -407,8 +413,8 @@ fn expand_exponent_notation(value: &str) -> anyhow::Result<String> {
     Ok(fixed)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn prepare_portal_lcia_projection(
-    spool_root: &Path,
     processes: &[PortalProcessSource],
     impacts: &[PortalImpactSource],
     shards: &[PortalLciaShard],
@@ -420,14 +426,23 @@ pub fn prepare_portal_lcia_projection(
     }
     validate_axis_indices(processes.iter().map(|item| item.process_index), "process")?;
     validate_axis_indices(impacts.iter().map(|item| item.impact_index), "impact")?;
+    let directory = Arc::new(
+        tempfile::Builder::new()
+            .prefix("portal-lcia-projection-")
+            .tempdir()?,
+    );
+    let spool_root = directory.path();
 
     let process_count = u64::try_from(processes.len())?;
     let impact_count = u64::try_from(impacts.len())?;
     let expected_value_count = process_count
         .checked_mul(impact_count)
         .ok_or_else(|| anyhow::anyhow!("Portal LCIA Cartesian grid size overflow"))?;
-    let mut process_writer =
-        RelationWriter::create(spool_root.join("process.ndjson"), "process", process_count)?;
+    let mut process_writer = RelationWriter::create(
+        spool_root.join("process.ndjson"),
+        "process-axis",
+        process_count,
+    )?;
     for process in processes {
         require_nonempty(&process.process_version, "processVersion")?;
         validate_sha256(&process.process_document_sha256, "processDocumentSha256")?;
@@ -463,8 +478,6 @@ pub fn prepare_portal_lcia_projection(
             ));
         }
         let record = PortalProcessRecord {
-            schema_version: PORTAL_LCIA_PROCESS_SCHEMA_VERSION,
-            ordinal: process.process_index + 1,
             process_index: process.process_index,
             process_id: process.process_id,
             process_version: process.process_version.clone(),
@@ -481,12 +494,20 @@ pub fn prepare_portal_lcia_projection(
             geography_precision,
             reference_year: process.reference_year,
         };
-        process_writer.write(record.ordinal, process_record_hash(&record)?, &record)?;
+        process_writer.write(
+            record.process_index + 1,
+            process_record_hash(&record)?,
+            &record,
+        )?;
     }
-    let process_relation = process_writer.finish("process", PORTAL_LCIA_PROCESS_SCHEMA_VERSION)?;
+    let process_relation =
+        process_writer.finish("process-axis", PORTAL_LCIA_PROCESS_SCHEMA_VERSION)?;
 
-    let mut impact_writer =
-        RelationWriter::create(spool_root.join("impact.ndjson"), "impact", impact_count)?;
+    let mut impact_writer = RelationWriter::create(
+        spool_root.join("impact.ndjson"),
+        "impact-axis",
+        impact_count,
+    )?;
     for impact in impacts {
         require_nonempty(&impact.method_version, "methodVersion")?;
         validate_sha256(&impact.method_document_sha256, "methodDocumentSha256")?;
@@ -494,8 +515,6 @@ pub fn prepare_portal_lcia_projection(
         let impact_name = normalize_localized_text(&impact.impact_name, "impactName")?;
         require_nonempty(&impact.result_unit, "resultUnit")?;
         let record = PortalImpactRecord {
-            schema_version: PORTAL_LCIA_IMPACT_SCHEMA_VERSION,
-            ordinal: impact.impact_index + 1,
             impact_index: impact.impact_index,
             method_id: impact.method_id,
             method_version: impact.method_version.clone(),
@@ -504,14 +523,18 @@ pub fn prepare_portal_lcia_projection(
             impact_name,
             result_unit: impact.result_unit.trim().to_owned(),
         };
-        impact_writer.write(record.ordinal, impact_record_hash(&record)?, &record)?;
+        impact_writer.write(
+            record.impact_index + 1,
+            impact_record_hash(&record)?,
+            &record,
+        )?;
     }
-    let impact_relation = impact_writer.finish("impact", PORTAL_LCIA_IMPACT_SCHEMA_VERSION)?;
+    let impact_relation = impact_writer.finish("impact-axis", PORTAL_LCIA_IMPACT_SCHEMA_VERSION)?;
 
     let chunk_descriptor_set_hash = chunk_descriptor_set_hash(shards)?;
     let mut value_writer = RelationWriter::create(
         spool_root.join("value.ndjson"),
-        "value",
+        "value-grid",
         expected_value_count,
     )?;
     let mut expected_value_ordinal = 0_u64;
@@ -548,7 +571,6 @@ pub fn prepare_portal_lcia_projection(
                 ));
             }
             let record = PortalValueRecord {
-                schema_version: PORTAL_LCIA_VALUE_SCHEMA_VERSION,
                 ordinal: expected_value_ordinal + 1,
                 process_index: process_ordinal,
                 impact_index: impact_ordinal,
@@ -570,7 +592,7 @@ pub fn prepare_portal_lcia_projection(
             "Portal LCIA Cartesian grid is incomplete: expected={expected_value_count} observed={expected_value_ordinal}"
         ));
     }
-    let value_relation = value_writer.finish("value", PORTAL_LCIA_VALUE_SCHEMA_VERSION)?;
+    let value_relation = value_writer.finish("value-grid", PORTAL_LCIA_VALUE_SCHEMA_VERSION)?;
 
     let relation_hash = relation_set_hash(&process_relation, &impact_relation, &value_relation)?;
     Ok(PreparedPortalLciaProjection {
@@ -582,6 +604,7 @@ pub fn prepare_portal_lcia_projection(
         process_relation,
         impact_relation,
         value_relation,
+        directory_guard: directory,
     })
 }
 
@@ -650,7 +673,7 @@ fn verify_sha256_file(path: &Path, expected_size: u64, expected_hash: &str) -> a
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut observed_size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -703,13 +726,14 @@ fn relation_set_hash(
     value: &PreparedPortalRelation,
 ) -> anyhow::Result<String> {
     sha256_fields(&[
-        Some("portal.lcia-projection.relation-set.v1"),
+        Some("portal.lcia-projection.grid-relation.v1"),
         Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
         Some(process.record_count.to_string().as_str()),
-        Some(process.relation_hash.as_str()),
         Some(impact.record_count.to_string().as_str()),
-        Some(impact.relation_hash.as_str()),
         Some(value.record_count.to_string().as_str()),
+        Some("ordinal=processIndex*impactCount+impactIndex+1"),
+        Some(process.relation_hash.as_str()),
+        Some(impact.relation_hash.as_str()),
         Some(value.relation_hash.as_str()),
     ])
 }
@@ -726,7 +750,6 @@ fn content_hash(
         Some("portal.lcia-projection.content.v1"),
         Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
         Some(PORTAL_LCIA_PROJECTION_CONTRACT_VERSION),
-        Some(PORTAL_LCIA_DECIMAL_CONTRACT_VERSION),
         Some(source.input_manifest_hash.as_str()),
         Some(source.closure_certificate_hash.as_str()),
         Some(source.snapshot_hash.as_str()),
@@ -749,88 +772,59 @@ fn content_hash(
 }
 
 fn process_record_hash(record: &PortalProcessRecord) -> anyhow::Result<String> {
-    let mut hasher = Sha256::new();
-    update_framed_fields(
-        &mut hasher,
-        &[
-            Some("portal.lcia-projection.process-record.v1"),
-            Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
-            Some(record.schema_version),
-            Some(record.ordinal.to_string().as_str()),
-            Some(record.process_index.to_string().as_str()),
-            Some(record.process_id.to_string().as_str()),
-            Some(record.process_version.as_str()),
-            Some(record.process_document_sha256.as_str()),
-            Some(record.reference_flow_id.to_string().as_str()),
-            Some(record.reference_flow_version.as_str()),
-            Some(record.reference_exchange_internal_id.as_str()),
-            Some(record.reference_flow_amount.as_str()),
-            Some(record.reference_flow_direction.as_str()),
-            Some(record.functional_unit_amount.as_str()),
-            Some(record.functional_unit_unit.as_str()),
-            Some(
-                record
-                    .functional_unit_description
-                    .len()
-                    .to_string()
-                    .as_str(),
-            ),
-        ],
-    )?;
-    for text in &record.functional_unit_description {
-        update_framed_fields(
-            &mut hasher,
-            &[Some(text.language.as_str()), Some(text.value.as_str())],
-        )?;
-    }
-    update_framed_fields(
-        &mut hasher,
-        &[
-            Some(record.geography_code.as_str()),
-            Some(record.geography_precision.as_str()),
-            Some(record.reference_year.to_string().as_str()),
-        ],
-    )?;
-    Ok(hex::encode(hasher.finalize()))
+    let localized = localized_text_frame_hex(&record.functional_unit_description)?;
+    sha256_fields(&[
+        Some(PORTAL_LCIA_PROCESS_SCHEMA_VERSION),
+        Some(record.process_index.to_string().as_str()),
+        Some(record.process_id.to_string().as_str()),
+        Some(record.process_version.as_str()),
+        Some(record.reference_flow_id.to_string().as_str()),
+        Some(record.reference_flow_version.as_str()),
+        Some(record.reference_exchange_internal_id.as_str()),
+        Some(record.reference_flow_amount.as_str()),
+        Some(record.reference_flow_direction.as_str()),
+        Some(record.functional_unit_amount.as_str()),
+        Some(record.functional_unit_unit.as_str()),
+        Some(localized.as_str()),
+        Some(record.geography_code.as_str()),
+        Some(record.geography_precision.as_str()),
+        Some(record.reference_year.to_string().as_str()),
+        Some(record.process_document_sha256.as_str()),
+    ])
 }
 
 fn impact_record_hash(record: &PortalImpactRecord) -> anyhow::Result<String> {
-    let mut hasher = Sha256::new();
-    update_framed_fields(
-        &mut hasher,
-        &[
-            Some("portal.lcia-projection.impact-record.v1"),
-            Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
-            Some(record.schema_version),
-            Some(record.ordinal.to_string().as_str()),
-            Some(record.impact_index.to_string().as_str()),
-            Some(record.method_id.to_string().as_str()),
-            Some(record.method_version.as_str()),
-            Some(record.method_document_sha256.as_str()),
-            Some(record.impact_category_id.as_str()),
-            Some(record.impact_name.len().to_string().as_str()),
-        ],
-    )?;
-    for text in &record.impact_name {
-        update_framed_fields(
-            &mut hasher,
-            &[Some(text.language.as_str()), Some(text.value.as_str())],
-        )?;
-    }
-    update_framed_fields(&mut hasher, &[Some(record.result_unit.as_str())])?;
-    Ok(hex::encode(hasher.finalize()))
+    let localized = localized_text_frame_hex(&record.impact_name)?;
+    sha256_fields(&[
+        Some(PORTAL_LCIA_IMPACT_SCHEMA_VERSION),
+        Some(record.impact_index.to_string().as_str()),
+        Some(record.method_id.to_string().as_str()),
+        Some(record.method_version.as_str()),
+        Some(record.impact_category_id.as_str()),
+        Some(localized.as_str()),
+        Some(record.result_unit.as_str()),
+        Some(record.method_document_sha256.as_str()),
+    ])
 }
 
 fn value_record_hash(record: &PortalValueRecord) -> anyhow::Result<String> {
     sha256_fields(&[
-        Some("portal.lcia-projection.value-record.v1"),
-        Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
-        Some(record.schema_version),
+        Some(PORTAL_LCIA_VALUE_SCHEMA_VERSION),
         Some(record.ordinal.to_string().as_str()),
         Some(record.process_index.to_string().as_str()),
         Some(record.impact_index.to_string().as_str()),
         Some(record.value_text.as_str()),
     ])
+}
+
+fn localized_text_frame_hex(values: &[PortalLocalizedText]) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    append_frame(&mut bytes, Some(values.len().to_string().as_str()))?;
+    for value in values {
+        append_frame(&mut bytes, Some(value.language.as_str()))?;
+        append_frame(&mut bytes, Some(value.value.as_str()))?;
+    }
+    Ok(hex::encode(bytes))
 }
 
 fn sha256_fields(fields: &[Option<&str>]) -> anyhow::Result<String> {
@@ -841,14 +835,21 @@ fn sha256_fields(fields: &[Option<&str>]) -> anyhow::Result<String> {
 
 fn update_framed_fields(hasher: &mut Sha256, fields: &[Option<&str>]) -> anyhow::Result<()> {
     for field in fields {
-        match field {
-            Some(field) => {
-                let length = i32::try_from(field.len())?;
-                hasher.update(length.to_be_bytes());
-                hasher.update(field.as_bytes());
-            }
-            None => hasher.update((-1_i32).to_be_bytes()),
+        let mut frame = Vec::new();
+        append_frame(&mut frame, *field)?;
+        hasher.update(frame);
+    }
+    Ok(())
+}
+
+fn append_frame(buffer: &mut Vec<u8>, field: Option<&str>) -> anyhow::Result<()> {
+    match field {
+        Some(field) => {
+            let length = i32::try_from(field.len())?;
+            buffer.extend_from_slice(&length.to_be_bytes());
+            buffer.extend_from_slice(field.as_bytes());
         }
+        None => buffer.extend_from_slice(&(-1_i32).to_be_bytes()),
     }
     Ok(())
 }
@@ -901,10 +902,15 @@ fn normalize_localized_text(
             "Portal LCIA projection {field} must not be empty"
         ));
     }
+    if values.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "Portal LCIA projection {field} contains too many localized values"
+        ));
+    }
     let mut normalized = values
         .iter()
         .map(|value| {
-            let language = value.language.trim();
+            let language = value.language.trim().to_ascii_lowercase();
             let text = value.value.trim();
             if language.is_empty()
                 || language.len() > 35
@@ -912,13 +918,14 @@ fn normalize_localized_text(
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
                 || text.is_empty()
+                || text.chars().count() > 4_096
             {
                 return Err(anyhow::anyhow!(
                     "Portal LCIA projection {field} contains invalid localized text"
                 ));
             }
             Ok(PortalLocalizedText {
-                language: language.to_owned(),
+                language,
                 value: text.to_owned(),
             })
         })
@@ -1003,6 +1010,7 @@ impl PreparedPortalLciaProjection {
             process_relation: self.process_relation,
             impact_relation: self.impact_relation,
             value_relation: self.value_relation,
+            directory_guard: self.directory_guard,
         })
     }
 }
@@ -1017,6 +1025,7 @@ impl BoundPortalLciaProjection {
         ]
     }
 
+    #[must_use]
     pub fn stage_descriptor(&self) -> Value {
         json!({
             "contractVersion": self.contract_version,
@@ -1049,23 +1058,25 @@ impl PortalProjectionBatchReader {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn next_batch(&mut self) -> anyhow::Result<Option<PortalProjectionBatch>> {
         if self.exhausted {
             return Ok(None);
         }
         let mut records = Vec::<Value>::new();
         let mut records_encoded_bytes = 2_usize;
+        let mut first_ordinal = None;
+        let mut last_ordinal = None;
         while records.len() < PORTAL_LCIA_MAX_BATCH_RECORDS {
-            let line = match self.next_line.take() {
-                Some(line) => line,
-                None => {
-                    let mut line = Vec::new();
-                    if self.reader.read_until(b'\n', &mut line)? == 0 {
-                        self.exhausted = true;
-                        break;
-                    }
-                    line
+            let line = if let Some(line) = self.next_line.take() {
+                line
+            } else {
+                let mut line = Vec::new();
+                if self.reader.read_until(b'\n', &mut line)? == 0 {
+                    self.exhausted = true;
+                    break;
                 }
+                line
             };
             if line.last() != Some(&b'\n') {
                 return Err(anyhow::anyhow!(
@@ -1092,9 +1103,11 @@ impl PortalProjectionBatchReader {
                     spool.ordinal
                 ));
             }
+            first_ordinal.get_or_insert(spool.ordinal);
+            last_ordinal = Some(spool.ordinal);
             self.next_expected_ordinal += 1;
             records_encoded_bytes = prospective;
-            records.push(serde_json::to_value(spool)?);
+            records.push(spool.record);
         }
         if records.is_empty() {
             if self.next_expected_ordinal
@@ -1112,26 +1125,26 @@ impl PortalProjectionBatchReader {
             }
             return Ok(None);
         }
-        let first_ordinal = records
-            .first()
-            .and_then(|value| value.get("ordinal"))
-            .and_then(Value::as_u64)
+        let first_ordinal = first_ordinal
             .ok_or_else(|| anyhow::anyhow!("Portal projection batch omitted first ordinal"))?;
-        let last_ordinal = records
-            .last()
-            .and_then(|value| value.get("ordinal"))
-            .and_then(Value::as_u64)
+        let last_ordinal = last_ordinal
             .ok_or_else(|| anyhow::anyhow!("Portal projection batch omitted last ordinal"))?;
+        let record_count = records.len();
+        let (processes, impacts, values) = match self.relation.relation {
+            "process-axis" => (records, Vec::new(), Vec::new()),
+            "impact-axis" => (Vec::new(), records, Vec::new()),
+            "value-grid" => (Vec::new(), Vec::new(), records),
+            relation => {
+                return Err(anyhow::anyhow!(
+                    "unsupported Portal projection relation: {relation}"
+                ));
+            }
+        };
         let payload = json!({
-            "contractVersion": PORTAL_LCIA_PROJECTION_CONTRACT_VERSION,
-            "relation": self.relation.relation,
-            "relationSchemaVersion": self.relation.schema_version,
-            "relationHash": self.relation.relation_hash,
-            "batchOrdinal": self.batch_ordinal,
-            "firstOrdinal": first_ordinal,
-            "lastOrdinal": last_ordinal,
-            "recordCount": records.len(),
-            "records": records,
+            "schemaVersion": "portal.lcia-projection.batch.v1",
+            "processes": processes,
+            "impacts": impacts,
+            "values": values,
         });
         let encoded_bytes = canonical_json_bytes(&payload)?.len();
         if encoded_bytes > PORTAL_LCIA_MAX_BATCH_ENCODED_BYTES {
@@ -1144,7 +1157,7 @@ impl PortalProjectionBatchReader {
             batch_ordinal: self.batch_ordinal,
             first_ordinal,
             last_ordinal,
-            record_count: records.len(),
+            record_count,
             payload,
             encoded_bytes,
         };
@@ -1292,6 +1305,14 @@ mod tests {
     }
 
     #[test]
+    fn int32be_framing_matches_the_database_cross_language_vector() {
+        assert_eq!(
+            sha256_fields(&[Some("A"), Some("é"), None, Some("")]).unwrap(),
+            "5a01047a86055adc7954e7411667d0ef91c64f0c9ff4550dce738aa4d2f4a6ea"
+        );
+    }
+
+    #[test]
     fn projection_is_deterministic_and_preserves_explicit_zero() {
         let directory = TempDir::new().unwrap();
         let (processes, impacts) = fixture_axes();
@@ -1300,31 +1321,23 @@ mod tests {
             &impacts,
             &[(0, 0, 0.0), (0, 1, 1.5), (1, 0, -2.0), (1, 1, 3.0)],
         );
-        let first = prepare_portal_lcia_projection(
-            &directory.path().join("one"),
-            &processes,
-            &impacts,
-            std::slice::from_ref(&shard),
-        )
-        .unwrap()
-        .bind_source(source_binding())
-        .unwrap();
-        let second = prepare_portal_lcia_projection(
-            &directory.path().join("two"),
-            &processes,
-            &impacts,
-            std::slice::from_ref(&shard),
-        )
-        .unwrap()
-        .bind_source(source_binding())
-        .unwrap();
+        let first =
+            prepare_portal_lcia_projection(&processes, &impacts, std::slice::from_ref(&shard))
+                .unwrap()
+                .bind_source(source_binding())
+                .unwrap();
+        let second =
+            prepare_portal_lcia_projection(&processes, &impacts, std::slice::from_ref(&shard))
+                .unwrap()
+                .bind_source(source_binding())
+                .unwrap();
         assert_eq!(first.content_hash, second.content_hash);
         assert_eq!(
             first.value_relation.relation_hash,
             second.value_relation.relation_hash
         );
         let text = std::fs::read_to_string(&first.value_relation.local_path).unwrap();
-        assert!(text.contains("\"valueText\":\"0\""));
+        assert!(text.contains("\"value\":\"0\""));
         assert!(text.contains("\"ordinal\":1"));
         assert_eq!(first.value_relation.record_count, 4);
     }
@@ -1338,15 +1351,7 @@ mod tests {
             &impacts,
             &[(0, 0, 1.0), (0, 1, 2.0), (1, 1, 4.0)],
         );
-        assert!(
-            prepare_portal_lcia_projection(
-                &directory.path().join("hole"),
-                &processes,
-                &impacts,
-                &[hole],
-            )
-            .is_err()
-        );
+        assert!(prepare_portal_lcia_projection(&processes, &impacts, &[hole],).is_err());
 
         let other = TempDir::new().unwrap();
         let mut reordered = fixture_shard(
@@ -1355,24 +1360,10 @@ mod tests {
             &[(0, 1, 1.0), (0, 0, 2.0), (1, 0, 3.0), (1, 1, 4.0)],
         );
         assert!(
-            prepare_portal_lcia_projection(
-                &other.path().join("reordered"),
-                &processes,
-                &impacts,
-                &[reordered.clone()],
-            )
-            .is_err()
+            prepare_portal_lcia_projection(&processes, &impacts, &[reordered.clone()],).is_err()
         );
         reordered.sha256 = "0".repeat(64);
-        assert!(
-            prepare_portal_lcia_projection(
-                &other.path().join("tamper"),
-                &processes,
-                &impacts,
-                &[reordered],
-            )
-            .is_err()
-        );
+        assert!(prepare_portal_lcia_projection(&processes, &impacts, &[reordered],).is_err());
     }
 
     #[test]
@@ -1386,32 +1377,19 @@ mod tests {
         );
         processes[0].geography_code.clear();
         assert!(
-            prepare_portal_lcia_projection(
-                &directory.path().join("missing"),
-                &processes,
-                &impacts,
-                std::slice::from_ref(&shard),
-            )
-            .is_err()
+            prepare_portal_lcia_projection(&processes, &impacts, std::slice::from_ref(&shard),)
+                .is_err()
         );
         processes[0].geography_code = "CN".to_owned();
         processes[1].process_index = 2;
-        assert!(
-            prepare_portal_lcia_projection(
-                &directory.path().join("gap"),
-                &processes,
-                &impacts,
-                &[shard],
-            )
-            .is_err()
-        );
+        assert!(prepare_portal_lcia_projection(&processes, &impacts, &[shard],).is_err());
     }
 
     #[test]
     fn batches_are_bounded_and_locator_free() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("relation.ndjson");
-        let mut writer = RelationWriter::create(path, "value", 501).unwrap();
+        let mut writer = RelationWriter::create(path, "value-grid", 501).unwrap();
         for ordinal in 0..501 {
             writer
                 .write(
@@ -1426,7 +1404,7 @@ mod tests {
                 .unwrap();
         }
         let relation = writer
-            .finish("value", PORTAL_LCIA_VALUE_SCHEMA_VERSION)
+            .finish("value-grid", PORTAL_LCIA_VALUE_SCHEMA_VERSION)
             .unwrap();
         let mut reader = relation.batches().unwrap();
         let first = reader.next_batch().unwrap().unwrap();

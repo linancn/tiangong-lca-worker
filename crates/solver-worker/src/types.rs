@@ -281,6 +281,12 @@ pub enum JobPayload {
         /// Hash of the numerical snapshot build contract.
         #[serde(default)]
         snapshot_build_contract_hash: Option<String>,
+        /// Required only by request.v3; enables the additive Portal numeric projection.
+        #[serde(default)]
+        portal_projection_contract_version: Option<String>,
+        /// Cross-language scalar framing contract required only by request.v3.
+        #[serde(default)]
+        portal_projection_hash_contract_version: Option<String>,
     },
     /// Validate and freeze one immutable data-product scope closure.
     ScopeClosureCheck {
