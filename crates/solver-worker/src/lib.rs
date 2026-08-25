@@ -31,6 +31,7 @@ pub mod package_execution;
 pub mod package_retention;
 pub mod package_types;
 pub mod pgbouncer_sqlx;
+pub mod portal_lcia_projection;
 pub mod queue;
 pub mod readiness;
 pub mod resource;
