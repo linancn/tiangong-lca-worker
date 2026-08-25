@@ -42,14 +42,15 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "Worker now owns a generic ai-worker runtime; ai.tidas_suggestion is its first versioned handler and remains behind Edge/Database control-plane boundaries."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
+lastReviewedNote: "Reviewed for Worker Issue #275: request.v3 alone materializes the bounded Portal LCIA projection; V1/V2 and unrelated job families remain unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+  - docs/agents/contracts/portal-lcia-projection-contract.md
   - docs/lca-api-contract.md
   - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
@@ -75,6 +76,7 @@ Start here when the task may change what the compute stack does.
 | `docs/agents/repo-validation.md` | minimum proof by change type, manual validation helpers, PR validation note shape | repo contract, branch policy truth, or long setup notes |
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
 | `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v3 issue/result, compact root-impact/witness, memory/cancellation, migration, and staged-publication invariants | general repo routing or durable database schema |
+| `docs/agents/contracts/portal-lcia-projection-contract.md` | V3-only typed LCIA projection records, cross-language hashes, bounded staging, lease fencing, and package binding | public Portal reads, durable database schema, or Release approval behavior |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
 | `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
@@ -98,6 +100,7 @@ Read in this order:
    - `docs/lca-api-contract.md`
    - `docs/scope-closure-contract.md`
    - `docs/agents/contracts/scope-closure-memory-and-result-contract.md`
+   - `docs/agents/contracts/portal-lcia-projection-contract.md`
    - `docs/matrix-readiness-report-contract.md`
    - `docs/review-quality-diagnostic-contract.md`
    - `docs/ai-worker-contract.md`
@@ -181,6 +184,7 @@ Route those tasks to:
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, requires the frozen technosphere boundary policy to be exactly `cutoff`, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset; unresolved provider balances remain warning/evidence rather than certificate blockers
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
+- only `lcia_result.package_build.request.v3` may carry `portalProjectionContractVersion=portal.lcia-projection.v1`; it derives typed Process/Method/value relations from frozen Calculation Bundle evidence, stages them through lease-fenced Database RPCs, verifies Database hashes/counts, and binds the exact projection ID/content hash into the private package artifact manifest before ready-marking. V1/V2 never generate or write this projection
 - package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION` (active governed default `0.2.0`), verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 - scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, with ordinary records unchanged in NDJSON partitions and individually oversized administrative records represented by a bounded index plus fixed canonical-byte chunks whose streamed reconstruction preserves the original relation hash; this delivery directly downloads only XLSX and the manifest, and direct member retrieval remains a separately tracked cross-repository contract
@@ -193,6 +197,7 @@ Route those tasks to:
 - if proof expectations or manual validation helper guidance change, update `docs/agents/repo-validation.md`
 - if repo shape, hotspot families, or path ownership explanation changes, update `docs/agents/repo-architecture.md`
 - if shared jobs/results/payload/status semantics change, update `docs/lca-api-contract.md`
+- if Portal LCIA projection records, hashes, staging, or package binding change, update `docs/agents/contracts/portal-lcia-projection-contract.md`
 - if closure traversal, immutable release evidence, artifacts, reuse, or build-certificate binding changes, update `docs/scope-closure-contract.md`
 - if matrix-readiness report schema, blocker/finding codes, policy defaults, or next_action semantics change, update `docs/matrix-readiness-report-contract.md`
 - if Review Admin quality-diagnostic job, joint pending-review scope, informational outcomes/findings, or compatibility boundary changes, update `docs/review-quality-diagnostic-contract.md`

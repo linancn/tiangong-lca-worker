@@ -36,9 +36,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "The runtime map now includes the generic ai-worker process and its first versioned ai.tidas_suggestion handler."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
+lastReviewedNote: "The runtime map now includes the V3-only Portal LCIA typed projection spool and Database staging boundary from Worker Issue #275."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -49,6 +49,7 @@ related:
   - ../../docs/review-quality-diagnostic-contract.md
   - ../../docs/ai-worker-contract.md
   - ./contracts/scope-closure-memory-and-result-contract.md
+  - ./contracts/portal-lcia-projection-contract.md
 ---
 
 ## Repo Shape
@@ -83,6 +84,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
 | `crates/solver-worker/src/snapshot_artifacts.rs` | numerical HDF5 envelope, Review projections, release-metadata/source-closure descriptor chain, and legacy graph/v1 readers |
 | `crates/solver-worker/src/calculation_bundle.rs` | canonical content-addressed Calculation Bundle shards plus streaming LCIA XLSX/CSV, LCI Parquet/CSV, and whole-bundle audit downloads |
+| `crates/solver-worker/src/portal_lcia_projection.rs` | V3-only typed Process/Impact/Value spool, canonical decimals, int32be hashes, verified LCIA shard reader, and bounded Database batches |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
 | `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
@@ -97,6 +99,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
 | `docs/scope-closure-contract.md` | closure traversal, immutable source, validation, artifact, reuse, and build-binding contract |
 | `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v4 bounded artifact shape with v3 issue semantics, compact root-impact/witness representation, memory/cancellation invariants, and Database #316 staged-publication handshake |
+| `docs/agents/contracts/portal-lcia-projection-contract.md` | V3 opt-in, typed records, cross-language hashes, lease-fenced staging, and exact package-manifest binding |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
 | `docs/review-quality-diagnostic-contract.md` | worker-owned manual Review Admin diagnostic, joint pending-review matrix, and informational report contract |
 | `docs/ai-worker-contract.md` | generic AI queue and versioned handler contract |
@@ -125,7 +128,7 @@ The worker currently covers families such as:
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker uses `SOLVER_QUEUE_BACKEND=worker-jobs`. It claims `private.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Ordinary solve jobs link LCA domain rows and use `private.worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `private.lca_results` plus `private.lca_latest_all_unit_results` as Worker-produced artifacts and then mark `private.lcia_result_packages` preview-ready through the database service-role command. The retired `lca_jobs` lifecycle and matrix-table fallback are not compatibility surfaces: selecting `SOLVER_QUEUE_BACKEND=pgmq` or encountering a snapshot without a ready artifact fails closed. The independent `pgmq` extension remains available to unrelated consumers.
+The main solver worker uses `SOLVER_QUEUE_BACKEND=worker-jobs`. It claims `private.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Ordinary solve jobs link LCA domain rows and use `private.worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `private.lca_results` plus `private.lca_latest_all_unit_results` as Worker-produced artifacts and then mark `private.lcia_result_packages` preview-ready through the database service-role command. Request V3 alone additionally derives a locator-free typed LCIA projection from the same frozen Calculation Bundle, writes it through lease-fenced Database RPCs, verifies the returned hashes/counts, and binds the exact projection ID/content hash into the package artifact manifest; V1/V2 do not enter that branch. The retired `lca_jobs` lifecycle and matrix-table fallback are not compatibility surfaces: selecting `SOLVER_QUEUE_BACKEND=pgmq` or encountering a snapshot without a ready artifact fails closed. The independent `pgmq` extension remains available to unrelated consumers.
 
 ### Generic AI jobs
 

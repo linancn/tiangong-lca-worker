@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-20
-lastReviewedCommit: 8b5197374dbb681d2b7b809967458f2209f743ad
-lastReviewedNote: "The review-quality snapshot helper and actor-owned draft scope preserve bounded file-backed Scope Closure results, private schema boundaries, memory limits, cancellation, and staged publication."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
+lastReviewedNote: "Reviewed for Worker Issue #275; the downstream Portal projection spool does not alter canonical Scope Closure v4 results, memory bounds, or Database #316 publication."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

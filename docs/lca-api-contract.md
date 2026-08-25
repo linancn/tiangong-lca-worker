@@ -25,9 +25,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "The shared job surface now includes the generic ai queue and versioned ai.tidas_suggestion request/result contract."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
+lastReviewedNote: "The shared job surface now includes the additive request.v3 Portal LCIA projection materialization and exact package binding from Worker Issue #275."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -40,6 +40,7 @@ related:
   - docs/frontend-integration.md
   - docs/agents/repo-validation.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+  - docs/agents/contracts/portal-lcia-projection-contract.md
 ---
 
 # LCA API Contract (Snapshot-First)
@@ -167,7 +168,7 @@ solver worker 使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend worke
 | `lca.build_snapshot` | `lca.build_snapshot.request.v1` / `lca.build_snapshot.request.v2` | `build_snapshot` | `lca.snapshot.result.v2` |
 | `lca.contribution_path` | `lca.contribution_path.request.v1` / `lca.contribution_path.request.v2` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
 | `lca.factorization_prepare` | `lca.factorization_prepare.request.v1` | `prepare_factorization` | `lca.factorization_prepare.result.v1` |
-| `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
+| `lcia_result.package_build` | `lcia_result.package_build.request.v1` / `.request.v2` / `.request.v3` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
 | `lcia.scope_closure_check` | `lcia.scope_closure_check.request.v1` | `scope_closure_check` | `lcia.scope_closure_check.result.v1` |
 
 `worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `private.lca_results`、`private.lca_result_cache`、`private.lca_latest_all_unit_results` 或 `private.lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不要求 retired `lca_jobs` parent row。
@@ -195,6 +196,27 @@ Factor coverage is counted for every selected method/exchange pair. Counts are `
 For this scope, `lca.solve_one.request.v2`, `lca.solve_all_unit.request.v2`, and `lca.contribution_path.request.v2` must carry `calculation_evidence_binding` equal to the snapshot-index evidence. The worker rejects missing, malformed, or drifted bindings before factorization/solve. A v1 solve against a bound snapshot is rejected, so the contract cannot silently downgrade. Successful scoped results repeat `calculation_evidence` in `lca_results.diagnostics` and job diagnostics; numeric trial results with gaps remain explicitly marked `incomplete_coverage`.
 
 `lcia_result.package_build` 不是普通求解 API 的用户请求类型，而是 data product manager command 创建的后台构建任务。payload 必须来自数据库/Edge 的 service-role command 边界，包含 `buildId`、`requestedBy`、published-only `inputManifest`、`inputManifestHash`、`coverageMode`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`。worker 只接受 `inputManifest.processes` 中 `stateCode/state_code` 为 `100..199` 的已发布过程；不会纳入 draft data。
+
+#### 3.7.1 Portal LCIA package build V3
+
+`lcia_result.package_build.request.v3` 是 additive opt-in，不替代 V1/V2。它必须在完整 V2 certificate binding 之外同时携带：
+
+- `portalProjectionContractVersion = portal.lcia-projection.v1`
+- `portalProjectionHashContractVersion = portal.lcia-projection.int32be-frame-sha256.v1`
+
+V1/V2 payload 携带任一 Portal marker 都会在 queue decode 阶段失败；V3 缺少或漂移任一 marker 也会失败。claim 后 Worker 通过 Database service RPC 重新读取同一 job/lease 的权威 payload，并要求逐 JSON 值等于已领取 job，之后才开始数值构建。
+
+V3 使用同一 verified Calculation Bundle 的 frozen Process axis、LCIA Method source documents 和本地 LCIA shards 生成三类 typed record。Process/Impact index 从 0 开始，Value ordinal 从 1 开始；decimal 为最多 38 个 ASCII digits 的 shortest round-tripping fixed string。Worker 在本地验证 compressed/uncompressed shard hash、byte size、record count、连续 range、dense Cartesian order、source context 和 record/relation/content hash，再以最多 500 records、最多 1 MiB serialized UTF-8 JSON 的 lease-fenced batches 写 Database。Database seal 返回的 counts 和所有 hashes 必须逐字符等于 Worker spool；任何 lease、row、identity、count 或 hash drift fail closed。
+
+V3 package ready 前，private `artifactManifest` 另外绑定：
+
+- `bundleContentHash`
+- `bundleManifestSha256`
+- `lciaChunkSetSha256`
+- `portalProjectionId`
+- `portalProjectionContentHash`
+
+这些字段是 private evidence，不是下载 locator。Release 只能发布/最终化 Database 已逐项核对的 exact projection；Portal 缺少 publication 时显示 unavailable，不能从 package artifact 或矩阵补数值 0。完整 record/hash/staging 契约见 `docs/agents/contracts/portal-lcia-projection-contract.md`。
 
 ### 3.8 `lcia.scope_closure_check` 与 Build V2 证书绑定
 
@@ -229,7 +251,7 @@ Singular/factorization failure diagnostics load the exact `(process_id, process_
 
 On success or failure, the worker links `private.lca_results`, `private.lca_result_cache`, `private.lca_latest_all_unit_results`, and `private.lca_factorization_registry` rows back to the canonical `private.worker_jobs.id` where those rows exist. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `private.lca_result_cache` failed state where a cache row exists. The retired PGMQ lifecycle fails closed.
 
-For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `private.cmd_lcia_result_package_mark_ready(...)`. The ready projection persists `availableImpactCategories` from the frozen snapshot impact axis as ordered canonical impact UUIDs; `defaultImpactCategory` is normalized from either a requested canonical UUID or frozen impact key to the matching canonical UUID, and defaults to the first frozen impact when omitted. An empty impact axis or a requested default outside that axis fails closed instead of publishing an empty category list. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `private.lca_result_cache`.
+For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key and computes the all-unit LCIA result plus query artifact. V1/V2 then use the established `private.cmd_lcia_result_package_mark_ready(...)` boundary. V3 first stages and seals its typed projection, then uses the dedicated projection-aware package-ready RPC so the exact projection ID/content hash is persisted with the package evidence. The ready projection persists `availableImpactCategories` from the frozen snapshot impact axis as ordered canonical impact UUIDs; `defaultImpactCategory` is normalized from either a requested canonical UUID or frozen impact key to the matching canonical UUID, and defaults to the first frozen impact when omitted. An empty impact axis or a requested default outside that axis fails closed instead of publishing an empty category list. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `private.lca_result_cache`.
 
 ### 3.9 `worker_jobs` AI 队列映射
 

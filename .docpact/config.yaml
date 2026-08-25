@@ -1,8 +1,8 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-25"
-lastReviewedCommit: "efa9d44f784eaa6a2a56908ef6c2c955c40fde12"
-lastReviewedNote: "Worker routes now include the generic ai-worker runtime and versioned AI handler contract introduced for Worker Issue #273."
+lastReviewedAt: "2026-08-26"
+lastReviewedCommit: "0093406327807bc62d9fe431aa1d33f6b049def6"
+lastReviewedNote: "Worker Issue #275 adds an explicitly routed V3-only Portal LCIA projection contract and three governed record schemas."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -17,6 +17,7 @@ catalog:
         - docs/agents/repo-validation.md
         - docs/agents/repo-architecture.md
         - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+        - docs/agents/contracts/portal-lcia-projection-contract.md
       workspaceIntegrationRequired: true
 
 ownership:
@@ -84,6 +85,7 @@ coverage:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+    - docs/agents/contracts/portal-lcia-projection-contract.md
     - docs/agents/contracts/*.schema.json
     - docs/lca-api-contract.md
     - docs/scope-closure-contract.md
@@ -178,6 +180,17 @@ routing:
         - docs/lca-api-contract.md
         - docs/agents/repo-architecture.md
         - docs/agents/repo-validation.md
+    portal-lcia-projection:
+      paths:
+        - crates/solver-worker/src/portal_lcia_projection.rs
+        - crates/solver-worker/src/calculation_bundle.rs
+        - crates/solver-worker/src/db.rs
+        - crates/solver-worker/src/queue.rs
+        - crates/solver-worker/src/types.rs
+        - docs/agents/contracts/portal-lcia-projection-contract.md
+        - docs/agents/contracts/portal-lcia-projection-*.schema.json
+        - docs/lca-api-contract.md
+        - docs/agents/repo-validation.md
     snapshot-and-provider:
       paths:
         - crates/solver-worker/src/bin/snapshot_builder.rs
@@ -252,6 +265,7 @@ docInventory:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+    - docs/agents/contracts/portal-lcia-projection-contract.md
     - docs/lca-api-contract.md
     - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
@@ -377,6 +391,38 @@ rules:
       - path: docs/tidas-package-contract.md
         mode: review_or_update
     reason: Closure execution, immutable release evidence, TIDAS parity, reuse, and package certificate binding must remain one reviewed contract surface.
+  - id: worker-portal-lcia-projection-contract
+    scope: repo
+    repo: worker
+    triggers:
+      - path: crates/solver-worker/src/portal_lcia_projection.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/calculation_bundle.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/db.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/queue.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/types.rs
+        kind: runtime-code
+      - path: docs/agents/contracts/portal-lcia-projection-contract.md
+        kind: runtime-contract
+      - path: docs/agents/contracts/portal-lcia-projection-*.schema.json
+        kind: result-contract
+    requiredDocs:
+      - path: AGENTS.md
+        mode: review_or_update
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/lca-api-contract.md
+        mode: review_or_update
+      - path: docs/agents/contracts/portal-lcia-projection-contract.md
+        mode: review_or_update
+    reason: V3-only projection records, hash framing, lease-fenced staging, and package binding must remain one reviewed cross-language Worker contract.
   - id: worker-provider-allocation-theory-contract
     scope: repo
     repo: worker

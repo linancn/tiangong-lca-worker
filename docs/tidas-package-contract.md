@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-19
-lastReviewedCommit: f51f816c53e32315d541346abf94cf3fd7dab345
-lastReviewedNote: "Review Admin diagnostics and actor-owned draft scope do not change TIDAS import/export jobs, artifact schemas, validation, retention, certificate binding, or result-package metadata."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
+lastReviewedNote: "Reviewed for Worker Issue #275; solver-queue V3 projection materialization does not change TIDAS import/export jobs, ZIP/report schemas, retention, or package-worker state."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -242,6 +242,8 @@ cargo run -p solver-worker --bin package_gc -- --execute
 Fresh scope closure uses the bounded `lcia.scope-closure-bundle.v4` binding manifest. Package verification downloads that JSON through the bounded file API, recomputes its exact hash, and streams only the schema/token binding fields; historical v1/v3 bundle files remain readable without materializing the complete object in memory. The growing administrative evidence is partitioned under the closure manifest and does not change TIDAS import/export ZIP semantics.
 
 这项绑定不会改变 TIDAS import/export ZIP、report、retention 或 `worker_queue=package` 状态机。完整契约见 `docs/scope-closure-contract.md` 与 `docs/lca-api-contract.md`。
+
+Solver queue 的 `lcia_result.package_build.request.v3` 可在同一证书和 Calculation Bundle 上额外生成 Portal typed projection；它不进入 `worker_queue=package`，不读取或改写 import/export ZIP，也不改变本文件的 report/retention contract。该投影契约见 `docs/agents/contracts/portal-lcia-projection-contract.md`。
 
 `worker.artifact_gc` 当前消费 Database Engine 管理的通用临时 artifact lifecycle contract，首先覆盖七天 scope-closure evidence。它不替代 `tidas.package_artifact_gc`、不改变本文件的 14/30 天 package retention、pin/cache/job protection 或 package-specific metadata cleanup。未来若 Database contract 将 package artifacts 纳入同一通用 claim surface，必须先在 database-engine 与本文件中显式协调迁移。
 
