@@ -29,8 +29,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
-lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change the manual Review Admin diagnostic payload, lease path, report, or non-blocking semantics."
+lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
+lastReviewedNote: "Reviewed for Worker Issue #275; the shared heartbeat precision and solver-only runtime guard do not change the manual Review Admin diagnostic payload, runner, report, or non-blocking semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

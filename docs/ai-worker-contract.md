@@ -24,8 +24,8 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
-lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change the AI runner's queue, handler, heartbeat, or result semantics."
+lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
+lastReviewedNote: "Reviewed for Worker Issue #275; the shared millisecond heartbeat period preserves the AI runner's one-third lease contract, while its queue, handler, runtime, and result semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
