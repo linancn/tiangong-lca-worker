@@ -25,7 +25,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 25b8bc651be3443c2aa0c460833939ddd6e65b01
+lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
 lastReviewedNote: "Reviewed the V3 package-ready response-loss recovery, strict locator-free receipt, and localized public-text validation for Worker Issue #275."
 related:
   - ../../../AGENTS.md
@@ -103,6 +103,8 @@ Worker uses the Database-owned service RPC sequence under the active V3 job leas
 The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable.
 
 The final package-ready call is a separate ambiguous-response boundary. Worker repeats that exact immutable Database call at most once and only when SQLx `fetch_one` fails; it never repeats Calculation Bundle work, object upload, projection staging, or sealing. A Database non-ok response, row decode error, malformed receipt, unexpected field, or identity/hash mismatch fails immediately without retry. Success is the exact locator-free `{ok,reused,data}` receipt: Worker requires the package version, `preview_ready` status, build Worker job, included-input count, projection ID/content hash, and hash-contract version to match its immutable inputs. `reused=false` and `reused=true` are both valid because the first fetch can fail before or after commit.
+
+Before any V3 snapshot preparation, calculation, upload, staging, or seal, a restarted Worker calls the service-only package-ready readback with its current job lease. Database returns stable 404 only when no committed package exists; an exact committed package returns the same strict receipt with `reused=true`, while any job/package/projection/artifact drift fails closed. This pre-build readback is what recovers a process crash after commit but before the original response or in-process retry; it does not rewrite the prepared projection's old lease or any package evidence.
 
 ## Package binding
 

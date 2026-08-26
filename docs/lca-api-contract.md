@@ -26,7 +26,7 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 25b8bc651be3443c2aa0c460833939ddd6e65b01
+lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
 lastReviewedNote: "Reviewed request.v3 package-ready ambiguous-response recovery and its exact locator-free Database receipt for Worker Issue #275."
 related:
   - AGENTS.md
@@ -218,7 +218,7 @@ V3 package ready 前，private `artifactManifest` 另外绑定：
 
 这些字段是 private evidence，不是下载 locator。Release 只能发布/最终化 Database 已逐项核对的 exact projection；Portal 缺少 publication 时显示 unavailable，不能从 package artifact 或矩阵补数值 0。完整 record/hash/staging 契约见 `docs/agents/contracts/portal-lcia-projection-contract.md`。
 
-V3 的最终 package-ready SQLx `fetch_one` 若失败，Worker 只以完全相同参数重放一次该 Database 调用，不重做计算、上传、staging 或 seal。Database non-ok、row decode、receipt schema、locator-free、projection identity/content hash 或 hash-contract 校验失败都立即 fail closed 且不重试。成功 receipt 顶层必须显式返回 `reused`；首次提交和已提交精确重放分别由 Database 返回 `false` / `true`。
+V3 的最终 package-ready SQLx `fetch_one` 若失败，Worker 只以完全相同参数重放一次该 Database 调用，不重做计算、上传、staging 或 seal。Database non-ok、row decode、receipt schema、locator-free、projection identity/content hash 或 hash-contract 校验失败都立即 fail closed 且不重试。成功 receipt 顶层必须显式返回 `reused`；首次提交和已提交精确重放分别由 Database 返回 `false` / `true`。若进程在提交后、收到响应前退出，下一次以新 job lease 启动时必须先调用 service-only package-ready readback；精确 receipt 直接完成 job，稳定 404 才进入计算，任何 evidence drift 都阻断且不重写旧 projection lease。
 
 ### 3.8 `lcia.scope_closure_check` 与 Build V2 证书绑定
 
