@@ -775,6 +775,7 @@ fn process_record_hash(record: &PortalProcessRecord) -> anyhow::Result<String> {
     let localized = localized_text_frame_hex(&record.functional_unit_description)?;
     sha256_fields(&[
         Some(PORTAL_LCIA_PROCESS_SCHEMA_VERSION),
+        Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
         Some(record.process_index.to_string().as_str()),
         Some(record.process_id.to_string().as_str()),
         Some(record.process_version.as_str()),
@@ -797,6 +798,7 @@ fn impact_record_hash(record: &PortalImpactRecord) -> anyhow::Result<String> {
     let localized = localized_text_frame_hex(&record.impact_name)?;
     sha256_fields(&[
         Some(PORTAL_LCIA_IMPACT_SCHEMA_VERSION),
+        Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
         Some(record.impact_index.to_string().as_str()),
         Some(record.method_id.to_string().as_str()),
         Some(record.method_version.as_str()),
@@ -810,6 +812,7 @@ fn impact_record_hash(record: &PortalImpactRecord) -> anyhow::Result<String> {
 fn value_record_hash(record: &PortalValueRecord) -> anyhow::Result<String> {
     sha256_fields(&[
         Some(PORTAL_LCIA_VALUE_SCHEMA_VERSION),
+        Some(PORTAL_LCIA_HASH_CONTRACT_VERSION),
         Some(record.ordinal.to_string().as_str()),
         Some(record.process_index.to_string().as_str()),
         Some(record.impact_index.to_string().as_str()),
@@ -1309,6 +1312,60 @@ mod tests {
         assert_eq!(
             sha256_fields(&[Some("A"), Some("é"), None, Some("")]).unwrap(),
             "5a01047a86055adc7954e7411667d0ef91c64f0c9ff4550dce738aa4d2f4a6ea"
+        );
+    }
+
+    #[test]
+    fn record_hashes_match_the_database_domain_vectors() {
+        let (processes, impacts) = fixture_axes();
+        let process = &processes[0];
+        let process_record = PortalProcessRecord {
+            process_index: process.process_index,
+            process_id: process.process_id,
+            process_version: process.process_version.clone(),
+            process_document_sha256: process.process_document_sha256.clone(),
+            reference_flow_id: process.reference_flow_id,
+            reference_flow_version: process.reference_flow_version.clone(),
+            reference_exchange_internal_id: process.reference_exchange_internal_id.clone(),
+            reference_flow_amount: canonical_portal_decimal(process.reference_flow_amount).unwrap(),
+            reference_flow_direction: process.reference_flow_direction.clone(),
+            functional_unit_amount: canonical_portal_decimal(process.functional_unit_amount)
+                .unwrap(),
+            functional_unit_unit: process.functional_unit_unit.clone(),
+            functional_unit_description: process.functional_unit_description.clone(),
+            geography_code: process.geography_code.clone(),
+            geography_precision: process.geography_precision.clone(),
+            reference_year: process.reference_year,
+        };
+        assert_eq!(
+            process_record_hash(&process_record).unwrap(),
+            "20eac36559a4bc196e480fdb4fd22acb565658de327327103ef23f9d0fce45a2"
+        );
+
+        let impact = &impacts[0];
+        let impact_record = PortalImpactRecord {
+            impact_index: impact.impact_index,
+            method_id: impact.method_id,
+            method_version: impact.method_version.clone(),
+            method_document_sha256: impact.method_document_sha256.clone(),
+            impact_category_id: impact.impact_category_id.clone(),
+            impact_name: impact.impact_name.clone(),
+            result_unit: impact.result_unit.clone(),
+        };
+        assert_eq!(
+            impact_record_hash(&impact_record).unwrap(),
+            "88c852ad1c3748da26420ab5b2d96fa604977847eea44862c3f09573b4551d45"
+        );
+
+        let value_record = PortalValueRecord {
+            ordinal: 1,
+            process_index: 0,
+            impact_index: 0,
+            value_text: "0".to_owned(),
+        };
+        assert_eq!(
+            value_record_hash(&value_record).unwrap(),
+            "0bcbcf38ddd7c709c3e0e1e55a68226c51c5bc18be404108794f04f5a37a7879"
         );
     }
 
