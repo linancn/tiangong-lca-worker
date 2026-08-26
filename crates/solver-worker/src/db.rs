@@ -2554,6 +2554,23 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         ));
     };
 
+    if portal_projection_contract_version.as_deref()
+        == Some(PORTAL_LCIA_PROJECTION_CONTRACT_VERSION)
+    {
+        let package_version = lcia_result_package_version(*build_id);
+        if let Some(receipt) = read_portal_lcia_result_package_ready_after_restart(
+            &state.pool,
+            build_worker_job_id,
+            worker_lease_token,
+            package_version.as_str(),
+            *included_input_count,
+        )
+        .await?
+        {
+            return Ok(receipt);
+        }
+    }
+
     let result_job_id = *build_id;
     let snapshot_execution_mode = package_snapshot_execution_mode(*closure_check_id);
     let request_roots = lcia_result_package_request_roots(
@@ -4016,6 +4033,84 @@ fn verify_portal_lcia_projection_seal(
     Ok(())
 }
 
+async fn read_portal_lcia_result_package_ready_after_restart(
+    pool: &PgPool,
+    build_worker_job_id: Uuid,
+    worker_lease_token: Uuid,
+    expected_package_version: &str,
+    expected_included_input_count: i32,
+) -> anyhow::Result<Option<Value>> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_package_ready_readback_v1(
+            $1, $2
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(build_worker_job_id)
+    .bind(worker_lease_token)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    parse_portal_package_ready_restart_readback(
+        result,
+        build_worker_job_id,
+        expected_package_version,
+        expected_included_input_count,
+    )
+}
+
+fn parse_portal_package_ready_restart_readback(
+    result: Value,
+    expected_build_worker_job_id: Uuid,
+    expected_package_version: &str,
+    expected_included_input_count: i32,
+) -> anyhow::Result<Option<Value>> {
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        if result.get("code").and_then(Value::as_str) == Some("projection_package_not_found")
+            && result.get("status").and_then(Value::as_i64) == Some(404)
+        {
+            return Ok(None);
+        }
+        return Err(anyhow::anyhow!(
+            "Portal package-ready restart readback returned non-ok result: {result}"
+        ));
+    }
+
+    let receipt: PortalPackageReadyReceipt =
+        serde_json::from_value(result.clone()).map_err(|error| {
+            anyhow::anyhow!("Portal package-ready restart receipt is invalid: {error}")
+        })?;
+    required_portal_projection_hash(
+        Some(receipt.data.projection.content_hash.as_str()),
+        "portalProjectionContentHash",
+    )?;
+    if !receipt.ok
+        || !receipt.reused
+        || receipt.data.package_id.is_nil()
+        || receipt.data.package_version != expected_package_version
+        || receipt.data.status != "preview_ready"
+        || receipt.data.build_worker_job_id != expected_build_worker_job_id
+        || receipt.data.included_input_count != expected_included_input_count
+        || receipt.data.projection.projection_id.is_nil()
+        || receipt.data.projection.hash_contract_version != PORTAL_LCIA_HASH_CONTRACT_VERSION
+    {
+        return Err(anyhow::anyhow!(
+            "Portal package-ready restart receipt does not match the current immutable Worker job"
+        ));
+    }
+    info!(
+        projection_id = %receipt.data.projection.projection_id,
+        package_id = %receipt.data.package_id,
+        "recovered committed Portal package before rebuilding"
+    );
+    Ok(Some(result))
+}
+
 async fn mark_portal_lcia_result_package_ready(
     pool: &PgPool,
     projection_id: Uuid,
@@ -5204,13 +5299,13 @@ mod tests {
         build_snapshot_heartbeat_interval, execute_portal_package_ready_with_response_loss_retry,
         lcia_result_package_impact_axis, lcia_result_package_request_roots,
         lcia_result_package_version, normalize_all_unit_batch_size,
-        package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
-        parse_snapshot_builder_resolved_snapshot_id, read_certified_closure_bundle_binding,
-        redact_sensitive_diagnostics, redacted_builder_command, resolve_solve_all_unit_options,
-        retired_snapshot_fallback_error, run_snapshot_builder_job,
-        run_snapshot_builder_job_with_worker_heartbeat, snapshot_builder_process_failure_code,
-        snapshot_builder_wall_timeout_seconds_from, tail_text, utf8_safe_tail,
-        validate_certified_process_axis,
+        package_snapshot_execution_mode, parse_portal_package_ready_restart_readback,
+        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
+        read_certified_closure_bundle_binding, redact_sensitive_diagnostics,
+        redacted_builder_command, resolve_solve_all_unit_options, retired_snapshot_fallback_error,
+        run_snapshot_builder_job, run_snapshot_builder_job_with_worker_heartbeat,
+        snapshot_builder_process_failure_code, snapshot_builder_wall_timeout_seconds_from,
+        tail_text, utf8_safe_tail, validate_certified_process_axis,
     };
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -6148,6 +6243,123 @@ mod tests {
 
         assert_eq!(attempts, 1);
         assert!(error.to_string().contains("receipt is invalid"));
+    }
+
+    #[test]
+    fn portal_package_ready_restart_readback_short_circuits_only_on_exact_receipt() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let receipt =
+            portal_package_ready_test_receipt(&input, projection_id, &"f".repeat(64), true);
+        let recovered = parse_portal_package_ready_restart_readback(
+            receipt.clone(),
+            build_worker_job_id,
+            input.package_version.as_str(),
+            input.included_input_count,
+        )
+        .expect("exact restart receipt")
+        .expect("restart short-circuit");
+        assert_eq!(recovered, receipt);
+
+        let missing = parse_portal_package_ready_restart_readback(
+            json!({
+                "ok": false,
+                "code": "projection_package_not_found",
+                "status": 404
+            }),
+            build_worker_job_id,
+            input.package_version.as_str(),
+            input.included_input_count,
+        )
+        .expect("stable not-found continues the build");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn portal_package_ready_restart_readback_rejects_drift_and_locator_fields() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let receipt =
+            portal_package_ready_test_receipt(&input, projection_id, &"a".repeat(64), true);
+
+        for drifted in [
+            {
+                let mut value = receipt.clone();
+                value["data"]["packageVersion"] = json!("other-version");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["data"]["projection"]["contentHash"] = json!("not-a-hash");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["data"]["artifactUrl"] = json!("s3://private/object");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["reused"] = json!(false);
+                value
+            },
+        ] {
+            assert!(
+                parse_portal_package_ready_restart_readback(
+                    drifted,
+                    build_worker_job_id,
+                    input.package_version.as_str(),
+                    input.included_input_count,
+                )
+                .is_err()
+            );
+        }
+
+        assert!(
+            parse_portal_package_ready_restart_readback(
+                json!({
+                    "ok": false,
+                    "code": "projection_package_binding_invalid",
+                    "status": 409
+                }),
+                build_worker_job_id,
+                input.package_version.as_str(),
+                input.included_input_count,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn portal_package_ready_restart_readback_precedes_all_expensive_work() {
+        let source = include_str!("db.rs");
+        let handler_start = source
+            .find("pub(crate) async fn handle_lcia_result_package_build_worker_job")
+            .expect("package handler source");
+        let handler_end = source[handler_start..]
+            .find("enum PackageSnapshotExecutionMode")
+            .map(|offset| handler_start + offset)
+            .expect("package handler end");
+        let handler = &source[handler_start..handler_end];
+        let readback = handler
+            .find("read_portal_lcia_result_package_ready_after_restart")
+            .expect("restart readback invocation");
+        for expensive_operation in [
+            "prepare_certified_package_snapshot",
+            "persist_lcia_result_package_all_unit_artifacts",
+            "materialize_portal_lcia_projection",
+            "mark_portal_lcia_result_package_ready",
+        ] {
+            assert!(
+                readback
+                    < handler
+                        .find(expensive_operation)
+                        .expect(expensive_operation),
+                "restart readback must precede {expensive_operation}"
+            );
+        }
     }
 
     #[test]
