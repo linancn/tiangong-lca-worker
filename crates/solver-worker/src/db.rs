@@ -2188,6 +2188,7 @@ struct SolvedAllUnitArtifacts {
 #[derive(Debug, Clone)]
 struct LciaResultPackageReadyInput {
     build_worker_job_id: Uuid,
+    included_input_count: i32,
     package_version: String,
     snapshot_id: Uuid,
     result_id: Uuid,
@@ -2199,6 +2200,39 @@ struct LciaResultPackageReadyInput {
     default_impact_category: Option<String>,
     package_result_hash: Option<String>,
     audit: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalPackageReadyReceipt {
+    ok: bool,
+    reused: bool,
+    data: PortalPackageReadyReceiptData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalPackageReadyReceiptData {
+    package_id: Uuid,
+    package_version: String,
+    status: String,
+    build_worker_job_id: Uuid,
+    included_input_count: i32,
+    projection: PortalPackageReadyProjectionReceipt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalPackageReadyProjectionReceipt {
+    projection_id: Uuid,
+    content_hash: String,
+    hash_contract_version: String,
+}
+
+#[derive(Debug)]
+enum PortalPackageReadyCallError<E> {
+    Fetch(E),
+    Decode(E),
 }
 
 #[derive(Debug, Clone)]
@@ -2497,6 +2531,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         build_id,
         input_manifest,
         input_manifest_hash,
+        included_input_count,
         default_impact_category,
         closure_check_id,
         closure_certificate_hash,
@@ -2747,6 +2782,7 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     }
     let ready_input = LciaResultPackageReadyInput {
         build_worker_job_id,
+        included_input_count: *included_input_count,
         package_version: lcia_result_package_version(*build_id),
         snapshot_id,
         result_id: artifacts.result_id,
@@ -2772,17 +2808,23 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             "latestAllUnitResultId": artifacts.latest_all_unit_result_id,
         }),
     };
-    let mark_ready = match projection_id {
-        Some(projection_id) => {
+    let mark_ready = match (projection_id, portal_projection.as_ref()) {
+        (Some(projection_id), Some(projection)) => {
             mark_portal_lcia_result_package_ready(
                 &state.pool,
                 projection_id,
+                projection.content_hash.as_str(),
                 worker_lease_token,
                 ready_input,
             )
             .await?
         }
-        None => mark_lcia_result_package_ready(&state.pool, ready_input).await?,
+        (None, None) => mark_lcia_result_package_ready(&state.pool, ready_input).await?,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Portal LCIA projection readiness state is inconsistent"
+            ));
+        }
     };
 
     Ok(mark_ready)
@@ -3977,9 +4019,25 @@ fn verify_portal_lcia_projection_seal(
 async fn mark_portal_lcia_result_package_ready(
     pool: &PgPool,
     projection_id: Uuid,
+    projection_content_hash: &str,
     worker_lease_token: Uuid,
     input: LciaResultPackageReadyInput,
 ) -> anyhow::Result<Value> {
+    execute_portal_package_ready_with_response_loss_retry(
+        projection_id,
+        projection_content_hash,
+        &input,
+        || call_portal_lcia_result_package_ready(pool, projection_id, worker_lease_token, &input),
+    )
+    .await
+}
+
+async fn call_portal_lcia_result_package_ready(
+    pool: &PgPool,
+    projection_id: Uuid,
+    worker_lease_token: Uuid,
+    input: &LciaResultPackageReadyInput,
+) -> Result<Value, PortalPackageReadyCallError<sqlx::Error>> {
     let row = sqlx::query(
         r"
         WITH _service_role AS (
@@ -3995,27 +4053,99 @@ async fn mark_portal_lcia_result_package_ready(
     .bind(projection_id)
     .bind(input.build_worker_job_id)
     .bind(worker_lease_token)
-    .bind(input.package_version)
+    .bind(input.package_version.as_str())
     .bind(input.snapshot_id)
     .bind(input.result_id)
     .bind(input.latest_all_unit_result_id)
-    .bind(input.result_artifact_ref)
-    .bind(input.query_artifact_ref)
-    .bind(input.artifact_manifest)
-    .bind(input.available_impact_categories)
-    .bind(input.default_impact_category)
-    .bind(input.package_result_hash)
-    .bind(input.audit)
+    .bind(&input.result_artifact_ref)
+    .bind(&input.query_artifact_ref)
+    .bind(&input.artifact_manifest)
+    .bind(&input.available_impact_categories)
+    .bind(input.default_impact_category.as_deref())
+    .bind(input.package_result_hash.as_deref())
+    .bind(&input.audit)
     .fetch_one(pool)
-    .await?;
-    let result = row.try_get::<Value, _>("result")?;
-    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(result)
-    } else {
-        Err(anyhow::anyhow!(
+    .await
+    .map_err(PortalPackageReadyCallError::Fetch)?;
+    row.try_get::<Value, _>("result")
+        .map_err(PortalPackageReadyCallError::Decode)
+}
+
+async fn execute_portal_package_ready_with_response_loss_retry<E, F, Fut>(
+    projection_id: Uuid,
+    projection_content_hash: &str,
+    input: &LciaResultPackageReadyInput,
+    mut call: F,
+) -> anyhow::Result<Value>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Value, PortalPackageReadyCallError<E>>>,
+{
+    // This retry encloses only the immutable Database call. All calculation,
+    // object upload, projection staging, and sealing have already completed.
+    let result = match call().await {
+        Ok(result) => result,
+        Err(PortalPackageReadyCallError::Fetch(first_error)) => match call().await {
+            Ok(result) => result,
+            Err(PortalPackageReadyCallError::Fetch(retry_error)) => {
+                return Err(anyhow::anyhow!(
+                    "Portal package-ready fetch failed and its single response-loss retry failed: first={first_error}; retry={retry_error}"
+                ));
+            }
+            Err(PortalPackageReadyCallError::Decode(retry_error)) => {
+                return Err(anyhow::anyhow!(
+                    "Portal package-ready response decode failed after one response-loss retry: {retry_error}"
+                ));
+            }
+        },
+        Err(PortalPackageReadyCallError::Decode(error)) => {
+            return Err(anyhow::anyhow!(
+                "Portal package-ready response decode failed: {error}"
+            ));
+        }
+    };
+    verify_portal_package_ready_receipt(&result, projection_id, projection_content_hash, input)?;
+    Ok(result)
+}
+
+fn verify_portal_package_ready_receipt(
+    result: &Value,
+    projection_id: Uuid,
+    projection_content_hash: &str,
+    input: &LciaResultPackageReadyInput,
+) -> anyhow::Result<PortalPackageReadyReceipt> {
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow::anyhow!(
             "svc_portal_lcia_projection_package_mark_ready_v1 returned non-ok result: {result}"
-        ))
+        ));
     }
+    let receipt: PortalPackageReadyReceipt = serde_json::from_value(result.clone())
+        .map_err(|error| anyhow::anyhow!("Portal package-ready receipt is invalid: {error}"))?;
+    if !receipt.ok
+        || receipt.data.package_id.is_nil()
+        || receipt.data.package_version != input.package_version
+        || receipt.data.status != "preview_ready"
+        || receipt.data.build_worker_job_id != input.build_worker_job_id
+        || receipt.data.included_input_count != input.included_input_count
+        || receipt.data.projection.projection_id != projection_id
+        || receipt.data.projection.content_hash != projection_content_hash
+        || receipt.data.projection.hash_contract_version != PORTAL_LCIA_HASH_CONTRACT_VERSION
+    {
+        return Err(anyhow::anyhow!(
+            "Portal package-ready receipt does not match the immutable Worker input"
+        ));
+    }
+    // Either value is valid: the first fetch may have failed before or after
+    // the Database transaction committed. Keep the recovery result observable
+    // without logging any private artifact locator.
+    info!(
+        projection_id = %projection_id,
+        package_id = %receipt.data.package_id,
+        reused = receipt.reused,
+        "verified Portal package-ready receipt"
+    );
+    Ok(receipt)
 }
 
 async fn link_lcia_result_package_worker_job_domain_refs(
@@ -5066,11 +5196,12 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 mod tests {
     use super::{
         BuildSnapshotWorkerLease, BuilderCommandCandidate, JobLifecycleBackend,
-        PackageSnapshotExecutionMode, SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE,
-        ScopeClosureSnapshotBuilderArgs, ScopeClosureSnapshotBuilderMode,
-        SnapshotBuilderProcessFailure, SnapshotBuilderTerminal, SolveOptionsPayload,
-        acquire_build_snapshot_worker_jobs_slot_sql, append_scope_closure_snapshot_args,
-        build_all_unit_rhs_batch, build_snapshot_heartbeat_interval,
+        LciaResultPackageReadyInput, PackageSnapshotExecutionMode, PortalPackageReadyCallError,
+        SNAPSHOT_BUILDER_BLOCKED_EXIT_CODE, ScopeClosureSnapshotBuilderArgs,
+        ScopeClosureSnapshotBuilderMode, SnapshotBuilderProcessFailure, SnapshotBuilderTerminal,
+        SolveOptionsPayload, acquire_build_snapshot_worker_jobs_slot_sql,
+        append_scope_closure_snapshot_args, build_all_unit_rhs_batch,
+        build_snapshot_heartbeat_interval, execute_portal_package_ready_with_response_loss_retry,
         lcia_result_package_impact_axis, lcia_result_package_request_roots,
         lcia_result_package_version, normalize_all_unit_batch_size,
         package_snapshot_execution_mode, parse_snapshot_builder_build_timing,
@@ -5084,6 +5215,7 @@ mod tests {
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use std::{
+        collections::VecDeque,
         fs::{self, File},
         io::{BufReader, BufWriter, Write},
         os::unix::fs::PermissionsExt,
@@ -5795,6 +5927,227 @@ mod tests {
             lcia_result_package_version(build_id),
             "lcia-result-3d620e54-2b83-47f6-9809-0b65ab00bfd9"
         );
+    }
+
+    fn portal_package_ready_test_input(build_worker_job_id: Uuid) -> LciaResultPackageReadyInput {
+        LciaResultPackageReadyInput {
+            build_worker_job_id,
+            included_input_count: 2,
+            package_version: "lcia-result-test".to_owned(),
+            snapshot_id: Uuid::new_v4(),
+            result_id: Uuid::new_v4(),
+            latest_all_unit_result_id: Some(Uuid::new_v4()),
+            result_artifact_ref: json!({}),
+            query_artifact_ref: json!({}),
+            artifact_manifest: json!({}),
+            available_impact_categories: json!([]),
+            default_impact_category: None,
+            package_result_hash: Some("1".repeat(64)),
+            audit: json!({}),
+        }
+    }
+
+    fn portal_package_ready_test_receipt(
+        input: &LciaResultPackageReadyInput,
+        projection_id: Uuid,
+        projection_content_hash: &str,
+        reused: bool,
+    ) -> serde_json::Value {
+        json!({
+            "ok": true,
+            "reused": reused,
+            "data": {
+                "packageId": Uuid::new_v4(),
+                "packageVersion": input.package_version,
+                "status": "preview_ready",
+                "buildWorkerJobId": input.build_worker_job_id,
+                "includedInputCount": input.included_input_count,
+                "projection": {
+                    "projectionId": projection_id,
+                    "contentHash": projection_content_hash,
+                    "hashContractVersion": super::PORTAL_LCIA_HASH_CONTRACT_VERSION,
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn portal_package_ready_first_fetch_success_is_not_retried() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let projection_content_hash = "a".repeat(64);
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let receipt = portal_package_ready_test_receipt(
+            &input,
+            projection_id,
+            &projection_content_hash,
+            false,
+        );
+        let mut attempts = 0;
+        let mut responses: VecDeque<
+            Result<serde_json::Value, PortalPackageReadyCallError<std::io::Error>>,
+        > = VecDeque::from([Ok(receipt)]);
+
+        let result = execute_portal_package_ready_with_response_loss_retry(
+            projection_id,
+            &projection_content_hash,
+            &input,
+            || {
+                attempts += 1;
+                std::future::ready(responses.pop_front().expect("one fake response"))
+            },
+        )
+        .await
+        .expect("first response accepted");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            result.get("reused").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_package_ready_fetch_loss_retries_once_and_accepts_exact_replay() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let projection_content_hash = "b".repeat(64);
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let replay = portal_package_ready_test_receipt(
+            &input,
+            projection_id,
+            &projection_content_hash,
+            true,
+        );
+        let mut attempts = 0;
+        let mut responses = VecDeque::from([
+            Err(PortalPackageReadyCallError::Fetch(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "response lost",
+            ))),
+            Ok(replay),
+        ]);
+
+        let result = execute_portal_package_ready_with_response_loss_retry(
+            projection_id,
+            &projection_content_hash,
+            &input,
+            || {
+                attempts += 1;
+                std::future::ready(responses.pop_front().expect("two fake responses"))
+            },
+        )
+        .await
+        .expect("exact replay accepted");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            result.get("reused").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_package_ready_two_fetch_errors_stop_after_one_retry() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let projection_content_hash = "c".repeat(64);
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let mut attempts = 0;
+        let mut responses = VecDeque::from([
+            Err(PortalPackageReadyCallError::Fetch(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "first response lost",
+            ))),
+            Err(PortalPackageReadyCallError::Fetch(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "retry timed out",
+            ))),
+        ]);
+
+        let error = execute_portal_package_ready_with_response_loss_retry(
+            projection_id,
+            &projection_content_hash,
+            &input,
+            || {
+                attempts += 1;
+                std::future::ready(responses.pop_front().expect("two fake errors"))
+            },
+        )
+        .await
+        .expect_err("two fetch failures must fail");
+
+        assert_eq!(attempts, 2);
+        assert!(
+            error
+                .to_string()
+                .contains("single response-loss retry failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_package_ready_non_ok_response_is_not_retried() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let projection_content_hash = "d".repeat(64);
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let mut attempts = 0;
+        let mut responses: VecDeque<
+            Result<serde_json::Value, PortalPackageReadyCallError<std::io::Error>>,
+        > = VecDeque::from([Ok(json!({
+            "ok": false,
+            "code": "projection_evidence_mismatch",
+            "status": 409
+        }))]);
+
+        let error = execute_portal_package_ready_with_response_loss_retry(
+            projection_id,
+            &projection_content_hash,
+            &input,
+            || {
+                attempts += 1;
+                std::future::ready(responses.pop_front().expect("one fake response"))
+            },
+        )
+        .await
+        .expect_err("non-ok response must fail without retry");
+
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("non-ok result"));
+    }
+
+    #[tokio::test]
+    async fn portal_package_ready_receipt_rejects_locator_fields_without_retry() {
+        let build_worker_job_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let projection_content_hash = "e".repeat(64);
+        let input = portal_package_ready_test_input(build_worker_job_id);
+        let mut receipt = portal_package_ready_test_receipt(
+            &input,
+            projection_id,
+            &projection_content_hash,
+            false,
+        );
+        receipt["data"]["artifactUrl"] = json!("s3://private/object");
+        let mut attempts = 0;
+        let mut responses: VecDeque<
+            Result<serde_json::Value, PortalPackageReadyCallError<std::io::Error>>,
+        > = VecDeque::from([Ok(receipt)]);
+
+        let error = execute_portal_package_ready_with_response_loss_retry(
+            projection_id,
+            &projection_content_hash,
+            &input,
+            || {
+                attempts += 1;
+                std::future::ready(responses.pop_front().expect("one fake response"))
+            },
+        )
+        .await
+        .expect_err("locator-bearing receipt must fail closed");
+
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("receipt is invalid"));
     }
 
     #[test]

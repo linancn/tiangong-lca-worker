@@ -915,13 +915,9 @@ fn normalize_localized_text(
         .map(|value| {
             let language = value.language.trim().to_ascii_lowercase();
             let text = value.value.trim();
-            if language.is_empty()
-                || language.len() > 35
-                || !language
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                || text.is_empty()
-                || text.chars().count() > 4_096
+            if value.value.chars().any(char::is_control)
+                || !portal_language_tag_valid(&language)
+                || !portal_public_text_valid(text, 4_096)
             {
                 return Err(anyhow::anyhow!(
                     "Portal LCIA projection {field} contains invalid localized text"
@@ -947,6 +943,43 @@ fn normalize_localized_text(
         ));
     }
     Ok(normalized)
+}
+
+fn portal_language_tag_valid(language: &str) -> bool {
+    if language.len() > 35 || !language.is_ascii() {
+        return false;
+    }
+    let mut segments = language.split('-');
+    let Some(primary) = segments.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    segments.all(|segment| {
+        (2..=8).contains(&segment.len())
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    })
+}
+
+fn portal_public_text_valid(text: &str, max_length: usize) -> bool {
+    if text.is_empty() || text.chars().count() > max_length || text.chars().any(char::is_control) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if ["http://", "https://", "s3://", "gs://", "file://"]
+        .iter()
+        .any(|scheme| lower.contains(scheme))
+    {
+        return false;
+    }
+    !text.as_bytes().windows(2).enumerate().any(|(index, pair)| {
+        pair == b".."
+            && (index == 0 || matches!(text.as_bytes()[index - 1], b'/' | b'\\'))
+            && (index + 2 == text.len() || matches!(text.as_bytes()[index + 2], b'/' | b'\\'))
+    })
 }
 
 fn validate_source_binding(source: &PortalProjectionSourceBinding) -> anyhow::Result<()> {
@@ -1308,6 +1341,53 @@ mod tests {
     }
 
     #[test]
+    fn localized_text_matches_database_language_and_public_text_guards() {
+        for language in ["en", "zh-hans", "pt-br", "und", "EN-us"] {
+            let normalized = normalize_localized_text(
+                &[PortalLocalizedText {
+                    language: language.to_owned(),
+                    value: "Public label".to_owned(),
+                }],
+                "test",
+            )
+            .expect("valid language tag");
+            assert_eq!(normalized[0].language, language.to_ascii_lowercase());
+        }
+        for language in ["e", "1n", "en-", "en-abcdefghi", "zh_zh", "éé"] {
+            assert!(
+                normalize_localized_text(
+                    &[PortalLocalizedText {
+                        language: language.to_owned(),
+                        value: "Public label".to_owned(),
+                    }],
+                    "test",
+                )
+                .is_err(),
+                "language tag should fail: {language}"
+            );
+        }
+        for text in [
+            "line\nbreak",
+            "https://example.test/private",
+            "FILE://private/path",
+            "../private",
+            "safe/../private",
+        ] {
+            assert!(
+                normalize_localized_text(
+                    &[PortalLocalizedText {
+                        language: "en".to_owned(),
+                        value: text.to_owned(),
+                    }],
+                    "test",
+                )
+                .is_err(),
+                "public text should fail: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn int32be_framing_matches_the_database_cross_language_vector() {
         assert_eq!(
             sha256_fields(&[Some("A"), Some("é"), None, Some("")]).unwrap(),
@@ -1389,6 +1469,22 @@ mod tests {
                 .bind_source(source_binding())
                 .unwrap();
         assert_eq!(first.content_hash, second.content_hash);
+        assert_eq!(
+            first.process_relation.relation_hash,
+            "246ad58816105072e2e2965a3eef142d53d9f3cab7a18a3860897eb0df158834"
+        );
+        assert_eq!(
+            first.impact_relation.relation_hash,
+            "d62569f24d158806b3041dfdd49fdaba0c5458e287e669b667fa811020a62164"
+        );
+        assert_eq!(
+            first.value_relation.relation_hash,
+            "5b4f9d81f34d8cf7b000bc04eaa44e78394f364e1153d508fbdc0af648550b3e"
+        );
+        assert_eq!(
+            first.relation_hash,
+            "2e955ee8542f9dc9cbf2bfbdc815cf18b0bde4b76317a1776ac73b336ee0ad9c"
+        );
         assert_eq!(
             first.value_relation.relation_hash,
             second.value_relation.relation_hash
