@@ -26,8 +26,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: aaea8f42a8412a6458a10bef040e8c5611b7414b
-lastReviewedNote: "Reviewed the V3-only continuous lease guard from authoritative readback through package ready for Worker Issue #275."
+lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
+lastReviewedNote: "Reviewed active-renewal completion fencing, sub-three-second lease margins, and the solver runtime's minimum two executor threads for Worker Issue #275."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -103,7 +103,9 @@ Worker uses the Database-owned service RPC sequence under the active V3 job leas
 7. compare Database seal/status hashes byte-for-byte with the Worker spool;
 8. call the V3-only package-ready RPC.
 
-The queue sends its existing precise initial heartbeat before execution, then installs a V3-only renewal guard before the lazy package future is first polled. A separate Tokio task renews at `lease_heartbeat_period`, consumes the interval's immediate tick because the queue already heartbeated, and calls the heartbeat RPC with `NULL` phase, progress, and diagnostics so later `0.70+` batch progress cannot regress. The guard covers authoritative readback, snapshot preparation, calculation, upload, staging, seal, and package-ready recovery/commit. A renewal error, non-ok lease response, or renewal that exceeds one heartbeat period drops the unfinished package future and fails closed before another stage; a completed package future stops and joins the renewal task, so no task is detached. V1/V2 bypass this guard and retain their established package path.
+The queue sends its existing precise initial heartbeat before execution, then installs a V3-only renewal guard before the lazy package future is first polled. A separate Tokio task renews at the millisecond-floor one-third lease period, consumes the interval's immediate tick because the queue already heartbeated, and calls the heartbeat RPC with `NULL` phase, progress, and diagnostics so later `0.70+` batch progress cannot regress. Even for one-, two-, or three-second leases, a stalled first renewal reaches its one-period timeout strictly before lease expiry. The solver binary explicitly builds a multi-thread Tokio runtime using `TOKIO_WORKER_THREADS` when it is a valid value of at least two, otherwise `max(available_parallelism, 2)`; this prevents a CPU-heavy package poll from owning the only executor thread without capping larger hosts.
+
+The guard covers authoritative readback, snapshot preparation, calculation, upload, staging, seal, and package-ready recovery/commit. Stop is observed only between renewals. Once a renewal starts, completed work joins it through success, error/non-ok lease response, or one-period timeout; failure wins and the package result cannot be returned. A renewal error or timeout while work is unfinished drops the package future and fails closed before another stage. Clean completion joins the renewal task, so no task is detached. V1/V2 bypass this guard and retain their established package path.
 
 The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable.
 
@@ -133,4 +135,4 @@ cargo check -p solver-worker --all-targets --all-features
 cargo fmt --all -- --check
 ```
 
-Focused proof must cover the fixed framing vector, decimal limits, explicit zero, source context, missing/reordered/tampered grids, 500-record/1-MiB batches, exact V3 schema gates, authoritative Worker input, response-loss replay, status/seal hash comparison, and V1/V2 non-opt-in behavior. It must also prove repeated renewals during long work, renewal progress-metadata preservation, independent renewal during a CPU-heavy poll, clean stop/join, stalled or failed renewal cancellation, completion/failure race precedence, and queue source order that wraps the lazy V3 future before handler execution. Cross-repository completion additionally requires the matching Database migration/pgTAP contract, Release publication workflow, and an isolated non-production Worker↔Database integration run; mock-only RPC tests are not sufficient for that final gate.
+Focused proof must cover the fixed framing vector, decimal limits, explicit zero, source context, missing/reordered/tampered grids, 500-record/1-MiB batches, exact V3 schema gates, authoritative Worker input, response-loss replay, status/seal hash comparison, and V1/V2 non-opt-in behavior. It must also prove exact one-/two-/three-second renewal periods and pre-expiry timeout margin, repeated renewals during long work, progress-metadata preservation, a one-parallelism host's guarded production runtime during a CPU-heavy poll, clean stop/join, unfinished-work cancellation, completed-work waiting for a pending renewal failure/timeout, and queue source order that wraps the lazy V3 future before handler execution. Cross-repository completion additionally requires the matching Database migration/pgTAP contract, Release publication workflow, and an isolated non-production Worker↔Database integration run; mock-only RPC tests are not sufficient for that final gate.
