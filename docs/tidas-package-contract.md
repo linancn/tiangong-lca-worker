@@ -20,8 +20,8 @@ checkPaths:
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "Reviewed for Worker Issue #275; solver-queue V3 projection materialization does not change TIDAS import/export jobs, ZIP/report schemas, retention, or package-worker state."
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change TIDAS import/export jobs, their lease executor, ZIP/report schemas, retention, or package-worker state."
 related:
   - AGENTS.md
   - .docpact/config.yaml

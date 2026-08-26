@@ -28,8 +28,8 @@ checkPaths:
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "Reviewed for Worker Issue #275; the downstream Portal projection spool does not alter canonical Scope Closure v4 results, memory bounds, or Database #316 publication."
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not alter canonical Scope Closure v4 results, memory bounds, cancellation, or Database #316 publication."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

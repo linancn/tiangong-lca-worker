@@ -32,8 +32,8 @@ checkPaths:
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "Reviewed for Worker Issue #275; downstream V3 projection consumes the existing certificate/snapshot/bundle binding without changing Scope Closure traversal, artifacts, or certificate semantics."
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not change Scope Closure traversal, its own lease executor, artifacts, or certificate semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

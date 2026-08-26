@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-26"
-lastReviewedCommit: "cb7467aabae4072d5e2c22d10503ff9921c4971f"
-lastReviewedNote: "Worker Issue #275 adds an explicitly routed V3-only Portal LCIA projection contract and three governed record schemas."
+lastReviewedCommit: "9ad692063a076c4ed886e3cfaf3627037ff5e389"
+lastReviewedNote: "Reviewed Worker Issue #275 V3-only queue lease renewal against the existing shared-runtime routing and required-doc graph; no rule changes are needed."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

@@ -29,8 +29,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "Reviewed for Worker Issue #275; V3 package projection code does not change the manual Review Admin diagnostic payload, report, or non-blocking semantics."
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change the manual Review Admin diagnostic payload, lease path, report, or non-blocking semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

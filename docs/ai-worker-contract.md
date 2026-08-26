@@ -23,9 +23,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "Introduced the generic ai-worker runtime and its first versioned ai.tidas_suggestion handler for Worker Issue #273."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change the AI runner's queue, handler, heartbeat, or result semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
