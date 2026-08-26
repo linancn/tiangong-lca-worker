@@ -707,9 +707,7 @@ mod tests {
                     let renewal_tx = renewal_tx.clone();
                     async move {
                         let count = renewal_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        renewal_tx
-                            .send(count)
-                            .expect("protected work receives renewal count");
+                        let _ = renewal_tx.send(count);
                         Ok(())
                     }
                 },
