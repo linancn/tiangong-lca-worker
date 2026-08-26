@@ -26,8 +26,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
-lastReviewedNote: "Reviewed request.v3 package-ready ambiguous-response recovery and its exact locator-free Database receipt for Worker Issue #275."
+lastReviewedCommit: aaea8f42a8412a6458a10bef040e8c5611b7414b
+lastReviewedNote: "Reviewed request.v3 continuous lease renewal from authoritative readback through package ready for Worker Issue #275."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -220,6 +220,8 @@ V3 package ready 前，private `artifactManifest` 另外绑定：
 
 V3 的最终 package-ready SQLx `fetch_one` 若失败，Worker 只以完全相同参数重放一次该 Database 调用，不重做计算、上传、staging 或 seal。Database non-ok、row decode、receipt schema、locator-free、projection identity/content hash 或 hash-contract 校验失败都立即 fail closed 且不重试。成功 receipt 顶层必须显式返回 `reused`；首次提交和已提交精确重放分别由 Database 返回 `false` / `true`。若进程在提交后、收到响应前退出，下一次以新 job lease 启动时必须先调用 service-only package-ready readback；精确 receipt 直接完成 job，稳定 404 才进入计算，任何 evidence drift 都阻断且不重写旧 projection lease。
 
+queue 在既有初始 heartbeat 成功后、首次 poll V3 lazy package future 之前启动独立 Tokio 续租任务。该任务使用 `lease_heartbeat_period`，消耗 interval 的立即 tick，之后以 `NULL` phase/progress/diagnostics 调用同一 heartbeat RPC，只延长 lease 而不覆盖 batch 已写入的精确 `0.70+` 进度。保护范围从 authoritative readback 覆盖 snapshot preparation、calculation、upload、staging、seal 到 package-ready recovery/commit；续租 non-ok、error 或超过一个 heartbeat period 会丢弃未完成 future 并 fail closed，成功完成会 stop/join 续租任务。V1/V2 不进入该续租分支。
+
 ### 3.8 `lcia.scope_closure_check` 与 Build V2 证书绑定
 
 `lcia.scope_closure_check` 只能由数据库命令边界创建。其 claim payload 是最小 envelope：`closure_check_id`、`scan_execution_id`、`data_snapshot_token`、`request_fingerprint`；完整 scope 和 `lcia.scope-closure-data-snapshot.v2` 必须通过 service-role worker-input RPC 读取。Worker 按当前 public release 的完整 exact dataset/hash allowlist 执行 union closure，不从 live state code 推断可用 universe。live-only identity、同 identity 内容漂移或 allowlisted row 不可读都会使 `scanCompleteness=incomplete`，且不能得到有效证书。
@@ -269,7 +271,7 @@ request 固定包含 `dataType=process|flow` 和完整 `data` object。结果返
 
 `worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path`、`prepare_factorization` 或 `lcia_result_package_build`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
 
-Worker 的 claim、heartbeat 与 terminal-result RPC 使用独立 control-plane pool；主业务 pool 仅承担 compute、snapshot、package 与 artifact 查询。终态写入只对数据库/传输错误做有界重试；数据库仅把同一 lease token、同一 status 和同一结果内容的重放视为幂等成功，冲突重放继续返回非成功结果。过期且达到最大尝试次数的任务按有界 `FOR UPDATE SKIP LOCKED` 候选集回收，单个被锁住的旧任务不得阻塞其他 queued/stale 任务的 claim。
+Worker 的 claim、heartbeat 与 terminal-result RPC 使用独立 control-plane pool；主业务 pool 仅承担 compute、snapshot、package 与 artifact 查询。Portal V3 package 的持续续租同样只使用 control-plane pool，且只发送 `NULL` metadata 以保留当前 phase/progress/diagnostics。终态写入只对数据库/传输错误做有界重试；数据库仅把同一 lease token、同一 status 和同一结果内容的重放视为幂等成功，冲突重放继续返回非成功结果。过期且达到最大尝试次数的任务按有界 `FOR UPDATE SKIP LOCKED` 候选集回收，单个被锁住的旧任务不得阻塞其他 queued/stale 任务的 claim。
 
 ## 5. 结果契约
 

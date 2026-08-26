@@ -43,8 +43,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
-lastReviewedNote: "Reviewed for Worker Issue #275: request.v3 alone materializes the bounded Portal LCIA projection; V1/V2 and unrelated job families remain unchanged."
+lastReviewedCommit: aaea8f42a8412a6458a10bef040e8c5611b7414b
+lastReviewedNote: "Reviewed for Worker Issue #275: the request.v3 package future alone has continuous fail-closed lease renewal; V1/V2 and unrelated job families remain unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -184,7 +184,7 @@ Route those tasks to:
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
 - certificate-grade closure reads only the immutable current-public-release dataset manifest, requires the frozen technosphere boundary policy to be exactly `cutoff`, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset; unresolved provider balances remain warning/evidence rather than certificate blockers
 - package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
-- only `lcia_result.package_build.request.v3` may carry `portalProjectionContractVersion=portal.lcia-projection.v1`; it derives typed Process/Method/value relations from frozen Calculation Bundle evidence, stages them through lease-fenced Database RPCs, verifies Database hashes/counts, and binds the exact projection ID/content hash into the private package artifact manifest before ready-marking. V1/V2 never generate or write this projection
+- only `lcia_result.package_build.request.v3` may carry `portalProjectionContractVersion=portal.lcia-projection.v1`; it derives typed Process/Method/value relations from frozen Calculation Bundle evidence, stages them through lease-fenced Database RPCs, verifies Database hashes/counts, and binds the exact projection ID/content hash into the private package artifact manifest before ready-marking. Its entire authoritative readback-to-ready future runs under a separate periodic lease-renewal task that preserves phase/progress/diagnostics and fails closed on renewal loss; V1/V2 never enter either the projection or renewal branch
 - package import and scope closure invoke only `TIDAS_BIN` (default `tidas`), require the exact `TIDAS_EXPECTED_VERSION` (active governed default `0.2.0`), verify `version` plus `validate --describe`, and accept validation evidence only from hash/count-verified file spools; scope closure hashes original issue-event NDJSON bytes before parsing and keeps document/reference evidence file-backed behind a compact graph; Python validators and command-candidate fallback are not runtime paths
 - the external validator does not own Worker lifecycle: leases, heartbeat, cooperative cancellation checks, timeout/error mapping, deterministic certificate evidence, and terminal projection remain Worker responsibilities
 - scope-closure report publication records the actual configured storage bucket, object path, SHA-256, byte size, content type, artifact role, and a trusted database-time seven-day expiry; the complete machine result is the deterministic bounded compressed partition set plus manifest, with ordinary records unchanged in NDJSON partitions and individually oversized administrative records represented by a bounded index plus fixed canonical-byte chunks whose streamed reconstruction preserves the original relation hash; this delivery directly downloads only XLSX and the manifest, and direct member retrieval remains a separately tracked cross-repository contract

@@ -22,11 +22,12 @@ checkPaths:
   - crates/solver-worker/src/db.rs
   - crates/solver-worker/src/queue.rs
   - crates/solver-worker/src/types.rs
+  - crates/solver-worker/src/worker_jobs.rs
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
-lastReviewedNote: "Reviewed the V3 package-ready recovery and the exact country/province/city location-code precision mapping for Worker Issue #275."
+lastReviewedCommit: aaea8f42a8412a6458a10bef040e8c5611b7414b
+lastReviewedNote: "Reviewed the V3-only continuous lease guard from authoritative readback through package ready for Worker Issue #275."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -102,6 +103,8 @@ Worker uses the Database-owned service RPC sequence under the active V3 job leas
 7. compare Database seal/status hashes byte-for-byte with the Worker spool;
 8. call the V3-only package-ready RPC.
 
+The queue sends its existing precise initial heartbeat before execution, then installs a V3-only renewal guard before the lazy package future is first polled. A separate Tokio task renews at `lease_heartbeat_period`, consumes the interval's immediate tick because the queue already heartbeated, and calls the heartbeat RPC with `NULL` phase, progress, and diagnostics so later `0.70+` batch progress cannot regress. The guard covers authoritative readback, snapshot preparation, calculation, upload, staging, seal, and package-ready recovery/commit. A renewal error, non-ok lease response, or renewal that exceeds one heartbeat period drops the unfinished package future and fails closed before another stage; a completed package future stops and joins the renewal task, so no task is detached. V1/V2 bypass this guard and retain their established package path.
+
 The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable.
 
 The final package-ready call is a separate ambiguous-response boundary. Worker repeats that exact immutable Database call at most once and only when SQLx `fetch_one` fails; it never repeats Calculation Bundle work, object upload, projection staging, or sealing. A Database non-ok response, row decode error, malformed receipt, unexpected field, or identity/hash mismatch fails immediately without retry. Success is the exact locator-free `{ok,reused,data}` receipt: Worker requires the package version, `preview_ready` status, build Worker job, included-input count, projection ID/content hash, and hash-contract version to match its immutable inputs. `reused=false` and `reused=true` are both valid because the first fetch can fail before or after commit.
@@ -130,4 +133,4 @@ cargo check -p solver-worker --all-targets --all-features
 cargo fmt --all -- --check
 ```
 
-Focused proof must cover the fixed framing vector, decimal limits, explicit zero, source context, missing/reordered/tampered grids, 500-record/1-MiB batches, exact V3 schema gates, authoritative Worker input, response-loss replay, status/seal hash comparison, and V1/V2 non-opt-in behavior. Cross-repository completion additionally requires the matching Database migration/pgTAP contract, Release publication workflow, and an isolated non-production Worker↔Database integration run; mock-only RPC tests are not sufficient for that final gate.
+Focused proof must cover the fixed framing vector, decimal limits, explicit zero, source context, missing/reordered/tampered grids, 500-record/1-MiB batches, exact V3 schema gates, authoritative Worker input, response-loss replay, status/seal hash comparison, and V1/V2 non-opt-in behavior. It must also prove repeated renewals during long work, renewal progress-metadata preservation, independent renewal during a CPU-heavy poll, clean stop/join, stalled or failed renewal cancellation, completion/failure race precedence, and queue source order that wraps the lazy V3 future before handler execution. Cross-repository completion additionally requires the matching Database migration/pgTAP contract, Release publication workflow, and an isolated non-production Worker↔Database integration run; mock-only RPC tests are not sufficient for that final gate.
