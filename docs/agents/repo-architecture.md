@@ -37,7 +37,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
+lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
 lastReviewedNote: "The runtime map now includes the V3-only Portal LCIA typed projection spool and Database staging boundary from Worker Issue #275."
 related:
   - ../../AGENTS.md

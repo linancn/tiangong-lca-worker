@@ -43,7 +43,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
+lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
 lastReviewedNote: "Reviewed for Worker Issue #275: request.v3 alone materializes the bounded Portal LCIA projection; V1/V2 and unrelated job families remain unchanged."
 related:
   - .docpact/config.yaml

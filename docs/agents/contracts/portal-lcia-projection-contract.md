@@ -25,8 +25,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
-lastReviewedNote: "Reviewed the V3 package-ready response-loss recovery, strict locator-free receipt, and localized public-text validation for Worker Issue #275."
+lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
+lastReviewedNote: "Reviewed the V3 package-ready recovery and the exact country/province/city location-code precision mapping for Worker Issue #275."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -57,6 +57,8 @@ The Worker derives the projection only while materializing the same verified Cal
 - Artifact binding includes input manifest, closure certificate, numerical snapshot, closure bundle, snapshot index/build contract, Calculation Bundle content/manifest, LCIA chunk set, result artifact, and query artifact hashes.
 
 A missing functional unit, reference Flow, geography, reference year, Method name, unit, source document, grid cell, or exact identity fails the V3 package build. Missing numerical values are never converted to zero; an explicit finite zero remains the canonical string `"0"`.
+
+Geography precision follows the checked-in location-code convention: a two-letter country code is `country`, one non-empty alphanumeric subdivision segment is `province`, and two or more subdivision segments are `city`; malformed or non-hierarchical codes remain `other`. The Worker must not collapse a city code such as `CN-GD-SZX` into province-level evidence.
 
 ## Typed records
 

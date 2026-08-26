@@ -1,7 +1,7 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-08-26"
-lastReviewedCommit: "5e3be7ff67e3a263709102e8a6338f6b8b77c432"
+lastReviewedCommit: "cb7467aabae4072d5e2c22d10503ff9921c4971f"
 lastReviewedNote: "Worker Issue #275 adds an explicitly routed V3-only Portal LCIA projection contract and three governed record schemas."
 
 # Keep deterministic governance facts here.

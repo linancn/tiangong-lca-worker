@@ -1586,12 +1586,19 @@ fn portal_process_reference_year(document: &Value) -> Option<i32> {
 }
 
 fn portal_geography_precision(code: &str) -> &'static str {
-    if code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        "country"
-    } else if code.contains('-') {
-        "province"
-    } else {
-        "other"
+    let segments = code.split('-').collect::<Vec<_>>();
+    let valid_country = segments.first().is_some_and(|country| {
+        country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic())
+    });
+    let valid_subdivisions = segments.iter().skip(1).all(|segment| {
+        !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    });
+
+    match segments.len() {
+        1 if valid_country => "country",
+        2 if valid_country && valid_subdivisions => "province",
+        3.. if valid_country && valid_subdivisions => "city",
+        _ => "other",
     }
 }
 
@@ -2459,6 +2466,18 @@ mod tests {
             impact_key: format!("method:{method_index}"),
             impact_name: format!("Method {method_index}"),
             unit: "kg".to_owned(),
+        }
+    }
+
+    #[test]
+    fn portal_geography_precision_distinguishes_country_province_and_city_codes() {
+        assert_eq!(portal_geography_precision("CN"), "country");
+        assert_eq!(portal_geography_precision("CN-GD"), "province");
+        assert_eq!(portal_geography_precision("CN-GD-SZX"), "city");
+        assert_eq!(portal_geography_precision("CN-GD-SZX-NS"), "city");
+
+        for malformed in ["GLO", "CN-", "-GD", "CN-GD-", "CN-GD-SZ X"] {
+            assert_eq!(portal_geography_precision(malformed), "other");
         }
     }
 

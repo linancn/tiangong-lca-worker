@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
+lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
 lastReviewedNote: "Validation now covers strict V3 package-ready receipts and a single fetch-only ambiguous-response retry in addition to the existing Portal LCIA proof."
 related:
   - ../../AGENTS.md

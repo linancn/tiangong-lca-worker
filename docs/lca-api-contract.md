@@ -26,7 +26,7 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 5e3be7ff67e3a263709102e8a6338f6b8b77c432
+lastReviewedCommit: cb7467aabae4072d5e2c22d10503ff9921c4971f
 lastReviewedNote: "Reviewed request.v3 package-ready ambiguous-response recovery and its exact locator-free Database receipt for Worker Issue #275."
 related:
   - AGENTS.md
