@@ -25,8 +25,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "Established the additive V3-only Portal LCIA materialization, cross-language hash, staging, and package-binding contract for Worker Issue #275."
+lastReviewedCommit: 25b8bc651be3443c2aa0c460833939ddd6e65b01
+lastReviewedNote: "Reviewed the V3 package-ready response-loss recovery, strict locator-free receipt, and localized public-text validation for Worker Issue #275."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -72,7 +72,7 @@ Indices are zero-based on Process and Impact axes. Dense Value ordinals are one-
 ordinal = processIndex * impactCount + impactIndex + 1
 ```
 
-Decimal fields are finite binary64 values converted to shortest round-tripping fixed notation, with no exponent, plus sign, trailing fractional zero, negative zero, or more than 38 ASCII digits. Localized arrays contain 1–64 unique, lowercase, sorted language tags; each trimmed value contains 1–4096 Unicode scalar values. Plain or untagged legacy source text becomes language `und` before normalization.
+Decimal fields are finite binary64 values converted to shortest round-tripping fixed notation, with no exponent, plus sign, trailing fractional zero, negative zero, or more than 38 ASCII digits. Localized arrays contain 1–64 unique, lowercase, sorted language tags matching `^[a-z]{2,3}(-[a-z0-9]{2,8})*$`; each trimmed value contains 1–4096 Unicode scalar values and rejects controls, locator schemes, and path traversal. Plain or untagged legacy source text becomes language `und` before normalization.
 
 Projection records and Database RPC payloads contain no object-store locator, credential, actor, team, or review field. Private Calculation Bundle and result locators remain in their existing artifact contracts and are never copied into the typed projection.
 
@@ -101,6 +101,8 @@ Worker uses the Database-owned service RPC sequence under the active V3 job leas
 8. call the V3-only package-ready RPC.
 
 The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable.
+
+The final package-ready call is a separate ambiguous-response boundary. Worker repeats that exact immutable Database call at most once and only when SQLx `fetch_one` fails; it never repeats Calculation Bundle work, object upload, projection staging, or sealing. A Database non-ok response, row decode error, malformed receipt, unexpected field, or identity/hash mismatch fails immediately without retry. Success is the exact locator-free `{ok,reused,data}` receipt: Worker requires the package version, `preview_ready` status, build Worker job, included-input count, projection ID/content hash, and hash-contract version to match its immutable inputs. `reused=false` and `reused=true` are both valid because the first fetch can fail before or after commit.
 
 ## Package binding
 

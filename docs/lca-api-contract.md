@@ -26,8 +26,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-08-26
-lastReviewedCommit: 0093406327807bc62d9fe431aa1d33f6b049def6
-lastReviewedNote: "The shared job surface now includes the additive request.v3 Portal LCIA projection materialization and exact package binding from Worker Issue #275."
+lastReviewedCommit: 25b8bc651be3443c2aa0c460833939ddd6e65b01
+lastReviewedNote: "Reviewed request.v3 package-ready ambiguous-response recovery and its exact locator-free Database receipt for Worker Issue #275."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -217,6 +217,8 @@ V3 package ready 前，private `artifactManifest` 另外绑定：
 - `portalProjectionContentHash`
 
 这些字段是 private evidence，不是下载 locator。Release 只能发布/最终化 Database 已逐项核对的 exact projection；Portal 缺少 publication 时显示 unavailable，不能从 package artifact 或矩阵补数值 0。完整 record/hash/staging 契约见 `docs/agents/contracts/portal-lcia-projection-contract.md`。
+
+V3 的最终 package-ready SQLx `fetch_one` 若失败，Worker 只以完全相同参数重放一次该 Database 调用，不重做计算、上传、staging 或 seal。Database non-ok、row decode、receipt schema、locator-free、projection identity/content hash 或 hash-contract 校验失败都立即 fail closed 且不重试。成功 receipt 顶层必须显式返回 `reused`；首次提交和已提交精确重放分别由 Database 返回 `false` / `true`。
 
 ### 3.8 `lcia.scope_closure_check` 与 Build V2 证书绑定
 
