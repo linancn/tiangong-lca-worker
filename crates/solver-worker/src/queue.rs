@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use crate::pgbouncer_sqlx::{self as sqlx, Row};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,8 @@ use crate::{
     },
     types::JobPayload,
     worker_jobs::{
-        WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result_reliably,
+        WorkerJob, WorkerJobResult, claim_worker_jobs, lease_heartbeat_period,
+        record_worker_job_result_reliably, renew_worker_job_lease, run_with_periodic_lease_renewal,
     },
 };
 
@@ -519,12 +520,38 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
     }
 
     let execution_result = match &payload {
+        JobPayload::LciaResultPackageBuild { .. }
+            if portal_package_lease_renewal_required(&job.payload_schema_version) =>
+        {
+            let package_build = async {
+                let closure_binding_result =
+                    validate_authoritative_portal_package_worker_input(&state.pool, &job).await;
+                match closure_binding_result {
+                    Ok(()) => handle_lcia_result_package_build_worker_job(
+                        state,
+                        job.id,
+                        job.lease_token,
+                        lease_seconds,
+                        &payload,
+                    )
+                    .await
+                    .map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            };
+            Box::pin(run_portal_lcia_v3_package_build_with_lease_renewal(
+                state,
+                job.id,
+                job.lease_token,
+                lease_seconds,
+                package_build,
+            ))
+            .await
+        }
         JobPayload::LciaResultPackageBuild { .. } => {
             let closure_binding_result = if job.payload_schema_version
-                == LCIA_RESULT_PACKAGE_BUILD_V3
+                == LCIA_RESULT_PACKAGE_BUILD_V2
             {
-                validate_authoritative_portal_package_worker_input(&state.pool, &job).await
-            } else if job.payload_schema_version == LCIA_RESULT_PACKAGE_BUILD_V2 {
                 match fetch_authoritative_package_closure_binding(&state.pool, job.id).await {
                     Ok(binding) => {
                         match validate_authoritative_package_closure_binding(&payload, &binding) {
@@ -574,6 +601,34 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
             record_solver_worker_job_failure(state, &job, &payload, lca_job_id, &err).await;
         }
     }
+}
+
+fn portal_package_lease_renewal_required(payload_schema_version: &str) -> bool {
+    payload_schema_version == LCIA_RESULT_PACKAGE_BUILD_V3
+}
+
+async fn run_portal_lcia_v3_package_build_with_lease_renewal<T, Work>(
+    state: &AppState,
+    worker_job_id: Uuid,
+    lease_token: Uuid,
+    lease_seconds: i32,
+    work: Work,
+) -> anyhow::Result<T>
+where
+    Work: Future<Output = anyhow::Result<T>>,
+{
+    let queue_pool = state.queue_pool.clone();
+    run_with_periodic_lease_renewal(
+        lease_heartbeat_period(lease_seconds),
+        move || {
+            let queue_pool = queue_pool.clone();
+            async move {
+                renew_worker_job_lease(&queue_pool, worker_job_id, lease_token, lease_seconds).await
+            }
+        },
+        work,
+    )
+    .await
 }
 
 async fn fetch_authoritative_package_closure_binding(
@@ -2053,9 +2108,10 @@ mod tests {
             AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
             LCIA_RESULT_PACKAGE_BUILD_V3, PORTAL_LCIA_PROJECTION_V1,
             lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
-            payload_type_name, result_schema_version_for_payload,
-            skipped_legacy_lca_job_projection, snapshot_builder_blocked_diagnostics,
-            snapshot_diagnostic_scope_pairs, solver_worker_job_payload, solver_worker_result_ref,
+            payload_type_name, portal_package_lease_renewal_required,
+            result_schema_version_for_payload, skipped_legacy_lca_job_projection,
+            snapshot_builder_blocked_diagnostics, snapshot_diagnostic_scope_pairs,
+            solver_worker_job_payload, solver_worker_result_ref,
             validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
@@ -2082,6 +2138,53 @@ mod tests {
                 "projectionSkipped": true,
             })
         );
+    }
+
+    #[test]
+    fn only_portal_v3_package_builds_require_queue_lease_renewal() {
+        assert!(portal_package_lease_renewal_required(
+            LCIA_RESULT_PACKAGE_BUILD_V3
+        ));
+        assert!(!portal_package_lease_renewal_required(
+            "lcia_result.package_build.request.v1"
+        ));
+        assert!(!portal_package_lease_renewal_required(
+            "lcia_result.package_build.request.v2"
+        ));
+    }
+
+    #[test]
+    fn portal_v3_queue_wraps_lazy_package_future_before_handler_execution() {
+        let source = include_str!("queue.rs");
+        let execution = source
+            .split_once("let execution_result = match &payload")
+            .expect("solver execution match")
+            .1;
+        let package_future = execution
+            .find("let package_build = async")
+            .expect("package build must be a lazy async future");
+        let package_handler = execution
+            .find("handle_lcia_result_package_build_worker_job(")
+            .expect("package handler must remain inside the protected future");
+        let renewal_wrapper = execution
+            .find("run_portal_lcia_v3_package_build_with_lease_renewal(")
+            .expect("Portal V3 queue path must install the renewal wrapper");
+        let wrapped_future = renewal_wrapper
+            + execution[renewal_wrapper..]
+                .find("package_build,")
+                .expect("renewal wrapper must receive the lazy package future");
+
+        assert!(package_future < package_handler);
+        assert!(package_handler < renewal_wrapper);
+        assert!(renewal_wrapper < wrapped_future);
+
+        let initial_heartbeat = source
+            .find("heartbeat_worker_job(\n        &state.queue_pool")
+            .expect("queue heartbeat before execution");
+        let execution_match = source
+            .find("let execution_result = match &payload")
+            .expect("solver execution match");
+        assert!(initial_heartbeat < execution_match);
     }
 
     fn worker_job(
