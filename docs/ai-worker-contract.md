@@ -23,9 +23,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "Introduced the generic ai-worker runtime and its first versioned ai.tidas_suggestion handler for Worker Issue #273."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
+lastReviewedNote: "Reviewed for Worker Issue #275; the shared millisecond heartbeat period preserves the AI runner's one-third lease contract, while its queue, handler, runtime, and result semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

@@ -23,9 +23,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "Added the generic ai-worker runtime and operator entrypoint for Worker Issue #273."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
+lastReviewedNote: "Documented the solver runtime's minimum two executor threads and fail-closed TOKIO_WORKER_THREADS override for Worker Issue #275."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -325,6 +325,7 @@ dataset payload。`worker.source-reference-audit.v1` 分开统计空对象占位
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
 - `WORKER_POLL_MS`（默认 `1000`）
 - `WORKER_VT_SECONDS`（默认 `30`；生产 `build_snapshot` 队列建议按最长任务耗时设置，例如 `1800`）
+- `TOKIO_WORKER_THREADS`（可选 solver runtime override；未设置时使用 `max(available_parallelism, 2)`，非法值或 `<2` 会在数据库/对象存储初始化前 fail closed）
 - `TIDAS_BIN`（统一 Rust `tidas` binary；默认通过 `PATH` 查找 `tidas`，生产建议使用原子切换的绝对路径）
 - `TIDAS_EXPECTED_VERSION`（必须与 binary `version` 及 validation describe package version 精确匹配，默认 `0.2.0`）
 - `TIDAS_TIMEOUT_SECONDS`（单次 `tidas` 子进程上限，默认 `1800`）

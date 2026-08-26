@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lca.tiangong.earth/contracts/portal-lcia-projection-impact.schema.json",
+  "title": "Portal LCIA projection impact axis record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "impactIndex",
+    "methodId",
+    "methodVersion",
+    "impactId",
+    "impactName",
+    "unit",
+    "methodDocumentSha256"
+  ],
+  "$defs": {
+    "localizedText": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["language", "value"],
+        "properties": {
+          "language": {
+            "type": "string",
+            "maxLength": 35,
+            "pattern": "^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$"
+          },
+          "value": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      }
+    }
+  },
+  "properties": {
+    "impactIndex": { "type": "integer", "minimum": 0 },
+    "methodId": { "type": "string", "format": "uuid" },
+    "methodVersion": { "type": "string", "pattern": "^[0-9]{2}\\.[0-9]{2}\\.[0-9]{3}$" },
+    "impactId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "impactName": { "$ref": "#/$defs/localizedText" },
+    "unit": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "methodDocumentSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lca.tiangong.earth/contracts/portal-lcia-projection-value.schema.json",
+  "title": "Portal LCIA projection dense value record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ordinal", "processIndex", "impactIndex", "value"],
+  "properties": {
+    "ordinal": { "type": "integer", "minimum": 1 },
+    "processIndex": { "type": "integer", "minimum": 0 },
+    "impactIndex": { "type": "integer", "minimum": 0 },
+    "value": {
+      "type": "string",
+      "maxLength": 40,
+      "pattern": "^-?(?=(?:[^0-9]*[0-9]){1,38}[^0-9]*$)(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$"
+    }
+  }
+}

@@ -28,9 +28,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-17
-lastReviewedCommit: 4c9f23335c10b01bd48466650ac9f0323b5ff9c4
-lastReviewedNote: "Reviewed after versioned calculation snapshots made legacy team/review guard fields optional; Review Admin diagnostics use their separate pending-review scope and this contract remains unchanged."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
+lastReviewedNote: "Reviewed for Worker Issue #275; the shared heartbeat precision and solver-only runtime guard do not change the manual Review Admin diagnostic payload, runner, report, or non-blocking semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml

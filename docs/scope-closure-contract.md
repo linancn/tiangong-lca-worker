@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-19
-lastReviewedCommit: f51f816c53e32315d541346abf94cf3fd7dab345
-lastReviewedNote: "Certificate-grade medium singular risk remains an auditable warning while compute failures stay blocking; the scanner cache identity advances to cutoff-readiness-r4."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not change Scope Closure traversal, its own lease executor, artifacts, or certificate semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -41,6 +41,7 @@ related:
   - docs/tidas-package-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
+  - docs/agents/contracts/portal-lcia-projection-contract.md
 ---
 
 # LCIA Scope Closure Worker Contract
@@ -278,6 +279,8 @@ The Worker accepts this authoritative eleven-field binding only all-or-none and 
 The Calculation Bundle impact axis is the snapshot-index's exact non-empty certified LCIA method axis. Every selected UUID/version must belong to the reviewed 25-method catalog, indices must be contiguous and identities unique, but the selected axis may contain one method or any other reviewed subset. Bundle materialization must not replace that frozen axis with the complete reviewed catalog.
 
 Closure binding changes provenance and eligibility, not numerical computation. The existing package snapshot build, all-unit solve, result artifact, and ready-marking path remains unchanged. Result JSON, result refs, persisted package metadata, and audit context preserve `closureCheckId` so downstream consumers can prove which certificate authorized the unchanged numerical output.
+
+Portal package request V3 consumes this same eleven-field binding and the same frozen Calculation Bundle after numerical output exists. Its typed projection spool is downstream evidence only: it does not rerun traversal, add closure roots, change the certified Process/Method axes, rewrite a certificate, or alter any Scope Closure artifact. Its separate contract is `docs/agents/contracts/portal-lcia-projection-contract.md`.
 
 ## Required proof
 

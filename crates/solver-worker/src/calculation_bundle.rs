@@ -35,6 +35,10 @@ use crate::{
         CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
         CompiledReleaseSourceDatasetType,
     },
+    portal_lcia_projection::{
+        PortalImpactSource, PortalLciaShard, PortalLocalizedText, PortalProcessSource,
+        PreparedPortalLciaProjection, prepare_portal_lcia_projection,
+    },
     snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport},
     snapshot_index::{SnapshotImpactMapEntry, SnapshotIndexDocument},
     storage::ObjectStoreClient,
@@ -151,6 +155,7 @@ pub struct BuiltCalculationBundle {
     pub manifest: CalculationBundleManifest,
     pub artifacts: Vec<LocalCalculationBundleArtifact>,
     pub downloads: Vec<LocalCalculationDownloadArtifact>,
+    pub portal_lcia_projection: Option<PreparedPortalLciaProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +292,7 @@ pub struct CalculationBundleWriter {
     process_axis_schema_version: &'static str,
     artifacts: Vec<LocalCalculationBundleArtifact>,
     completed_result_chunks: BTreeSet<usize>,
+    portal_projection_axes: Option<(Vec<PortalProcessSource>, Vec<PortalImpactSource>)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -673,9 +679,27 @@ impl CalculationBundleWriter {
             process_axis_schema_version,
             artifacts: Vec::new(),
             completed_result_chunks: BTreeSet::new(),
+            portal_projection_axes: None,
         };
         writer.write_static_artifacts(release_evidence)?;
         Ok(writer)
+    }
+
+    pub fn enable_portal_lcia_projection(
+        &mut self,
+        release_evidence: &CompiledReleaseEvidence,
+    ) -> anyhow::Result<()> {
+        if self.portal_projection_axes.is_some() {
+            return Err(anyhow::anyhow!(
+                "Portal LCIA projection preparation was enabled more than once"
+            ));
+        }
+        self.portal_projection_axes = Some(portal_projection_axes(
+            &self.processes,
+            &self.impacts,
+            release_evidence,
+        )?);
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -889,6 +913,14 @@ impl CalculationBundleWriter {
             &self.processes,
             &self.impacts,
         )?;
+        let portal_lcia_projection = self
+            .portal_projection_axes
+            .take()
+            .map(|(processes, impacts)| {
+                let shards = portal_lcia_shards(&self.artifacts)?;
+                prepare_portal_lcia_projection(&processes, &impacts, &shards)
+            })
+            .transpose()?;
 
         Ok(BuiltCalculationBundle {
             _directory: self.directory,
@@ -900,6 +932,7 @@ impl CalculationBundleWriter {
             manifest,
             artifacts: self.artifacts,
             downloads,
+            portal_lcia_projection,
         })
     }
 
@@ -1301,6 +1334,334 @@ fn artifacts_of_kind<'a>(
     artifacts
         .iter()
         .filter(|artifact| artifact.metadata.kind == kind)
+        .collect()
+}
+
+fn portal_lcia_shards(
+    artifacts: &[LocalCalculationBundleArtifact],
+) -> anyhow::Result<Vec<PortalLciaShard>> {
+    artifacts
+        .iter()
+        .filter(|artifact| artifact.metadata.kind == "lcia")
+        .enumerate()
+        .map(|(chunk_ordinal, artifact)| {
+            Ok(PortalLciaShard {
+                chunk_ordinal: u64::try_from(chunk_ordinal)?,
+                first_process_ordinal: u64::try_from(
+                    artifact.metadata.first_process_index.ok_or_else(|| {
+                        anyhow::anyhow!("Calculation Bundle LCIA shard omitted first process index")
+                    })?,
+                )?,
+                last_process_ordinal: u64::try_from(
+                    artifact.metadata.last_process_index.ok_or_else(|| {
+                        anyhow::anyhow!("Calculation Bundle LCIA shard omitted last process index")
+                    })?,
+                )?,
+                sha256: artifact.metadata.sha256.clone(),
+                uncompressed_sha256: artifact.metadata.uncompressed_sha256.clone().ok_or_else(
+                    || anyhow::anyhow!("Calculation Bundle LCIA shard omitted plain SHA-256"),
+                )?,
+                byte_size: artifact.metadata.byte_size,
+                uncompressed_byte_size: artifact.metadata.uncompressed_byte_size.ok_or_else(
+                    || anyhow::anyhow!("Calculation Bundle LCIA shard omitted plain byte size"),
+                )?,
+                record_count: artifact.metadata.record_count,
+                local_path: artifact.local_path.clone(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn portal_projection_axes(
+    processes: &[ReleaseProcessRecord],
+    impacts: &[ReleaseImpact],
+    release_evidence: &CompiledReleaseEvidence,
+) -> anyhow::Result<(Vec<PortalProcessSource>, Vec<PortalImpactSource>)> {
+    let process_axis = processes
+        .iter()
+        .map(|process| {
+            let source = portal_source_dataset(
+                release_evidence,
+                CompiledReleaseSourceDatasetType::Process,
+                process.root_process.id,
+                process.root_process.version.as_str(),
+            )?;
+            let reference_exchange = portal_reference_exchange(
+                &source.document,
+                process.quantitative_reference.exchange_internal_id.as_str(),
+            )?;
+            let description = reference_exchange
+                .get("referenceToFlowDataSet")
+                .and_then(|value| {
+                    value
+                        .get("common:shortDescription")
+                        .or_else(|| value.get("shortDescription"))
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Portal LCIA functional-unit description is missing for process {}@{}",
+                        process.root_process.id,
+                        process.root_process.version
+                    )
+                })?;
+            let pivot = process
+                .quantitative_reference
+                .pivot
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Portal LCIA quantitative-reference pivot is missing for process {}@{}",
+                        process.root_process.id,
+                        process.root_process.version
+                    )
+                })?;
+            let geography_code = portal_process_geography(&source.document).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Portal LCIA geography is missing for process {}@{}",
+                    process.root_process.id,
+                    process.root_process.version
+                )
+            })?;
+            let reference_year =
+                portal_process_reference_year(&source.document).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Portal LCIA reference year is missing for process {}@{}",
+                        process.root_process.id,
+                        process.root_process.version
+                    )
+                })?;
+            Ok(PortalProcessSource {
+                process_index: u64::try_from(process.process_index)?,
+                process_id: process.root_process.id,
+                process_version: process.root_process.version.clone(),
+                process_document_sha256: source.document_sha256.clone(),
+                reference_flow_id: process.quantitative_reference.flow.id,
+                reference_flow_version: process.quantitative_reference.flow.version.clone(),
+                reference_exchange_internal_id: process
+                    .quantitative_reference
+                    .exchange_internal_id
+                    .clone(),
+                reference_flow_amount: pivot.raw_mean_amount,
+                reference_flow_direction: match pivot.raw_direction {
+                    CompiledExchangeDirection::Input => "input",
+                    CompiledExchangeDirection::Output => "output",
+                }
+                .to_owned(),
+                functional_unit_amount: process.quantitative_reference.mean_amount,
+                functional_unit_unit: process.quantitative_reference.reference_unit.clone(),
+                functional_unit_description: portal_localized_text(description)?,
+                geography_precision: portal_geography_precision(geography_code.as_str()).to_owned(),
+                geography_code,
+                reference_year,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let impact_axis = impacts
+        .iter()
+        .map(|impact| {
+            let source = portal_source_dataset(
+                release_evidence,
+                CompiledReleaseSourceDatasetType::LciaMethod,
+                impact.id,
+                impact.version.as_str(),
+            )?;
+            let name = portal_lcia_method_name(&source.document).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Portal LCIA method name is missing for {}@{}",
+                    impact.id,
+                    impact.version
+                )
+            })?;
+            let impact_name = portal_localized_text(name)?;
+            if !impact_name
+                .iter()
+                .any(|value| value.value.trim() == impact.name.trim())
+            {
+                return Err(anyhow::anyhow!(
+                    "Portal LCIA method name drift for {}@{}: certified={} frozen={:?}",
+                    impact.id,
+                    impact.version,
+                    impact.name,
+                    impact_name
+                ));
+            }
+            Ok(PortalImpactSource {
+                impact_index: u64::try_from(impact.index)?,
+                method_id: impact.id,
+                method_version: impact.version.clone(),
+                method_document_sha256: source.document_sha256.clone(),
+                impact_category_id: impact.key.clone(),
+                impact_name,
+                result_unit: impact.unit.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((process_axis, impact_axis))
+}
+
+fn portal_source_dataset<'a>(
+    release_evidence: &'a CompiledReleaseEvidence,
+    dataset_type: CompiledReleaseSourceDatasetType,
+    id: Uuid,
+    version: &str,
+) -> anyhow::Result<&'a CompiledReleaseSourceDataset> {
+    let mut matches = release_evidence.source_datasets.iter().filter(|source| {
+        source.dataset_type == dataset_type
+            && source.dataset_id == id
+            && source.dataset_version == version
+    });
+    let source = matches.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Portal LCIA frozen source document is missing for {}:{id}@{version}",
+            dataset_type.as_str()
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "Portal LCIA frozen source identity is duplicated for {}:{id}@{version}",
+            dataset_type.as_str()
+        ));
+    }
+    Ok(source)
+}
+
+fn portal_reference_exchange<'a>(
+    process_document: &'a Value,
+    internal_id: &str,
+) -> anyhow::Result<&'a Value> {
+    let exchanges = process_document
+        .get("processDataSet")
+        .and_then(|value| value.get("exchanges"))
+        .and_then(|value| value.get("exchange"))
+        .ok_or_else(|| anyhow::anyhow!("Portal LCIA process exchanges are missing"))?;
+    let mut matches = match exchanges {
+        Value::Array(items) => items
+            .iter()
+            .filter(|item| {
+                item.get("@dataSetInternalID").and_then(Value::as_str) == Some(internal_id)
+            })
+            .collect::<Vec<_>>(),
+        Value::Object(_)
+            if exchanges.get("@dataSetInternalID").and_then(Value::as_str) == Some(internal_id) =>
+        {
+            vec![exchanges]
+        }
+        _ => Vec::new(),
+    };
+    if matches.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "Portal LCIA reference exchange must resolve exactly once: internalId={internal_id} matches={}",
+            matches.len()
+        ));
+    }
+    Ok(matches.remove(0))
+}
+
+fn portal_process_geography(document: &Value) -> Option<String> {
+    document
+        .get("processDataSet")?
+        .get("processInformation")?
+        .get("geography")?
+        .get("locationOfOperationSupplyOrProduction")?
+        .get("@location")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn portal_process_reference_year(document: &Value) -> Option<i32> {
+    let value = document
+        .get("processDataSet")?
+        .get("processInformation")?
+        .get("time")?
+        .get("common:referenceYear")?;
+    match value {
+        Value::Number(number) => number.as_i64().and_then(|year| i32::try_from(year).ok()),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn portal_geography_precision(code: &str) -> &'static str {
+    let segments = code.split('-').collect::<Vec<_>>();
+    let valid_country = segments.first().is_some_and(|country| {
+        country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic())
+    });
+    let valid_subdivisions = segments.iter().skip(1).all(|segment| {
+        !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    });
+
+    match segments.len() {
+        1 if valid_country => "country",
+        2 if valid_country && valid_subdivisions => "province",
+        3.. if valid_country && valid_subdivisions => "city",
+        _ => "other",
+    }
+}
+
+fn portal_lcia_method_name(document: &Value) -> Option<&Value> {
+    [
+        ("LCIAMethodInformation", "dataSetInformation"),
+        ("methodInformation", "dataSetInformation"),
+        ("methodInfo", "dataSetInformation"),
+        ("methodInfo", "dataSetInfo"),
+    ]
+    .into_iter()
+    .find_map(|(information, data_set_information)| {
+        let data = document
+            .get("LCIAMethodDataSet")?
+            .get(information)?
+            .get(data_set_information)?;
+        data.get("name")
+            .and_then(|name| name.get("baseName").or(Some(name)))
+    })
+}
+
+fn portal_localized_text(value: &Value) -> anyhow::Result<Vec<PortalLocalizedText>> {
+    let values = match value {
+        Value::Array(values) => values.iter().collect::<Vec<_>>(),
+        _ => vec![value],
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            let (language, text) = match value {
+                Value::String(text) => ("und", text.as_str()),
+                Value::Object(object) => {
+                    let language = object
+                        .get("@xml:lang")
+                        .or_else(|| object.get("@lang"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("und");
+                    let text = object
+                        .get("#text")
+                        .or_else(|| object.get("value"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Portal LCIA localized text omitted value")
+                        })?;
+                    (language, text)
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Portal LCIA localized text must be text or a language-tagged object"
+                    ));
+                }
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(anyhow::anyhow!("Portal LCIA localized text omitted value"));
+            }
+            Ok(PortalLocalizedText {
+                language: language.to_owned(),
+                value: text.to_owned(),
+            })
+        })
         .collect()
 }
 
@@ -2108,6 +2469,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn portal_geography_precision_distinguishes_country_province_and_city_codes() {
+        assert_eq!(portal_geography_precision("CN"), "country");
+        assert_eq!(portal_geography_precision("CN-GD"), "province");
+        assert_eq!(portal_geography_precision("CN-GD-SZX"), "city");
+        assert_eq!(portal_geography_precision("CN-GD-SZX-NS"), "city");
+
+        for malformed in ["GLO", "CN-", "-GD", "CN-GD-", "CN-GD-SZ X"] {
+            assert_eq!(portal_geography_precision(malformed), "other");
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn fixture_writer() -> CalculationBundleWriter {
         let method_indices = (0..RELEASE_METHOD_IDENTITIES.len()).collect::<Vec<_>>();
@@ -2309,6 +2682,24 @@ mod tests {
             &evidence,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn portal_localized_text_accepts_legacy_plain_and_untagged_values() {
+        assert_eq!(
+            portal_localized_text(&json!("Global warming")).unwrap(),
+            vec![PortalLocalizedText {
+                language: "und".to_owned(),
+                value: "Global warming".to_owned(),
+            }]
+        );
+        assert_eq!(
+            portal_localized_text(&json!({ "#text": "one kilogram" })).unwrap(),
+            vec![PortalLocalizedText {
+                language: "und".to_owned(),
+                value: "one kilogram".to_owned(),
+            }]
+        );
     }
 
     #[test]

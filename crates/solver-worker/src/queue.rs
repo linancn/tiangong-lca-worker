@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use crate::pgbouncer_sqlx::{self as sqlx, Row};
 use serde::{Deserialize, Serialize};
@@ -25,13 +25,16 @@ use crate::{
     },
     types::JobPayload,
     worker_jobs::{
-        WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result_reliably,
+        WorkerJob, WorkerJobResult, claim_worker_jobs, lease_heartbeat_period,
+        record_worker_job_result_reliably, renew_worker_job_lease, run_with_periodic_lease_renewal,
     },
 };
 
 const SOLVER_WORKER_QUEUE: &str = "solver";
 
 const LCIA_RESULT_PACKAGE_BUILD_V2: &str = "lcia_result.package_build.request.v2";
+const LCIA_RESULT_PACKAGE_BUILD_V3: &str = "lcia_result.package_build.request.v3";
+const PORTAL_LCIA_PROJECTION_V1: &str = "portal.lcia-projection.v1";
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,6 +57,40 @@ struct AuthoritativePackageClosureBinding {
     input_manifest: Value,
     input_manifest_hash: String,
     effective_scope: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PortalWorkerInputResponse {
+    Success(PortalWorkerInputSuccess),
+    Error(PortalWorkerInputError),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalWorkerInputSuccess {
+    ok: bool,
+    data: PortalWorkerInputData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalWorkerInputError {
+    ok: bool,
+    code: String,
+    status: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortalWorkerInputData {
+    build_worker_job_id: Uuid,
+    build_id: Uuid,
+    payload_schema_version: String,
+    projection_contract_version: String,
+    hash_contract_version: String,
+    payload: Value,
+    payload_ref: Value,
 }
 
 fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
@@ -483,6 +520,34 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
     }
 
     let execution_result = match &payload {
+        JobPayload::LciaResultPackageBuild { .. }
+            if portal_package_lease_renewal_required(&job.payload_schema_version) =>
+        {
+            let package_build = async {
+                let closure_binding_result =
+                    validate_authoritative_portal_package_worker_input(&state.pool, &job).await;
+                match closure_binding_result {
+                    Ok(()) => handle_lcia_result_package_build_worker_job(
+                        state,
+                        job.id,
+                        job.lease_token,
+                        lease_seconds,
+                        &payload,
+                    )
+                    .await
+                    .map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            };
+            Box::pin(run_portal_lcia_v3_package_build_with_lease_renewal(
+                state,
+                job.id,
+                job.lease_token,
+                lease_seconds,
+                package_build,
+            ))
+            .await
+        }
         JobPayload::LciaResultPackageBuild { .. } => {
             let closure_binding_result = if job.payload_schema_version
                 == LCIA_RESULT_PACKAGE_BUILD_V2
@@ -503,9 +568,15 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 Ok(())
             };
             match closure_binding_result {
-                Ok(()) => handle_lcia_result_package_build_worker_job(state, job.id, &payload)
-                    .await
-                    .map(|_| ()),
+                Ok(()) => handle_lcia_result_package_build_worker_job(
+                    state,
+                    job.id,
+                    job.lease_token,
+                    lease_seconds,
+                    &payload,
+                )
+                .await
+                .map(|_| ()),
                 Err(err) => Err(err),
             }
         }
@@ -530,6 +601,34 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
             record_solver_worker_job_failure(state, &job, &payload, lca_job_id, &err).await;
         }
     }
+}
+
+fn portal_package_lease_renewal_required(payload_schema_version: &str) -> bool {
+    payload_schema_version == LCIA_RESULT_PACKAGE_BUILD_V3
+}
+
+async fn run_portal_lcia_v3_package_build_with_lease_renewal<T, Work>(
+    state: &AppState,
+    worker_job_id: Uuid,
+    lease_token: Uuid,
+    lease_seconds: i32,
+    work: Work,
+) -> anyhow::Result<T>
+where
+    Work: Future<Output = anyhow::Result<T>>,
+{
+    let queue_pool = state.queue_pool.clone();
+    run_with_periodic_lease_renewal(
+        lease_heartbeat_period(lease_seconds),
+        move || {
+            let queue_pool = queue_pool.clone();
+            async move {
+                renew_worker_job_lease(&queue_pool, worker_job_id, lease_token, lease_seconds).await
+            }
+        },
+        work,
+    )
+    .await
 }
 
 async fn fetch_authoritative_package_closure_binding(
@@ -559,6 +658,65 @@ async fn fetch_authoritative_package_closure_binding(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("scope closure build binding RPC omitted data"))?;
     Ok(serde_json::from_value(data)?)
+}
+
+async fn validate_authoritative_portal_package_worker_input(
+    pool: &sqlx::PgPool,
+    job: &WorkerJob,
+) -> anyhow::Result<()> {
+    let result = sqlx::query_scalar::<Value>(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.svc_portal_lcia_projection_worker_input_v1($1, $2)
+        FROM _service_role
+        ",
+    )
+    .bind(job.id)
+    .bind(job.lease_token)
+    .fetch_one(pool)
+    .await?;
+    let response: PortalWorkerInputResponse = serde_json::from_value(result)?;
+    let data = match response {
+        PortalWorkerInputResponse::Success(success) if success.ok => success.data,
+        PortalWorkerInputResponse::Success(_) => {
+            return Err(anyhow::anyhow!(
+                "Portal projection worker input returned malformed success"
+            ));
+        }
+        PortalWorkerInputResponse::Error(error) if !error.ok => {
+            return Err(anyhow::anyhow!(
+                "Portal projection worker input rejected the lease: code={} status={}",
+                error.code,
+                error.status
+            ));
+        }
+        PortalWorkerInputResponse::Error(_) => {
+            return Err(anyhow::anyhow!(
+                "Portal projection worker input returned malformed error"
+            ));
+        }
+    };
+    let payload_build_id = data
+        .payload
+        .get("build_id")
+        .or_else(|| data.payload.get("buildId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if data.build_worker_job_id != job.id
+        || payload_build_id != Some(data.build_id)
+        || data.payload_schema_version != LCIA_RESULT_PACKAGE_BUILD_V3
+        || data.projection_contract_version != PORTAL_LCIA_PROJECTION_V1
+        || data.hash_contract_version != "portal.lcia-projection.int32be-frame-sha256.v1"
+        || data.payload != job.payload
+    {
+        return Err(anyhow::anyhow!(
+            "Portal projection worker input differs from the claimed V3 job"
+        ));
+    }
+    let _ = data.payload_ref;
+    Ok(())
 }
 
 fn validate_authoritative_package_closure_binding(
@@ -1371,6 +1529,16 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
         "snapshotBuildContractHash",
         "snapshot_build_contract_hash",
     );
+    copy_alias(
+        &mut payload,
+        "portalProjectionContractVersion",
+        "portal_projection_contract_version",
+    );
+    copy_alias(
+        &mut payload,
+        "portalProjectionHashContractVersion",
+        "portal_projection_hash_contract_version",
+    );
     copy_alias(&mut payload, "requestedScopeHash", "requested_scope_hash");
     copy_alias(&mut payload, "policyFingerprint", "policy_fingerprint");
     copy_alias(
@@ -1432,7 +1600,9 @@ fn payload_schema_supported_for_job_kind(job_kind: &str, schema: &str) -> bool {
             )
             | (
                 "lcia_result.package_build",
-                "lcia_result.package_build.request.v1" | "lcia_result.package_build.request.v2"
+                "lcia_result.package_build.request.v1"
+                    | "lcia_result.package_build.request.v2"
+                    | "lcia_result.package_build.request.v3"
             )
             | (SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION)
     )
@@ -1580,6 +1750,8 @@ fn validate_versioned_payload_contract(
                 snapshot_artifact_id,
                 snapshot_index_sha256,
                 snapshot_build_contract_hash,
+                portal_projection_contract_version,
+                portal_projection_hash_contract_version,
                 ..
             },
         ) => {
@@ -1608,6 +1780,13 @@ fn validate_versioned_payload_contract(
                     "legacy lcia result package v1 payload cannot carry closure evidence; use request.v2"
                 ));
             }
+            if portal_projection_contract_version.is_some()
+                || portal_projection_hash_contract_version.is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "legacy lcia result package v1 payload cannot enable Portal projection"
+                ));
+            }
         }
         (
             "lcia_result.package_build.request.v2",
@@ -1627,6 +1806,8 @@ fn validate_versioned_payload_contract(
                 snapshot_artifact_id,
                 snapshot_index_sha256,
                 snapshot_build_contract_hash,
+                portal_projection_contract_version,
+                portal_projection_hash_contract_version,
                 ..
             },
         ) => {
@@ -1653,6 +1834,66 @@ fn validate_versioned_payload_contract(
             if binding_count != 15 {
                 return Err(anyhow::anyhow!(
                     "lcia result package v2 requires the complete closure evidence binding"
+                ));
+            }
+            if portal_projection_contract_version.is_some()
+                || portal_projection_hash_contract_version.is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "lcia result package v2 payload cannot enable Portal projection; use request.v3"
+                ));
+            }
+        }
+        (
+            LCIA_RESULT_PACKAGE_BUILD_V3,
+            JobPayload::LciaResultPackageBuild {
+                closure_check_id,
+                closure_certificate_hash,
+                requested_scope_hash,
+                policy_fingerprint,
+                effective_scope_hash,
+                effective_scope,
+                data_snapshot_token,
+                snapshot_id,
+                snapshot_hash,
+                closure_bundle_artifact_id,
+                closure_bundle_hash,
+                report_artifact_manifest_hash,
+                snapshot_artifact_id,
+                snapshot_index_sha256,
+                snapshot_build_contract_hash,
+                portal_projection_contract_version,
+                portal_projection_hash_contract_version,
+                ..
+            },
+        ) => {
+            let binding_count = [
+                closure_check_id.is_some(),
+                closure_certificate_hash.is_some(),
+                requested_scope_hash.is_some(),
+                policy_fingerprint.is_some(),
+                effective_scope_hash.is_some(),
+                effective_scope.is_some(),
+                data_snapshot_token.is_some(),
+                snapshot_id.is_some(),
+                snapshot_hash.is_some(),
+                closure_bundle_artifact_id.is_some(),
+                closure_bundle_hash.is_some(),
+                report_artifact_manifest_hash.is_some(),
+                snapshot_artifact_id.is_some(),
+                snapshot_index_sha256.is_some(),
+                snapshot_build_contract_hash.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if binding_count != 15
+                || portal_projection_contract_version.as_deref() != Some(PORTAL_LCIA_PROJECTION_V1)
+                || portal_projection_hash_contract_version.as_deref()
+                    != Some("portal.lcia-projection.int32be-frame-sha256.v1")
+            {
+                return Err(anyhow::anyhow!(
+                    "lcia result package v3 requires complete closure evidence and portalProjectionContractVersion=portal.lcia-projection.v1"
                 ));
             }
         }
@@ -1865,10 +2106,12 @@ mod tests {
         },
         queue::{
             AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
+            LCIA_RESULT_PACKAGE_BUILD_V3, PORTAL_LCIA_PROJECTION_V1,
             lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
-            payload_type_name, result_schema_version_for_payload,
-            skipped_legacy_lca_job_projection, snapshot_builder_blocked_diagnostics,
-            snapshot_diagnostic_scope_pairs, solver_worker_job_payload, solver_worker_result_ref,
+            payload_type_name, portal_package_lease_renewal_required,
+            result_schema_version_for_payload, skipped_legacy_lca_job_projection,
+            snapshot_builder_blocked_diagnostics, snapshot_diagnostic_scope_pairs,
+            solver_worker_job_payload, solver_worker_result_ref,
             validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
@@ -1895,6 +2138,53 @@ mod tests {
                 "projectionSkipped": true,
             })
         );
+    }
+
+    #[test]
+    fn only_portal_v3_package_builds_require_queue_lease_renewal() {
+        assert!(portal_package_lease_renewal_required(
+            LCIA_RESULT_PACKAGE_BUILD_V3
+        ));
+        assert!(!portal_package_lease_renewal_required(
+            "lcia_result.package_build.request.v1"
+        ));
+        assert!(!portal_package_lease_renewal_required(
+            "lcia_result.package_build.request.v2"
+        ));
+    }
+
+    #[test]
+    fn portal_v3_queue_wraps_lazy_package_future_before_handler_execution() {
+        let source = include_str!("queue.rs");
+        let execution = source
+            .split_once("let execution_result = match &payload")
+            .expect("solver execution match")
+            .1;
+        let package_future = execution
+            .find("let package_build = async")
+            .expect("package build must be a lazy async future");
+        let package_handler = execution
+            .find("handle_lcia_result_package_build_worker_job(")
+            .expect("package handler must remain inside the protected future");
+        let renewal_wrapper = execution
+            .find("run_portal_lcia_v3_package_build_with_lease_renewal(")
+            .expect("Portal V3 queue path must install the renewal wrapper");
+        let wrapped_future = renewal_wrapper
+            + execution[renewal_wrapper..]
+                .find("package_build,")
+                .expect("renewal wrapper must receive the lazy package future");
+
+        assert!(package_future < package_handler);
+        assert!(package_handler < renewal_wrapper);
+        assert!(renewal_wrapper < wrapped_future);
+
+        let initial_heartbeat = source
+            .find("heartbeat_worker_job(\n        &state.queue_pool")
+            .expect("queue heartbeat before execution");
+        let execution_match = source
+            .find("let execution_result = match &payload")
+            .expect("solver execution match");
+        assert!(initial_heartbeat < execution_match);
     }
 
     fn worker_job(
@@ -2475,6 +2765,30 @@ mod tests {
             }),
         );
         assert!(solver_worker_job_payload(&full).is_ok());
+
+        let mut v3 = full.clone();
+        v3.payload_schema_version = LCIA_RESULT_PACKAGE_BUILD_V3.to_owned();
+        v3.payload.as_object_mut().unwrap().insert(
+            "portalProjectionContractVersion".to_owned(),
+            json!(PORTAL_LCIA_PROJECTION_V1),
+        );
+        v3.payload.as_object_mut().unwrap().insert(
+            "portalProjectionHashContractVersion".to_owned(),
+            json!("portal.lcia-projection.int32be-frame-sha256.v1"),
+        );
+        assert!(solver_worker_job_payload(&v3).is_ok());
+
+        let mut illegal_v2 = full.clone();
+        illegal_v2.payload.as_object_mut().unwrap().insert(
+            "portalProjectionContractVersion".to_owned(),
+            json!(PORTAL_LCIA_PROJECTION_V1),
+        );
+        assert!(
+            solver_worker_job_payload(&illegal_v2)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot enable Portal projection")
+        );
 
         let mut partial = full;
         partial

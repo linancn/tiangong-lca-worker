@@ -36,9 +36,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-25
-lastReviewedCommit: efa9d44f784eaa6a2a56908ef6c2c955c40fde12
-lastReviewedNote: "The runtime map now includes the generic ai-worker process and its first versioned ai.tidas_suggestion handler."
+lastReviewedAt: 2026-08-26
+lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
+lastReviewedNote: "The runtime map now includes the guarded multi-thread solver entry and active-renewal completion fence for V3 package work."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -49,6 +49,7 @@ related:
   - ../../docs/review-quality-diagnostic-contract.md
   - ../../docs/ai-worker-contract.md
   - ./contracts/scope-closure-memory-and-result-contract.md
+  - ./contracts/portal-lcia-projection-contract.md
 ---
 
 ## Repo Shape
@@ -83,6 +84,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/solver-worker/src/storage.rs` | S3-compatible object operations plus byte-capped, hash-verified, cancellable file download/upload primitives |
 | `crates/solver-worker/src/snapshot_artifacts.rs` | numerical HDF5 envelope, Review projections, release-metadata/source-closure descriptor chain, and legacy graph/v1 readers |
 | `crates/solver-worker/src/calculation_bundle.rs` | canonical content-addressed Calculation Bundle shards plus streaming LCIA XLSX/CSV, LCI Parquet/CSV, and whole-bundle audit downloads |
+| `crates/solver-worker/src/portal_lcia_projection.rs` | V3-only typed Process/Impact/Value spool, canonical decimals, int32be hashes, verified LCIA shard reader, and bounded Database batches |
 | `crates/solver-worker/src/artifact_gc.rs` | generic artifact lifecycle candidate validation and object-first retry-safe GC state machine |
 | `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, canonical v3 issue partitions, compact root-impact/witness evidence, staged artifact publication, scan reuse, and package certificate verification |
 | `scripts/scope_closure_qualification.py` and `scripts/run_scope_closure_*_qualification.sh` | fail-closed Linux orchestration for the real external package and isolated non-production provider child-result contracts consumed by the root qualification adapter |
@@ -97,6 +99,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
 | `docs/scope-closure-contract.md` | closure traversal, immutable source, validation, artifact, reuse, and build-binding contract |
 | `docs/agents/contracts/scope-closure-memory-and-result-contract.md` | canonical v4 bounded artifact shape with v3 issue semantics, compact root-impact/witness representation, memory/cancellation invariants, and Database #316 staged-publication handshake |
+| `docs/agents/contracts/portal-lcia-projection-contract.md` | V3 opt-in, typed records, cross-language hashes, lease-fenced staging, and exact package-manifest binding |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
 | `docs/review-quality-diagnostic-contract.md` | worker-owned manual Review Admin diagnostic, joint pending-review matrix, and informational report contract |
 | `docs/ai-worker-contract.md` | generic AI queue and versioned handler contract |
@@ -125,7 +128,7 @@ The worker currently covers families such as:
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker uses `SOLVER_QUEUE_BACKEND=worker-jobs`. It claims `private.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Ordinary solve jobs link LCA domain rows and use `private.worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `private.lca_results` plus `private.lca_latest_all_unit_results` as Worker-produced artifacts and then mark `private.lcia_result_packages` preview-ready through the database service-role command. The retired `lca_jobs` lifecycle and matrix-table fallback are not compatibility surfaces: selecting `SOLVER_QUEUE_BACKEND=pgmq` or encountering a snapshot without a ready artifact fails closed. The independent `pgmq` extension remains available to unrelated consumers.
+The main solver worker uses `SOLVER_QUEUE_BACKEND=worker-jobs`. It claims `private.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Its explicit multi-thread runtime preserves configured/available host parallelism while enforcing a two-thread minimum before AppState initialization; `TOKIO_WORKER_THREADS<2` or malformed values fail closed. Ordinary solve jobs link LCA domain rows and use `private.worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `private.lca_results` plus `private.lca_latest_all_unit_results` as Worker-produced artifacts and then mark `private.lcia_result_packages` preview-ready through the database service-role command. Request V3 alone additionally derives a locator-free typed LCIA projection from the same frozen Calculation Bundle, writes it through lease-fenced Database RPCs, verifies the returned hashes/counts, and binds the exact projection ID/content hash into the package artifact manifest. The queue wraps that V3-only lazy package future in a separate periodic renewal task spanning authoritative readback through ready-marking; renewals preserve phase/progress/diagnostics, and an active renewal completes or reaches its timeout before work completion can return. V1/V2 do not enter either branch. The retired `lca_jobs` lifecycle and matrix-table fallback are not compatibility surfaces: selecting `SOLVER_QUEUE_BACKEND=pgmq` or encountering a snapshot without a ready artifact fails closed. The independent `pgmq` extension remains available to unrelated consumers.
 
 ### Generic AI jobs
 
@@ -210,7 +213,7 @@ Calculation Bundle reads exact release evidence from the current integrity-bound
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
 - The worker uses a main DB pool plus an optional control-plane pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it must remain on a session/direct connection or session pooler when compute paths use SQLx bound queries. Supabase's known `:6543` transaction endpoint is rejected for the main pool at startup. The control-plane pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; it owns worker-job claim, heartbeat, terminal-result RPCs, and pgmq read/archive traffic. If no queue URL is set it reuses the main pool.
-- `WORKER_ID`, `WORKER_JOBS_CLAIM_LIMIT`, and `WORKER_JOBS_LEASE_SECONDS` control solver `worker_jobs` claim diagnostics, batch size, and lease renewal. Keep the lease longer than a normal solve/snapshot heartbeat interval and use `BUILD_SNAPSHOT_MAX_CONCURRENCY` for actual snapshot build throttling.
+- `WORKER_ID`, `WORKER_JOBS_CLAIM_LIMIT`, and `WORKER_JOBS_LEASE_SECONDS` control solver `worker_jobs` claim diagnostics, batch size, and lease renewal. `TOKIO_WORKER_THREADS` may override solver executor parallelism only with an integer of at least two; unset uses `max(available_parallelism, 2)`. Keep the lease longer than a normal solve/snapshot heartbeat interval and use `BUILD_SNAPSHOT_MAX_CONCURRENCY` for actual snapshot build throttling.
 - `build_snapshot` is globally throttled with a PostgreSQL transaction-level advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
 - Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. Worker-job control-plane RPCs and high-frequency pgmq polling/archive operations use the control-plane pool plus simple-query SQL, so they can run through Supabase's 6543 transaction pooler without moving compute, package, snapshot, or artifact queries onto that pooler. Terminal-result writes retry only bounded database/transport failures; an identical same-lease database replay is idempotent.
 - Snapshot-builder local reports under `reports/snapshot-coverage` are guarded optional diagnostics, not durable artifacts. `SNAPSHOT_REPORT_MODE`, `SNAPSHOT_REPORT_RETENTION_DAYS`, `SNAPSHOT_REPORT_MAX_FILES`, and `SNAPSHOT_REPORT_MIN_FREE_BYTES` control local report writes, retention, and low-disk skipping; object-store snapshot artifacts remain the durable compute payload.

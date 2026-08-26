@@ -1,8 +1,11 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::time::sleep;
+use tokio::{
+    sync::oneshot,
+    time::{MissedTickBehavior, interval, sleep, timeout},
+};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -259,8 +262,72 @@ impl<'a> WorkerJobProgress<'a> {
 
 #[must_use]
 pub fn lease_heartbeat_period(lease_seconds: i32) -> std::time::Duration {
-    let lease_seconds = u64::try_from(lease_seconds.max(3)).unwrap_or(3);
-    std::time::Duration::from_secs((lease_seconds / 3).max(1))
+    let lease_seconds = u64::try_from(lease_seconds.max(1)).unwrap_or(1);
+    std::time::Duration::from_millis(lease_seconds.saturating_mul(1_000) / 3)
+}
+
+pub async fn run_with_periodic_lease_renewal<T, Work, Renew, RenewFuture>(
+    heartbeat_period: Duration,
+    mut renew: Renew,
+    work: Work,
+) -> anyhow::Result<T>
+where
+    Work: Future<Output = anyhow::Result<T>>,
+    Renew: FnMut() -> RenewFuture + Send + 'static,
+    RenewFuture: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let period = heartbeat_period.max(Duration::from_millis(1));
+    let mut renewal_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        let mut heartbeat = interval(period);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The queue path already sent the initial heartbeat before execution.
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => return Ok(()),
+                _ = heartbeat.tick() => {
+                    match timeout(period, renew()).await {
+                        Ok(result) => result?,
+                        Err(_) => return Err(anyhow::anyhow!(
+                            "worker lease renewal exceeded its heartbeat period"
+                        )),
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        renewal = &mut renewal_task => {
+            match renewal {
+                Ok(Ok(())) => Err(anyhow::anyhow!(
+                    "worker lease renewal stopped before protected work completed"
+                )),
+                Ok(Err(error)) => Err(error.context(
+                    "worker lease renewal failed before protected work completed"
+                )),
+                Err(error) => Err(anyhow::anyhow!(
+                    "worker lease renewal task failed before protected work completed: {error}"
+                )),
+            }
+        }
+        result = &mut work => {
+            let _ = stop_tx.send(());
+            match renewal_task.await {
+                Ok(Ok(())) => result,
+                Ok(Err(error)) => Err(error.context(
+                    "worker lease renewal failed while protected work completed"
+                )),
+                Err(error) => Err(anyhow::anyhow!(
+                    "worker lease renewal task failed while protected work completed: {error}"
+                )),
+            }
+        }
+    }
 }
 
 pub async fn claim_worker_jobs(
@@ -320,6 +387,41 @@ pub async fn heartbeat_worker_job(
     let row = sqlx::raw_query(&sql).fetch_one(pool).await?;
     let result = row.try_get::<Value, _>("result")?;
     ensure_ok(&result, "worker_heartbeat_job")?;
+    Ok(())
+}
+
+fn worker_job_lease_renewal_sql(job_id: Uuid, lease_token: Uuid, lease_seconds: i32) -> String {
+    format!(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT private.worker_heartbeat_job(
+            {}::uuid,
+            {}::uuid,
+            NULL::text,
+            NULL::numeric,
+            NULL::jsonb,
+            {}
+        ) AS result
+        FROM _service_role
+        ",
+        sql_string_literal(&job_id.to_string()),
+        sql_string_literal(&lease_token.to_string()),
+        lease_seconds.clamp(1, 86_400),
+    )
+}
+
+pub async fn renew_worker_job_lease(
+    pool: &PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<()> {
+    let sql = worker_job_lease_renewal_sql(job_id, lease_token, lease_seconds);
+    let row = sqlx::raw_query(&sql).fetch_one(pool).await?;
+    let result = row.try_get::<Value, _>("result")?;
+    ensure_ok(&result, "worker_heartbeat_job lease renewal")?;
     Ok(())
 }
 
@@ -482,20 +584,49 @@ struct ReviewQualityDiagnosticScope {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::pending,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
     use serde_json::json;
+    use tokio::{
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
     use uuid::Uuid;
 
     use super::{
         REVIEW_QUALITY_DIAGNOSTIC_JOB_KIND, REVIEW_QUALITY_DIAGNOSTIC_PAYLOAD_SCHEMA_VERSION,
         REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE, WorkerJob, lease_heartbeat_period,
-        result_write_retry_delay,
+        result_write_retry_delay, run_with_periodic_lease_renewal, worker_job_lease_renewal_sql,
     };
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn lease_heartbeat_period_refreshes_before_expiry() {
-        assert_eq!(lease_heartbeat_period(900).as_secs(), 300);
-        assert_eq!(lease_heartbeat_period(2).as_secs(), 1);
-        assert_eq!(lease_heartbeat_period(-1).as_secs(), 1);
+        assert_eq!(lease_heartbeat_period(1), Duration::from_millis(333));
+        assert_eq!(lease_heartbeat_period(2), Duration::from_millis(666));
+        assert_eq!(lease_heartbeat_period(3), Duration::from_millis(1_000));
+        assert_eq!(lease_heartbeat_period(900), Duration::from_secs(300));
+        assert_eq!(lease_heartbeat_period(-1), Duration::from_millis(333));
+        for lease_seconds in 1..=3 {
+            assert!(
+                lease_heartbeat_period(lease_seconds).saturating_mul(2)
+                    < Duration::from_secs(u64::try_from(lease_seconds).unwrap())
+            );
+        }
     }
 
     #[test]
@@ -503,6 +634,257 @@ mod tests {
         assert_eq!(result_write_retry_delay(1).as_millis(), 100);
         assert_eq!(result_write_retry_delay(2).as_millis(), 200);
         assert_eq!(result_write_retry_delay(99).as_millis(), 1_600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_interval_tick_does_not_duplicate_the_queue_heartbeat() {
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let renewal_counter = Arc::clone(&renewals);
+        run_with_periodic_lease_renewal(
+            Duration::from_secs(1),
+            move || {
+                renewal_counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            async { Ok(()) },
+        )
+        .await
+        .expect("immediate protected work completes");
+
+        assert_eq!(renewals.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_lease_renewal_repeats_and_stops_cleanly() {
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let renewal_counter = Arc::clone(&renewals);
+        let renewal_task_dropped = Arc::new(AtomicBool::new(false));
+        let renewal_drop = DropFlag(Arc::clone(&renewal_task_dropped));
+        let (renewal_tx, mut renewal_rx) = mpsc::unbounded_channel();
+        let result = timeout(
+            Duration::from_secs(1),
+            run_with_periodic_lease_renewal(
+                Duration::from_millis(5),
+                move || {
+                    let _renewal_task_lifetime = &renewal_drop;
+                    renewal_counter.fetch_add(1, Ordering::SeqCst);
+                    renewal_tx
+                        .send(())
+                        .expect("protected work receives renewal");
+                    async { Ok(()) }
+                },
+                async move {
+                    for _ in 0..3 {
+                        renewal_rx
+                            .recv()
+                            .await
+                            .expect("renewal task remains active");
+                    }
+                    Ok(42_u8)
+                },
+            ),
+        )
+        .await
+        .expect("renewal orchestration completes before test deadline")
+        .expect("protected work completes");
+
+        assert_eq!(result, 42);
+        assert_eq!(renewals.load(Ordering::SeqCst), 3);
+        assert!(renewal_task_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_task_is_not_starved_by_cpu_heavy_work_poll() {
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let renewal_counter = Arc::clone(&renewals);
+        let (renewal_tx, mut renewal_rx) = mpsc::unbounded_channel();
+        let renewals_during_block = timeout(
+            Duration::from_secs(1),
+            run_with_periodic_lease_renewal(
+                Duration::from_millis(5),
+                move || {
+                    let renewal_counter = Arc::clone(&renewal_counter);
+                    let renewal_tx = renewal_tx.clone();
+                    async move {
+                        let count = renewal_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = renewal_tx.send(count);
+                        Ok(())
+                    }
+                },
+                async move {
+                    let before = renewal_rx.recv().await.expect("first renewal");
+                    let blocked_until = Instant::now() + Duration::from_millis(50);
+                    while Instant::now() < blocked_until {
+                        std::hint::spin_loop();
+                    }
+                    Ok(renewals.load(Ordering::SeqCst).saturating_sub(before))
+                },
+            ),
+        )
+        .await
+        .expect("CPU-heavy orchestration completes before test deadline")
+        .expect("CPU-heavy protected work completes");
+
+        assert!(renewals_during_block >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_failure_cancels_unfinished_work_and_joins_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let work_drop = Arc::clone(&dropped);
+        let renewal_task_dropped = Arc::new(AtomicBool::new(false));
+        let renewal_drop = DropFlag(Arc::clone(&renewal_task_dropped));
+        let error = timeout(
+            Duration::from_secs(1),
+            run_with_periodic_lease_renewal(
+                Duration::from_millis(5),
+                move || {
+                    let _renewal_task_lifetime = &renewal_drop;
+                    async { Err(anyhow::anyhow!("lease lost")) }
+                },
+                async move {
+                    let _drop_flag = DropFlag(work_drop);
+                    pending::<()>().await;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("lease-loss orchestration completes before test deadline")
+        .expect_err("renewal failure must cancel protected work");
+
+        assert!(error.to_string().contains("lease renewal failed"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(renewal_task_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_work_waits_for_a_pending_renewal_failure() {
+        let (renewal_started_tx, renewal_started_rx) = oneshot::channel();
+        let mut renewal_started_tx = Some(renewal_started_tx);
+        let (work_completed_tx, work_completed_rx) = oneshot::channel();
+        let (release_renewal_tx, release_renewal_rx) = oneshot::channel();
+        let mut release_renewal_rx = Some(release_renewal_rx);
+        let orchestration = tokio::spawn(run_with_periodic_lease_renewal(
+            Duration::from_millis(5),
+            move || {
+                renewal_started_tx
+                    .take()
+                    .expect("test expects exactly one renewal")
+                    .send(())
+                    .expect("protected work observes in-flight renewal");
+                let release_renewal_rx = release_renewal_rx
+                    .take()
+                    .expect("test expects exactly one renewal");
+                async move {
+                    release_renewal_rx.await.expect("test releases renewal");
+                    Err(anyhow::anyhow!("lease lost after work completed"))
+                }
+            },
+            async move {
+                renewal_started_rx
+                    .await
+                    .expect("renewal starts before work completes");
+                work_completed_tx
+                    .send(())
+                    .expect("test observes completed work");
+                Ok(())
+            },
+        ));
+
+        work_completed_rx.await.expect("protected work completed");
+        tokio::task::yield_now().await;
+        assert!(!orchestration.is_finished());
+        release_renewal_tx
+            .send(())
+            .expect("in-flight renewal remains attached after work completion");
+        let error = timeout(Duration::from_secs(1), orchestration)
+            .await
+            .expect("renewal failure resolves before test deadline")
+            .expect("orchestration task joins")
+            .expect_err("completed work must not mask lease loss");
+
+        assert!(error.to_string().contains("lease renewal failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_work_waits_for_a_pending_renewal_timeout() {
+        let (renewal_started_tx, renewal_started_rx) = oneshot::channel();
+        let mut renewal_started_tx = Some(renewal_started_tx);
+        let (work_completed_tx, work_completed_rx) = oneshot::channel();
+        let orchestration = tokio::spawn(run_with_periodic_lease_renewal(
+            Duration::from_millis(100),
+            move || {
+                renewal_started_tx
+                    .take()
+                    .expect("test expects exactly one renewal")
+                    .send(())
+                    .expect("protected work observes in-flight renewal");
+                pending::<anyhow::Result<()>>()
+            },
+            async move {
+                renewal_started_rx
+                    .await
+                    .expect("renewal starts before work completes");
+                work_completed_tx
+                    .send(())
+                    .expect("test observes completed work");
+                Ok(())
+            },
+        ));
+
+        work_completed_rx.await.expect("protected work completed");
+        tokio::task::yield_now().await;
+        assert!(!orchestration.is_finished());
+        let error = timeout(Duration::from_secs(1), orchestration)
+            .await
+            .expect("renewal timeout resolves before test deadline")
+            .expect("orchestration task joins")
+            .expect_err("completed work must wait for the renewal timeout");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("exceeded its heartbeat period"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_renewal_fails_closed_before_the_lease_can_expire() {
+        let work_dropped = Arc::new(AtomicBool::new(false));
+        let work_drop = Arc::clone(&work_dropped);
+        let error = timeout(
+            Duration::from_secs(1),
+            run_with_periodic_lease_renewal(
+                Duration::from_millis(5),
+                pending::<anyhow::Result<()>>,
+                async move {
+                    let _drop_flag = DropFlag(work_drop);
+                    pending::<()>().await;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("stalled-renewal orchestration completes before test deadline")
+        .expect_err("a stalled renewal must cancel protected work");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("exceeded its heartbeat period"))
+        );
+        assert!(work_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lease_renewal_preserves_phase_progress_and_diagnostics() {
+        let sql = worker_job_lease_renewal_sql(Uuid::new_v4(), Uuid::new_v4(), 900);
+        assert!(sql.contains("NULL::text"));
+        assert!(sql.contains("NULL::numeric"));
+        assert!(sql.contains("NULL::jsonb"));
+        assert!(!sql.contains("0.05"));
+        assert!(!sql.contains("0.70"));
     }
     #[test]
     fn parses_review_quality_diagnostic_worker_job_payload() {
