@@ -14,7 +14,8 @@ use crate::{
         validate_public_owner_draft_build_request,
     },
     db::{
-        AppState, archive_queue_message, fetch_snapshot_index_document, handle_job_payload,
+        AppState, SnapshotBuilderProcessFailure, archive_queue_message,
+        fetch_snapshot_index_document, handle_job_payload,
         handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
         latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
         snapshot_builder_process_failure_code, update_legacy_lca_job_status,
@@ -25,7 +26,7 @@ use crate::{
     },
     types::JobPayload,
     worker_jobs::{
-        WorkerJob, WorkerJobResult, claim_worker_jobs, lease_heartbeat_period,
+        FailureDisposition, WorkerJob, WorkerJobResult, claim_worker_jobs, lease_heartbeat_period,
         record_worker_job_result_reliably, renew_worker_job_lease, run_with_periodic_lease_renewal,
     },
 };
@@ -855,12 +856,52 @@ async fn record_invalid_solver_worker_job_payload(
         }),
         Some(json!({"error": err_message})),
         None,
+        FailureDisposition::NonRetryable,
     );
     if let Err(record_err) =
         record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
     {
         error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid worker_jobs payload");
     }
+}
+
+fn classify_solver_worker_failure(job_kind: &str, error: &anyhow::Error) -> FailureDisposition {
+    if job_kind == "lca.build_snapshot"
+        && let Some(failure) = error.downcast_ref::<SnapshotBuilderProcessFailure>()
+    {
+        return match failure {
+            SnapshotBuilderProcessFailure::Launch { .. }
+            | SnapshotBuilderProcessFailure::Timeout { .. }
+            | SnapshotBuilderProcessFailure::Signal { .. } => FailureDisposition::Retryable,
+            SnapshotBuilderProcessFailure::Blocked { .. } => FailureDisposition::NonRetryable,
+            SnapshotBuilderProcessFailure::Exit { .. }
+            | SnapshotBuilderProcessFailure::Protocol { .. } => FailureDisposition::Unclassified,
+        };
+    }
+
+    if job_kind == "lca.solve_all_unit"
+        && let Some(failure) = error.downcast_ref::<solver_core::SolverError>()
+    {
+        return match failure {
+            solver_core::SolverError::DataBuilder(_)
+            | solver_core::SolverError::Factorization(_)
+            | solver_core::SolverError::ValidationFailed(_)
+            | solver_core::SolverError::RhsDimensionMismatch { .. } => {
+                FailureDisposition::NonRetryable
+            }
+            solver_core::SolverError::NotPrepared { .. } => FailureDisposition::Retryable,
+            solver_core::SolverError::WorkloadAdmissionRejected { .. }
+            | solver_core::SolverError::CacheAdmission(_) => FailureDisposition::Unclassified,
+        };
+    }
+
+    if error.chain().any(|source| {
+        source.is::<sqlx::Error>() || source.is::<reqwest::Error>() || source.is::<std::io::Error>()
+    }) {
+        return FailureDisposition::Retryable;
+    }
+
+    FailureDisposition::Unclassified
 }
 
 async fn record_solver_worker_job_failure(
@@ -905,6 +946,7 @@ async fn record_solver_worker_job_failure(
                 "buildId": build_id,
                 "payloadType": payload_type_name(payload),
             })),
+            FailureDisposition::Unclassified,
         );
         result.result_ref = Some(lcia_result_package_worker_result_ref(
             job.id,
@@ -947,6 +989,7 @@ async fn record_solver_worker_job_failure(
         }),
         Some(diagnostics),
         None,
+        classify_solver_worker_failure(&job.job_kind, error),
     );
     result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
     if let Err(record_err) =
@@ -1005,6 +1048,7 @@ async fn record_solver_worker_job_success(
                         "buildId": build_id,
                         "payloadType": payload_type_name(payload),
                     })),
+                    FailureDisposition::Unclassified,
                 );
                 result.result_ref = Some(lcia_result_package_worker_result_ref(
                     job.id,
@@ -1035,6 +1079,7 @@ async fn record_solver_worker_job_success(
                 }),
                 Some(json!({"error": err_message})),
                 None,
+                FailureDisposition::Unclassified,
             );
             result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
             if let Err(record_err) = record_worker_job_result_reliably(
@@ -2107,16 +2152,78 @@ mod tests {
         queue::{
             AuthoritativePackageClosureBinding, CANONICAL_LCA_WORKER_JOB_DOMAIN_REF_UPDATES,
             LCIA_RESULT_PACKAGE_BUILD_V3, PORTAL_LCIA_PROJECTION_V1,
-            lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
-            payload_type_name, portal_package_lease_renewal_required,
-            result_schema_version_for_payload, skipped_legacy_lca_job_projection,
-            snapshot_builder_blocked_diagnostics, snapshot_diagnostic_scope_pairs,
-            solver_worker_job_payload, solver_worker_result_ref,
+            classify_solver_worker_failure, lcia_result_package_worker_result_ref,
+            parse_build_snapshot_worker_projection, payload_type_name,
+            portal_package_lease_renewal_required, result_schema_version_for_payload,
+            skipped_legacy_lca_job_projection, snapshot_builder_blocked_diagnostics,
+            snapshot_diagnostic_scope_pairs, solver_worker_job_payload, solver_worker_result_ref,
             validate_authoritative_package_closure_binding,
         },
         types::JobPayload,
-        worker_jobs::WorkerJob,
+        worker_jobs::{FailureDisposition, WorkerJob},
     };
+
+    #[test]
+    fn immutable_solver_failures_are_non_retryable() {
+        let error = anyhow::Error::new(solver_core::SolverError::RhsDimensionMismatch {
+            rhs_len: 2,
+            process_count: 3,
+        });
+
+        assert_eq!(
+            classify_solver_worker_failure("lca.solve_all_unit", &error),
+            FailureDisposition::NonRetryable
+        );
+    }
+
+    #[test]
+    fn snapshot_builder_blockers_are_non_retryable() {
+        let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Blocked {
+            code: "snapshot_source_closure_blocked".to_owned(),
+            blocking_reasons: Vec::new(),
+            blocking_reason_count: 0,
+            blocking_reasons_sha256: "0".repeat(64),
+            blocking_reasons_truncated: false,
+            blocking_reasons_spool: None,
+        });
+
+        assert_eq!(
+            classify_solver_worker_failure("lca.build_snapshot", &error),
+            FailureDisposition::NonRetryable
+        );
+    }
+
+    #[test]
+    fn transient_snapshot_and_transport_failures_are_retryable() {
+        let snapshot_error =
+            anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Timeout {
+                command: "snapshot-builder".to_owned(),
+                timeout_seconds: 60,
+            });
+        let database_error = anyhow::Error::new(crate::pgbouncer_sqlx::Error::PoolTimedOut);
+
+        assert_eq!(
+            classify_solver_worker_failure("lca.build_snapshot", &snapshot_error),
+            FailureDisposition::Retryable
+        );
+        assert_eq!(
+            classify_solver_worker_failure("lca.solve_all_unit", &database_error),
+            FailureDisposition::Retryable
+        );
+    }
+
+    #[test]
+    fn ambiguous_snapshot_failures_remain_unclassified() {
+        let error = anyhow::Error::new(crate::db::SnapshotBuilderProcessFailure::Protocol {
+            command: "snapshot-builder".to_owned(),
+            message: "unexpected terminal payload".to_owned(),
+        });
+
+        assert_eq!(
+            classify_solver_worker_failure("lca.build_snapshot", &error),
+            FailureDisposition::Unclassified
+        );
+    }
 
     #[test]
     fn canonical_worker_job_domain_links_never_reference_legacy_lca_jobs() {

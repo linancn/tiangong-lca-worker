@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
-lastReviewedNote: "Reviewed for Worker Issue #275; the solver-queue V3 renewal wrapper does not change TIDAS import/export jobs, their lease executor, ZIP/report schemas, retention, or package-worker state."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Documented Worker Issue #277 package retention safety: fixed run cutoffs, object-first deletion, bounded metadata cleanup, and retained canonical Worker history."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -184,11 +184,14 @@ package artifact 必须带或刷新 `expires_at`：
 worker 侧 GC 必须 object-aware：
 
 1. dry-run 先输出 eligible/protected reason；
-2. 只处理 `expires_at <= now()`、`is_pinned = false`、父 job 非 `queued/running`、且无 active/recent request-cache 引用的 ready artifact；
-3. 先删除对象存储 payload；
-4. 对象删除成功后，才把 artifact 标记为 `deleted`；
-5. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
-6. 旧 package job metadata cleanup 已取消；retention 以 `worker_job_id`、artifact/cache TTL 和 canonical Worker 状态作为保护条件。
+2. 每次运行固定一个 `as_of`，候选扫描、复核、cache/detail cleanup 都使用同一截止时间；
+3. 只处理 `expires_at <= as_of`、`is_pinned = false`、无 `queued/running/waiting` canonical 或 legacy parent、且无 active/recent request-cache 引用的 ready artifact；缺失 parent 本身不是永久保护条件；
+4. 每个 candidate 在对象删除前按同一 `as_of` 再复核一次；
+5. 先删除对象存储 payload；对象已不存在按幂等成功处理；
+6. 对象删除成功后，才把 artifact 标记为 `deleted`；
+7. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
+8. artifact GC 后再以 bounded `FOR UPDATE SKIP LOCKED` batch 清理 stale request-cache 与无 live artifact/cache/active-parent 保护的 export-item detail；
+9. canonical `private.worker_jobs` history 永不由 package GC 删除。数据库 `util.apply_lca_package_retention(...)` 仅保留 dry-run preview，`p_dry_run=false` 必须 fail closed。
 
 当前 worker runtime 提供 `package_gc` CLI：
 
@@ -202,9 +205,10 @@ cargo run -p solver-worker --bin package_gc -- --execute
 生产部署契约：
 
 - `package_gc` release binary 应随 `package_worker` 一起部署到所有活跃 worker 主机；
-- legacy `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
+- checked-in `deploy/systemd/package-gc.service` 与 `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
 - 统一队列模式下，timer 或 operator action 只负责 enqueue `tidas.package_artifact_gc` worker job，不直接代表任务事实；
 - timer 首次启用必须 dry-run，不带 `--execute`，并检查 `[retention]` eligible/protected reason 与 `[summary] dry_run=true ...`；
+- timer 默认每天 `03:15 UTC` enqueue 一次，并增加最多 15 分钟随机延迟；dry-run 与 execute 的默认 idempotency key 都按 UTC 日期分桶，同日重复触发复用同一 maintenance job，包括已到终态的 job；
 - destructive 清理必须显式加 `--execute`，并在首轮保留小批量限制，例如 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1`；
 - `--execute` 模式需要对象存储环境变量，且会先删对象 payload，再标记 artifact `deleted`；对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
 - `--execute` 模式使用 PostgreSQL advisory lock 防止重叠执行；在统一队列模式下还必须使用 `worker_jobs.concurrency_key` 防止同环境同类 GC 并发；

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily TianGong LCA Package Artifact GC Dry Run
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=package-gc.service
+
+[Install]
+WantedBy=timers.target

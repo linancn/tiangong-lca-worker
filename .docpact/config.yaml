@@ -1,7 +1,7 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-08-26"
-lastReviewedCommit: "9c8cfd562fb22c3a7af9287326bd6c63a813c965"
+lastReviewedAt: "2026-08-29"
+lastReviewedCommit: "c7f362e7a50eb003104851dcc1112fece81038bc"
 lastReviewedNote: "Reviewed Worker Issue #275 active-renewal fencing, millisecond heartbeat period, and guarded solver runtime against the shared-runtime routing graph; no rule changes are needed."
 
 # Keep deterministic governance facts here.

@@ -9,7 +9,7 @@ use solver_worker::{
     db_pool::{APP_MAINTENANCE_WORKER, WorkerDbPoolOptions},
     pgbouncer_sqlx::{self as sqlx, Row},
     worker_jobs::{
-        WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
+        FailureDisposition, WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
         record_worker_job_result_reliably,
     },
 };
@@ -436,6 +436,7 @@ async fn record_invalid_maintenance_job(pool: &sqlx::PgPool, job: &WorkerJob, er
         }),
         Some(json!({"error": err_message})),
         None,
+        FailureDisposition::NonRetryable,
     );
     if let Err(record_err) =
         record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await

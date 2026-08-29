@@ -25,9 +25,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
-lastReviewedNote: "Reviewed request.v3 active-renewal fencing, short-lease timing, and solver runtime executor capacity for Worker Issue #275."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Documented Worker Issue #277 failure retryability, exact-request negative admission, and coalesced heartbeat persistence."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -255,7 +255,7 @@ On success, the worker records a terminal `worker_jobs` result with:
 
 Singular/factorization failure diagnostics load the exact `(process_id, process_version)` pairs from `snapshot-index.process_map`. Duplicate-exchange and service-loop scans join only those pairs; they do not reconstruct scope from broad owner/state filters.
 
-On success or failure, the worker links `private.lca_results`, `private.lca_result_cache`, `private.lca_latest_all_unit_results`, and `private.lca_factorization_registry` rows back to the canonical `private.worker_jobs.id` where those rows exist. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `private.lca_result_cache` failed state where a cache row exists. The retired PGMQ lifecycle fails closed.
+On success or failure, the worker links `private.lca_results`, `private.lca_result_cache`, `private.lca_latest_all_unit_results`, and `private.lca_factorization_registry` rows back to the canonical `private.worker_jobs.id` where those rows exist. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `private.lca_result_cache` failed state where a cache row exists. Failure retryability is explicit tri-state: immutable payload/validation failures and deterministic `build_snapshot` blockers are `retryable=false`; recognized database, network, process-launch/timeout/signal, or missing prepared-state failures are `retryable=true`; ambiguous exit/protocol/projection/capacity failures remain SQL `NULL` rather than being guessed. The retired PGMQ lifecycle fails closed.
 
 For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key and computes the all-unit LCIA result plus query artifact. V1/V2 then use the established `private.cmd_lcia_result_package_mark_ready(...)` boundary. V3 first stages and seals its typed projection, then uses the dedicated projection-aware package-ready RPC so the exact projection ID/content hash is persisted with the package evidence. The ready projection persists `availableImpactCategories` from the frozen snapshot impact axis as ordered canonical impact UUIDs; `defaultImpactCategory` is normalized from either a requested canonical UUID or frozen impact key to the matching canonical UUID, and defaults to the first frozen impact when omitted. An empty impact axis or a requested default outside that axis fails closed instead of publishing an empty category list. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `private.lca_result_cache`.
 
@@ -273,7 +273,7 @@ request 固定包含 `dataType=process|flow` 和完整 `data` object。结果返
 
 `worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path`、`prepare_factorization` 或 `lcia_result_package_build`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
 
-Worker 的 claim、heartbeat 与 terminal-result RPC 使用独立 control-plane pool；主业务 pool 仅承担 compute、snapshot、package 与 artifact 查询。Portal V3 package 的持续续租同样只使用 control-plane pool，且只发送 `NULL` metadata 以保留当前 phase/progress/diagnostics。solver runtime 的最少两线程保证只改变 executor capacity，不创建第二 runtime，也不把 SQLx pool/socket 跨 runtime 移动。终态写入只对数据库/传输错误做有界重试；数据库仅把同一 lease token、同一 status 和同一结果内容的重放视为幂等成功，冲突重放继续返回非成功结果。过期且达到最大尝试次数的任务按有界 `FOR UPDATE SKIP LOCKED` 候选集回收，单个被锁住的旧任务不得阻塞其他 queued/stale 任务的 claim。
+Worker 的 claim、heartbeat 与 terminal-result RPC 使用独立 control-plane pool；主业务 pool 仅承担 compute、snapshot、package 与 artifact 查询。Portal V3 package 的持续续租同样只使用 control-plane pool，且只发送 `NULL` metadata 以保留当前 phase/progress/diagnostics。纯 lease renewal 只更新 heartbeat/lease，不推进 `updated_at`、不追加 event；业务 heartbeat 只在 phase 变化、首次 progress 或跨过新的 5% progress bucket 时追加 event，diagnostics 保留在 current `worker_jobs` row 而不复制进 event history。solver runtime 的最少两线程保证只改变 executor capacity，不创建第二 runtime，也不把 SQLx pool/socket 跨 runtime 移动。终态写入只对数据库/传输错误做有界重试；数据库仅把同一 lease token、同一 status 和同一结果内容的重放视为幂等成功，冲突重放继续返回非成功结果。过期且达到最大尝试次数的任务按有界 `FOR UPDATE SKIP LOCKED` 候选集回收，单个被锁住的旧任务不得阻塞其他 queued/stale 任务的 claim。
 
 ## 5. 结果契约
 
@@ -473,6 +473,8 @@ Worker 重任务可使用共享 `worker.resource-profile.v1` primitive 声明并
 ## 6. 幂等与请求缓存（建议约束）
 
 - `worker_jobs.idempotency_key` / `worker_jobs.request_hash`：同一业务请求重试时复用，避免重复创建 canonical worker job。
+- Database 以 runtime、job kind、requester/team、queue key、payload schema version 和 request hash 组成 exact request identity。该 identity 最新一次终态若为 `failed` 且明确 `retryable=false`，enqueue/cache/snapshot facade 返回 `WORKER_REQUEST_NON_RETRYABLE_FAILURE`（HTTP 409 semantics），不创建新 job，也不把 cache 重置为 pending；`retryable=true` 或 `NULL` 允许新的受控尝试。
+- maintenance job 的默认 idempotency key 按 `job_kind/environment/mode/UTC date` 分桶；同日重复触发复用已有 maintenance job，即使该 job 已到终态。dry-run 与 execute 使用不同 mode key。
 - `lca_results.job_id` / `lca_result_cache.job_id`：仅为历史 compatibility UUID，不要求 `lca_jobs` parent row。
 - `lca_result_cache`：
   - 唯一键 `(scope, snapshot_id, request_key)`

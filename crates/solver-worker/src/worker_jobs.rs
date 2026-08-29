@@ -56,6 +56,33 @@ pub struct WorkerJobResult {
     pub retryable: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    Retryable,
+    NonRetryable,
+    Unclassified,
+}
+
+impl FailureDisposition {
+    #[must_use]
+    pub const fn from_retryable(retryable: bool) -> Self {
+        if retryable {
+            Self::Retryable
+        } else {
+            Self::NonRetryable
+        }
+    }
+
+    #[must_use]
+    pub const fn retryable(self) -> Option<bool> {
+        match self {
+            Self::Retryable => Some(true),
+            Self::NonRetryable => Some(false),
+            Self::Unclassified => None,
+        }
+    }
+}
+
 impl WorkerJob {
     pub fn from_json(value: &Value) -> anyhow::Result<Self> {
         let id = value
@@ -190,6 +217,7 @@ impl WorkerJobResult {
         error_details: Value,
         diagnostics: Option<Value>,
         result_json: Option<Value>,
+        disposition: FailureDisposition,
     ) -> Self {
         Self {
             status: "failed".to_owned(),
@@ -202,7 +230,7 @@ impl WorkerJobResult {
             error_details: Some(error_details),
             blocker_codes: Vec::new(),
             resolution_scope: None,
-            retryable: Some(true),
+            retryable: disposition.retryable(),
         }
     }
 }
