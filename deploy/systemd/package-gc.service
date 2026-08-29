@@ -1,0 +1,15 @@
+[Unit]
+Description=TianGong LCA Package Artifact GC Enqueue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
+EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
+Environment=RUST_LOG=info
+Environment=MAINTENANCE_JOB_ENVIRONMENT=main
+SyslogIdentifier=maintenance_enqueue
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/maintenance_enqueue package-artifact-gc --batch-size 100 --max-batches 1

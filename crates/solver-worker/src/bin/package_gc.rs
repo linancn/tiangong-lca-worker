@@ -1,10 +1,12 @@
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use solver_worker::{
     db_pool::{APP_PACKAGE_GC, WorkerDbPoolOptions},
     package_retention::{
-        PackageArtifactGcCandidate, delete_package_jobs_after_object_gc,
-        delete_stale_package_request_cache_rows, fetch_package_artifact_gc_candidates,
-        fetch_package_retention_summary, mark_package_artifact_deleted,
+        PackageArtifactGcCandidate, PackageRetentionSummaryRow,
+        delete_package_export_items_after_object_gc, delete_stale_package_request_cache_rows,
+        fetch_package_artifact_gc_candidates, fetch_package_retention_summary,
+        mark_package_artifact_deleted, reconcile_package_artifact_gc_candidate,
         record_package_artifact_gc_error, validate_retention_days,
     },
     pgbouncer_sqlx::{self as sqlx},
@@ -47,7 +49,7 @@ struct Cli {
     /// Optional hard cap on total processed batches.
     #[arg(long, env = "PACKAGE_GC_MAX_BATCHES")]
     max_batches: Option<i64>,
-    /// Terminal package job metadata retention window.
+    /// Package export-item detail retention window.
     #[arg(long, env = "PACKAGE_GC_JOB_RETENTION_DAYS", default_value_t = 30_i32)]
     job_retention_days: i32,
     /// Request-cache recent-access protection window.
@@ -69,8 +71,13 @@ struct PackageGcTotals {
     object_deleted: u64,
     object_delete_failed: u64,
     artifacts_marked_deleted: u64,
+    request_cache_candidates: u64,
     request_cache_deleted: u64,
-    jobs_deleted: u64,
+    export_item_candidates: u64,
+    export_items_deleted: u64,
+    orphan_export_items_deleted: u64,
+    export_items_protected_by_artifact: u64,
+    export_items_protected_by_cache: u64,
 }
 
 fn required<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
@@ -171,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         &pool,
         store.as_ref(),
         &cli,
+        Utc::now(),
         job_retention_days,
         request_cache_retention_days,
     )
@@ -186,15 +194,20 @@ async fn main() -> anyhow::Result<()> {
     unlock_result?;
 
     println!(
-        "[summary] dry_run={} batches={} artifact_candidates={} object_deleted={} object_delete_failed={} artifacts_marked_deleted={} request_cache_deleted={} jobs_deleted={}",
+        "[summary] dry_run={} batches={} artifact_candidates={} object_deleted={} object_delete_failed={} artifacts_marked_deleted={} request_cache_candidates={} request_cache_deleted={} export_items_candidates={} export_items_deleted={} orphan_export_items_deleted={} export_items_protected_by_artifact={} export_items_protected_by_cache={} canonical_jobs_deleted=0 unclassified=0",
         !cli.execute,
         totals.batches,
         totals.artifact_candidates,
         totals.object_deleted,
         totals.object_delete_failed,
         totals.artifacts_marked_deleted,
+        totals.request_cache_candidates,
         totals.request_cache_deleted,
-        totals.jobs_deleted
+        totals.export_item_candidates,
+        totals.export_items_deleted,
+        totals.orphan_export_items_deleted,
+        totals.export_items_protected_by_artifact,
+        totals.export_items_protected_by_cache
     );
 
     Ok(())
@@ -204,12 +217,107 @@ async fn run_package_gc(
     pool: &sqlx::PgPool,
     store: Option<&ObjectStoreClient>,
     cli: &Cli,
+    as_of: DateTime<Utc>,
     job_retention_days: i32,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<PackageGcTotals> {
-    let summary =
-        fetch_package_retention_summary(pool, job_retention_days, request_cache_retention_days)
+    let summary = fetch_package_retention_summary(
+        pool,
+        as_of,
+        job_retention_days,
+        request_cache_retention_days,
+    )
+    .await?;
+    let mut totals = print_retention_summary(summary)?;
+
+    if !cli.execute {
+        let candidates = fetch_package_artifact_gc_candidates(
+            pool,
+            as_of,
+            cli.batch_size,
+            request_cache_retention_days,
+        )
+        .await?;
+        print_dry_run_candidates(candidates.as_slice());
+        return Ok(totals);
+    }
+
+    let store = store.ok_or_else(|| anyhow::anyhow!("object store is required for --execute"))?;
+    totals.artifact_candidates = 0;
+    totals.request_cache_candidates = 0;
+    totals.export_item_candidates = 0;
+    loop {
+        if let Some(max_batches) = cli.max_batches
+            && totals.batches >= max_batches
+        {
+            break;
+        }
+
+        let candidates = fetch_package_artifact_gc_candidates(
+            pool,
+            as_of,
+            cli.batch_size,
+            request_cache_retention_days,
+        )
+        .await?;
+        let candidate_count = u64::try_from(candidates.len())
+            .map_err(|_| anyhow::anyhow!("candidate count overflow"))?;
+
+        let object_deleted_before = totals.object_deleted;
+        for candidate in candidates {
+            process_artifact_candidate(
+                pool,
+                store,
+                &candidate,
+                as_of,
+                request_cache_retention_days,
+                &mut totals,
+            )
             .await?;
+        }
+
+        let request_cache_deleted = delete_stale_package_request_cache_rows(
+            pool,
+            as_of,
+            cli.batch_size,
+            request_cache_retention_days,
+        )
+        .await?;
+        let export_item_delete = delete_package_export_items_after_object_gc(
+            pool,
+            as_of,
+            cli.batch_size,
+            job_retention_days,
+            request_cache_retention_days,
+        )
+        .await?;
+
+        totals.request_cache_deleted += request_cache_deleted;
+        totals.export_items_deleted += export_item_delete.deleted;
+        totals.orphan_export_items_deleted += export_item_delete.orphan_deleted;
+
+        if candidate_count == 0 && request_cache_deleted == 0 && export_item_delete.deleted == 0 {
+            break;
+        }
+        totals.batches += 1;
+        if totals.object_deleted == object_deleted_before
+            && request_cache_deleted == 0
+            && export_item_delete.deleted == 0
+        {
+            eprintln!(
+                "[warn] package GC made no progress; stopping this run so failed object deletes retry on a later schedule"
+            );
+            break;
+        }
+    }
+
+    Ok(totals)
+}
+
+fn print_retention_summary(
+    summary: Vec<PackageRetentionSummaryRow>,
+) -> anyhow::Result<PackageGcTotals> {
+    let mut totals = PackageGcTotals::default();
     for row in summary {
         println!(
             "[retention] area={} action={} eligible={} reason={} rows={} artifact_bytes={} hits={}",
@@ -221,67 +329,27 @@ async fn run_package_gc(
             row.total_artifact_bytes,
             row.total_hit_count
         );
-    }
-
-    if !cli.execute {
-        let candidates = fetch_package_artifact_gc_candidates(
-            pool,
-            cli.batch_size,
-            request_cache_retention_days,
-        )
-        .await?;
-        print_dry_run_candidates(candidates.as_slice());
-        return Ok(PackageGcTotals {
-            artifact_candidates: u64::try_from(candidates.len())
-                .map_err(|_| anyhow::anyhow!("candidate count overflow"))?,
-            ..PackageGcTotals::default()
-        });
-    }
-
-    let store = store.ok_or_else(|| anyhow::anyhow!("object store is required for --execute"))?;
-    let mut totals = PackageGcTotals::default();
-    loop {
-        if let Some(max_batches) = cli.max_batches
-            && totals.batches >= max_batches
-        {
-            break;
+        let row_count = u64::try_from(row.row_count)
+            .map_err(|_| anyhow::anyhow!("retention row count overflow"))?;
+        if row.is_eligible {
+            match row.retention_area.as_str() {
+                "lca_package_artifacts" => totals.artifact_candidates += row_count,
+                "lca_package_request_cache" => totals.request_cache_candidates += row_count,
+                "lca_package_export_items" => totals.export_item_candidates += row_count,
+                _ => {}
+            }
+        } else if row.retention_area == "lca_package_export_items" {
+            match row.reason.as_str() {
+                "protected_live_artifact_reference" => {
+                    totals.export_items_protected_by_artifact += row_count;
+                }
+                "protected_request_cache_reference" => {
+                    totals.export_items_protected_by_cache += row_count;
+                }
+                _ => {}
+            }
         }
-
-        let candidates = fetch_package_artifact_gc_candidates(
-            pool,
-            cli.batch_size,
-            request_cache_retention_days,
-        )
-        .await?;
-        let candidate_count = u64::try_from(candidates.len())
-            .map_err(|_| anyhow::anyhow!("candidate count overflow"))?;
-
-        for candidate in candidates {
-            process_artifact_candidate(pool, store, &candidate, &mut totals).await?;
-        }
-
-        let request_cache_deleted = delete_stale_package_request_cache_rows(
-            pool,
-            cli.batch_size,
-            request_cache_retention_days,
-        )
-        .await?;
-        let jobs_deleted = delete_package_jobs_after_object_gc(
-            pool,
-            cli.batch_size,
-            job_retention_days,
-            request_cache_retention_days,
-        )?;
-
-        totals.request_cache_deleted += request_cache_deleted;
-        totals.jobs_deleted += jobs_deleted;
-
-        if candidate_count == 0 && request_cache_deleted == 0 && jobs_deleted == 0 {
-            break;
-        }
-        totals.batches += 1;
     }
-
     Ok(totals)
 }
 
@@ -301,14 +369,31 @@ async fn process_artifact_candidate(
     pool: &sqlx::PgPool,
     store: &ObjectStoreClient,
     candidate: &PackageArtifactGcCandidate,
+    as_of: DateTime<Utc>,
+    request_cache_retention_days: i32,
     totals: &mut PackageGcTotals,
 ) -> anyhow::Result<()> {
+    let Some(candidate) = reconcile_package_artifact_gc_candidate(
+        pool,
+        candidate.artifact_id,
+        as_of,
+        request_cache_retention_days,
+    )
+    .await?
+    else {
+        println!(
+            "[info] skipped package artifact after candidate reconciliation artifact_id={}",
+            candidate.artifact_id
+        );
+        return Ok(());
+    };
+
     totals.artifact_candidates += 1;
     match store.delete_object_url(&candidate.artifact_url).await {
         Ok(()) => {
             totals.object_deleted += 1;
             totals.artifacts_marked_deleted +=
-                mark_package_artifact_deleted(pool, candidate.artifact_id).await?;
+                mark_package_artifact_deleted(pool, candidate.artifact_id, as_of).await?;
             println!(
                 "[info] deleted package artifact object artifact_id={} job_id={} kind={}",
                 candidate.artifact_id, candidate.job_id, candidate.artifact_kind
@@ -317,7 +402,8 @@ async fn process_artifact_candidate(
         Err(err) => {
             totals.object_delete_failed += 1;
             let message = err.to_string();
-            let _ = record_package_artifact_gc_error(pool, candidate.artifact_id, &message).await?;
+            let _ = record_package_artifact_gc_error(pool, candidate.artifact_id, as_of, &message)
+                .await?;
             eprintln!(
                 "[warn] package artifact object delete failed artifact_id={} job_id={} kind={} error={message}",
                 candidate.artifact_id, candidate.job_id, candidate.artifact_kind
@@ -326,4 +412,53 @@ async fn process_artifact_candidate(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use solver_worker::package_retention::PackageRetentionSummaryRow;
+
+    use super::print_retention_summary;
+
+    fn row(area: &str, eligible: bool, row_count: i64) -> PackageRetentionSummaryRow {
+        PackageRetentionSummaryRow {
+            retention_area: area.to_owned(),
+            retention_action: "test".to_owned(),
+            is_eligible: eligible,
+            reason: "test".to_owned(),
+            row_count,
+            total_artifact_bytes: 0,
+            total_hit_count: 0,
+        }
+    }
+
+    #[test]
+    fn dry_run_summary_counts_only_eligible_domain_rows() {
+        let totals = print_retention_summary(vec![
+            row("lca_package_artifacts", true, 2),
+            row("lca_package_artifacts", false, 7),
+            row("lca_package_request_cache", true, 3),
+            row("lca_package_export_items", true, 5),
+            PackageRetentionSummaryRow {
+                reason: "protected_live_artifact_reference".to_owned(),
+                ..row("lca_package_export_items", false, 7)
+            },
+            PackageRetentionSummaryRow {
+                reason: "protected_request_cache_reference".to_owned(),
+                ..row("lca_package_export_items", false, 11)
+            },
+        ])
+        .expect("summary");
+
+        assert_eq!(totals.artifact_candidates, 2);
+        assert_eq!(totals.request_cache_candidates, 3);
+        assert_eq!(totals.export_item_candidates, 5);
+        assert_eq!(totals.export_items_protected_by_artifact, 7);
+        assert_eq!(totals.export_items_protected_by_cache, 11);
+    }
+
+    #[test]
+    fn eligible_summary_rejects_negative_database_counts() {
+        assert!(print_retention_summary(vec![row("lca_package_artifacts", true, -1)]).is_err());
+    }
 }

@@ -22,8 +22,9 @@ use crate::{
         ReadinessFinding, verify_matrix_readiness,
     },
     worker_jobs::{
-        REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE, ReviewQualityDiagnosticWorkerRequest, WorkerJob,
-        WorkerJobProgress, WorkerJobResult, claim_worker_jobs, record_worker_job_result_reliably,
+        FailureDisposition, REVIEW_QUALITY_DIAGNOSTIC_WORKER_QUEUE,
+        ReviewQualityDiagnosticWorkerRequest, WorkerJob, WorkerJobProgress, WorkerJobResult,
+        claim_worker_jobs, record_worker_job_result_reliably,
     },
 };
 
@@ -184,6 +185,7 @@ async fn process_claimed_review_quality_diagnostic(
                     json!({ "error": error.to_string() }),
                     Some(json!({ "runner": RUNNER_NAME, "workerJobId": job.id })),
                     None,
+                    FailureDisposition::NonRetryable,
                 ),
             )
             .await?;
@@ -215,6 +217,7 @@ async fn process_claimed_review_quality_diagnostic(
                     json!({ "error": error.to_string() }),
                     Some(json!({ "runner": RUNNER_NAME, "workerJobId": job.id })),
                     None,
+                    FailureDisposition::Unclassified,
                 ),
             )
             .await?;

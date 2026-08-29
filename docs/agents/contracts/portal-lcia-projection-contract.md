@@ -25,9 +25,9 @@ checkPaths:
   - crates/solver-worker/src/worker_jobs.rs
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
-lastReviewedNote: "Reviewed active-renewal completion fencing, sub-three-second lease margins, and the solver runtime's minimum two executor threads for Worker Issue #275."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Reviewed for Worker Issue #277; ambiguous V3 build/projection failures now remain unclassified instead of inheriting a retry default."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml
@@ -107,7 +107,7 @@ The queue sends its existing precise initial heartbeat before execution, then in
 
 The guard covers authoritative readback, snapshot preparation, calculation, upload, staging, seal, and package-ready recovery/commit. Stop is observed only between renewals. Once a renewal starts, completed work joins it through success, error/non-ok lease response, or one-period timeout; failure wins and the package result cannot be returned. A renewal error or timeout while work is unfinished drops the package future and fails closed before another stage. Clean completion joins the renewal task, so no task is detached. V1/V2 bypass this guard and retain their established package path.
 
-The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable.
+The same batch is safe to replay after response loss. A reused ordinal/identity with different content conflicts. Lease loss, status drift, missing rows, hash drift, or an unavailable RPC fails closed. Worker makes one bounded response-loss retry after status readback and records a locator-free best-effort stage failure when the stage is still writable. Outer package-build/projection terminal failures remain `retryable=NULL` unless a narrower typed boundary proves a retry disposition; the Worker never turns protocol ambiguity into an automatic retry promise.
 
 The final package-ready call is a separate ambiguous-response boundary. Worker repeats that exact immutable Database call at most once and only when SQLx `fetch_one` fails; it never repeats Calculation Bundle work, object upload, projection staging, or sealing. A Database non-ok response, row decode error, malformed receipt, unexpected field, or identity/hash mismatch fails immediately without retry. Success is the exact locator-free `{ok,reused,data}` receipt: Worker requires the package version, `preview_ready` status, build Worker job, included-input count, projection ID/content hash, and hash-contract version to match its immutable inputs. `reused=false` and `reused=true` are both valid because the first fetch can fail before or after commit.
 

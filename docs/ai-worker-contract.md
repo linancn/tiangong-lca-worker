@@ -23,9 +23,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
-lastReviewedNote: "Reviewed for Worker Issue #275; the shared millisecond heartbeat period preserves the AI runner's one-third lease contract, while its queue, handler, runtime, and result semantics remain unchanged."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Documented Worker Issue #277 explicit AI terminal failure disposition and unchanged one-third lease behavior."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -161,6 +161,8 @@ shape 与原值完全一致。shape 不一致、非 JSON 或额外解释文本�
 - `failed`：有命中路径但没有任何路径完成；返回原始完整 dataset，Worker terminal status
   为 `failed`，并保留 versioned result JSON。
 - 没有命中任何现有路径是合法的 `complete` no-op。
+
+terminal failure 的 `retryable` 不能依赖 constructor 默认值：无效 queue/job/schema/payload、输入超限/非法或 ruleset 缺失明确为 `false`；provider transport/timeout、429/5xx 等运行时瞬态明确为 `true`；所有路径失败时，只要任一稳定 failure 明确可重试，terminal 结果即为 `true`，否则为 `false`。
 
 AI 输出始终是 advisory suggestion。Worker 不写 Process/Flow domain row，不改变 Review 或
 发布状态；用户接受哪些差异仍由产品层决定。

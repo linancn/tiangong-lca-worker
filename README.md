@@ -23,9 +23,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 1c43c27991c29b793c918593895dd5f3c8476433
-lastReviewedNote: "Documented the solver runtime's minimum two executor threads and fail-closed TOKIO_WORKER_THREADS override for Worker Issue #275."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Documented Worker Issue #277 package-GC scheduling, fixed-cutoff object-first cleanup, and explicit Worker retryability semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -815,7 +815,7 @@ target/release/maintenance_enqueue package-artifact-gc --environment main --batc
 target/release/maintenance_enqueue process-flow-graph-cache --environment main --limit-flows 10 --limit-processes 20 --max-edges 200
 ```
 
-destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 dry-run / execute 生成不同的 idempotency/concurrency key；execute 默认 `max_attempts=1`。
+destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 dry-run / execute 生成不同的 idempotency/concurrency key，并按 UTC 日期分桶；同日重复触发会复用同一 maintenance job，包括已到终态的 job。execute 默认 `max_attempts=1`。
 
 `worker.artifact_gc` 是 application-level GC runner，通过 Database Engine #309 的 scope-closure lifecycle RPC claim bounded candidates。`object_delete` candidate 必须带 locator 且只删除一次对象；对象已不存在视为幂等成功，对象删除失败会释放 claim 并记录 retry count。若首轮 tombstone 后仍有 detail，数据库持久化 pending state；新 Worker 进程以新的 fenced token claim `detail_cleanup` candidate，其 `objectDeleteRequired=false` 且不含 bucket/path，然后继续 bounded cleanup 直到 `detailsRemaining=0`。checked-in fixture 已与 #309 commit `cc059eef` 的精确 payload 对齐。
 
@@ -842,7 +842,7 @@ target/release/maintenance_enqueue process-flow-graph-cache \
 
 ### 6.6 TIDAS Package Artifact GC（systemd timer，推荐）
 
-`package_gc` 负责清理 package artifact 对象、过期 request cache 和已无 artifact 依赖的 terminal package job metadata。统一队列模式下，timer 只 enqueue `tidas.package_artifact_gc` job，实际执行由 `maintenance_worker` 调用 `package_gc`。
+`package_gc` 负责清理 package artifact 对象、过期 request cache 和已无 live artifact/cache/active-parent 保护的 export-item detail。它永不删除 canonical `private.worker_jobs` history。统一队列模式下，timer 只 enqueue `tidas.package_artifact_gc` job，实际执行由 `maintenance_worker` 调用 `package_gc`。
 
 - 所有活跃 worker 主机都构建并保留最新 `target/release/package_gc` 和 `target/release/maintenance_worker`，便于切换。
 - `package-gc.timer` 只负责调用 `maintenance_enqueue package-artifact-gc` enqueue worker job，不直接执行删除。
@@ -855,41 +855,14 @@ cd /home/ubuntu/projects/lca_workspace/tiangong-lca-worker
 cargo build -p solver-worker --bin maintenance_enqueue --bin maintenance_worker --bin package_gc --release
 ```
 
-创建 dry-run 服务文件 `/etc/systemd/system/package-gc.service`：
+仓库已提供默认 dry-run unit；只在一个调度主机安装：
 
-```ini
-[Unit]
-Description=TianGong LCA Package Artifact GC (dry-run)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
-EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
-Environment=RUST_LOG=info
-Environment=MAINTENANCE_JOB_ENVIRONMENT=main
-SyslogIdentifier=maintenance_enqueue
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/maintenance_enqueue package-artifact-gc --batch-size 100 --max-batches 1
+```bash
+sudo install -m 0644 deploy/systemd/package-gc.service /etc/systemd/system/package-gc.service
+sudo install -m 0644 deploy/systemd/package-gc.timer /etc/systemd/system/package-gc.timer
 ```
 
-创建 timer 文件 `/etc/systemd/system/package-gc.timer`：
-
-```ini
-[Unit]
-Description=Daily TianGong LCA Package Artifact GC dry-run
-
-[Timer]
-OnCalendar=*-*-* 03:15:00
-RandomizedDelaySec=15m
-Persistent=true
-Unit=package-gc.service
-
-[Install]
-WantedBy=timers.target
-```
+timer 每天 `03:15 UTC` 触发，并增加最多 15 分钟随机延迟。其他活跃主机只保留相同 binary/unit 作为故障切换候选，不启用 timer。
 
 启用 timer 并立即跑一次 dry-run：
 
@@ -907,7 +880,7 @@ job 完成后，`worker_jobs.result_json.summary` 里应出现 `dry_run=true` �
 ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/maintenance_enqueue package-artifact-gc --execute --batch-size 100 --max-batches 1
 ```
 
-execute job 由 `maintenance_worker` 调用 `package_gc --execute`，仍会先删除对象存储 payload，再标记 artifact 为 `deleted`；对象删除失败时不会删除 DB metadata。建议保留 `--batch-size 100 --max-batches 1` 作为首轮 execute canary，再按运行结果逐步调整。
+execute job 由 `maintenance_worker` 调用 `package_gc --execute`。一次运行固定一个 `as_of`，candidate 在对象删除前复核；对象 payload 删除成功或已不存在后才标记 artifact `deleted`，失败时不删除 DB metadata。artifact 后续只做 bounded request-cache/export-item cleanup，数据库 helper 的 mutation 模式保持 fail closed。建议保留 `--batch-size 100 --max-batches 1` 作为首轮 execute canary，再按运行结果逐步调整。
 
 ### 6.7 Snapshot Storage GC（systemd timer，推荐）
 

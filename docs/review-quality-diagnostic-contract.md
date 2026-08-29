@@ -28,9 +28,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9c8cfd562fb22c3a7af9287326bd6c63a813c965
-lastReviewedNote: "Reviewed for Worker Issue #275; the shared heartbeat precision and solver-only runtime guard do not change the manual Review Admin diagnostic payload, runner, report, or non-blocking semantics."
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedNote: "Documented Worker Issue #277 explicit invalid-payload and unclassified runtime failure disposition; diagnostic workflow semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -150,7 +150,7 @@ snapshot 使用 `review_quality_diagnostic` artifact purpose、no-LCIA 模式和
 
 完整性 section 复用 matrix-readiness 的 provider closure、reference normalization、allocation 和 graph coverage 事实。数值稳定性 section 复用 singular-risk、factorization、matrix validation 与有界 unit-solve 事实。
 
-构建阶段的结构化 source-closure findings 会直接形成 `not_evaluable` 报告。可归因于数据内容的 snapshot builder 非零退出也形成通用完整性 finding；launch、timeout、signal 或 terminal protocol 错误属于 worker 运行失败，写 `status = failed`，仍不影响 Review 状态。
+构建阶段的结构化 source-closure findings 会直接形成 `not_evaluable` 报告。可归因于数据内容的 snapshot builder 非零退出也形成通用完整性 finding；launch、timeout、signal 或 terminal protocol 错误属于 worker 运行失败，写 `status = failed`，仍不影响 Review 状态。无效 diagnostic job payload 明确记录 `retryable=false`；报告生成前的其他 runtime failure 保持 `retryable=NULL`，由后续证据或 operator 判断，不猜测可重试性。
 
 该诊断使用 `matrix_readiness_report.v2` 的当前计算规则，但不复用它的 `passed / failed` Gate 语义。worker 将原 `blocker` 严重度映射为 finding `level = error`，同时固定 `workflowBlocking = false`。
 

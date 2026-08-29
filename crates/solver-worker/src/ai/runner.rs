@@ -8,8 +8,8 @@ use tracing::{info, warn};
 use crate::{
     pgbouncer_sqlx::PgPool,
     worker_jobs::{
-        WorkerJob, WorkerJobProgress, WorkerJobResult, claim_worker_jobs, lease_heartbeat_period,
-        record_worker_job_result_reliably,
+        FailureDisposition, WorkerJob, WorkerJobProgress, WorkerJobResult, claim_worker_jobs,
+        lease_heartbeat_period, record_worker_job_result_reliably,
     },
 };
 
@@ -125,14 +125,14 @@ async fn process_claimed_job(
     let request = match parse_tidas_suggestion_request(job) {
         Ok(request) => request,
         Err(error) => {
-            let mut result = WorkerJobResult::failed(
+            let result = WorkerJobResult::failed(
                 "invalid_ai_worker_job",
                 "AI worker job payload or contract is invalid",
                 json!({ "reason": error.to_string() }),
                 Some(job_diagnostics(job, "rejected")),
                 None,
+                FailureDisposition::NonRetryable,
             );
-            result.retryable = Some(false);
             record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await?;
             return Ok(AiJobOutcome::Invalid);
         }
@@ -171,14 +171,14 @@ async fn process_claimed_job(
         Ok(suggestion) => suggestion,
         Err(error) => {
             warn!(worker_job_id = %job.id, error = %error, "AI job handler failed");
-            let mut result = WorkerJobResult::failed(
+            let result = WorkerJobResult::failed(
                 "ai_tidas_suggestion_runtime_error",
                 "AI TIDAS suggestion handler failed before producing a result",
                 json!({ "reason": safe_runtime_error(&error) }),
                 Some(job_diagnostics(job, "runtime_error")),
                 None,
+                FailureDisposition::from_retryable(is_retryable_runtime_error(&error)),
             );
-            result.retryable = Some(is_retryable_runtime_error(&error));
             record_worker_job_result_reliably(pool, job.id, job.lease_token, result).await?;
             return Ok(AiJobOutcome::Failed);
         }
@@ -204,10 +204,10 @@ async fn process_claimed_job(
                 }),
                 Some(job_diagnostics(job, "failed")),
                 Some(result_json),
+                FailureDisposition::from_retryable(retryable),
             );
             result.result_schema_version =
                 Some(AI_TIDAS_SUGGESTION_RESULT_SCHEMA_VERSION.to_owned());
-            result.retryable = Some(retryable);
             result
         }
     };

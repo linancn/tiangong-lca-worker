@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{
@@ -27,6 +28,12 @@ pub struct PackageArtifactGcCandidate {
     pub artifact_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageExportItemDeleteResult {
+    pub deleted: u64,
+    pub orphan_deleted: u64,
+}
+
 #[must_use]
 pub const fn default_package_artifact_retention_days(kind: PackageArtifactKind) -> i32 {
     match kind {
@@ -49,15 +56,8 @@ pub fn validate_retention_days(value: i32, name: &str) -> anyhow::Result<i32> {
 #[allow(clippy::too_many_lines)]
 pub async fn fetch_package_retention_summary(
     pool: &PgPool,
-    _job_retention_days: i32,
-    request_cache_retention_days: i32,
-) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
-    fetch_package_retention_summary_without_legacy_jobs(pool, request_cache_retention_days).await
-}
-
-#[allow(clippy::too_many_lines)]
-async fn fetch_package_retention_summary_without_legacy_jobs(
-    pool: &PgPool,
+    as_of: DateTime<Utc>,
+    job_retention_days: i32,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
     let rows = sqlx::query(
@@ -74,16 +74,24 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
           FROM (
             SELECT
               artifacts.*,
-              worker_job.status AS parent_worker_job_status,
               CASE
-                WHEN artifacts.worker_job_id IS NULL THEN 'protected_missing_parent_worker_job'
-                WHEN worker_job.id IS NULL THEN 'protected_missing_parent_worker_job'
                 WHEN artifacts.is_pinned THEN 'protected_pinned_artifact'
                 WHEN artifacts.status = 'deleted' THEN 'protected_already_deleted'
                 WHEN artifacts.status <> 'ready' THEN 'protected_artifact_not_ready'
-                WHEN worker_job.status IN ('queued', 'running', 'waiting') THEN 'protected_active_parent_worker_job'
                 WHEN artifacts.expires_at IS NULL THEN 'protected_missing_expires_at'
-                WHEN artifacts.expires_at > NOW() THEN 'protected_expires_at_in_future'
+                WHEN artifacts.expires_at > $1 THEN 'protected_expires_at_in_future'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.worker_jobs AS active_job
+                  WHERE active_job.status IN ('queued', 'running', 'waiting')
+                    AND (
+                      (
+                        artifacts.worker_job_id IS NOT NULL
+                        AND active_job.id = artifacts.worker_job_id
+                      )
+                      OR active_job.payload_json ->> 'job_id' = artifacts.job_id::text
+                    )
+                ) THEN 'protected_active_parent_worker_job'
                 WHEN EXISTS (
                   SELECT 1
                   FROM private.lca_package_request_cache AS recent_cache
@@ -93,14 +101,12 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
                     )
                     AND (
                       recent_cache.status IN ('pending', 'running')
-                      OR recent_cache.last_accessed_at >= NOW() - make_interval(days => $1::integer)
+                      OR recent_cache.last_accessed_at >= $1 - make_interval(days => $3::integer)
                     )
                 ) THEN 'protected_request_cache_reference'
                 ELSE 'eligible_expired_unpinned_artifact'
               END AS reason
             FROM private.lca_package_artifacts AS artifacts
-            LEFT JOIN private.worker_jobs AS worker_job
-              ON worker_job.id = artifacts.worker_job_id
           ) AS classified
         ),
         request_cache_classified AS (
@@ -115,22 +121,110 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
           FROM (
             SELECT
               request_cache.*,
-              worker_job.status AS parent_worker_job_status,
               CASE
                 WHEN request_cache.status IN ('pending', 'running') THEN 'protected_active_request_cache'
-                WHEN request_cache.last_accessed_at >= NOW() - make_interval(days => $1::integer) THEN 'protected_recent_request_cache_access'
-                WHEN worker_job.status IN ('queued', 'running', 'waiting') THEN 'protected_active_parent_worker_job'
+                WHEN request_cache.last_accessed_at >= $1 - make_interval(days => $3::integer) THEN 'protected_recent_request_cache_access'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.worker_jobs AS active_job
+                  WHERE active_job.status IN ('queued', 'running', 'waiting')
+                    AND (
+                      (
+                        request_cache.worker_job_id IS NOT NULL
+                        AND active_job.id = request_cache.worker_job_id
+                      )
+                      OR active_job.payload_json ->> 'job_id' = request_cache.job_id::text
+                    )
+                ) THEN 'protected_active_parent_worker_job'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.lca_package_artifacts AS artifact
+                  WHERE artifact.status <> 'deleted'
+                    AND artifact.id IN (
+                      request_cache.export_artifact_id,
+                      request_cache.report_artifact_id
+                    )
+                ) THEN 'protected_live_artifact_reference'
                 ELSE 'eligible_stale_request_cache'
               END AS reason
             FROM private.lca_package_request_cache AS request_cache
-            LEFT JOIN private.worker_jobs AS worker_job
-              ON worker_job.id = request_cache.worker_job_id
+          ) AS classified
+        ),
+        export_item_classified AS (
+          SELECT
+            'lca_package_export_items'::text AS retention_area,
+            'delete_export_item_after_object_gc'::text AS retention_action,
+            (classified.reason = 'eligible_export_item_after_object_gc') AS is_eligible,
+            classified.reason,
+            1::bigint AS row_count,
+            0::bigint AS total_artifact_bytes,
+            0::bigint AS total_hit_count
+          FROM (
+            SELECT
+              export_item.*,
+              canonical_job.finished_at AS canonical_finished_at,
+              canonical_job.updated_at AS canonical_updated_at,
+              canonical_job.created_at AS canonical_created_at,
+              CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.worker_jobs AS active_job
+                  WHERE active_job.status IN ('queued', 'running', 'waiting')
+                    AND (
+                      (
+                        export_item.worker_job_id IS NOT NULL
+                        AND active_job.id = export_item.worker_job_id
+                      )
+                      OR active_job.payload_json ->> 'job_id' = export_item.job_id::text
+                    )
+                ) THEN 'protected_active_parent_worker_job'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.lca_package_artifacts AS artifact
+                  WHERE artifact.status <> 'deleted'
+                    AND (
+                      (
+                        export_item.worker_job_id IS NOT NULL
+                        AND artifact.worker_job_id = export_item.worker_job_id
+                      )
+                      OR artifact.job_id = export_item.job_id
+                    )
+                ) THEN 'protected_live_artifact_reference'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM private.lca_package_request_cache AS request_cache
+                  WHERE (
+                      request_cache.status IN ('pending', 'running')
+                      OR request_cache.last_accessed_at >= $1 - make_interval(days => $3::integer)
+                    )
+                    AND (
+                      (
+                        export_item.worker_job_id IS NOT NULL
+                        AND request_cache.worker_job_id = export_item.worker_job_id
+                      )
+                      OR request_cache.job_id = export_item.job_id
+                    )
+                ) THEN 'protected_request_cache_reference'
+                WHEN COALESCE(
+                  canonical_job.finished_at,
+                  canonical_job.updated_at,
+                  canonical_job.created_at,
+                  export_item.created_at
+                ) >= $1 - make_interval(days => $2::integer)
+                  THEN 'protected_recent_export_item'
+                ELSE 'eligible_export_item_after_object_gc'
+              END AS reason
+            FROM private.lca_package_export_items AS export_item
+            LEFT JOIN private.worker_jobs AS canonical_job
+              ON canonical_job.id = export_item.worker_job_id
           ) AS classified
         ),
         classified AS (
           SELECT * FROM artifact_classified
           UNION ALL
           SELECT * FROM request_cache_classified
+          UNION ALL
+          SELECT * FROM export_item_classified
         )
         SELECT
           retention_area,
@@ -145,6 +239,8 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
         ORDER BY retention_area, is_eligible DESC, reason
         ",
     )
+    .bind(as_of)
+    .bind(job_retention_days)
     .bind(request_cache_retention_days)
     .fetch_all(pool)
     .await?;
@@ -167,6 +263,7 @@ async fn fetch_package_retention_summary_without_legacy_jobs(
 
 pub async fn fetch_package_artifact_gc_candidates(
     pool: &PgPool,
+    as_of: DateTime<Utc>,
     batch_size: i64,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<Vec<PackageArtifactGcCandidate>> {
@@ -178,13 +275,22 @@ pub async fn fetch_package_artifact_gc_candidates(
           artifacts.artifact_kind,
           artifacts.artifact_url
         FROM private.lca_package_artifacts AS artifacts
-        JOIN private.worker_jobs AS worker_job
-          ON worker_job.id = artifacts.worker_job_id
         WHERE artifacts.status = 'ready'
           AND artifacts.is_pinned = FALSE
           AND artifacts.expires_at IS NOT NULL
-          AND artifacts.expires_at <= NOW()
-          AND worker_job.status NOT IN ('queued', 'running', 'waiting')
+          AND artifacts.expires_at <= $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM private.worker_jobs AS active_job
+            WHERE active_job.status IN ('queued', 'running', 'waiting')
+              AND (
+                (
+                  artifacts.worker_job_id IS NOT NULL
+                  AND active_job.id = artifacts.worker_job_id
+                )
+                OR active_job.payload_json ->> 'job_id' = artifacts.job_id::text
+              )
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM private.lca_package_request_cache AS request_cache
@@ -194,14 +300,16 @@ pub async fn fetch_package_artifact_gc_candidates(
               )
               AND (
                 request_cache.status IN ('pending', 'running')
-                OR request_cache.last_accessed_at >= NOW() - make_interval(days => $2::integer)
+                OR request_cache.last_accessed_at >= $2 - make_interval(days => $3::integer)
               )
           )
         ORDER BY artifacts.expires_at ASC, artifacts.created_at ASC, artifacts.id ASC
         LIMIT $1
+        FOR UPDATE OF artifacts SKIP LOCKED
         ",
     )
     .bind(batch_size)
+    .bind(as_of)
     .bind(request_cache_retention_days)
     .fetch_all(pool)
     .await?;
@@ -219,9 +327,74 @@ pub async fn fetch_package_artifact_gc_candidates(
         .map_err(Into::into)
 }
 
+pub async fn reconcile_package_artifact_gc_candidate(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    as_of: DateTime<Utc>,
+    request_cache_retention_days: i32,
+) -> anyhow::Result<Option<PackageArtifactGcCandidate>> {
+    let row = sqlx::query(
+        r"
+        SELECT
+          artifacts.id AS artifact_id,
+          artifacts.job_id,
+          artifacts.artifact_kind,
+          artifacts.artifact_url
+        FROM private.lca_package_artifacts AS artifacts
+        WHERE artifacts.id = $1
+          AND artifacts.status = 'ready'
+          AND artifacts.is_pinned = FALSE
+          AND artifacts.expires_at IS NOT NULL
+          AND artifacts.expires_at <= $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM private.worker_jobs AS active_job
+            WHERE active_job.status IN ('queued', 'running', 'waiting')
+              AND (
+                (
+                  artifacts.worker_job_id IS NOT NULL
+                  AND active_job.id = artifacts.worker_job_id
+                )
+                OR active_job.payload_json ->> 'job_id' = artifacts.job_id::text
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM private.lca_package_request_cache AS request_cache
+            WHERE (
+                request_cache.export_artifact_id = artifacts.id
+                OR request_cache.report_artifact_id = artifacts.id
+              )
+              AND (
+                request_cache.status IN ('pending', 'running')
+                OR request_cache.last_accessed_at >= $2 - make_interval(days => $3::integer)
+              )
+          )
+        FOR UPDATE OF artifacts SKIP LOCKED
+        ",
+    )
+    .bind(artifact_id)
+    .bind(as_of)
+    .bind(request_cache_retention_days)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| -> Result<_, sqlx::Error> {
+        Ok(PackageArtifactGcCandidate {
+            artifact_id: row.try_get("artifact_id")?,
+            job_id: row.try_get("job_id")?,
+            artifact_kind: row.try_get("artifact_kind")?,
+            artifact_url: row.try_get("artifact_url")?,
+        })
+    })
+    .transpose()
+    .map_err(Into::into)
+}
+
 pub async fn mark_package_artifact_deleted(
     pool: &PgPool,
     artifact_id: Uuid,
+    as_of: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r"
@@ -232,6 +405,7 @@ pub async fn mark_package_artifact_deleted(
               jsonb_build_object(
                 'status', 'object_deleted',
                 'deleted_at', NOW(),
+                'as_of', $2,
                 'reason', 'eligible_expired_unpinned_artifact'
               )
             ),
@@ -241,6 +415,7 @@ pub async fn mark_package_artifact_deleted(
         ",
     )
     .bind(artifact_id)
+    .bind(as_of)
     .execute(pool)
     .await?;
 
@@ -250,6 +425,7 @@ pub async fn mark_package_artifact_deleted(
 pub async fn record_package_artifact_gc_error(
     pool: &PgPool,
     artifact_id: Uuid,
+    as_of: DateTime<Utc>,
     error_message: &str,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
@@ -260,7 +436,8 @@ pub async fn record_package_artifact_gc_error(
               jsonb_build_object(
                 'status', 'object_delete_failed',
                 'last_error_at', NOW(),
-                'last_error', $2
+                'as_of', $2,
+                'last_error', $3
               )
             ),
             updated_at = NOW()
@@ -269,6 +446,7 @@ pub async fn record_package_artifact_gc_error(
         ",
     )
     .bind(artifact_id)
+    .bind(as_of)
     .bind(error_message)
     .execute(pool)
     .await?;
@@ -278,6 +456,7 @@ pub async fn record_package_artifact_gc_error(
 
 pub async fn delete_stale_package_request_cache_rows(
     pool: &PgPool,
+    as_of: DateTime<Utc>,
     batch_size: i64,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<u64> {
@@ -286,11 +465,29 @@ pub async fn delete_stale_package_request_cache_rows(
         WITH candidates AS (
           SELECT request_cache.id
           FROM private.lca_package_request_cache AS request_cache
-          LEFT JOIN private.worker_jobs AS worker_job
-            ON worker_job.id = request_cache.worker_job_id
           WHERE request_cache.status NOT IN ('pending', 'running')
-            AND request_cache.last_accessed_at < NOW() - make_interval(days => $2::integer)
-            AND COALESCE(worker_job.status NOT IN ('queued', 'running', 'waiting'), TRUE)
+            AND request_cache.last_accessed_at < $2 - make_interval(days => $3::integer)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM private.worker_jobs AS active_job
+              WHERE active_job.status IN ('queued', 'running', 'waiting')
+                AND (
+                  (
+                    request_cache.worker_job_id IS NOT NULL
+                    AND active_job.id = request_cache.worker_job_id
+                  )
+                  OR active_job.payload_json ->> 'job_id' = request_cache.job_id::text
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM private.lca_package_artifacts AS artifact
+              WHERE artifact.status <> 'deleted'
+                AND artifact.id IN (
+                  request_cache.export_artifact_id,
+                  request_cache.report_artifact_id
+                )
+            )
           ORDER BY request_cache.last_accessed_at ASC, request_cache.id ASC
           LIMIT $1
           FOR UPDATE OF request_cache SKIP LOCKED
@@ -301,6 +498,7 @@ pub async fn delete_stale_package_request_cache_rows(
         ",
     )
     .bind(batch_size)
+    .bind(as_of)
     .bind(request_cache_retention_days)
     .execute(pool)
     .await?;
@@ -308,13 +506,97 @@ pub async fn delete_stale_package_request_cache_rows(
     Ok(result.rows_affected())
 }
 
-pub fn delete_package_jobs_after_object_gc(
-    _pool: &PgPool,
-    _batch_size: i64,
-    _job_retention_days: i32,
-    _request_cache_retention_days: i32,
-) -> anyhow::Result<u64> {
-    Ok(0)
+pub async fn delete_package_export_items_after_object_gc(
+    pool: &PgPool,
+    as_of: DateTime<Utc>,
+    batch_size: i64,
+    job_retention_days: i32,
+    request_cache_retention_days: i32,
+) -> anyhow::Result<PackageExportItemDeleteResult> {
+    let row = sqlx::query(
+        r"
+        WITH candidates AS (
+          SELECT export_item.id, export_item.worker_job_id
+          FROM private.lca_package_export_items AS export_item
+          LEFT JOIN private.worker_jobs AS canonical_job
+            ON canonical_job.id = export_item.worker_job_id
+          WHERE COALESCE(
+              canonical_job.finished_at,
+              canonical_job.updated_at,
+              canonical_job.created_at,
+              export_item.created_at
+            ) < $2 - make_interval(days => $3::integer)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM private.worker_jobs AS active_job
+              WHERE active_job.status IN ('queued', 'running', 'waiting')
+                AND (
+                  (
+                    export_item.worker_job_id IS NOT NULL
+                    AND active_job.id = export_item.worker_job_id
+                  )
+                  OR active_job.payload_json ->> 'job_id' = export_item.job_id::text
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM private.lca_package_artifacts AS artifact
+              WHERE artifact.status <> 'deleted'
+                AND (
+                  (
+                    export_item.worker_job_id IS NOT NULL
+                    AND artifact.worker_job_id = export_item.worker_job_id
+                  )
+                  OR artifact.job_id = export_item.job_id
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM private.lca_package_request_cache AS request_cache
+              WHERE (
+                  request_cache.status IN ('pending', 'running')
+                  OR request_cache.last_accessed_at >= $2 - make_interval(days => $4::integer)
+                )
+                AND (
+                  (
+                    export_item.worker_job_id IS NOT NULL
+                    AND request_cache.worker_job_id = export_item.worker_job_id
+                  )
+                  OR request_cache.job_id = export_item.job_id
+                )
+            )
+          ORDER BY export_item.created_at ASC, export_item.id ASC
+          LIMIT $1
+          FOR UPDATE OF export_item SKIP LOCKED
+        ),
+        deleted AS (
+          DELETE FROM private.lca_package_export_items AS export_item
+          USING candidates
+          WHERE export_item.id = candidates.id
+          RETURNING candidates.worker_job_id
+        )
+        SELECT
+          COUNT(*)::bigint AS deleted_count,
+          COUNT(*) FILTER (WHERE worker_job_id IS NULL)::bigint AS orphan_deleted_count
+        FROM deleted
+        ",
+    )
+    .bind(batch_size)
+    .bind(as_of)
+    .bind(job_retention_days)
+    .bind(request_cache_retention_days)
+    .fetch_one(pool)
+    .await?;
+
+    let deleted = u64::try_from(row.try_get::<i64, _>("deleted_count")?)
+        .map_err(|_| anyhow::anyhow!("deleted export-item count overflow"))?;
+    let orphan_deleted = u64::try_from(row.try_get::<i64, _>("orphan_deleted_count")?)
+        .map_err(|_| anyhow::anyhow!("orphan export-item count overflow"))?;
+
+    Ok(PackageExportItemDeleteResult {
+        deleted,
+        orphan_deleted,
+    })
 }
 
 pub async fn refresh_import_source_retention(

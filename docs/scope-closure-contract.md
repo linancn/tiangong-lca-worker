@@ -31,8 +31,8 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-26
-lastReviewedCommit: 9ad692063a076c4ed886e3cfaf3627037ff5e389
+lastReviewedAt: 2026-08-29
+lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
 lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not change Scope Closure traversal, its own lease executor, artifacts, or certificate semantics."
 related:
   - AGENTS.md

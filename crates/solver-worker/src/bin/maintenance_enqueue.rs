@@ -295,14 +295,7 @@ fn default_idempotency_key(
     mode: &str,
     now: DateTime<Utc>,
 ) -> String {
-    if mode == "execute" {
-        format!(
-            "{job_kind}:{environment}:{mode}:{}",
-            now.format("%Y%m%dT%H%M%SZ")
-        )
-    } else {
-        format!("{job_kind}:{environment}:{mode}:{}", now.format("%Y-%m-%d"))
-    }
+    format!("{job_kind}:{environment}:{mode}:{}", now.format("%Y-%m-%d"))
 }
 
 fn default_concurrency_key(job_kind: &str, environment: &str, mode: &str) -> String {
@@ -428,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             default_idempotency_key("lca.snapshot_gc", "main", "execute", now),
-            "lca.snapshot_gc:main:execute:20260531T123456Z"
+            "lca.snapshot_gc:main:execute:2026-05-31"
         );
         assert_eq!(
             default_concurrency_key("lca.snapshot_gc", "main", "execute"),

@@ -21,7 +21,7 @@ use solver_worker::{
     pgbouncer_sqlx::{self as sqlx, Row},
     storage::ObjectStoreUploadError,
     worker_jobs::{
-        WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
+        FailureDisposition, WorkerJob, WorkerJobResult, claim_worker_jobs, heartbeat_worker_job,
         lease_heartbeat_period, record_worker_job_result_reliably,
     },
 };
@@ -307,6 +307,7 @@ async fn record_invalid_package_worker_job_payload(
         }),
         Some(json!({"error": err_message})),
         None,
+        FailureDisposition::NonRetryable,
     );
     if let Err(record_err) =
         record_worker_job_result_reliably(&state.queue_pool, job.id, job.lease_token, result).await
@@ -416,6 +417,7 @@ async fn record_package_worker_job_success(
                 }),
                 Some(json!({"error": err_message})),
                 None,
+                FailureDisposition::Unclassified,
             );
             if let Err(record_err) = record_worker_job_result_reliably(
                 &state.queue_pool,
