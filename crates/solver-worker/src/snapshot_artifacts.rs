@@ -87,6 +87,11 @@ pub struct SnapshotBuildConfig {
     /// Provider candidate eligibility mode.
     #[serde(default)]
     pub provider_candidate_eligibility_mode: String,
+    /// Versioned lineage gate applied before provider routing.
+    #[serde(default = "default_provider_lineage_policy")]
+    pub provider_lineage_policy: String,
+    #[serde(default)]
+    pub provider_lineage_source_sha256: Option<String>,
     /// Quantitative reference normalization mode (`strict`/`lenient`).
     #[serde(default = "default_strict_mode")]
     pub reference_normalization_mode: String,
@@ -133,6 +138,10 @@ pub struct SnapshotBuildConfig {
     pub method_id: Option<Uuid>,
     /// Optional LCIA method version.
     pub method_version: Option<String>,
+}
+
+fn default_provider_lineage_policy() -> String {
+    "legacy-flow-compatible-v0".to_owned()
 }
 
 /// Matching coverage diagnostics.
@@ -1053,6 +1062,8 @@ mod tests {
             process_limit: 0,
             provider_rule: "strict_unique_provider".to_owned(),
             provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+            provider_lineage_policy: "legacy-flow-compatible-v0".to_owned(),
+            provider_lineage_source_sha256: None,
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             allocation_semantics_version: "tidas-quantitative-reference-v2".to_owned(),

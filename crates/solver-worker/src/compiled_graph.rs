@@ -75,6 +75,8 @@ pub struct CompiledProcess {
     pub process_version: String,
     pub process_name: Option<String>,
     pub model_id: Option<Uuid>,
+    #[serde(default)]
+    pub model_version: Option<String>,
     pub location: Option<String>,
     pub reference_year: Option<i32>,
     #[serde(default)]
@@ -156,6 +158,24 @@ pub enum CompiledProviderCandidateEligibility {
     RejectedSameSignReference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProviderLineageRelationship {
+    ModelResultAndComponent,
+    SelectedAndSupersededModelResult,
+    AlternativeModelResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProviderLineageRejectionReason {
+    ModelComponentOfSelectedResult,
+    SupersededModelResult,
+    AlternativeModelResult,
+    NotSelectedByExactModelResult,
+    LineageOverlapRequiresBinding,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompiledProviderOutputAllocationState {
@@ -170,6 +190,12 @@ pub enum CompiledProviderOutputAllocationState {
 pub struct CompiledProviderCandidate {
     pub provider_idx: i32,
     pub provider_id: Uuid,
+    #[serde(default)]
+    pub provider_version: String,
+    #[serde(default)]
+    pub model_id: Option<Uuid>,
+    #[serde(default)]
+    pub model_version: Option<String>,
     #[serde(default)]
     pub output_exchange_internal_id: Option<String>,
     #[serde(default)]
@@ -192,6 +218,10 @@ pub struct CompiledProviderCandidate {
     pub reference_exchange_internal_id: Option<String>,
     #[serde(default)]
     pub reference_coefficient: Option<f64>,
+    #[serde(default)]
+    pub lineage_relationships: Vec<CompiledProviderLineageRelationship>,
+    #[serde(default)]
+    pub lineage_rejection_reason: Option<CompiledProviderLineageRejectionReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +237,7 @@ pub enum CompiledProviderDecisionKind {
 #[serde(rename_all = "snake_case")]
 pub enum CompiledProviderResolutionStrategy {
     UniqueProvider,
+    SelectedModelResult,
     BestProviderStrict,
     SplitByEvidence,
     SplitByProcessVolume,
@@ -243,6 +274,7 @@ pub enum CompiledProviderFailureReason {
     Top1Top2RatioTooClose,
     ScoreSumNonPositive,
     NoOppositeSignReference,
+    LineageOverlapRequiresBinding,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

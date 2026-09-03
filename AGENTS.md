@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-08-29
-lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
 lastReviewedNote: "Reviewed for Worker Issue #275: the V3-only renewal guard preserves active renewal outcomes and the solver runtime guarantees at least two executor threads."
 related:
   - .docpact/config.yaml
