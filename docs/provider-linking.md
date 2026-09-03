@@ -145,7 +145,7 @@ closure = c_r + sum(c_i * activity_requirement_i) = 0
 
 `self_loop_cutoff` 仅保留为对角值风险诊断阈值，不得过滤或改写真实 `A[i,i]`。`M = I - A` 是否可分解由求解器对完整矩阵判定；Worker 不通过删除自链接制造可解矩阵。
 
-在候选数量分支之前，Worker 先执行 `version-exact-lineage-gate-v1`。这一步对所有 provider rules 生效，不能被 unique-provider 快路径绕过。
+在候选数量分支之前，Worker 先执行 `version-exact-lineage-gate-v1`。Request-root dependency closure 与最终矩阵编译共用这一 gate；它对所有 provider rules 生效，不能被 closure、unique-provider 快路径或后续 fallback 绕过。
 
 ## Lifecycle Model 谱系与“当前 resulting Process”
 
@@ -155,9 +155,9 @@ closure = c_r + sum(c_i * activity_requirement_i) = 0
 - Lifecycle Model 的 `referenceToResultingProcess` 指定该 Model revision 的 resulting Process revision；
 - Lifecycle Model 的 `processInstance.referenceToProcess` 指定该 Model revision 的直接 component Process revisions，Worker 会对已加载的相关 Model 做有界、带 cycle guard 的传递展开。
 
-当前请求面没有 exchange-level provider link，也没有显式 boundary-mix weights。请求中的 exact `root_process UUID@version` 是当前可验证的选择证据：当它恰好是冲突候选中的 resulting Process 时，该 Process 以 `selected_model_result`、权重 `1.0` 胜出，component、同一 Model UUID 的旧版本结果或同一 exact Model 的 alternative result 会以 lineage-specific reason 保留在 candidate evidence 中但不写入 `A`。
+当前请求与 schema 明确不支持 exchange-level provider link 或显式 boundary-mix weights，也不应把它们作为本策略的后续兼容入口。请求中的 exact `root_process UUID@version` 是唯一的请求侧选择证据：当它恰好是冲突候选中的 resulting Process 时，该 Process 以 `selected_model_result`、权重 `1.0` 胜出，component、同一 Model UUID 的旧版本结果或同一 exact Model 的 alternative result 会以 lineage-specific reason 保留在 candidate evidence 中但不写入 `A`。
 
-如果 Flow-compatible candidates 存在上述谱系冲突，而请求没有选中其中唯一一个 exact resulting Process，Worker 返回 `lineage_overlap_requires_binding`，不再根据地理、年产量或 equal fallback 猜测边界。没有谱系冲突的候选集合完全沿用原 provider rule；一个 Process 也不会仅因为它在别处是 component 就被全局排除。
+如果 Flow-compatible candidates 存在上述谱系冲突，而请求没有选中其中唯一一个 exact resulting Process，Worker 返回 `lineage_overlap_requires_binding`，不再根据地理、年产量或 equal fallback 猜测边界。这里的 `binding` 指通过 exact request root 明确选择 resulting Process，或修复数据中的 Lifecycle Model 边界；它不表示调用方可以提交任意 provider weights。没有谱系冲突的候选集合完全沿用原 provider rule；一个 Process 也不会仅因为它在别处是 component 就被全局排除。
 
 候选数量分支：
 

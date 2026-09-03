@@ -89,7 +89,7 @@ The regional mix only receives candidates accepted by the lineage gate. Lifecycl
 
 When an exact request root selects the resulting Process among conflicting candidates, that result exclusively supplies the edge; component Processes, results of older revisions of the same Model UUID, and alternative results do not enter the implicit mix. A lineage conflict without that evidence becomes unresolved as `lineage_overlap_requires_binding`; annual-volume and equal fallback cannot guess the boundary. Unrelated peer suppliers retain legacy behavior, and being a component does not globally disqualify a Process.
 
-The current request contract has no exchange-level provider link or explicit boundary-mix weights. This automatic patch therefore uses only the exact root and exact Model lineage as selection evidence and fails closed for conflicting candidates without evidence.
+The request contract and schema explicitly do not support exchange-level provider links or explicit boundary-mix weights, and this policy does not reserve them as a future extension point. The automatic patch uses only the exact root and exact Model lineage as selection evidence and fails closed for conflicts without that evidence. Callers select the resulting Process as a root or repair the Lifecycle Model boundary; they cannot submit arbitrary mix weights.
 
 ## Same-model priority
 

@@ -1584,6 +1584,27 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
             (identity.clone(), flow_space_for_source_type(source_type))
         })
         .collect::<HashMap<_, _>>();
+    let (closure_provider_lineage, closure_provider_lineage_fetch_sec) = if request_roots.is_empty()
+    {
+        (None, None)
+    } else {
+        let provider_lineage_started = Instant::now();
+        let snapshot = fetch_provider_lineage_snapshot(
+            &pool,
+            &candidate_processes,
+            &request_roots,
+            versioned_scope.as_ref(),
+        )
+        .await?;
+        (
+            Some(snapshot),
+            Some(provider_lineage_started.elapsed().as_secs_f64()),
+        )
+    };
+    let empty_provider_lineage = ProviderLineageIndex::default();
+    let closure_provider_lineage_index = closure_provider_lineage
+        .as_ref()
+        .map_or(&empty_provider_lineage, |snapshot| &snapshot.index);
     let resolved_scope = resolve_process_selection_with_flow_versions(
         candidate_processes,
         all_states,
@@ -1594,18 +1615,29 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         cli.process_limit,
         Some(&request_scope_flow_spaces),
         Some(&request_scope_flow_meta),
+        closure_provider_lineage_index,
     )?;
-    let provider_lineage_started = Instant::now();
-    let provider_lineage = fetch_provider_lineage_snapshot(
-        &pool,
-        &resolved_scope.processes,
-        &request_roots,
-        versioned_scope.as_ref(),
-    )
-    .await?;
+    let (provider_lineage, provider_lineage_fetch_sec) =
+        if let Some(snapshot) = closure_provider_lineage {
+            (
+                snapshot,
+                closure_provider_lineage_fetch_sec
+                    .ok_or_else(|| anyhow::anyhow!("missing closure lineage fetch timing"))?,
+            )
+        } else {
+            let provider_lineage_started = Instant::now();
+            let snapshot = fetch_provider_lineage_snapshot(
+                &pool,
+                &resolved_scope.processes,
+                &request_roots,
+                versioned_scope.as_ref(),
+            )
+            .await?;
+            (snapshot, provider_lineage_started.elapsed().as_secs_f64())
+        };
     build_config.provider_lineage_source_sha256 =
         Some(provider_lineage.model_payload_sha256.clone());
-    build_timing.fetch_provider_lineage_sec = provider_lineage_started.elapsed().as_secs_f64();
+    build_timing.fetch_provider_lineage_sec = provider_lineage_fetch_sec;
     let fingerprint_started = Instant::now();
     let (source_summary, source_fingerprint) = compute_source_fingerprint(
         &pool,
@@ -6936,6 +6968,7 @@ fn resolve_process_selection(
         process_limit,
         flow_space_by_identity,
         None,
+        &ProviderLineageIndex::default(),
     )
 }
 
@@ -6950,6 +6983,7 @@ fn resolve_process_selection_with_flow_versions(
     process_limit: usize,
     flow_space_by_identity: Option<&HashMap<FlowLinkIdentity, CompiledFlowSpace>>,
     resolved_flow_meta: Option<&ResolvedFlowMetadata>,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<ResolvedProcessSelection> {
     if request_roots.is_empty() {
         if process_limit > 0 && candidate_processes.len() > process_limit {
@@ -7116,6 +7150,8 @@ fn resolve_process_selection_with_flow_versions(
             let reference_ports = reference_port_map.get(&flow_link_identity(exchange));
             let providers =
                 eligible_balancing_process_indices(reference_ports, residual_coefficient);
+            let providers =
+                apply_provider_lineage_gate(&providers, &process_meta, provider_lineage)?.providers;
             let provider_cnt = providers.len();
             let next_indices = if provider_cnt == 1 {
                 providers
@@ -14021,6 +14057,127 @@ mod tests {
             .map(|row| row.id)
             .collect::<Vec<_>>();
         assert_eq!(selected_ids, vec![root_process_id, local_provider_id]);
+    }
+
+    #[test]
+    fn request_roots_closure_applies_lineage_gate_before_provider_resolution() {
+        let consumer_id = Uuid::from_u128(20_001);
+        let result_id = Uuid::from_u128(20_002);
+        let component_id = Uuid::from_u128(20_003);
+        let model_id = Uuid::from_u128(20_004);
+        let demanded_flow_id = fixed_flow_id("lineage-flow");
+        let row = |id, exchanges| ProcessRow {
+            id,
+            version: "01.00.000".to_owned(),
+            model_id: Some(model_id),
+            model_version: Some("01.00.000".to_owned()),
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(exchanges),
+        };
+        let processes = vec![
+            row(
+                consumer_id,
+                &[("Output", Uuid::new_v4()), ("Input", demanded_flow_id)],
+            ),
+            row(result_id, &[("Output", demanded_flow_id)]),
+            row(component_id, &[("Output", demanded_flow_id)]),
+        ];
+        let roots = vec![
+            RequestRootProcess::new(consumer_id, "01.00.000"),
+            RequestRootProcess::new(result_id, "01.00.000"),
+        ];
+        let models = vec![super::LifecycleModelLineageRow {
+            identity: super::VersionedModelIdentity::new(model_id, "01.00.000"),
+            modified_at: None,
+            json: lineage_model_json(result_id, &[component_id]),
+        }];
+        let lineage = super::build_provider_lineage_index(&processes, &models, &roots);
+
+        let selected = super::resolve_process_selection_with_flow_versions(
+            processes,
+            false,
+            &[100],
+            None,
+            &roots,
+            ProviderRule::SplitEqual,
+            0,
+            None,
+            None,
+            &lineage,
+        )
+        .expect("resolve lineage-gated closure");
+
+        assert_eq!(
+            selected
+                .processes
+                .iter()
+                .map(|process| process.id)
+                .collect::<Vec<_>>(),
+            vec![consumer_id, result_id]
+        );
+    }
+
+    #[test]
+    fn request_roots_closure_does_not_traverse_unbound_lineage_overlap() {
+        let consumer_id = Uuid::from_u128(21_001);
+        let result_id = Uuid::from_u128(21_002);
+        let component_id = Uuid::from_u128(21_003);
+        let model_id = Uuid::from_u128(21_004);
+        let demanded_flow_id = fixed_flow_id("unbound-flow");
+        let row = |id, exchanges| ProcessRow {
+            id,
+            version: "01.00.000".to_owned(),
+            model_id: Some(model_id),
+            model_version: Some("01.00.000".to_owned()),
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(exchanges),
+        };
+        let processes = vec![
+            row(
+                consumer_id,
+                &[("Output", Uuid::new_v4()), ("Input", demanded_flow_id)],
+            ),
+            row(result_id, &[("Output", demanded_flow_id)]),
+            row(component_id, &[("Output", demanded_flow_id)]),
+        ];
+        let roots = vec![RequestRootProcess::new(consumer_id, "01.00.000")];
+        let models = vec![super::LifecycleModelLineageRow {
+            identity: super::VersionedModelIdentity::new(model_id, "01.00.000"),
+            modified_at: None,
+            json: lineage_model_json(result_id, &[component_id]),
+        }];
+        let lineage = super::build_provider_lineage_index(&processes, &models, &roots);
+
+        let selected = super::resolve_process_selection_with_flow_versions(
+            processes,
+            false,
+            &[100],
+            None,
+            &roots,
+            ProviderRule::SplitEqual,
+            0,
+            None,
+            None,
+            &lineage,
+        )
+        .expect("resolve unbound lineage closure");
+
+        assert_eq!(
+            selected
+                .processes
+                .iter()
+                .map(|process| process.id)
+                .collect::<Vec<_>>(),
+            vec![consumer_id]
+        );
     }
 
     #[test]

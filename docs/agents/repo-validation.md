@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
+lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
 lastReviewedNote: "Validation now covers explicit failure disposition, fixed-cutoff package GC, terminal maintenance reuse, and retained canonical Worker history."
 related:
   - ../../AGENTS.md

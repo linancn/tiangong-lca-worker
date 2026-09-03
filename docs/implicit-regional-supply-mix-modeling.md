@@ -95,7 +95,7 @@ Regional mix 只处理 lineage gate 接受后的候选。Lifecycle Model 的 `re
 
 当 exact request root 选中了冲突候选中的 resulting Process 时，该 result 独占本条 routing，component、旧 Model revision 的 result 或 alternative result 不进入隐式 mix。若存在谱系冲突但没有这样的选择证据，本条 residual 以 `lineage_overlap_requires_binding` unresolved，不能用 annual-volume 或 equal fallback 自动混合。没有谱系关系的 peer suppliers 保持原行为；component 身份不会造成全局禁用。
 
-当前 request contract 尚无 exchange-level provider link 或显式 boundary-mix weights；因此这里的自动补丁只使用 exact root + exact Model lineage 作为选择证据，并对缺少证据的冲突 fail closed。
+当前 request contract 与 schema 明确不支持 exchange-level provider link 或显式 boundary-mix weights，也不把它们作为后续扩展点。自动补丁只使用 exact root + exact Model lineage 作为选择证据，并对缺少证据的冲突 fail closed；调用方应选择 resulting Process root 或修复 Lifecycle Model 边界，而不是提交任意混合权重。
 
 ## Same-model 优先
 
