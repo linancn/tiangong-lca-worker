@@ -43,8 +43,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
-lastReviewedNote: "Reviewed for Worker Issue #275: the V3-only renewal guard preserves active renewal outcomes and the solver runtime guarantees at least two executor threads."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production API lineage-query hotfix; runtime ownership and hard boundaries remain unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

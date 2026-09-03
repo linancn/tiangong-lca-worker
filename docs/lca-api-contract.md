@@ -26,8 +26,8 @@ checkPaths:
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
-lastReviewedNote: "Documented Worker Issue #277 failure retryability, exact-request negative admission, and coalesced heartbeat persistence."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production calculation hotfix; API request, job, and result contracts remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

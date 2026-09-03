@@ -42,8 +42,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
-lastReviewedNote: "Validation now covers explicit failure disposition, fixed-cutoff package GC, terminal maintenance reuse, and retained canonical Worker history."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production-schema regression test; existing snapshot and provider proof requirements remain sufficient."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

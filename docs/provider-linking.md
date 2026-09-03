@@ -23,8 +23,8 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
-lastReviewedNote: "Reviewed for Issue #279: exact Lifecycle Model lineage now gates implicit provider routing before every provider rule."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production query hotfix; provider decision order and lineage-gate semantics remain unchanged."
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

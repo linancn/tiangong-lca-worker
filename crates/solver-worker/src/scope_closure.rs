@@ -1583,6 +1583,7 @@ fn snapshot_dataset_universe(
 
 // The provider trait is intentionally async for database-backed methods; this
 // immutable in-memory lookup completes synchronously within the same boundary.
+#[allow(unknown_lints)]
 #[allow(clippy::unused_async_trait_impl)]
 impl ScopeClosureProvider for PgScopeClosureProvider<'_> {
     async fn checkpoint(&self, scanned: usize, scheduled: usize) -> anyhow::Result<()> {
@@ -9946,6 +9947,7 @@ mod tests {
     }
 
     // The fake preserves the production async trait while using in-memory test data.
+    #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     impl ScopeClosureProvider for FakeProvider {
         async fn checkpoint(&self, _scanned: usize, _scheduled: usize) -> anyhow::Result<()> {

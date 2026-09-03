@@ -838,6 +838,7 @@ mod tests {
     }
 
     // The fake preserves the production async backend contract without I/O.
+    #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     impl ArtifactGcBackend for FakeRunBackend {
         fn expected_bucket(&self) -> &'static str {

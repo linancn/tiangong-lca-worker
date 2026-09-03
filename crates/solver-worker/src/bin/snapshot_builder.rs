@@ -7227,6 +7227,23 @@ fn resolve_process_selection_with_flow_versions(
     })
 }
 
+// Scope manifests apply collaboration guards to Process and Flow rows. Lifecycle Model
+// visibility is public state 100 plus the actor's own state-0 drafts; the production table
+// intentionally has no review_id column.
+const VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL: &str = r#"
+    SELECT m.id, btrim(m.version::text) AS version, m.modified_at, m.json
+    FROM public.lifecyclemodels m
+    INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+      ON requested.id = m.id
+     AND requested.version = btrim(m.version::text)
+    WHERE m.state_code = 100
+       OR (
+         m.user_id = $3
+         AND m.state_code = 0
+       )
+    ORDER BY m.id, btrim(m.version::text)
+"#;
+
 async fn fetch_provider_lineage_snapshot(
     pool: &PgPool,
     processes: &[ProcessRow],
@@ -7259,30 +7276,12 @@ async fn fetch_provider_lineage_snapshot(
     let rows = if ids.is_empty() {
         Vec::new()
     } else if let Some(scope) = versioned_scope {
-        sqlx::query(
-            r#"
-            SELECT m.id, btrim(m.version::text) AS version, m.modified_at, m.json
-            FROM public.lifecyclemodels m
-            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
-              ON requested.id = m.id
-             AND requested.version = btrim(m.version::text)
-            WHERE m.state_code = 100
-               OR (
-                 m.user_id = $3
-                 AND m.state_code = 0
-                 AND (NOT $4 OR m.team_id IS NULL)
-                 AND (NOT $5 OR m.review_id IS NULL)
-               )
-            ORDER BY m.id, btrim(m.version::text)
-            "#,
-        )
-        .bind(&ids)
-        .bind(&versions)
-        .bind(scope.actor_user_id)
-        .bind(scope.include_user_unassigned_only)
-        .bind(scope.include_user_review_free_only)
-        .fetch_all(pool)
-        .await?
+        sqlx::query(VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL)
+            .bind(&ids)
+            .bind(&versions)
+            .bind(scope.actor_user_id)
+            .fetch_all(pool)
+            .await?
     } else {
         sqlx::query(
             r#"
@@ -10632,9 +10631,9 @@ mod tests {
         MultiProviderDecision, NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow,
         ProviderRule, ResolvedLciaMethodIdentity, ResolvedLciaMethodRow, SnapshotBuildConfig,
         SnapshotSelectionMode, SourceDatasetReadIdentity, SourceDatasetReference,
-        SourceSnapshotSummary, accumulate_finite_factor, add_technosphere_edge,
-        assemble_sparse_payload, attach_artifact_lifecycle, biosphere_gross_value,
-        build_compiled_release_evidence, build_lcia_factor_coverage,
+        SourceSnapshotSummary, VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL, accumulate_finite_factor,
+        add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
+        biosphere_gross_value, build_compiled_release_evidence, build_lcia_factor_coverage,
         build_review_submit_overlay_graph, candidate_count_bucket_label,
         collect_lcia_factor_flow_references, compute_review_submit_overlay_source_hash,
         compute_scope_hash, compute_source_fingerprint_from_summary,
@@ -11756,6 +11755,16 @@ mod tests {
         assert!(!validated.include_user_unassigned_only);
         assert!(!validated.include_user_review_free_only);
         assert_eq!(validated.scope_manifest_sha256, manifest_hash);
+    }
+
+    #[test]
+    fn versioned_lifecycle_model_lineage_query_matches_production_schema() {
+        assert!(VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("public.lifecyclemodels"));
+        assert!(VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("m.state_code = 100"));
+        assert!(VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("m.user_id = $3"));
+        assert!(VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("m.state_code = 0"));
+        assert!(!VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("m.review_id"));
+        assert!(!VERSIONED_LIFECYCLE_MODEL_LINEAGE_SQL.contains("m.team_id"));
     }
 
     #[test]
