@@ -25,8 +25,8 @@ checkPaths:
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
-lastReviewedNote: "Reviewed for Issue #279: regional mixes consume only candidates accepted by the exact Lifecycle Model lineage gate."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production query hotfix; Lifecycle Model visibility compatibility does not change allocation theory."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

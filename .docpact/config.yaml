@@ -1,8 +1,8 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-09-03"
-lastReviewedCommit: "0f97652fe0e9aec52342f06a6708b5d9b0115b08"
-lastReviewedNote: "Reviewed Worker Issue #275 active-renewal fencing, millisecond heartbeat period, and guarded solver runtime against the shared-runtime routing graph; no rule changes are needed."
+lastReviewedCommit: "0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32"
+lastReviewedNote: "Reviewed the Issue #279 production API lineage-query hotfix; repository routing and governed-doc rules remain unchanged."
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.

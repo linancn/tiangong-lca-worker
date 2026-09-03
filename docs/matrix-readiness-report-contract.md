@@ -25,8 +25,8 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
-lastReviewedNote: "Reviewed for Issue #279: readiness preserves lineage-specific unresolved and rejected-provider evidence."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production query hotfix; readiness schema and lineage evidence semantics remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

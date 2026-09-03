@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-29
-lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
-lastReviewedNote: "Documented Worker Issue #277 package retention safety: fixed run cutoffs, object-first deletion, bounded metadata cleanup, and retained canonical Worker history."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production hotfix; Clippy annotation compatibility does not alter TIDAS package import/export contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml

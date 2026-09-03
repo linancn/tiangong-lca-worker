@@ -37,8 +37,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0f97652fe0e9aec52342f06a6708b5d9b0115b08
-lastReviewedNote: "The runtime map now records package-GC ownership, retained canonical job history, and explicit failure/heartbeat persistence semantics."
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed the Issue #279 Lifecycle Model query compatibility hotfix; runtime topology and ownership remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

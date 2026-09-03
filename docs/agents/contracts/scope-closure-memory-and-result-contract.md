@@ -27,9 +27,9 @@ checkPaths:
   - docs/agents/contracts/scope-closure-external-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-result.v1.schema.json
   - docs/agents/contracts/scope-closure-provider-owned-result.v1.schema.json
-lastReviewedAt: 2026-08-29
-lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
-lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not alter canonical Scope Closure v4 results, memory bounds, cancellation, or Database #316 publication."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production hotfix; Clippy annotation compatibility does not alter Scope Closure results, memory, cancellation, or publication semantics."
 related:
   - ../../../AGENTS.md
   - ../../../.docpact/config.yaml

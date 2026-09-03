@@ -31,9 +31,9 @@ checkPaths:
   - scripts/scope_closure_qualification.py
   - scripts/run_scope_closure_external_qualification.sh
   - scripts/run_scope_closure_provider_qualification.sh
-lastReviewedAt: 2026-08-29
-lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
-lastReviewedNote: "Reviewed for Worker Issue #275; the downstream V3 package renewal guard does not change Scope Closure traversal, its own lease executor, artifacts, or certificate semantics."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
+lastReviewedNote: "Reviewed for the Issue #279 production hotfix; Clippy annotation compatibility does not alter Scope Closure execution or evidence contracts."
 related:
   - AGENTS.md
   - .docpact/config.yaml
