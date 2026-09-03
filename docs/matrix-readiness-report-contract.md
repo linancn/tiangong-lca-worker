@@ -24,9 +24,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-08-13
-lastReviewedCommit: 9165fa7941cbcd8d86343a06d9f57474410c7b5b
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and effective snapshot configuration preserve matrix-readiness report v2 semantics and defaults."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
+lastReviewedNote: "Reviewed for Issue #279: readiness preserves lineage-specific unresolved and rejected-provider evidence."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -87,6 +87,8 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 | `provider_closure_reference_provider_missing` | legacy compiled graph 的实际 decision 仅存在 non-reference output candidate | 发布完整 reference Process 后重跑；新 signed-flow graph 通常由 `unresolved_balances` 直接解释 | 否 |
 | `provider_closure_multi_unresolved` | `coverage.matching.matched_multi_unresolved` 超过 `policy.max_multi_unresolved`，默认 `0` | 修复多 provider 决策后重跑 | 是，调整 `max_multi_unresolved` |
 | `provider_closure_equal_fallback` | 存在 equal fallback，且 `policy.allow_equal_fallback = false` | 补充 provider volume / evidence 或显式允许 fallback | 是，设置 `allow_equal_fallback` |
+
+`provider_closure_multi_unresolved` 的逐边 `failure_reason` 可以是 `lineage_overlap_requires_binding`。它表示 exact-flow、opposite-sign candidates 中同时出现 Lifecycle Model result/component、同一 Model UUID 的不同 revision results，或同一 exact Model 的 alternative results，但当前 exact request root 没有唯一选中其中一个 resulting Process。Readiness 不得把这种冲突降级为普通 equal/volume fallback；candidate evidence 应保留 Process/model exact identity、lineage relationships 与 rejection reason。
 | `reference_normalization_not_closed` | quantitative reference 存在 missing 或 invalid 计数 | 修复 process reference 后重跑 | 否 |
 | `allocation_fraction_invalid` | 除两个有界 legacy fallback 外，已声明 allocation 的 target、fraction 或 targetless shape 无法按 TIDAS target-aware 规则安全解析，因而产生 invalid 计数 | 修复 allocation target / fraction 声明后重跑 | 否 |
 | `singular_risk_high` | singular risk 为 `high`，且 `allow_high_singular_risk = false` | 修复矩阵结构或人工确认风险 | 是，设置 `allow_high_singular_risk` |
@@ -119,7 +121,7 @@ Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。�
 
 单个 targetless full allocation 只有在 Process 有唯一 reference exchange、其有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时才推断为 factor `1.0`，并计入 `legacy_single_reference_target_inferred_count`。旧 `legacy_single_output_target_inferred_count` 仅为兼容字段。方向不参与该推断。
 
-Snapshot build config 使用 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1` 与 `source_closure_policy = selected-lcia-factor-flow-support-v1`。这些版本、boundary 和 flow identity policy 均进入 source/review fingerprint，所以 readiness 不会把旧语义或 exchange-only source closure snapshot 当作同一构建身份复用。LCIA source dependency selection 与 C 共用 biosphere Flow/direction 轴；off-axis factor 不进入 readiness 的 C、source blocker 或 provider 指标。
+Snapshot build config 使用 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`provider_lineage_policy = version-exact-lineage-gate-v1` 与 `source_closure_policy = selected-lcia-factor-flow-support-v1`。这些版本、boundary、flow identity policy 以及被消费 Lifecycle Model payload 的 canonical digest 均进入 `source-fingerprint:v2`，所以 readiness 不会把旧语义、旧 lineage 或 exchange-only source closure snapshot 当作同一构建身份复用。LCIA source dependency selection 与 C 共用 biosphere Flow/direction 轴；off-axis factor 不进入 readiness 的 C、source blocker 或 provider 指标。
 
 `provider_closure_reference_provider_missing` 只针对实际 input provider decision，不会因为 Process 中一个没有被 demand 的 co-product 本身而触发。其 `details.examples[]` 必须给出 consumer index / ID / version / name、`flow_id`、`flow_version`、candidate provider index / ID / process name、output exchange internal ID、是否为 reference output、normalized amount、allocation state 与 eligibility。它可以与通用的 `provider_closure_unmatched` 同时出现：前者解释“为什么没有合法 provider”，后者仍表达 coverage policy 失败。
 

@@ -1,0 +1,57 @@
+{
+  "schema": "provider-lineage-fixture.v1",
+  "requestRoots": [
+    {
+      "processId": "00000000-0000-0000-0000-000000000065",
+      "processVersion": "01.00.000"
+    }
+  ],
+  "lifecycleModels": [
+    {
+      "id": "00000000-0000-0000-0000-0000000000c9",
+      "version": "01.00.000",
+      "json": {
+        "lifeCycleModelDataSet": {
+          "lifeCycleModelInformation": {
+            "dataSetInformation": {
+              "referenceToResultingProcess": {
+                "@refObjectId": "00000000-0000-0000-0000-000000000065",
+                "@version": "01.00.000"
+              }
+            },
+            "technology": {
+              "processes": {
+                "processInstance": [
+                  {
+                    "referenceToProcess": {
+                      "@refObjectId": "00000000-0000-0000-0000-000000000066",
+                      "@version": "01.00.000"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "providerCandidates": [
+    {
+      "processId": "00000000-0000-0000-0000-000000000065",
+      "processVersion": "01.00.000",
+      "referenceCoefficient": 1.0
+    },
+    {
+      "processId": "00000000-0000-0000-0000-000000000066",
+      "processVersion": "01.00.000",
+      "referenceCoefficient": 1.0
+    }
+  ],
+  "expected": {
+    "selectedProcessId": "00000000-0000-0000-0000-000000000065",
+    "selectedWeight": 1.0,
+    "rejectedProcessId": "00000000-0000-0000-0000-000000000066",
+    "rejectionReason": "model_component_of_selected_result"
+  }
+}

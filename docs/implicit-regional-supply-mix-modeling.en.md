@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-17
-lastReviewedCommit: 4c9f23335c10b01bd48466650ac9f0323b5ff9c4
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve signed-flow routing and provider-selection semantics."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
+lastReviewedNote: "Reviewed for Issue #279: regional mixes consume only candidates accepted by the exact Lifecycle Model lineage gate."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -46,6 +46,7 @@ An implicit regional supply mix does not decide which exchange is a demand or a 
 ```text
 signed coefficient / reference pivot
   -> exact same-flow, opposite-sign candidates
+  -> version-exact Lifecycle Model lineage gate
   -> same-model scope, if available
   -> supply-region anchor
   -> best non-empty geography tier
@@ -81,6 +82,14 @@ c_r + sum(c_i * activity_requirement_i) = 0
 ```
 
 Opposite signs guarantee non-negative activity requirements. Annual volume, geography, and model metadata must not alter coefficient signs, the reference pivot, or the magnitude to be balanced.
+
+## Lifecycle boundary before regional routing
+
+The regional mix only receives candidates accepted by the lineage gate. Lifecycle Model `referenceToResultingProcess` and `processInstance.referenceToProcess` define exact-version result/component relationships. `processes.model_version` (falling back to the Process version under the database compatibility contract) identifies the exact Model revision associated with a Process. There is no global `is_current` flag.
+
+When an exact request root selects the resulting Process among conflicting candidates, that result exclusively supplies the edge; component Processes, results of older revisions of the same Model UUID, and alternative results do not enter the implicit mix. A lineage conflict without that evidence becomes unresolved as `lineage_overlap_requires_binding`; annual-volume and equal fallback cannot guess the boundary. Unrelated peer suppliers retain legacy behavior, and being a component does not globally disqualify a Process.
+
+The current request contract has no exchange-level provider link or explicit boundary-mix weights. This automatic patch therefore uses only the exact root and exact Model lineage as selection evidence and fails closed for conflicting candidates without evidence.
 
 ## Same-model priority
 

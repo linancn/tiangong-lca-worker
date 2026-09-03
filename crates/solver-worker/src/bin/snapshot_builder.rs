@@ -41,10 +41,12 @@ use solver_worker::compiled_graph::{
     CompiledFlowSpace, CompiledGraph, CompiledMatchingStats, CompiledProcess,
     CompiledProviderAllocation, CompiledProviderCandidate, CompiledProviderCandidateEligibility,
     CompiledProviderDecision, CompiledProviderDecisionKind, CompiledProviderFailureReason,
-    CompiledProviderGeographyTier, CompiledProviderOutput, CompiledProviderOutputAllocationState,
-    CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource, CompiledReferencePort,
-    CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseInventoryExchange,
-    CompiledReleaseProcess, CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
+    CompiledProviderGeographyTier, CompiledProviderLineageRejectionReason,
+    CompiledProviderLineageRelationship, CompiledProviderOutput,
+    CompiledProviderOutputAllocationState, CompiledProviderResolutionStrategy,
+    CompiledProviderSupplyRegionSource, CompiledReferencePort, CompiledReferenceStats,
+    CompiledReleaseEvidence, CompiledReleaseInventoryExchange, CompiledReleaseProcess,
+    CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
     CompiledReleaseSourceDatasetType, CompiledReleaseTechnosphereEdge, CompiledSourceFlowType,
     CompiledSourceReferenceProvenance, CompiledTechnosphereEdge, CompiledUnresolvedBalance,
 };
@@ -327,6 +329,7 @@ struct ProcessRow {
     id: Uuid,
     version: String,
     model_id: Option<Uuid>,
+    model_version: Option<String>,
     user_id: Option<Uuid>,
     state_code: i32,
     team_id: Option<Uuid>,
@@ -497,9 +500,461 @@ struct ProcessMeta {
     process_version: String,
     process_name: Option<String>,
     model_id: Option<Uuid>,
+    model_version: Option<String>,
     location: Option<String>,
     reference_year: Option<i32>,
     annual_supply_or_production_volume: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+struct VersionedProcessIdentity {
+    process_id: Uuid,
+    process_version: String,
+}
+
+impl VersionedProcessIdentity {
+    fn new(process_id: Uuid, process_version: impl Into<String>) -> Self {
+        Self {
+            process_id,
+            process_version: process_version.into().trim().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+struct VersionedModelIdentity {
+    model_id: Uuid,
+    model_version: String,
+}
+
+impl VersionedModelIdentity {
+    fn new(model_id: Uuid, model_version: impl Into<String>) -> Self {
+        Self {
+            model_id,
+            model_version: model_version.into().trim().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleModelLineageRow {
+    identity: VersionedModelIdentity,
+    modified_at: Option<DateTime<Utc>>,
+    json: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderLineageIndex {
+    model_components: HashMap<VersionedModelIdentity, HashSet<VersionedProcessIdentity>>,
+    result_models: HashMap<VersionedProcessIdentity, HashSet<VersionedModelIdentity>>,
+    component_models: HashMap<VersionedProcessIdentity, HashSet<VersionedModelIdentity>>,
+    selected_results: HashSet<VersionedProcessIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderLineageSnapshot {
+    index: ProviderLineageIndex,
+    model_count: i64,
+    model_max_modified_at_utc: String,
+    model_payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderLineageGate {
+    providers: Vec<i32>,
+    relationships_by_provider: HashMap<i32, BTreeSet<CompiledProviderLineageRelationship>>,
+    rejection_by_provider: HashMap<i32, CompiledProviderLineageRejectionReason>,
+    selected_model_result: Option<i32>,
+    unresolved: bool,
+}
+
+fn process_identity(meta: &ProcessMeta) -> VersionedProcessIdentity {
+    VersionedProcessIdentity::new(meta.process_id, meta.process_version.clone())
+}
+
+fn collect_exact_process_references(value: &Value, out: &mut Vec<VersionedProcessIdentity>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_exact_process_references(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let (Some(id), Some(version)) = (
+                map.get("@refObjectId")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.trim().parse::<Uuid>().ok()),
+                map.get("@version")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                out.push(VersionedProcessIdentity::new(id, version));
+            }
+            for nested in map.values() {
+                collect_exact_process_references(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lifecycle_model_result_references(json: &Value) -> HashSet<VersionedProcessIdentity> {
+    let mut references = Vec::new();
+    if let Some(value) = json.pointer(
+        "/lifeCycleModelDataSet/lifeCycleModelInformation/dataSetInformation/referenceToResultingProcess",
+    ) {
+        collect_exact_process_references(value, &mut references);
+    }
+    references.into_iter().collect()
+}
+
+fn lifecycle_model_component_references(json: &Value) -> HashSet<VersionedProcessIdentity> {
+    let mut references = Vec::new();
+    let Some(instances) = json.pointer(
+        "/lifeCycleModelDataSet/lifeCycleModelInformation/technology/processes/processInstance",
+    ) else {
+        return HashSet::new();
+    };
+    match instances {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(reference) = item.get("referenceToProcess") {
+                    collect_exact_process_references(reference, &mut references);
+                }
+            }
+        }
+        Value::Object(_) => {
+            if let Some(reference) = instances.get("referenceToProcess") {
+                collect_exact_process_references(reference, &mut references);
+            }
+        }
+        _ => {}
+    }
+    references.into_iter().collect()
+}
+
+fn expand_model_components(
+    model: &VersionedModelIdentity,
+    direct_components: &HashMap<VersionedModelIdentity, HashSet<VersionedProcessIdentity>>,
+    result_models: &HashMap<VersionedProcessIdentity, HashSet<VersionedModelIdentity>>,
+    memo: &mut HashMap<VersionedModelIdentity, HashSet<VersionedProcessIdentity>>,
+    visiting: &mut HashSet<VersionedModelIdentity>,
+) -> HashSet<VersionedProcessIdentity> {
+    if let Some(cached) = memo.get(model) {
+        return cached.clone();
+    }
+    if !visiting.insert(model.clone()) {
+        return HashSet::new();
+    }
+
+    let mut expanded = direct_components.get(model).cloned().unwrap_or_default();
+    let direct = expanded.iter().cloned().collect::<Vec<_>>();
+    for component in direct {
+        let Some(nested_models) = result_models.get(&component) else {
+            continue;
+        };
+        for nested_model in nested_models {
+            if nested_model == model {
+                continue;
+            }
+            expanded.extend(expand_model_components(
+                nested_model,
+                direct_components,
+                result_models,
+                memo,
+                visiting,
+            ));
+        }
+    }
+    visiting.remove(model);
+    memo.insert(model.clone(), expanded.clone());
+    expanded
+}
+
+fn build_provider_lineage_index(
+    _processes: &[ProcessRow],
+    models: &[LifecycleModelLineageRow],
+    request_roots: &[RequestRootProcess],
+) -> ProviderLineageIndex {
+    let mut model_results = HashMap::new();
+    let mut direct_components = HashMap::new();
+    let mut result_models =
+        HashMap::<VersionedProcessIdentity, HashSet<VersionedModelIdentity>>::new();
+    for model in models {
+        let results = lifecycle_model_result_references(&model.json);
+        for result in &results {
+            result_models
+                .entry(result.clone())
+                .or_default()
+                .insert(model.identity.clone());
+        }
+        model_results.insert(model.identity.clone(), results);
+        direct_components.insert(
+            model.identity.clone(),
+            lifecycle_model_component_references(&model.json),
+        );
+    }
+
+    let mut model_components = HashMap::new();
+    let mut visiting = HashSet::new();
+    for model in direct_components.keys() {
+        let expanded = expand_model_components(
+            model,
+            &direct_components,
+            &result_models,
+            &mut model_components,
+            &mut visiting,
+        );
+        model_components.insert(model.clone(), expanded);
+    }
+    let mut component_models =
+        HashMap::<VersionedProcessIdentity, HashSet<VersionedModelIdentity>>::new();
+    for (model, components) in &model_components {
+        for component in components {
+            component_models
+                .entry(component.clone())
+                .or_default()
+                .insert(model.clone());
+        }
+    }
+
+    let selected_results = request_roots
+        .iter()
+        .map(|root| VersionedProcessIdentity::new(root.process_id, root.process_version.clone()))
+        .filter(|root| result_models.contains_key(root))
+        .collect();
+
+    ProviderLineageIndex {
+        model_components,
+        result_models,
+        component_models,
+        selected_results,
+    }
+}
+
+fn provider_lineage_relationships(
+    left: &VersionedProcessIdentity,
+    right: &VersionedProcessIdentity,
+    lineage: &ProviderLineageIndex,
+) -> BTreeSet<CompiledProviderLineageRelationship> {
+    let mut relationships = BTreeSet::new();
+    let left_result_models = lineage.result_models.get(left);
+    let right_result_models = lineage.result_models.get(right);
+    let left_component_models = lineage.component_models.get(left);
+    let right_component_models = lineage.component_models.get(right);
+    if left_result_models.is_some_and(|models| {
+        right_component_models.is_some_and(|components| !models.is_disjoint(components))
+    }) || right_result_models.is_some_and(|models| {
+        left_component_models.is_some_and(|components| !models.is_disjoint(components))
+    }) {
+        relationships.insert(CompiledProviderLineageRelationship::ModelResultAndComponent);
+    }
+
+    if let (Some(left_models), Some(right_models)) = (left_result_models, right_result_models) {
+        for left_model in left_models {
+            for right_model in right_models {
+                if left_model.model_id != right_model.model_id {
+                    continue;
+                }
+                if left_model == right_model {
+                    relationships
+                        .insert(CompiledProviderLineageRelationship::AlternativeModelResult);
+                } else if lineage.selected_results.contains(left)
+                    || lineage.selected_results.contains(right)
+                {
+                    relationships.insert(
+                        CompiledProviderLineageRelationship::SelectedAndSupersededModelResult,
+                    );
+                } else {
+                    relationships
+                        .insert(CompiledProviderLineageRelationship::AlternativeModelResult);
+                }
+            }
+        }
+    }
+    relationships
+}
+
+fn lineage_rejection_for_selected_result(
+    selected: &VersionedProcessIdentity,
+    rejected: &VersionedProcessIdentity,
+    relationships: &BTreeSet<CompiledProviderLineageRelationship>,
+    lineage: &ProviderLineageIndex,
+) -> CompiledProviderLineageRejectionReason {
+    if relationships
+        .contains(&CompiledProviderLineageRelationship::SelectedAndSupersededModelResult)
+    {
+        return CompiledProviderLineageRejectionReason::SupersededModelResult;
+    }
+    if relationships.contains(&CompiledProviderLineageRelationship::ModelResultAndComponent) {
+        let rejected_is_component = lineage.result_models.get(selected).is_some_and(|models| {
+            lineage
+                .component_models
+                .get(rejected)
+                .is_some_and(|components| !models.is_disjoint(components))
+        });
+        if rejected_is_component {
+            return CompiledProviderLineageRejectionReason::ModelComponentOfSelectedResult;
+        }
+    }
+    if relationships.contains(&CompiledProviderLineageRelationship::AlternativeModelResult) {
+        return CompiledProviderLineageRejectionReason::AlternativeModelResult;
+    }
+    CompiledProviderLineageRejectionReason::NotSelectedByExactModelResult
+}
+
+fn apply_provider_lineage_gate(
+    providers: &[i32],
+    process_meta: &[ProcessMeta],
+    lineage: &ProviderLineageIndex,
+) -> anyhow::Result<ProviderLineageGate> {
+    let mut gate = ProviderLineageGate {
+        providers: providers.to_vec(),
+        ..ProviderLineageGate::default()
+    };
+    let identities = providers
+        .iter()
+        .map(|provider_idx| {
+            let meta = process_meta_for_idx(process_meta, *provider_idx).ok_or_else(|| {
+                anyhow::anyhow!("missing provider process meta idx={provider_idx}")
+            })?;
+            Ok((*provider_idx, process_identity(meta)))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let candidate_providers_by_identity = identities.iter().fold(
+        HashMap::<VersionedProcessIdentity, BTreeSet<i32>>::new(),
+        |mut grouped, (provider_idx, identity)| {
+            grouped
+                .entry(identity.clone())
+                .or_default()
+                .insert(*provider_idx);
+            grouped
+        },
+    );
+    let mut result_providers_by_model = HashMap::<VersionedModelIdentity, BTreeSet<i32>>::new();
+    for (provider_idx, identity) in &identities {
+        if let Some(models) = lineage.result_models.get(identity) {
+            for model in models {
+                result_providers_by_model
+                    .entry(model.clone())
+                    .or_default()
+                    .insert(*provider_idx);
+            }
+        }
+    }
+
+    let mut conflict = false;
+    for (model, result_providers) in &result_providers_by_model {
+        let component_providers = lineage
+            .model_components
+            .get(model)
+            .into_iter()
+            .flatten()
+            .filter_map(|component| candidate_providers_by_identity.get(component))
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let participants = result_providers
+            .union(&component_providers)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if !result_providers.is_empty() && !component_providers.is_empty() && participants.len() > 1
+        {
+            conflict = true;
+            for provider_idx in participants {
+                gate.relationships_by_provider
+                    .entry(provider_idx)
+                    .or_default()
+                    .insert(CompiledProviderLineageRelationship::ModelResultAndComponent);
+            }
+        }
+    }
+
+    let mut results_by_model_id =
+        HashMap::<Uuid, HashMap<VersionedModelIdentity, BTreeSet<i32>>>::new();
+    for (model, provider_indices) in &result_providers_by_model {
+        results_by_model_id
+            .entry(model.model_id)
+            .or_default()
+            .insert(model.clone(), provider_indices.clone());
+    }
+    for exact_models in results_by_model_id.values() {
+        for provider_indices in exact_models.values().filter(|items| items.len() > 1) {
+            conflict = true;
+            for provider_idx in provider_indices {
+                gate.relationships_by_provider
+                    .entry(*provider_idx)
+                    .or_default()
+                    .insert(CompiledProviderLineageRelationship::AlternativeModelResult);
+            }
+        }
+        if exact_models.len() <= 1 {
+            continue;
+        }
+        conflict = true;
+        let all_providers = exact_models
+            .values()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let has_selected_result = identities.iter().any(|(provider_idx, identity)| {
+            all_providers.contains(provider_idx) && lineage.selected_results.contains(identity)
+        });
+        let relationship = if has_selected_result {
+            CompiledProviderLineageRelationship::SelectedAndSupersededModelResult
+        } else {
+            CompiledProviderLineageRelationship::AlternativeModelResult
+        };
+        for provider_idx in all_providers {
+            gate.relationships_by_provider
+                .entry(provider_idx)
+                .or_default()
+                .insert(relationship);
+        }
+    }
+    if !conflict {
+        return Ok(gate);
+    }
+
+    let selected = identities
+        .iter()
+        .filter(|(_, identity)| lineage.selected_results.contains(identity))
+        .collect::<Vec<_>>();
+    if selected.len() == 1 {
+        let (selected_idx, selected_identity) = selected[0];
+        gate.providers = vec![*selected_idx];
+        gate.selected_model_result = Some(*selected_idx);
+        for (provider_idx, identity) in &identities {
+            if provider_idx == selected_idx {
+                continue;
+            }
+            let relationships =
+                provider_lineage_relationships(selected_identity, identity, lineage);
+            gate.rejection_by_provider.insert(
+                *provider_idx,
+                lineage_rejection_for_selected_result(
+                    selected_identity,
+                    identity,
+                    &relationships,
+                    lineage,
+                ),
+            );
+        }
+    } else {
+        gate.providers.clear();
+        gate.unresolved = true;
+        for (provider_idx, _) in identities {
+            if gate.relationships_by_provider.contains_key(&provider_idx) {
+                gate.rejection_by_provider.insert(
+                    provider_idx,
+                    CompiledProviderLineageRejectionReason::LineageOverlapRequiresBinding,
+                );
+            }
+        }
+    }
+    Ok(gate)
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +1088,9 @@ type ParsedProcessChunk = (
 struct SourceSnapshotSummary {
     process_count: i64,
     process_max_modified_at_utc: String,
+    lifecyclemodel_count: i64,
+    lifecyclemodel_max_modified_at_utc: String,
+    lifecyclemodel_payload_sha256: String,
     flow_count: i64,
     flow_max_modified_at_utc: String,
     lciamethod_count: i64,
@@ -675,6 +1133,7 @@ struct BuildTimingSec {
     review_submit_overlay_reused: bool,
     total_sec: f64,
     resolve_method_identity_sec: f64,
+    fetch_provider_lineage_sec: f64,
     compute_source_fingerprint_sec: f64,
     reuse_lookup_sec: f64,
     load_method_factors_sec: f64,
@@ -1056,7 +1515,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
     build_timing.resolve_method_identity_sec = method_started.elapsed().as_secs_f64();
     let artifact_expires_in_seconds = positive_seconds(cli.artifact_expires_in_seconds);
     let reuse_max_age_seconds = positive_seconds(cli.reuse_max_age_seconds);
-    let build_config = SnapshotBuildConfig {
+    let mut build_config = SnapshotBuildConfig {
         process_states: process_states_label.clone(),
         include_user_id: cli.include_user_id,
         data_scope: versioned_scope
@@ -1075,6 +1534,8 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("process_limit overflow"))?,
         provider_rule: cli.provider_rule.clone(),
         provider_candidate_eligibility_mode: "opposite_sign_reference_port".to_owned(),
+        provider_lineage_policy: "version-exact-lineage-gate-v1".to_owned(),
+        provider_lineage_source_sha256: None,
         reference_normalization_mode: cli.reference_normalization_mode.clone(),
         allocation_fraction_mode: cli.allocation_fraction_mode.clone(),
         allocation_semantics_version:
@@ -1134,6 +1595,17 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         Some(&request_scope_flow_spaces),
         Some(&request_scope_flow_meta),
     )?;
+    let provider_lineage_started = Instant::now();
+    let provider_lineage = fetch_provider_lineage_snapshot(
+        &pool,
+        &resolved_scope.processes,
+        &request_roots,
+        versioned_scope.as_ref(),
+    )
+    .await?;
+    build_config.provider_lineage_source_sha256 =
+        Some(provider_lineage.model_payload_sha256.clone());
+    build_timing.fetch_provider_lineage_sec = provider_lineage_started.elapsed().as_secs_f64();
     let fingerprint_started = Instant::now();
     let (source_summary, source_fingerprint) = compute_source_fingerprint(
         &pool,
@@ -1141,6 +1613,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         &build_config,
         versioned_scope.as_ref(),
         Some(&method),
+        &provider_lineage,
     )
     .await?;
     build_timing.compute_source_fingerprint_sec = fingerprint_started.elapsed().as_secs_f64();
@@ -1205,9 +1678,12 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         println!("[info] reuse_max_age_seconds={max_age_seconds}");
     }
     println!(
-        "[source] processes={} max_modified_at={} flows={} max_modified_at={} lciamethods={} max_modified_at={}",
+        "[source] processes={} max_modified_at={} lifecyclemodels={} max_modified_at={} payload_sha256={} flows={} max_modified_at={} lciamethods={} max_modified_at={}",
         source_summary.process_count,
         source_summary.process_max_modified_at_utc,
+        source_summary.lifecyclemodel_count,
+        source_summary.lifecyclemodel_max_modified_at_utc,
+        source_summary.lifecyclemodel_payload_sha256,
         source_summary.flow_count,
         source_summary.flow_max_modified_at_utc,
         source_summary.lciamethod_count,
@@ -1225,6 +1701,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
             &replay_rules,
             reference_normalization_mode,
             allocation_mode,
+            &provider_lineage.index,
         )
         .await?;
         let replay_base = requested_snapshot_id.map_or_else(
@@ -1277,6 +1754,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
             artifact_expires_in_seconds,
             reuse_max_age_seconds,
             report_policy,
+            provider_lineage,
         ))
         .await;
     }
@@ -1386,6 +1864,7 @@ async fn run_snapshot_builder(cli: Cli) -> anyhow::Result<()> {
         } else {
             ArtifactPurpose::CalculationBundle
         },
+        &provider_lineage.index,
     )
     .await?;
     build_timing.build_sparse_payload_sec = build_started.elapsed().as_secs_f64();
@@ -1922,6 +2401,7 @@ async fn run_review_submit_overlay_build(
     artifact_expires_in_seconds: Option<i64>,
     reuse_max_age_seconds: Option<i64>,
     report_policy: LocalSnapshotReportPolicy,
+    provider_lineage: ProviderLineageSnapshot,
 ) -> anyhow::Result<()> {
     if method.has_lcia {
         return Err(anyhow::anyhow!(
@@ -1964,12 +2444,17 @@ async fn run_review_submit_overlay_build(
     baseline_config.artifact_purpose = Some(REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE.to_owned());
     baseline_config.root_dependency_fingerprint = Some(root_dependency_fingerprint.clone());
     baseline_config.root_revision_checksum = None;
+    let baseline_lineage =
+        fetch_provider_lineage_snapshot(pool, &baseline_processes, &[], None).await?;
+    baseline_config.provider_lineage_source_sha256 =
+        Some(baseline_lineage.model_payload_sha256.clone());
     let (baseline_source_summary, baseline_source_hash) = compute_source_fingerprint(
         pool,
         &baseline_processes,
         &baseline_config,
         None,
         Some(&method),
+        &baseline_lineage,
     )
     .await?;
 
@@ -2054,6 +2539,7 @@ async fn run_review_submit_overlay_build(
         reuse_max_age_seconds,
         &mut build_timing,
         report_policy,
+        &baseline_lineage.index,
     )
     .await?;
     build_timing.build_sparse_payload_sec += baseline_started.elapsed().as_secs_f64();
@@ -2067,6 +2553,7 @@ async fn run_review_submit_overlay_build(
         provider_rule,
         reference_normalization_mode,
         allocation_mode,
+        &provider_lineage.index,
     )
     .await?;
     let built = assemble_sparse_payload(
@@ -2174,6 +2661,7 @@ async fn load_or_build_review_submit_baseline(
     reuse_max_age_seconds: Option<i64>,
     build_timing: &mut BuildTimingSec,
     report_policy: LocalSnapshotReportPolicy,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<CompiledGraph> {
     if let Some(reused) = find_reusable_snapshot_with_age_basis(
         pool,
@@ -2252,6 +2740,7 @@ async fn load_or_build_review_submit_baseline(
         false,
         &[],
         ArtifactPurpose::ReviewSubmit,
+        provider_lineage,
     )
     .await?;
     let artifact_url = persist_built_snapshot_artifact(
@@ -2425,6 +2914,7 @@ async fn build_review_submit_overlay_graph(
     provider_rule: ProviderRule,
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<CompiledGraph> {
     let mut graph = baseline_graph.clone();
     let target_idx = i32::try_from(graph.processes.len())
@@ -2443,6 +2933,7 @@ async fn build_review_submit_overlay_graph(
         process_version: target_meta.process_version.clone(),
         process_name: target_meta.process_name.clone(),
         model_id: target_meta.model_id,
+        model_version: target_meta.model_version.clone(),
         location: target_meta.location.clone(),
         reference_year: target_meta.reference_year,
         annual_supply_or_production_volume: target_meta.annual_supply_or_production_volume,
@@ -2614,6 +3105,7 @@ async fn build_review_submit_overlay_graph(
         &process_meta,
         &graph.processes,
         provider_rule,
+        provider_lineage,
     )?;
     graph.provider_decisions.extend(balance_batch.decisions);
     graph
@@ -2650,6 +3142,7 @@ fn process_meta_from_compiled(process: &CompiledProcess) -> ProcessMeta {
         process_version: process.process_version.clone(),
         process_name: process.process_name.clone(),
         model_id: process.model_id,
+        model_version: process.model_version.clone(),
         location: process.location.clone(),
         reference_year: process.reference_year,
         annual_supply_or_production_volume: process.annual_supply_or_production_volume,
@@ -3710,6 +4203,7 @@ async fn build_sparse_payload(
     has_lcia: bool,
     impact_factor_sets: &[ImpactFactorSet],
     artifact_purpose: ArtifactPurpose,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<BuildOutput> {
     if processes.is_empty() {
         return Err(anyhow::anyhow!("no processes matched filter"));
@@ -3728,6 +4222,7 @@ async fn build_sparse_payload(
         reference_normalization_mode,
         allocation_mode,
         impact_factor_sets,
+        provider_lineage,
         artifact_purpose,
         versioned_scope.is_some(),
     )
@@ -3760,6 +4255,7 @@ fn parse_process_chunk(
         process_version: proc_row.version.clone(),
         process_name: parse_process_name(&proc_row.json),
         model_id: proc_row.model_id,
+        model_version: proc_row.model_version.clone(),
         location: parse_process_location(&proc_row.json),
         reference_year: parse_process_reference_year(&proc_row.json),
         annual_supply_or_production_volume: parse_process_annual_supply_or_production_volume(
@@ -4005,6 +4501,7 @@ fn compile_signed_flow_balances(
     process_meta: &[ProcessMeta],
     compiled_processes: &[CompiledProcess],
     provider_rule: ProviderRule,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<CompiledBalanceBatch> {
     let mut batch = CompiledBalanceBatch::default();
     for exchange in exchanges {
@@ -4023,8 +4520,21 @@ fn compile_signed_flow_balances(
         let candidate_ports = reference_port_map.get(&flow_link_identity(exchange));
         let balancing_processes =
             eligible_balancing_process_indices(candidate_ports, residual_coefficient);
-        let candidates =
+        let gate =
+            apply_provider_lineage_gate(&balancing_processes, process_meta, provider_lineage)?;
+        let mut candidates =
             compiled_balance_candidates(candidate_ports, process_meta, residual_coefficient)?;
+        for candidate in &mut candidates {
+            candidate.lineage_relationships = gate
+                .relationships_by_provider
+                .get(&candidate.provider_idx)
+                .map(|items| items.iter().copied().collect())
+                .unwrap_or_default();
+            candidate.lineage_rejection_reason = gate
+                .rejection_by_provider
+                .get(&candidate.provider_idx)
+                .copied();
+        }
         let candidate_count = i32::try_from(balancing_processes.len())
             .map_err(|_| anyhow::anyhow!("balance candidate count overflow"))?;
 
@@ -4036,16 +4546,32 @@ fn compile_signed_flow_balances(
             volume_fallback_to_one_count,
             geography_tier,
             allocations,
-        ) = if candidate_count == 1 {
+        ) = if gate.unresolved {
+            batch.matching_stats.matched_multi_provider += 1;
+            batch.matching_stats.matched_multi_unresolved += 1;
+            (
+                CompiledProviderDecisionKind::MultiUnresolved,
+                None,
+                Some(CompiledProviderFailureReason::LineageOverlapRequiresBinding),
+                false,
+                0,
+                None,
+                Vec::new(),
+            )
+        } else if gate.providers.len() == 1 {
             batch.matching_stats.matched_unique_provider += 1;
-            let balancing_process_idx = balancing_processes[0];
+            let balancing_process_idx = gate.providers[0];
             let balancing_meta = process_meta_for_idx(process_meta, balancing_process_idx)
                 .ok_or_else(|| {
                     anyhow::anyhow!("missing balancing process meta idx={balancing_process_idx}")
                 })?;
             (
                 CompiledProviderDecisionKind::UniqueProvider,
-                Some(CompiledProviderResolutionStrategy::UniqueProvider),
+                Some(if gate.selected_model_result.is_some() {
+                    CompiledProviderResolutionStrategy::SelectedModelResult
+                } else {
+                    CompiledProviderResolutionStrategy::UniqueProvider
+                }),
                 None,
                 false,
                 0,
@@ -4058,14 +4584,9 @@ fn compile_signed_flow_balances(
                     weight: 1.0,
                 }],
             )
-        } else if candidate_count > 1 {
+        } else if gate.providers.len() > 1 {
             batch.matching_stats.matched_multi_provider += 1;
-            match resolve_multi_provider(
-                provider_rule,
-                exchange,
-                &balancing_processes,
-                process_meta,
-            )? {
+            match resolve_multi_provider(provider_rule, exchange, &gate.providers, process_meta)? {
                 MultiProviderDecision::Resolved(mut resolution) => {
                     batch.matching_stats.matched_multi_resolved += 1;
                     if resolution.used_equal_fallback {
@@ -4265,6 +4786,7 @@ async fn compile_scope_graph(
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
     impact_factor_sets: &[ImpactFactorSet],
+    provider_lineage: &ProviderLineageIndex,
     artifact_purpose: ArtifactPurpose,
     directional_lcia: bool,
 ) -> anyhow::Result<CompiledScopeGraph> {
@@ -4326,6 +4848,7 @@ async fn compile_scope_graph(
             process_version: meta.process_version.clone(),
             process_name: meta.process_name.clone(),
             model_id: meta.model_id,
+            model_version: meta.model_version.clone(),
             location: meta.location.clone(),
             reference_year: meta.reference_year,
             annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
@@ -4454,6 +4977,7 @@ async fn compile_scope_graph(
         &process_meta,
         &compiled_processes,
         provider_rule,
+        provider_lineage,
     )?;
     let provider_decisions = balance_batch.decisions;
     let technosphere_edges = balance_batch.technosphere_edges;
@@ -5786,6 +6310,9 @@ fn compiled_balance_candidates(
             Ok(CompiledProviderCandidate {
                 provider_idx: port.process_idx,
                 provider_id: meta.process_id,
+                provider_version: meta.process_version.clone(),
+                model_id: meta.model_id,
+                model_version: meta.model_version.clone(),
                 output_exchange_internal_id: port.reference_exchange_internal_id.clone(),
                 output_exchange_is_reference: true,
                 output_normalized_amount: Some(port.raw_amount),
@@ -5801,6 +6328,8 @@ fn compiled_balance_candidates(
                 annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
                 reference_exchange_internal_id: port.reference_exchange_internal_id.clone(),
                 reference_coefficient: Some(port.coefficient),
+                lineage_relationships: Vec::new(),
+                lineage_rejection_reason: None,
             })
         })
         .collect()
@@ -6268,6 +6797,7 @@ fn provider_resolution_strategy_label(
 ) -> &'static str {
     match strategy {
         CompiledProviderResolutionStrategy::UniqueProvider => "unique_provider",
+        CompiledProviderResolutionStrategy::SelectedModelResult => "selected_model_result",
         CompiledProviderResolutionStrategy::BestProviderStrict => "best_provider_strict",
         CompiledProviderResolutionStrategy::SplitByEvidence => "split_by_evidence",
         CompiledProviderResolutionStrategy::SplitByProcessVolume => "split_by_process_volume",
@@ -6306,6 +6836,9 @@ fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> &'sta
         CompiledProviderFailureReason::Top1Top2RatioTooClose => "top1_top2_ratio_too_close",
         CompiledProviderFailureReason::ScoreSumNonPositive => "score_sum_non_positive",
         CompiledProviderFailureReason::NoOppositeSignReference => "no_opposite_sign_reference",
+        CompiledProviderFailureReason::LineageOverlapRequiresBinding => {
+            "lineage_overlap_requires_binding"
+        }
     }
 }
 
@@ -6494,6 +7027,7 @@ fn resolve_process_selection_with_flow_versions(
                     process_version: proc_row.version.clone(),
                     process_name: parse_process_name(&proc_row.json),
                     model_id: proc_row.model_id,
+                    model_version: proc_row.model_version.clone(),
                     location: parse_process_location(&proc_row.json),
                     reference_year: parse_process_reference_year(&proc_row.json),
                     annual_supply_or_production_volume:
@@ -6657,12 +7191,123 @@ fn resolve_process_selection_with_flow_versions(
     })
 }
 
+async fn fetch_provider_lineage_snapshot(
+    pool: &PgPool,
+    processes: &[ProcessRow],
+    request_roots: &[RequestRootProcess],
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<ProviderLineageSnapshot> {
+    let identities = processes
+        .iter()
+        .filter_map(|process| {
+            process.model_id.map(|model_id| {
+                VersionedModelIdentity::new(
+                    model_id,
+                    process
+                        .model_version
+                        .clone()
+                        .unwrap_or_else(|| process.version.clone()),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let ids = identities
+        .iter()
+        .map(|item| item.model_id)
+        .collect::<Vec<_>>();
+    let versions = identities
+        .iter()
+        .map(|item| item.model_version.clone())
+        .collect::<Vec<_>>();
+
+    let rows = if ids.is_empty() {
+        Vec::new()
+    } else if let Some(scope) = versioned_scope {
+        sqlx::query(
+            r#"
+            SELECT m.id, btrim(m.version::text) AS version, m.modified_at, m.json
+            FROM public.lifecyclemodels m
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = m.id
+             AND requested.version = btrim(m.version::text)
+            WHERE m.state_code = 100
+               OR (
+                 m.user_id = $3
+                 AND m.state_code = 0
+                 AND (NOT $4 OR m.team_id IS NULL)
+                 AND (NOT $5 OR m.review_id IS NULL)
+               )
+            ORDER BY m.id, btrim(m.version::text)
+            "#,
+        )
+        .bind(&ids)
+        .bind(&versions)
+        .bind(scope.actor_user_id)
+        .bind(scope.include_user_unassigned_only)
+        .bind(scope.include_user_review_free_only)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT m.id, btrim(m.version::text) AS version, m.modified_at, m.json
+            FROM public.lifecyclemodels m
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = m.id
+             AND requested.version = btrim(m.version::text)
+            ORDER BY m.id, btrim(m.version::text)
+            "#,
+        )
+        .bind(&ids)
+        .bind(&versions)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut models = Vec::with_capacity(rows.len());
+    for row in rows {
+        models.push(LifecycleModelLineageRow {
+            identity: VersionedModelIdentity::new(
+                row.try_get::<Uuid, _>("id")?,
+                row.try_get::<String, _>("version")?,
+            ),
+            modified_at: row.try_get::<Option<DateTime<Utc>>, _>("modified_at")?,
+            json: row.try_get::<Value, _>("json")?,
+        });
+    }
+    models.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let digest_payload = models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "model_id": model.identity.model_id,
+                "model_version": model.identity.model_version,
+                "json": model.json,
+            })
+        })
+        .collect::<Vec<_>>();
+    let model_payload_sha256 = stable_json_sha256(&Value::Array(digest_payload))?;
+    let model_count = i64::try_from(models.len())
+        .map_err(|_| anyhow::anyhow!("lifecycle model count overflow"))?;
+    let model_max_modified_at_utc =
+        format_modified_at_utc(models.iter().filter_map(|model| model.modified_at).max());
+    let index = build_provider_lineage_index(processes, &models, request_roots);
+
+    Ok(ProviderLineageSnapshot {
+        index,
+        model_count,
+        model_max_modified_at_utc,
+        model_payload_sha256,
+    })
+}
+
 async fn compute_source_fingerprint(
     pool: &PgPool,
     selected_processes: &[ProcessRow],
     config: &SnapshotBuildConfig,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     method: Option<&MethodSelection>,
+    provider_lineage: &ProviderLineageSnapshot,
 ) -> anyhow::Result<(SourceSnapshotSummary, String)> {
     let (process_count, process_max_modified_at_utc) =
         summarize_selected_processes(selected_processes)?;
@@ -6691,6 +7336,9 @@ async fn compute_source_fingerprint(
     let summary = SourceSnapshotSummary {
         process_count,
         process_max_modified_at_utc,
+        lifecyclemodel_count: provider_lineage.model_count,
+        lifecyclemodel_max_modified_at_utc: provider_lineage.model_max_modified_at_utc.clone(),
+        lifecyclemodel_payload_sha256: provider_lineage.model_payload_sha256.clone(),
         flow_count,
         flow_max_modified_at_utc,
         lciamethod_count,
@@ -6706,11 +7354,16 @@ fn compute_source_fingerprint_from_summary(
     config: &SnapshotBuildConfig,
 ) -> anyhow::Result<String> {
     let body = serde_json::json!({
-        "schema": "source-fingerprint:v1",
+        "schema": "source-fingerprint:v2",
         "source": {
             "processes": {
                 "count": summary.process_count,
                 "max_modified_at_utc": summary.process_max_modified_at_utc,
+            },
+            "lifecyclemodels": {
+                "count": summary.lifecyclemodel_count,
+                "max_modified_at_utc": summary.lifecyclemodel_max_modified_at_utc,
+                "payload_sha256": summary.lifecyclemodel_payload_sha256,
             },
             "flows": {
                 "count": summary.flow_count,
@@ -6984,7 +7637,8 @@ async fn fetch_processes(
             .collect::<Vec<_>>();
         sqlx::query(
             r#"
-            SELECT p.id, btrim(p.version::text) AS version, p.model_id, p.user_id,
+            SELECT p.id, btrim(p.version::text) AS version, p.model_id,
+                   btrim(p.model_version::text) AS model_version, p.user_id,
                    p.state_code, p.team_id, p.review_id, p.modified_at, p.json
             FROM public.processes p
             INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
@@ -7003,7 +7657,8 @@ async fn fetch_processes(
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+              id, version, model_id, btrim(model_version::text) AS model_version,
+              user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE (
                 state_code = 100
@@ -7027,7 +7682,8 @@ async fn fetch_processes(
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+              id, version, model_id, btrim(model_version::text) AS model_version,
+              user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE json ? 'processDataSet'
             ORDER BY id, version DESC
@@ -7039,7 +7695,8 @@ async fn fetch_processes(
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+              id, version, model_id, btrim(model_version::text) AS model_version,
+              user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE (state_code = ANY($1) OR user_id = $2)
               AND json ? 'processDataSet'
@@ -7054,7 +7711,8 @@ async fn fetch_processes(
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+              id, version, model_id, btrim(model_version::text) AS model_version,
+              user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE state_code = ANY($1)
               AND json ? 'processDataSet'
@@ -7086,6 +7744,10 @@ async fn fetch_processes(
             id: row.try_get::<Uuid, _>("id")?,
             version: row.try_get::<String, _>("version")?.trim().to_owned(),
             model_id: row.try_get::<Option<Uuid>, _>("model_id")?,
+            model_version: row
+                .try_get::<Option<String>, _>("model_version")?
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             user_id: row.try_get::<Option<Uuid>, _>("user_id")?,
             state_code: row.try_get::<i32, _>("state_code")?,
             team_id: row.try_get::<Option<Uuid>, _>("team_id")?,
@@ -9377,6 +10039,10 @@ fn write_report_files(
         build_timing.resolve_method_identity_sec
     ));
     md.push_str(&format!(
+        "- fetch_provider_lineage_sec: `{}`\n",
+        build_timing.fetch_provider_lineage_sec
+    ));
+    md.push_str(&format!(
         "- compute_source_fingerprint_sec: `{}`\n",
         build_timing.compute_source_fingerprint_sec
     ));
@@ -9417,6 +10083,18 @@ fn write_report_files(
     md.push_str(&format!(
         "- processes_max_modified_at_utc: `{}`\n",
         source_summary.process_max_modified_at_utc
+    ));
+    md.push_str(&format!(
+        "- lifecyclemodels_count: `{}`\n",
+        source_summary.lifecyclemodel_count
+    ));
+    md.push_str(&format!(
+        "- lifecyclemodels_max_modified_at_utc: `{}`\n",
+        source_summary.lifecyclemodel_max_modified_at_utc
+    ));
+    md.push_str(&format!(
+        "- lifecyclemodels_payload_sha256: `{}`\n",
+        source_summary.lifecyclemodel_payload_sha256
     ));
     md.push_str(&format!("- flows_count: `{}`\n", source_summary.flow_count));
     md.push_str(&format!(
@@ -9754,6 +10432,7 @@ async fn run_provider_rule_replay(
     rules: &[ProviderRule],
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
+    provider_lineage: &ProviderLineageIndex,
 ) -> anyhow::Result<Vec<ProviderRuleReplayRow>> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
@@ -9766,6 +10445,7 @@ async fn run_provider_rule_replay(
             reference_normalization_mode,
             allocation_mode,
             &[],
+            provider_lineage,
             ArtifactPurpose::CalculationBundle,
             versioned_scope.is_some(),
         )
@@ -10190,6 +10870,8 @@ mod tests {
             process_limit: 0,
             provider_rule: "split_by_process_volume".to_owned(),
             provider_candidate_eligibility_mode: "opposite_sign_reference_port".to_owned(),
+            provider_lineage_policy: "version-exact-lineage-gate-v1".to_owned(),
+            provider_lineage_source_sha256: None,
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             allocation_semantics_version: allocation_semantics_version.to_owned(),
@@ -10256,9 +10938,12 @@ mod tests {
 
     #[test]
     fn allocation_semantics_version_changes_snapshot_source_fingerprint() {
-        let summary = SourceSnapshotSummary {
+        let mut summary = SourceSnapshotSummary {
             process_count: 2,
             process_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            lifecyclemodel_count: 0,
+            lifecyclemodel_max_modified_at_utc: "none".to_owned(),
+            lifecyclemodel_payload_sha256: "empty".to_owned(),
             flow_count: 3,
             flow_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
             lciamethod_count: 0,
@@ -10273,6 +10958,15 @@ mod tests {
             .expect("fallback source fingerprint");
 
         assert_ne!(strict_hash, fallback_hash);
+
+        let before_lineage_change = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("lineage source fingerprint");
+        summary.lifecyclemodel_payload_sha256 = "changed-lineage-payload".to_owned();
+        assert_ne!(
+            before_lineage_change,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("changed lineage source fingerprint")
+        );
     }
 
     #[test]
@@ -10280,6 +10974,9 @@ mod tests {
         let summary = SourceSnapshotSummary {
             process_count: 2,
             process_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            lifecyclemodel_count: 0,
+            lifecyclemodel_max_modified_at_utc: "none".to_owned(),
+            lifecyclemodel_payload_sha256: "empty".to_owned(),
             flow_count: 3,
             flow_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
             lciamethod_count: 0,
@@ -10375,6 +11072,7 @@ mod tests {
                 process_version: meta.process_version.clone(),
                 process_name: meta.process_name.clone(),
                 model_id: meta.model_id,
+                model_version: None,
                 location: meta.location.clone(),
                 reference_year: meta.reference_year,
                 annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
@@ -10438,6 +11136,7 @@ mod tests {
                 &process_meta,
                 &compiled_processes,
                 ProviderRule::StrictUniqueProvider,
+                &super::ProviderLineageIndex::default(),
             )
             .expect("signed-flow balance")
         };
@@ -10492,6 +11191,7 @@ mod tests {
             &process_meta,
             &compiled_processes,
             ProviderRule::StrictUniqueProvider,
+            &super::ProviderLineageIndex::default(),
         )
         .expect("product signed-flow balance");
         assert_close(product_batch.technosphere_edges[0].amount, 2.0);
@@ -10508,6 +11208,7 @@ mod tests {
             &process_meta,
             &compiled_processes,
             ProviderRule::StrictUniqueProvider,
+            &super::ProviderLineageIndex::default(),
         )
         .expect("mismatched flow revision remains unresolved");
         assert!(mismatched_batch.technosphere_edges.is_empty());
@@ -10530,6 +11231,7 @@ mod tests {
                 process_version: process.process_version.clone(),
                 process_name: process.process_name.clone(),
                 model_id: process.model_id,
+                model_version: None,
                 location: process.location.clone(),
                 reference_year: process.reference_year,
                 annual_supply_or_production_volume: process.annual_supply_or_production_volume,
@@ -10586,6 +11288,7 @@ mod tests {
             &process_meta,
             &compiled_processes,
             ProviderRule::StrictUniqueProvider,
+            &super::ProviderLineageIndex::default(),
         )
         .expect("same-process opposite-sign balance");
 
@@ -10627,6 +11330,7 @@ mod tests {
             &process_meta,
             &compiled_processes,
             ProviderRule::SplitEqual,
+            &super::ProviderLineageIndex::default(),
         )
         .expect("same and external candidates share routing");
         assert_eq!(mixed.technosphere_edges.len(), 2);
@@ -10663,6 +11367,7 @@ mod tests {
             process_version: "01.00.000".to_owned(),
             process_name: None,
             model_id: None,
+            model_version: None,
             location: None,
             reference_year: None,
             annual_supply_or_production_volume: None,
@@ -11045,6 +11750,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11068,6 +11774,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11101,6 +11808,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: Some("provider".to_owned()),
                 model_id: None,
+                model_version: None,
                 location: Some("CN".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: Some(10.0),
@@ -11165,6 +11873,7 @@ mod tests {
             id: target_id,
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11181,6 +11890,7 @@ mod tests {
             ProviderRule::SplitByProcessVolume,
             NormalizationMode::Lenient,
             AllocationMode::Lenient,
+            &super::ProviderLineageIndex::default(),
         )
         .await
         .expect("overlay graph");
@@ -11234,6 +11944,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: Some("tiny-value process".to_owned()),
                 model_id: None,
+                model_version: None,
                 location: None,
                 reference_year: None,
                 annual_supply_or_production_volume: None,
@@ -11360,6 +12071,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: None,
                 reference_year: None,
                 annual_supply_or_production_volume: None,
@@ -11718,6 +12430,7 @@ mod tests {
             id,
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11828,6 +12541,7 @@ mod tests {
                     id: public_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -11842,6 +12556,7 @@ mod tests {
                     id: private_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: Some(private_user),
                     state_code: 0,
                     team_id: None,
@@ -11925,6 +12640,7 @@ mod tests {
             id: root_process_id,
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11936,6 +12652,7 @@ mod tests {
             id: provider_process_id,
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -11990,6 +12707,7 @@ mod tests {
                     id: root_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -12001,6 +12719,7 @@ mod tests {
                     id: balancing_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -12097,6 +12816,7 @@ mod tests {
             id,
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -12193,6 +12913,7 @@ mod tests {
                     process_version: "01.00.000".to_owned(),
                     process_name: Some("consumer with providers".to_owned()),
                     model_id: None,
+                    model_version: None,
                     location: Some("CN-BJ".to_owned()),
                     reference_year: Some(2026),
                     annual_supply_or_production_volume: None,
@@ -12204,6 +12925,7 @@ mod tests {
                     process_version: "01.00.000".to_owned(),
                     process_name: Some("consumer with gap".to_owned()),
                     model_id: None,
+                    model_version: None,
                     location: Some("CN".to_owned()),
                     reference_year: Some(2026),
                     annual_supply_or_production_volume: None,
@@ -12556,6 +13278,7 @@ mod tests {
             process_version: "01.00.000".to_owned(),
             process_name: None,
             model_id: None,
+            model_version: None,
             location: location.map(ToOwned::to_owned),
             reference_year: Some(2026),
             annual_supply_or_production_volume: annual_volume,
@@ -12571,6 +13294,287 @@ mod tests {
         let mut meta = test_process_meta(process_idx, location, annual_volume);
         meta.model_id = model_id;
         meta
+    }
+
+    fn lineage_model_json(result: Uuid, components: &[Uuid]) -> serde_json::Value {
+        json!({
+            "lifeCycleModelDataSet": {
+                "lifeCycleModelInformation": {
+                    "dataSetInformation": {
+                        "referenceToResultingProcess": {
+                            "@refObjectId": result,
+                            "@version": "01.00.000"
+                        }
+                    },
+                    "technology": {
+                        "processes": {
+                            "processInstance": components.iter().map(|component| json!({
+                                "referenceToProcess": {
+                                    "@refObjectId": component,
+                                    "@version": "01.00.000"
+                                }
+                            })).collect::<Vec<_>>()
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn lineage_meta(process_idx: i32, process_id: Uuid) -> ProcessMeta {
+        let mut meta = test_process_meta(process_idx, None, None);
+        meta.process_id = process_id;
+        meta
+    }
+
+    #[test]
+    fn selected_result_excludes_its_component_before_provider_scoring() {
+        let result = Uuid::from_u128(101);
+        let component = Uuid::from_u128(102);
+        let model_id = Uuid::from_u128(201);
+        let models = vec![super::LifecycleModelLineageRow {
+            identity: super::VersionedModelIdentity::new(model_id, "01.00.000"),
+            modified_at: None,
+            json: lineage_model_json(result, &[component]),
+        }];
+        let roots = vec![super::RequestRootProcess {
+            process_id: result,
+            process_version: "01.00.000".to_owned(),
+        }];
+        let lineage = super::build_provider_lineage_index(&[], &models, &roots);
+        let gate = super::apply_provider_lineage_gate(
+            &[0, 1],
+            &[lineage_meta(0, result), lineage_meta(1, component)],
+            &lineage,
+        )
+        .expect("lineage gate");
+
+        assert_eq!(gate.providers, vec![0]);
+        assert_eq!(gate.selected_model_result, Some(0));
+        assert_eq!(
+            gate.rejection_by_provider.get(&1),
+            Some(
+                &solver_worker::compiled_graph::CompiledProviderLineageRejectionReason::ModelComponentOfSelectedResult
+            )
+        );
+    }
+
+    #[test]
+    fn sanitized_result_component_fixture_selects_exact_root() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider_lineage_v1/result_component_conflict.json"
+        ))
+        .expect("provider lineage fixture");
+        let roots = fixture["requestRoots"]
+            .as_array()
+            .expect("request roots")
+            .iter()
+            .map(|root| super::RequestRootProcess {
+                process_id: root["processId"]
+                    .as_str()
+                    .expect("root id")
+                    .parse()
+                    .expect("root uuid"),
+                process_version: root["processVersion"]
+                    .as_str()
+                    .expect("root version")
+                    .to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let models = fixture["lifecycleModels"]
+            .as_array()
+            .expect("lifecycle models")
+            .iter()
+            .map(|model| super::LifecycleModelLineageRow {
+                identity: super::VersionedModelIdentity::new(
+                    model["id"]
+                        .as_str()
+                        .expect("model id")
+                        .parse()
+                        .expect("model uuid"),
+                    model["version"].as_str().expect("model version"),
+                ),
+                modified_at: None,
+                json: model["json"].clone(),
+            })
+            .collect::<Vec<_>>();
+        let candidates = fixture["providerCandidates"]
+            .as_array()
+            .expect("provider candidates")
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| {
+                lineage_meta(
+                    i32::try_from(idx).expect("candidate idx"),
+                    candidate["processId"]
+                        .as_str()
+                        .expect("candidate id")
+                        .parse()
+                        .expect("candidate uuid"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lineage = super::build_provider_lineage_index(&[], &models, &roots);
+        let gate = super::apply_provider_lineage_gate(&[0, 1], &candidates, &lineage)
+            .expect("lineage gate");
+
+        assert_eq!(gate.providers, vec![0]);
+        assert_eq!(
+            candidates[usize::try_from(gate.providers[0]).expect("selected idx")].process_id,
+            fixture["expected"]["selectedProcessId"]
+                .as_str()
+                .expect("selected id")
+                .parse::<Uuid>()
+                .expect("selected uuid")
+        );
+    }
+
+    #[test]
+    fn unbound_result_component_overlap_is_reported_unresolved() {
+        let result = Uuid::from_u128(301);
+        let component = Uuid::from_u128(302);
+        let models = vec![super::LifecycleModelLineageRow {
+            identity: super::VersionedModelIdentity::new(Uuid::from_u128(401), "01.00.000"),
+            modified_at: None,
+            json: lineage_model_json(result, &[component]),
+        }];
+        let lineage = super::build_provider_lineage_index(&[], &models, &[]);
+        let gate = super::apply_provider_lineage_gate(
+            &[0, 1],
+            &[lineage_meta(0, result), lineage_meta(1, component)],
+            &lineage,
+        )
+        .expect("lineage gate");
+
+        assert!(gate.unresolved);
+        assert!(gate.providers.is_empty());
+    }
+
+    #[test]
+    fn transitive_model_components_are_detected() {
+        let top_result = Uuid::from_u128(501);
+        let nested_result = Uuid::from_u128(502);
+        let leaf = Uuid::from_u128(503);
+        let models = vec![
+            super::LifecycleModelLineageRow {
+                identity: super::VersionedModelIdentity::new(Uuid::from_u128(601), "01.00.000"),
+                modified_at: None,
+                json: lineage_model_json(top_result, &[nested_result]),
+            },
+            super::LifecycleModelLineageRow {
+                identity: super::VersionedModelIdentity::new(Uuid::from_u128(602), "01.00.000"),
+                modified_at: None,
+                json: lineage_model_json(nested_result, &[leaf]),
+            },
+        ];
+        let lineage = super::build_provider_lineage_index(&[], &models, &[]);
+        let relationships = super::provider_lineage_relationships(
+            &super::VersionedProcessIdentity::new(top_result, "01.00.000"),
+            &super::VersionedProcessIdentity::new(leaf, "01.00.000"),
+            &lineage,
+        );
+
+        assert!(relationships.contains(
+            &solver_worker::compiled_graph::CompiledProviderLineageRelationship::ModelResultAndComponent
+        ));
+    }
+
+    #[test]
+    fn unrelated_peer_providers_keep_legacy_candidate_set() {
+        let result = Uuid::from_u128(701);
+        let component = Uuid::from_u128(702);
+        let peer = Uuid::from_u128(703);
+        let models = vec![super::LifecycleModelLineageRow {
+            identity: super::VersionedModelIdentity::new(Uuid::from_u128(801), "01.00.000"),
+            modified_at: None,
+            json: lineage_model_json(result, &[component]),
+        }];
+        let lineage = super::build_provider_lineage_index(&[], &models, &[]);
+        let gate = super::apply_provider_lineage_gate(
+            &[0, 1],
+            &[lineage_meta(0, result), lineage_meta(1, peer)],
+            &lineage,
+        )
+        .expect("lineage gate");
+
+        assert!(!gate.unresolved);
+        assert_eq!(gate.providers, vec![0, 1]);
+    }
+
+    #[test]
+    fn exact_root_selects_current_result_over_same_model_legacy_result() {
+        let model_id = Uuid::from_u128(901);
+        let current = Uuid::from_u128(902);
+        let legacy = Uuid::from_u128(903);
+        let models = vec![
+            super::LifecycleModelLineageRow {
+                identity: super::VersionedModelIdentity::new(model_id, "02.00.000"),
+                modified_at: None,
+                json: lineage_model_json(current, &[]),
+            },
+            super::LifecycleModelLineageRow {
+                identity: super::VersionedModelIdentity::new(model_id, "01.00.000"),
+                modified_at: None,
+                json: lineage_model_json(legacy, &[]),
+            },
+        ];
+        let roots = vec![super::RequestRootProcess {
+            process_id: current,
+            process_version: "01.00.000".to_owned(),
+        }];
+        let lineage = super::build_provider_lineage_index(&[], &models, &roots);
+        let gate = super::apply_provider_lineage_gate(
+            &[0, 1],
+            &[lineage_meta(0, current), lineage_meta(1, legacy)],
+            &lineage,
+        )
+        .expect("lineage gate");
+
+        assert_eq!(gate.providers, vec![0]);
+        assert_eq!(
+            gate.rejection_by_provider.get(&1),
+            Some(
+                &solver_worker::compiled_graph::CompiledProviderLineageRejectionReason::SupersededModelResult
+            )
+        );
+    }
+
+    #[test]
+    fn lineage_parser_accepts_array_results_and_single_process_instance() {
+        let result = Uuid::from_u128(1_001);
+        let component = Uuid::from_u128(1_002);
+        let document = json!({
+            "lifeCycleModelDataSet": {
+                "lifeCycleModelInformation": {
+                    "dataSetInformation": {
+                        "referenceToResultingProcess": [{
+                            "@refObjectId": result,
+                            "@version": "01.00.000"
+                        }]
+                    },
+                    "technology": {
+                        "processes": {
+                            "processInstance": {
+                                "referenceToProcess": {
+                                    "@refObjectId": component,
+                                    "@version": "01.00.000"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(
+            super::lifecycle_model_result_references(&document)
+                .contains(&super::VersionedProcessIdentity::new(result, "01.00.000"))
+        );
+        assert!(
+            super::lifecycle_model_component_references(&document).contains(
+                &super::VersionedProcessIdentity::new(component, "01.00.000")
+            )
+        );
     }
 
     #[test]
@@ -12953,6 +13957,7 @@ mod tests {
                     id: root_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -12968,6 +13973,7 @@ mod tests {
                     id: local_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -12983,6 +13989,7 @@ mod tests {
                     id: global_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13029,6 +14036,7 @@ mod tests {
                     id: root_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13047,6 +14055,7 @@ mod tests {
                     id: local_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13062,6 +14071,7 @@ mod tests {
                     id: global_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13109,6 +14119,7 @@ mod tests {
                     id: root_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13124,6 +14135,7 @@ mod tests {
                     id: local_non_reference_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13142,6 +14154,7 @@ mod tests {
                     id: global_reference_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13191,6 +14204,7 @@ mod tests {
                     id: root_process_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13206,6 +14220,7 @@ mod tests {
                     id: missing_reference_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13220,6 +14235,7 @@ mod tests {
                     id: global_reference_provider_id,
                     version: "01.00.000".to_owned(),
                     model_id: None,
+                    model_version: None,
                     user_id: None,
                     state_code: 100,
                     team_id: None,
@@ -13290,6 +14306,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13300,6 +14317,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13310,6 +14328,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("GLO".to_owned()),
                 reference_year: Some(2010),
                 annual_supply_or_production_volume: None,
@@ -13363,6 +14382,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: Some(model_consumer),
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13373,6 +14393,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: Some(model_consumer),
+                model_version: None,
                 location: Some("CN".to_owned()),
                 reference_year: Some(2024),
                 annual_supply_or_production_volume: None,
@@ -13383,6 +14404,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: Some(model_other),
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13430,6 +14452,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13440,6 +14463,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13450,6 +14474,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN".to_owned()),
                 reference_year: Some(2024),
                 annual_supply_or_production_volume: None,
@@ -13499,6 +14524,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13509,6 +14535,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13519,6 +14546,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13565,6 +14593,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
                 annual_supply_or_production_volume: None,
@@ -13575,6 +14604,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("GLO".to_owned()),
                 reference_year: None,
                 annual_supply_or_production_volume: None,
@@ -13585,6 +14615,7 @@ mod tests {
                 process_version: "01.00.000".to_owned(),
                 process_name: None,
                 model_id: None,
+                model_version: None,
                 location: Some("US".to_owned()),
                 reference_year: Some(2010),
                 annual_supply_or_production_volume: None,
@@ -13945,6 +14976,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: Some(actor),
             state_code: 0,
             team_id: None,
@@ -14205,6 +15237,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -14273,6 +15306,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -14337,6 +15371,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -14400,6 +15435,7 @@ mod tests {
             id: Uuid::new_v4(),
             version: "01.00.000".to_owned(),
             model_id: None,
+            model_version: None,
             user_id: None,
             state_code: 100,
             team_id: None,
@@ -15085,6 +16121,7 @@ mod tests {
             process_version: "01.01.000".to_owned(),
             process_name: Some("alumina production".to_owned()),
             model_id: None,
+            model_version: None,
             location: None,
             reference_year: None,
             annual_supply_or_production_volume: None,

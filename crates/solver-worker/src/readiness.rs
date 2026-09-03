@@ -930,6 +930,7 @@ fn provider_decision_kind_label(kind: CompiledProviderDecisionKind) -> String {
 fn provider_resolution_strategy_label(strategy: CompiledProviderResolutionStrategy) -> String {
     match strategy {
         CompiledProviderResolutionStrategy::UniqueProvider => "unique_provider",
+        CompiledProviderResolutionStrategy::SelectedModelResult => "selected_model_result",
         CompiledProviderResolutionStrategy::BestProviderStrict => "best_provider_strict",
         CompiledProviderResolutionStrategy::SplitByEvidence => "split_by_evidence",
         CompiledProviderResolutionStrategy::SplitByProcessVolume => "split_by_process_volume",
@@ -951,6 +952,9 @@ fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> Strin
         CompiledProviderFailureReason::Top1Top2RatioTooClose => "top1_top2_ratio_too_close",
         CompiledProviderFailureReason::ScoreSumNonPositive => "score_sum_non_positive",
         CompiledProviderFailureReason::NoOppositeSignReference => "no_opposite_sign_reference",
+        CompiledProviderFailureReason::LineageOverlapRequiresBinding => {
+            "lineage_overlap_requires_binding"
+        }
     }
     .to_owned()
 }
@@ -1171,6 +1175,9 @@ mod tests {
         decision.candidates = vec![CompiledProviderCandidate {
             provider_idx: 0,
             provider_id,
+            provider_version: "01.00.000".to_owned(),
+            model_id: None,
+            model_version: None,
             output_exchange_internal_id: Some("coproduct".to_owned()),
             output_exchange_is_reference: false,
             output_normalized_amount: Some(0.4),
@@ -1182,6 +1189,8 @@ mod tests {
             annual_supply_or_production_volume: Some(10.0),
             reference_exchange_internal_id: Some("coproduct".to_owned()),
             reference_coefficient: Some(1.0),
+            lineage_relationships: Vec::new(),
+            lineage_rejection_reason: None,
         }];
 
         let report = verify_matrix_readiness(&input);
@@ -1482,6 +1491,7 @@ mod tests {
                         process_version: "01.00.000".to_owned(),
                         process_name: Some("provider".to_owned()),
                         model_id: None,
+                        model_version: None,
                         location: Some("CN".to_owned()),
                         reference_year: Some(2024),
                         annual_supply_or_production_volume: None,
@@ -1493,6 +1503,7 @@ mod tests {
                         process_version: "01.00.000".to_owned(),
                         process_name: Some("consumer".to_owned()),
                         model_id: None,
+                        model_version: None,
                         location: Some("CN".to_owned()),
                         reference_year: Some(2024),
                         annual_supply_or_production_volume: None,
@@ -1538,6 +1549,9 @@ mod tests {
                 candidates: vec![CompiledProviderCandidate {
                     provider_idx: 0,
                     provider_id,
+                    provider_version: "01.00.000".to_owned(),
+                    model_id: None,
+                    model_version: None,
                     output_exchange_internal_id: Some("1".to_owned()),
                     output_exchange_is_reference: true,
                     output_normalized_amount: Some(1.0),
@@ -1549,6 +1563,8 @@ mod tests {
                     annual_supply_or_production_volume: Some(10.0),
                     reference_exchange_internal_id: Some("1".to_owned()),
                     reference_coefficient: Some(1.0),
+                    lineage_relationships: Vec::new(),
+                    lineage_rejection_reason: None,
                 }],
                 decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
                 resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),

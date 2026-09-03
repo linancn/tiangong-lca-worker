@@ -1638,6 +1638,7 @@ mod tests {
             process_version: "01.00.000".to_owned(),
             process_name: Some(process_name.to_owned()),
             model_id: None,
+            model_version: None,
             location: Some("CN".to_owned()),
             reference_year: Some(2024),
             annual_supply_or_production_volume: None,

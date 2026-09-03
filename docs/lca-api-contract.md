@@ -25,8 +25,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-08-29
-lastReviewedCommit: c7f362e7a50eb003104851dcc1112fece81038bc
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
 lastReviewedNote: "Documented Worker Issue #277 failure retryability, exact-request negative admission, and coalesced heartbeat persistence."
 related:
   - AGENTS.md

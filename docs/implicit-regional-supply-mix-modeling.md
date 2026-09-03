@@ -24,9 +24,9 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-08-17
-lastReviewedCommit: 4c9f23335c10b01bd48466650ac9f0323b5ff9c4
-lastReviewedNote: "Reviewed for Worker PR #225 conflict resolution: schema cutover and readiness configuration preserve signed-flow routing and provider-selection semantics."
+lastReviewedAt: 2026-09-03
+lastReviewedCommit: 72b8247aa9fade1f57ead7e4801e7bd975fcaf7f
+lastReviewedNote: "Reviewed for Issue #279: regional mixes consume only candidates accepted by the exact Lifecycle Model lineage gate."
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -47,6 +47,7 @@ Implicit regional supply mix 不判断谁是“需求”或“供给”。它只
 ```text
 signed coefficient / reference pivot
   -> exact same-flow, opposite-sign candidates
+  -> version-exact Lifecycle Model lineage gate
   -> same-model scope, if available
   -> supply-region anchor
   -> best non-empty geography tier
@@ -87,6 +88,14 @@ c_r + sum(c_i * activity_requirement_i) = 0
 ```
 
 相反符号保证 activity requirement 非负。Annual volume、geography 或 model metadata 不得修改 coefficient 符号、reference pivot 或待闭合总量。
+
+## Regional routing 之前的 Lifecycle boundary
+
+Regional mix 只处理 lineage gate 接受后的候选。Lifecycle Model 的 `referenceToResultingProcess` 与 `processInstance.referenceToProcess` 定义 exact-version result/component 关系；`processes.model_version`（为空时按数据库合同回退到 Process version）确定 Process 所属的 exact Model revision。系统不存在一个全局 `is_current` 标志。
+
+当 exact request root 选中了冲突候选中的 resulting Process 时，该 result 独占本条 routing，component、旧 Model revision 的 result 或 alternative result 不进入隐式 mix。若存在谱系冲突但没有这样的选择证据，本条 residual 以 `lineage_overlap_requires_binding` unresolved，不能用 annual-volume 或 equal fallback 自动混合。没有谱系关系的 peer suppliers 保持原行为；component 身份不会造成全局禁用。
+
+当前 request contract 尚无 exchange-level provider link 或显式 boundary-mix weights；因此这里的自动补丁只使用 exact root + exact Model lineage 作为选择证据，并对缺少证据的冲突 fail closed。
 
 ## Same-model 优先
 
