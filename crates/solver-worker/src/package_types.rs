@@ -13,6 +13,9 @@ pub const PACKAGE_IMPORT_WORKER_JOB_KIND: &str = "tidas.import_package";
 pub const PACKAGE_EXPORT_PAYLOAD_SCHEMA_VERSION: &str = "tidas.export_package.request.v1";
 /// Payload schema for TIDAS package import worker jobs.
 pub const PACKAGE_IMPORT_PAYLOAD_SCHEMA_VERSION: &str = "tidas.import_package.request.v1";
+/// Opt-in package-local root-closure import; v1 tasks retain their old policy.
+pub const PACKAGE_IMPORT_V2_PAYLOAD_SCHEMA_VERSION: &str = "tidas.import_package.request.v2";
+pub const PACKAGE_IMPORT_V2_POLICY: &str = "root_closure_v2";
 /// Result schema for TIDAS package export worker jobs.
 pub const PACKAGE_EXPORT_RESULT_SCHEMA_VERSION: &str = "tidas.export_package.result.v1";
 /// Result schema for TIDAS package import worker jobs.
@@ -59,6 +62,7 @@ pub enum PackageArtifactKind {
     ExportZip,
     ExportReport,
     ImportReport,
+    ImportDetails,
 }
 
 impl PackageArtifactKind {
@@ -69,6 +73,7 @@ impl PackageArtifactKind {
             Self::ImportSource | Self::ExportZip => PACKAGE_ZIP_ARTIFACT_FORMAT,
             Self::ExportReport => PACKAGE_EXPORT_REPORT_ARTIFACT_FORMAT,
             Self::ImportReport => PACKAGE_IMPORT_REPORT_ARTIFACT_FORMAT,
+            Self::ImportDetails => "tidas-package-import-details:v2",
         }
     }
 
@@ -76,7 +81,7 @@ impl PackageArtifactKind {
     #[must_use]
     pub const fn content_type(self) -> &'static str {
         match self {
-            Self::ImportSource | Self::ExportZip => PACKAGE_ZIP_CONTENT_TYPE,
+            Self::ImportSource | Self::ExportZip | Self::ImportDetails => PACKAGE_ZIP_CONTENT_TYPE,
             Self::ExportReport | Self::ImportReport => PACKAGE_REPORT_CONTENT_TYPE,
         }
     }

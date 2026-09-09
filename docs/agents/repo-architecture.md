@@ -36,9 +36,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
-lastReviewedNote: "Reviewed the Issue #279 Lifecycle Model query compatibility hotfix; runtime topology and ownership remain unchanged."
+lastReviewedAt: "2026-09-09"
+lastReviewedCommit: "dd549b2e4ac8610f17c2e20619ccfe2fd631ee33"
+lastReviewedNote: "Worker #283: reviewed additive root_closure_v2 import, package-local validation, transactional group receipts and v2 artifacts; legacy v1 and calculation contracts remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

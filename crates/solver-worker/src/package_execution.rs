@@ -17,6 +17,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+#[path = "package_import_v2.rs"]
+pub mod partial_import;
+
 use crate::{
     db::AppState,
     package_artifacts::{
@@ -1821,24 +1824,30 @@ fn parse_tidas_validation_report(
     Ok(report)
 }
 
-fn run_tidas_validation(input_dir: &Path) -> anyhow::Result<TidasValidationReport> {
-    let handshake = tidas_cli::handshake()?;
-    let temp = TempDir::new().context("create bounded tidas package validation spool")?;
-    let issues_path = temp.path().join("validation-issues.jsonl");
-    let input_arg = input_dir.to_string_lossy().into_owned();
-    let issues_arg = issues_path.to_string_lossy().into_owned();
-    let output = tidas_cli::run_json(&[
+/// Shared ZIP-import command: v1 and v2 must execute the same complete validator.
+fn run_tidas_package_command(
+    input: &std::path::Path,
+    issues: &std::path::Path,
+) -> anyhow::Result<tidas_cli::TidasCommandOutput> {
+    tidas_cli::run_json(&[
         "validate",
-        input_arg.as_str(),
+        &input.to_string_lossy(),
         "--input-format",
         "tidas-json",
         "--issues",
-        issues_arg.as_str(),
+        &issues.to_string_lossy(),
         "--format",
         "json",
         "--progress",
         "never",
-    ])?;
+    ])
+}
+
+fn run_tidas_validation(input_dir: &Path) -> anyhow::Result<TidasValidationReport> {
+    let handshake = tidas_cli::handshake()?;
+    let temp = TempDir::new().context("create bounded tidas package validation spool")?;
+    let issues_path = temp.path().join("validation-issues.jsonl");
+    let output = run_tidas_package_command(input_dir, &issues_path)?;
     if output.report.get("command").and_then(Value::as_str) != Some("validate")
         || output.report.get("completeness").and_then(Value::as_str) != Some("complete")
     {
@@ -3703,6 +3712,7 @@ fn parse_artifact_kind(value: &str) -> Option<PackageArtifactKind> {
         "export_zip" => Some(PackageArtifactKind::ExportZip),
         "export_report" => Some(PackageArtifactKind::ExportReport),
         "import_report" => Some(PackageArtifactKind::ImportReport),
+        "import_details" => Some(PackageArtifactKind::ImportDetails),
         _ => None,
     }
 }

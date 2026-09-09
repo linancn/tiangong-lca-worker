@@ -221,7 +221,35 @@ async fn handle_package_job_payload_once_with_heartbeat(
     payload: &PackageJobPayload,
     lease_seconds: i32,
 ) -> anyhow::Result<PackageJobContinuation> {
-    let operation = handle_package_job_payload_once(state, payload.clone());
+    let operation = async {
+        if job.payload_schema_version
+            == solver_worker::package_types::PACKAGE_IMPORT_V2_PAYLOAD_SCHEMA_VERSION
+        {
+            let PackageJobPayload::ImportPackage {
+                job_id,
+                source_artifact_id,
+                ..
+            } = payload
+            else {
+                return Err(anyhow::anyhow!("partial import requires an import payload"));
+            };
+            solver_worker::package_execution::partial_import::execute(
+                state,
+                job,
+                *job_id,
+                *source_artifact_id,
+            )
+            .await?;
+            solver_worker::package_retention::refresh_import_source_retention(
+                &state.pool,
+                *source_artifact_id,
+            )
+            .await?;
+            Ok(PackageJobContinuation::Complete)
+        } else {
+            handle_package_job_payload_once(state, payload.clone()).await
+        }
+    };
     tokio::pin!(operation);
     let mut heartbeat = interval(lease_heartbeat_period(lease_seconds));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -616,7 +644,10 @@ fn package_worker_job_payload(job: &WorkerJob) -> anyhow::Result<PackageJobPaylo
 
     let expected_schema = package_payload_schema_version_for_job_kind(&job.job_kind)
         .ok_or_else(|| anyhow::anyhow!("unsupported package worker job kind: {}", job.job_kind))?;
-    if job.payload_schema_version != expected_schema {
+    let partial_import = job.job_kind == PACKAGE_IMPORT_WORKER_JOB_KIND
+        && job.payload_schema_version
+            == solver_worker::package_types::PACKAGE_IMPORT_V2_PAYLOAD_SCHEMA_VERSION;
+    if job.payload_schema_version != expected_schema && !partial_import {
         return Err(anyhow::anyhow!(
             "unsupported package payload schema for {}: {}",
             job.job_kind,
@@ -625,6 +656,14 @@ fn package_worker_job_payload(job: &WorkerJob) -> anyhow::Result<PackageJobPaylo
     }
 
     let mut payload = normalize_package_worker_payload_object(job.payload.clone())?;
+    let policy = payload.get("import_policy").and_then(Value::as_str);
+    if (partial_import && policy != Some(solver_worker::package_types::PACKAGE_IMPORT_V2_POLICY))
+        || (!partial_import && policy.is_some())
+    {
+        return Err(anyhow::anyhow!(
+            "package import policy and payload schema disagree"
+        ));
+    }
     if !payload.contains_key("requested_by")
         && let Some(requested_by) = job.requested_by
     {

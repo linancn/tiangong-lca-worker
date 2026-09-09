@@ -41,9 +41,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
-lastReviewedNote: "Reviewed for the Issue #279 production-schema regression test; existing snapshot and provider proof requirements remain sufficient."
+lastReviewedAt: "2026-09-09"
+lastReviewedCommit: "dd549b2e4ac8610f17c2e20619ccfe2fd631ee33"
+lastReviewedNote: "Worker #283: reviewed additive root_closure_v2 import, package-local validation, transactional group receipts and v2 artifacts; legacy v1 and calculation contracts remain unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -192,3 +192,5 @@ Install the versioned local hook once per checkout:
 ```
 
 The `pre-push` hook runs `scripts/docpact-gate.sh`, which delegates CLI lookup to `scripts/docpact` and performs strict config validation plus enforced lint before the push leaves the machine. It then runs `make check` as the local test gate. The wrapper checks `DOCPACT_BIN`, Cargo install locations, Homebrew install locations, and then `PATH`, so local agent shells should not fail only because bare `docpact` is unavailable. The default comparison base is `origin/main`. Override it for unusual stacks with `DOCPACT_BASE_REF=<ref>` or `scripts/docpact-gate.sh --base <ref>`. The gate writes its detailed report to a temporary file so normal pushes do not create `.docpact/runs/` artifacts.
+
+Partial package import additionally runs the package_execution unit tests, full Clippy, real TIDAS 0.2.0 parity fixtures and PostgreSQL group/lease/recovery qualification. Mock or graph tests do not prove real-validator parity. See `docs/tidas-package-contract.md` for v2 policy and capacity boundaries.

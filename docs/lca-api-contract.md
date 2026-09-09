@@ -25,9 +25,9 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
-lastReviewedNote: "Reviewed for the Issue #279 production calculation hotfix; API request, job, and result contracts remain unchanged."
+lastReviewedAt: "2026-09-09"
+lastReviewedCommit: "dd549b2e4ac8610f17c2e20619ccfe2fd631ee33"
+lastReviewedNote: "Worker #283: reviewed additive root_closure_v2 import, package-local validation, transactional group receipts and v2 artifacts; legacy v1 and calculation contracts remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml

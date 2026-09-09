@@ -40,9 +40,9 @@ pub const fn default_package_artifact_retention_days(kind: PackageArtifactKind) 
         PackageArtifactKind::ExportZip | PackageArtifactKind::ExportReport => {
             DEFAULT_EXPORT_PACKAGE_ARTIFACT_RETENTION_DAYS
         }
-        PackageArtifactKind::ImportSource | PackageArtifactKind::ImportReport => {
-            DEFAULT_IMPORT_PACKAGE_ARTIFACT_RETENTION_DAYS
-        }
+        PackageArtifactKind::ImportSource
+        | PackageArtifactKind::ImportReport
+        | PackageArtifactKind::ImportDetails => DEFAULT_IMPORT_PACKAGE_ARTIFACT_RETENTION_DAYS,
     }
 }
 

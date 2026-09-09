@@ -19,9 +19,9 @@ checkPaths:
   - docs/agents/repo-validation.md
   - docs/scope-closure-contract.md
   - docs/agents/contracts/scope-closure-memory-and-result-contract.md
-lastReviewedAt: 2026-09-03
-lastReviewedCommit: 0b853ac7b79a0c438abd4f5dfbb08af0a3bcab32
-lastReviewedNote: "Reviewed for the Issue #279 production hotfix; Clippy annotation compatibility does not alter TIDAS package import/export contracts."
+lastReviewedAt: "2026-09-09"
+lastReviewedCommit: "dd549b2e4ac8610f17c2e20619ccfe2fd631ee33"
+lastReviewedNote: "Worker #283: reviewed additive root_closure_v2 import, package-local validation, transactional group receipts and v2 artifacts; legacy v1 and calculation contracts remain unchanged."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -82,6 +82,7 @@ worker payload `type`：
 | --- | --- | --- | --- |
 | `tidas.export_package` | `tidas.export_package.request.v1` | `export_package` | `tidas.export_package.result.v1` |
 | `tidas.import_package` | `tidas.import_package.request.v1` | `import_package` | `tidas.import_package.result.v1` |
+| `tidas.import_package` | `tidas.import_package.request.v2` | `import_package` + `import_policy=root_closure_v2` | `tidas.import_package.result.v1` transport envelope; v2 report artifact |
 
 `package_worker` 走 `worker_jobs` 并领取 `worker_queue=package`。显式选择 `--package-queue-backend pgmq` 会在启动时失败，不会消费消息。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
 
@@ -126,7 +127,7 @@ worker payload `type`：
 
 payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_artifacts`、`lca_package_export_items` 和 `lca_package_request_cache` 的历史 `job_id` columns 仍用于同一次 package 请求内分组与 artifact/cache lookup。该 UUID 不要求存在 `lca_package_jobs` parent row。
 
-## 6.3 `import_package` worker 执行顺序（新增）
+## 6.3 v1 `import_package` worker 执行顺序
 
 `import_package` 在 worker 侧执行时，必须先做结构化校验，再进入冲突检测/写库：
 
@@ -143,6 +144,20 @@ payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_
 冲突检测以 `table + UUID + 规范化 version` 为精确键。目标环境中已存在的 `state_code = 100..=200` 记录统一视为可复用记录：Worker 跳过 package 中的对应条目，并继续导入其余数据；为保持现有 consumer 兼容，这些记录仍投影到 `filtered_open_data_count` 与 `filtered_open_data`。`state_code` 为 `null` 或不在 `100..=200` 时仍属于 `user_conflicts`，任一此类冲突都会返回 `USER_DATA_CONFLICT` 并阻止整包写入。该导入规则不改变 `open_data` export scope；导出仍只选择 `state_code = 100..=199`。
 
 运行时不得探测 Python module、`tidas-validate` 或其他候选命令。统一 binary 无法启动、版本/协议不匹配、超时、report/spool 不完整或 hash/count 不一致时，任务必须 fail closed，并映射为稳定的 `tidas_*` error code；这些 system failures 不能伪装为数据 validation issue。Worker 继续独立持有 job lease、heartbeat、取消检查、request-cache 状态和 terminal result projection，`tidas` 不接管这些行为。等待长时 validation 时，worker-jobs executor 每个 lease 的三分之一周期续租；heartbeat 被拒绝即丢弃当前 operation future，禁止继续接受或投影 validator evidence。
+
+## 6.4 v2 过程／模型引用链部分导入
+
+`package_import_v2.rs` 只处理显式 v2 policy。包内扫描、身份／重复检测、全部 issue spool 消费、引用图及候选引用链复验全部完成后，才进入业务表写入；不以数据库补齐缺失引用，也不以 `state_code` 跳过包内校验。每条过程和模型均为独立根对象，按完整直接／间接引用闭包传播阻断；孤立支持数据不写入，环通过已访问集合终止。
+
+v1 与 v2 共用 `run_tidas_package_command`，保持同一精确 binary 握手、assets、参数和 `summary.validation.error_count` 门槛。独立的 eILCD/XSD/roundtrip 输出保留为证据，本改造不把它们提升为新门槛。全包 native error 可能提前结束后续阶段，因此候选闭包继续使用同一完整命令复验。显示样本的 1,000 条限制不参与判定；原始 JSON 字节与来源路径保留。
+
+完整计划绑定 source SHA、policy、validator/assets 和计划摘要。每个成功候选调用 Database `private.tidas_import_group_apply_v2`：同事务写入根对象／依赖和成功回执，`ON CONFLICT(id,version) DO NOTHING` 处理所有已有状态。分组只插入，不覆盖、不比较数据库内容。模型与过程在同一分组时复用原有 `backfill_process_model_ids`；失败模型不自动阻断独立过程。共享记录全局去重计数。只有 serialization/deadlock 最多重试两次；约束错误回滚当前组，连接／lease 错误停止后续组。最终 lease fence 防止失租提交。
+
+v2 `import_report` 使用 `tidas-package-import-report:v2`，业务 `outcome` 为 `success/partial/none/interrupted`；Worker completed 仅表示执行返回。`roots` 最多 100 条，完整 `import_details` ZIP 包含全部 issues、validation、references、roots、records 和 plan NDJSON，manifest 绑定各文件大小与 SHA。records 的 ordinal 对应 plan 节点编号。系统失败放入 execution error，不伪装为数据校验 issue。准备失败不会入库；报告上传中断后，数据库回执仍是已提交事实，`api.svc_tidas_package_read_v2` 提供 owner-scoped 计数。两个报告制品复用现有 14 天导入保留期。
+
+显式容量为 ZIP 512 MiB／解压 2 GiB／文档 16 MiB／数据 100,000 条／引用 1,000,000 条／根 2,000 条；每组 50,000 条且 64 MiB，引用链复验累计文档访问上限 2,000,000。问题证据流及校验摘要流分别最多 512 MiB；单条问题最多 16 MiB，界面问题样本最多 1,000 条且 8 MiB。超限必须明确失败，不可截断成成功。
+
+部署顺序：先发布兼容 v1/v2 的 Worker 与 Database 增量迁移，再发布 Edge，最后启用 Next v2 提交。必须保留历史 v1 jobs/reports 的读取路径。
 
 ## 7. Artifact 契约
 
